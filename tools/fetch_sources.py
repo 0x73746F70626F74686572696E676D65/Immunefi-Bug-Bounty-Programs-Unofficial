@@ -154,6 +154,8 @@ def archive_repo(owner, repo, ref):
 
 def github(entry):
     url=entry['url'];repair_reason=None
+    if url=='https://github.com/aave-dao/gho-origin/blob/main/src/contracts/facilitators/aave/oracle/GhoOracle.so':
+        url='https://github.com/aave-dao/gho-origin/blob/main/src/contracts/misc/GhoOracle.sol';repair_reason='The pinned repository contains GhoOracle.sol under src/contracts/misc; the metadata uses an obsolete directory and a truncated .so extension.'
     if url=='https://github.com/Gearbox-protocol/security/tree/main/disclosure':
         url='https://github.com/Gearbox-protocol/security/tree/main/disclosures';repair_reason='The current security repository uses the disclosures directory, while the metadata links to disclosure.'
     if url.startswith('https://github.com/sky-ecosystem/mip21-toolkit'):

@@ -6,7 +6,19 @@ import fetch_submodules as submodules
 
 def main():
     submodules.main(retry_failed=True)
-    inventory=json.loads((f.OUT/'inventory.json').read_text());results=json.loads((f.OUT/'results.json').read_text());by_id={r['id']:r for r in results}
+    inventory=json.loads((f.OUT/'inventory.json').read_text());results=json.loads((f.OUT/'results.json').read_text())
+    repaired=[]
+    for row in results:
+        if row['status']!='missing_scoped_path' or row['url']!='https://github.com/aave-dao/gho-origin/blob/main/src/contracts/facilitators/aave/oracle/GhoOracle.so':continue
+        path='src/contracts/misc/GhoOracle.sol'
+        if any(item['path']==path for item in json.loads((f.ROOT/row['file_index']).read_text())):
+            row.update(status='fetched',scope_path=path,scope_path_present=True,metadata_url_repair={'original_url':row['url'],'resolved_url':'https://github.com/aave-dao/gho-origin/blob/main/'+path,'reason':'The pinned archive contains the requested GhoOracle source under its current directory with the full .sol extension.'});repaired.append(row)
+    if repaired:
+        f.save_json(f.OUT/'results.json',results)
+        summary=json.loads((f.OUT/'summary.json').read_text());summary['statuses']=dict(collections.Counter(r['status'] for r in results));f.save_json(f.OUT/'summary.json',summary)
+        manifest=f.OUT/'recoveries.json';recovered={r['id']:r for r in json.loads(manifest.read_text())} if manifest.exists() else {}
+        recovered.update({r['id']:r for r in repaired});f.save_json(manifest,list(recovered.values()))
+    by_id={r['id']:r for r in results}
     errors=[];archives=0;total_bytes=0
     for file in (f.OUT/'github').rglob('snapshot.json'):
         obj=json.loads(file.read_text());digest=hashlib.sha256()
