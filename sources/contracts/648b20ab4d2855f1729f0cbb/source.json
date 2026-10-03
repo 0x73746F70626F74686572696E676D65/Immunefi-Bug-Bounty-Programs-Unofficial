@@ -1,0 +1,339 @@
+{
+  "sources": {
+    "contracts/release/extensions/external-position-manager/external-positions/aave-v3-debt/AaveV3DebtPositionParser.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\nimport {IAaveAToken} from \"../../../../../external-interfaces/IAaveAToken.sol\";\nimport {IERC20} from \"../../../../../external-interfaces/IERC20.sol\";\nimport {AddOnlyAddressListOwnerConsumerMixin} from\n    \"../../../../../persistent/address-list-registry/address-list-owners/utils/0.8.19/AddOnlyAddressListOwnerConsumerMixin.sol\";\nimport {IExternalPositionParser} from \"../../IExternalPositionParser.sol\";\nimport {AaveV3DebtPositionDataDecoder} from \"./AaveV3DebtPositionDataDecoder.sol\";\nimport {IAaveV3DebtPosition} from \"./IAaveV3DebtPosition.sol\";\n\npragma solidity 0.8.19;\n\n/// @title AaveV3DebtPositionParser\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Parser for Aave Debt Positions\ncontract AaveV3DebtPositionParser is\n    IExternalPositionParser,\n    AaveV3DebtPositionDataDecoder,\n    AddOnlyAddressListOwnerConsumerMixin\n{\n    constructor(address _addressListRegistry, uint256 _aTokenListId)\n        AddOnlyAddressListOwnerConsumerMixin(_addressListRegistry, _aTokenListId)\n    {}\n\n    /// @notice Parses the assets to send and receive for the callOnExternalPosition\n    /// @param _externalPosition The _externalPosition to be called\n    /// @param _actionId The _actionId for the callOnExternalPosition\n    /// @param _encodedActionArgs The encoded parameters for the callOnExternalPosition\n    /// @return assetsToTransfer_ The assets to be transferred from the Vault\n    /// @return amountsToTransfer_ The amounts to be transferred from the Vault\n    /// @return assetsToReceive_ The assets to be received at the Vault\n    function parseAssetsForAction(address _externalPosition, uint256 _actionId, bytes memory _encodedActionArgs)\n        external\n        override\n        returns (\n            address[] memory assetsToTransfer_,\n            uint256[] memory amountsToTransfer_,\n            address[] memory assetsToReceive_\n        )\n    {\n        if (_actionId == uint256(IAaveV3DebtPosition.Actions.AddCollateral)) {\n            bool fromUnderlying;\n            (assetsToTransfer_, amountsToTransfer_, fromUnderlying) =\n                __decodeAddCollateralActionArgs(_encodedActionArgs);\n\n            for (uint256 i; i < assetsToTransfer_.length; i++) {\n                // initialiy the assetsToTransfer_ are the aTokens\n                __validateAndAddListItemIfUnregistered(assetsToTransfer_[i]);\n\n                if (fromUnderlying) {\n                    assetsToTransfer_[i] = IAaveAToken(assetsToTransfer_[i]).UNDERLYING_ASSET_ADDRESS();\n                }\n            }\n        } else if (_actionId == uint256(IAaveV3DebtPosition.Actions.Borrow)) {\n            // No need to validate tokens, as `borrow()` call to Aave will fail for invalid tokens,\n            // and even if Aave logic changes to fail silently, the worst case would be that\n            // this function is used to indirectly add and track a misc asset\n            (assetsToReceive_,) = __decodeBorrowActionArgs(_encodedActionArgs);\n        } else if (_actionId == uint256(IAaveV3DebtPosition.Actions.RemoveCollateral)) {\n            bool toUnderlying;\n            // Lib validates that each is a valid collateral asset\n            (assetsToReceive_,, toUnderlying) = __decodeRemoveCollateralActionArgs(_encodedActionArgs);\n\n            if (toUnderlying) {\n                for (uint256 i; i < assetsToReceive_.length; i++) {\n                    assetsToReceive_[i] = IAaveAToken(assetsToReceive_[i]).UNDERLYING_ASSET_ADDRESS();\n                }\n            }\n        } else if (_actionId == uint256(IAaveV3DebtPosition.Actions.RepayBorrow)) {\n            // Lib validates that each is a valid borrowed asset\n            (assetsToTransfer_, amountsToTransfer_) = __decodeRepayBorrowActionArgs(_encodedActionArgs);\n\n            for (uint256 i; i < assetsToTransfer_.length; i++) {\n                if (amountsToTransfer_[i] == type(uint256).max) {\n                    // Transfers the full repay amount to the external position,\n                    // which will still call `repay()` on the lending pool with max uint.\n                    // This is fine, because `repay()` only uses up to the full repay amount.\n                    address debtToken =\n                        IAaveV3DebtPosition(_externalPosition).getDebtTokenForBorrowedAsset(assetsToTransfer_[i]);\n                    amountsToTransfer_[i] = IERC20(debtToken).balanceOf(_externalPosition);\n                }\n            }\n        } else if (_actionId == uint256(IAaveV3DebtPosition.Actions.ClaimRewards)) {\n            (,, address rewardToken) = __decodeClaimRewardsActionArgs(_encodedActionArgs);\n            assetsToReceive_ = new address[](1);\n            assetsToReceive_[0] = rewardToken;\n        } else if (_actionId == uint256(IAaveV3DebtPosition.Actions.ClaimMerklRewards)) {\n            (assetsToReceive_,,) = __decodeClaimMerklRewardsActionArgs(_encodedActionArgs);\n        }\n\n        // No validations or transferred assets passed for Actions.SetEMode, Actions.SetUseReserveAsCollateral, and Actions.Sweep\n        return (assetsToTransfer_, amountsToTransfer_, assetsToReceive_);\n    }\n\n    /// @notice Parse and validate input arguments to be used when initializing a newly-deployed ExternalPositionProxy\n    /// @dev Empty for this external position type\n    function parseInitArgs(address, bytes memory) external override returns (bytes memory) {}\n}\n"
+    },
+    "contracts/external-interfaces/IAaveAToken.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IAaveAToken interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Common Aave aToken interface for V2 and V3\ninterface IAaveAToken {\n    function UNDERLYING_ASSET_ADDRESS() external view returns (address underlying_);\n}\n"
+    },
+    "contracts/external-interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IERC20 Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IERC20 {\n    // IERC20 - strict\n\n    function allowance(address _owner, address _spender) external view returns (uint256 allowance_);\n\n    function approve(address _spender, uint256 _value) external returns (bool approve_);\n\n    function balanceOf(address _account) external view returns (uint256 balanceOf_);\n\n    function totalSupply() external view returns (uint256 totalSupply_);\n\n    function transfer(address _to, uint256 _value) external returns (bool transfer_);\n\n    function transferFrom(address _from, address _to, uint256 _value) external returns (bool transferFrom_);\n\n    // IERC20 - typical\n\n    function decimals() external view returns (uint8 decimals_);\n\n    function name() external view returns (string memory name_);\n\n    function symbol() external view returns (string memory symbol_);\n}\n"
+    },
+    "contracts/persistent/address-list-registry/address-list-owners/utils/0.8.19/AddOnlyAddressListOwnerConsumerMixin.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.8.19;\n\nimport \"../../../IAddressListRegistry.sol\";\nimport \"../IAddOnlyAddressListOwner.sol\";\n\n/// @title AddOnlyAddressListOwnerConsumerMixin Contract\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Mixin contract for interacting with a contract that inherits `AddOnlyAddressListOwnerBase`\nabstract contract AddOnlyAddressListOwnerConsumerMixin {\n    IAddressListRegistry internal immutable ADDRESS_LIST_REGISTRY_CONTRACT;\n    uint256 internal immutable LIST_ID;\n    IAddOnlyAddressListOwner internal immutable LIST_OWNER_CONTRACT;\n\n    constructor(address _addressListRegistry, uint256 _listId) {\n        ADDRESS_LIST_REGISTRY_CONTRACT = IAddressListRegistry(_addressListRegistry);\n        LIST_ID = _listId;\n\n        address listOwner = IAddressListRegistry(_addressListRegistry).getListOwner(_listId);\n        LIST_OWNER_CONTRACT = IAddOnlyAddressListOwner(listOwner);\n    }\n\n    /// @dev Helper to lookup an item's existence and then attempt to add it.\n    /// AddOnlyAddressListOwnerBase.addValidatedItemsToList() performs validation on the item\n    /// via the __validateItems() implementation of its inheriting contract.\n    function __validateAndAddListItemIfUnregistered(address _item) internal {\n        if (!ADDRESS_LIST_REGISTRY_CONTRACT.isInList(LIST_ID, _item)) {\n            address[] memory items = new address[](1);\n            items[0] = _item;\n\n            LIST_OWNER_CONTRACT.addValidatedItemsToList(items);\n        }\n    }\n}\n"
+    },
+    "contracts/release/extensions/external-position-manager/IExternalPositionParser.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IExternalPositionParser Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Interface for all external position parsers\ninterface IExternalPositionParser {\n    function parseAssetsForAction(address _externalPosition, uint256 _actionId, bytes memory _encodedActionArgs)\n        external\n        returns (\n            address[] memory assetsToTransfer_,\n            uint256[] memory amountsToTransfer_,\n            address[] memory assetsToReceive_\n        );\n\n    function parseInitArgs(address _vaultProxy, bytes memory _initializationData)\n        external\n        returns (bytes memory initArgs_);\n}\n"
+    },
+    "contracts/release/extensions/external-position-manager/external-positions/aave-v3-debt/AaveV3DebtPositionDataDecoder.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Foundation <security@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.8.19;\n\n/// @title AaveV3DebtPositionDataDecoder Contract\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Abstract contract containing data decodings for AaveV3DebtPosition payloads\nabstract contract AaveV3DebtPositionDataDecoder {\n    /// @dev Helper to decode args used during the AddCollateral action\n    function __decodeAddCollateralActionArgs(bytes memory _actionArgs)\n        internal\n        pure\n        returns (address[] memory aTokens_, uint256[] memory amounts_, bool fromUnderlying_)\n    {\n        return abi.decode(_actionArgs, (address[], uint256[], bool));\n    }\n\n    /// @dev Helper to decode args used during the Borrow action\n    function __decodeBorrowActionArgs(bytes memory _actionArgs)\n        internal\n        pure\n        returns (address[] memory underlyings_, uint256[] memory amounts_)\n    {\n        return abi.decode(_actionArgs, (address[], uint256[]));\n    }\n\n    /// @dev Helper to decode args used during the RemoveCollateral action\n    function __decodeRemoveCollateralActionArgs(bytes memory _actionArgs)\n        internal\n        pure\n        returns (address[] memory aTokens_, uint256[] memory amounts_, bool toUnderlying_)\n    {\n        return abi.decode(_actionArgs, (address[], uint256[], bool));\n    }\n\n    /// @dev Helper to decode args used during the RepayBorrow action\n    function __decodeRepayBorrowActionArgs(bytes memory _actionArgs)\n        internal\n        pure\n        returns (address[] memory underlyings_, uint256[] memory amounts_)\n    {\n        return abi.decode(_actionArgs, (address[], uint256[]));\n    }\n\n    /// @dev Helper to decode args used during the SetEMode action\n    function __decodeSetEModeActionArgs(bytes memory _actionArgs) internal pure returns (uint8 categoryId_) {\n        return abi.decode(_actionArgs, (uint8));\n    }\n\n    /// @dev Helper to decode args used during the SetUseReserveAsCollateral action\n    function __decodeSetUseReserveAsCollateralActionArgs(bytes memory _actionArgs)\n        internal\n        pure\n        returns (address underlying_, bool useAsCollateral_)\n    {\n        return abi.decode(_actionArgs, (address, bool));\n    }\n\n    /// @dev Helper to decode args used during the ClaimRewards action\n    function __decodeClaimRewardsActionArgs(bytes memory _actionArgs)\n        internal\n        pure\n        returns (address[] memory assets_, uint256 amount_, address rewardToken_)\n    {\n        return abi.decode(_actionArgs, (address[], uint256, address));\n    }\n\n    /// @dev Helper to decode args used during the Sweep action\n    function __decodeSweepActionArgs(bytes memory _actionArgs) internal pure returns (address[] memory assets_) {\n        return abi.decode(_actionArgs, (address[]));\n    }\n\n    /// @dev Helper to decode args used during the ClaimMerklRewards action\n    function __decodeClaimMerklRewardsActionArgs(bytes memory _actionArgs)\n        internal\n        pure\n        returns (address[] memory tokens_, uint256[] memory amounts_, bytes32[][] memory proofs_)\n    {\n        return abi.decode(_actionArgs, (address[], uint256[], bytes32[][]));\n    }\n}\n"
+    },
+    "contracts/release/extensions/external-position-manager/external-positions/aave-v3-debt/IAaveV3DebtPosition.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Foundation <security@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\nimport {IExternalPosition} from \"../../IExternalPosition.sol\";\n\npragma solidity 0.8.19;\n\n/// @title IAaveDebtPosition Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IAaveV3DebtPosition is IExternalPosition {\n    enum Actions {\n        AddCollateral,\n        RemoveCollateral,\n        Borrow,\n        RepayBorrow,\n        SetEMode,\n        SetUseReserveAsCollateral,\n        ClaimRewards,\n        Sweep,\n        ClaimMerklRewards\n    }\n\n    function getDebtTokenForBorrowedAsset(address) external view returns (address);\n}\n"
+    },
+    "contracts/persistent/address-list-registry/IAddressListRegistry.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\n/// @title IAddressListRegistry Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IAddressListRegistry {\n    enum UpdateType {\n        None,\n        AddOnly,\n        RemoveOnly,\n        AddAndRemove\n    }\n\n    struct ListInfo {\n        address owner;\n        UpdateType updateType;\n        mapping(address => bool) itemToIsInList;\n    }\n\n    /////////////////////\n    // LIST MANAGEMENT //\n    /////////////////////\n\n    function addToList(uint256 _id, address[] calldata _items) external;\n\n    function attestLists(uint256[] calldata _ids, string[] calldata _descriptions) external;\n\n    function createList(address _owner, UpdateType _updateType, address[] calldata _initialItems)\n        external\n        returns (uint256 id_);\n\n    function removeFromList(uint256 _id, address[] calldata _items) external;\n\n    function setListOwner(uint256 _id, address _nextOwner) external;\n\n    function setListUpdateType(uint256 _id, UpdateType _nextUpdateType) external;\n\n    /////////////////\n    // LIST SEARCH //\n    /////////////////\n\n    function areAllInAllLists(uint256[] memory _ids, address[] memory _items)\n        external\n        view\n        returns (bool areAllInAllLists_);\n\n    function areAllInList(uint256 _id, address[] memory _items) external view returns (bool areAllInList_);\n\n    function areAllInSomeOfLists(uint256[] memory _ids, address[] memory _items)\n        external\n        view\n        returns (bool areAllInSomeOfLists_);\n\n    function areAllNotInAnyOfLists(uint256[] memory _ids, address[] memory _items)\n        external\n        view\n        returns (bool areAllNotInAnyOfLists_);\n\n    function areAllNotInList(uint256 _id, address[] memory _items) external view returns (bool areAllNotInList_);\n\n    function isInAllLists(uint256[] memory _ids, address _item) external view returns (bool isInAllLists_);\n\n    function isInList(uint256 _id, address _item) external view returns (bool isInList_);\n\n    function isInSomeOfLists(uint256[] memory _ids, address _item) external view returns (bool isInSomeOfLists_);\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    function getListCount() external view returns (uint256 count_);\n\n    function getListOwner(uint256 _id) external view returns (address owner_);\n\n    function getListUpdateType(uint256 _id) external view returns (UpdateType updateType_);\n}\n"
+    },
+    "contracts/persistent/address-list-registry/address-list-owners/utils/IAddOnlyAddressListOwner.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IAddOnlyAddressListOwner Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IAddOnlyAddressListOwner {\n    function addValidatedItemsToList(address[] calldata _items) external;\n}\n"
+    },
+    "contracts/release/extensions/external-position-manager/IExternalPosition.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Foundation <security@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport {IExternalPositionLibCore} from \"../../../persistent/external-positions/IExternalPositionLibCore.sol\";\n\n/// @title IExternalPosition Contract\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IExternalPosition is IExternalPositionLibCore {\n    function getDebtAssets() external returns (address[] memory assets_, uint256[] memory amounts_);\n\n    function getManagedAssets() external returns (address[] memory assets_, uint256[] memory amounts_);\n\n    function init(bytes memory _data) external;\n}\n"
+    },
+    "contracts/persistent/external-positions/IExternalPositionLibCore.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Foundation <security@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IExternalPositionLibCore interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice An interface for core required functions of an IExternalPositionLib instance\ninterface IExternalPositionLibCore {\n    function receiveCallFromVault(bytes memory _data) external;\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.19+commit.7dd6d404"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_addressListRegistry",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_aTokenListId",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_externalPosition",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_actionId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_encodedActionArgs",
+              "type": "bytes"
+            }
+          ],
+          "name": "parseAssetsForAction",
+          "outputs": [
+            {
+              "internalType": "address[]",
+              "name": "assetsToTransfer_",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "amountsToTransfer_",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "address[]",
+              "name": "assetsToReceive_",
+              "type": "address[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "parseInitArgs",
+          "outputs": [
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Enzyme Foundation <security@enzyme.finance>",
+        "kind": "dev",
+        "methods": {
+          "parseAssetsForAction(address,uint256,bytes)": {
+            "params": {
+              "_actionId": "The _actionId for the callOnExternalPosition",
+              "_encodedActionArgs": "The encoded parameters for the callOnExternalPosition",
+              "_externalPosition": "The _externalPosition to be called"
+            },
+            "returns": {
+              "amountsToTransfer_": "The amounts to be transferred from the Vault",
+              "assetsToReceive_": "The assets to be received at the Vault",
+              "assetsToTransfer_": "The assets to be transferred from the Vault"
+            }
+          },
+          "parseInitArgs(address,bytes)": {
+            "details": "Empty for this external position type"
+          }
+        },
+        "title": "AaveV3DebtPositionParser",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "parseAssetsForAction(address,uint256,bytes)": {
+            "notice": "Parses the assets to send and receive for the callOnExternalPosition"
+          },
+          "parseInitArgs(address,bytes)": {
+            "notice": "Parse and validate input arguments to be used when initializing a newly-deployed ExternalPositionProxy"
+          }
+        },
+        "notice": "Parser for Aave Debt Positions",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/release/extensions/external-position-manager/external-positions/aave-v3-debt/AaveV3DebtPositionParser.sol": "AaveV3DebtPositionParser"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "appendCBOR": false,
+        "bytecodeHash": "none"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "inliner": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": false
+        },
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":morpho-blue/=lib/morpho-blue/src/libraries/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "sources": {
+      "contracts/external-interfaces/IAaveAToken.sol": {
+        "keccak256": "0xa8c9810dc335e9e33d741e9a102c45b9023647c3d2be5042aafd66d0a09d7370",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://1033519ba328dbc81dcbf5f71e0e30314b66596ee7d28c8461251c838d76ff24",
+          "dweb:/ipfs/QmUk78vE98jCvZLevxUB47eYF1433UsAXEndDpwxWTQekT"
+        ]
+      },
+      "contracts/external-interfaces/IERC20.sol": {
+        "keccak256": "0x0e3b292dac297f351b4f8147d10e7d8bc870daa4e4651ac12ad78ba6b1f3dfb0",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://06041127874184dc391018da2eefe673636750696c9135bde6bbeab1c7640419",
+          "dweb:/ipfs/QmeNgv1D9NYTGnhEGjujATjsHD1KFxtqehGB1nfnEDy629"
+        ]
+      },
+      "contracts/persistent/address-list-registry/IAddressListRegistry.sol": {
+        "keccak256": "0x56cb1cced78b355a42192c3fa189b29f1fc3881183f450089d402d171af60475",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://644ade439405d30b7ed957dcb00e9cdf65f2ca7a09795dab4582cbd7c3fa7501",
+          "dweb:/ipfs/QmWNzMMWzPFkV9fVUKoeBLYEYEQaZqRa2rKeBD7fZHhq5X"
+        ]
+      },
+      "contracts/persistent/address-list-registry/address-list-owners/utils/0.8.19/AddOnlyAddressListOwnerConsumerMixin.sol": {
+        "keccak256": "0xd987e5f469d52686b229ee079acbba85874296112f4f12d200627d418a73e316",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://67bdf3d8e2bb8c33dc412f919b362b3e2969df4f9d0de7d2f31598b5db1df258",
+          "dweb:/ipfs/QmWWRERzD9VGUFkkMycxGVNTJoUdyp1YRaae7v3q9ddYm1"
+        ]
+      },
+      "contracts/persistent/address-list-registry/address-list-owners/utils/IAddOnlyAddressListOwner.sol": {
+        "keccak256": "0x091e7bd50b87987a3581dba06a9e338a501b0f71f8c458e8a0db3e9561a2d9be",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://e0882bc793228c4eb19f8eac4643bfb21ba925021cb6f9d43894f1538a3b1559",
+          "dweb:/ipfs/QmUDsBygrnGiFnJjeALdP5BF9dCAdEJzfPVPxVY6YZ35sN"
+        ]
+      },
+      "contracts/persistent/external-positions/IExternalPositionLibCore.sol": {
+        "keccak256": "0xafb1863e2067ddd78d3ada779ecbd3e06a9a018cd383171b902d2977cae8a9a8",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://310684e55e5d4395edc6b7c9ba35802c0295409e691ec3a827fd15dbd955c536",
+          "dweb:/ipfs/QmSBG5QB2xtwNP6Tn6fvJpNTSEceYMR92ZdgEX9AxPWp22"
+        ]
+      },
+      "contracts/release/extensions/external-position-manager/IExternalPosition.sol": {
+        "keccak256": "0xc9edde1202cec5f200763eba4564f11fdce83078549a4a5131ae6b927400a97d",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://c07ea617087146b23feb6858b13371845d6b78c5e4c03fa40d6f44e38973216c",
+          "dweb:/ipfs/Qmc1jMZJEgfvxfDK5U4Jr2h9bvvfVkZwg4Y5B932WZkmGc"
+        ]
+      },
+      "contracts/release/extensions/external-position-manager/IExternalPositionParser.sol": {
+        "keccak256": "0xb376611a016e2fbbfe3aa3b736400f137b8f45226519197fad11f7e8f54984e4",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://0bd67f49710dbd264aa8ece78cf7cb34cb7dff209cf409fb50a4fa52d0c0c39b",
+          "dweb:/ipfs/QmaGW5yQu2qQfJb9qzV6fnrohHhTQyh4p32rRbK3DtEjyu"
+        ]
+      },
+      "contracts/release/extensions/external-position-manager/external-positions/aave-v3-debt/AaveV3DebtPositionDataDecoder.sol": {
+        "keccak256": "0x498313292cc5ee55e707ec436c1b817fd30255a1385f3afa180149964074eecc",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://3d3ef386304603bd0eb1cbd72e4cb66445664e997a112aec42a960919cd3dbaf",
+          "dweb:/ipfs/Qmb1kxnxKbDFpXEnpdDMRR3oD3tEDneyUh71Gkb9FJKQEd"
+        ]
+      },
+      "contracts/release/extensions/external-position-manager/external-positions/aave-v3-debt/AaveV3DebtPositionParser.sol": {
+        "keccak256": "0xef3988495f523500575617301ee4e646f4f2b7c25d3979a29bd8f6acc51a4bf6",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://6988a5ebef3287bbbdb455f7f1e3bcc989809a412b7bd9a4da1905bd09c8abfb",
+          "dweb:/ipfs/QmYUDZcvfH3CX9EPgdHtdPWXbgQq26FSNJzHW2zWMrqAMh"
+        ]
+      },
+      "contracts/release/extensions/external-position-manager/external-positions/aave-v3-debt/IAaveV3DebtPosition.sol": {
+        "keccak256": "0x2d822f239555cf640da448a3e42d76b2330df2157058b6e81284142462d5b9ec",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://56c188874ee245b182bb20bdb74a2ff7ed779b001abfd2f4c1266a2112c17d09",
+          "dweb:/ipfs/QmY89t6uREdfBrnSp975wgMnh3zKKu2Rf9GPbDqrshDBr8"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.19+commit.7dd6d404",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": false,
+        "bytecodeHash": "none",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "details": {
+          "yul": false
+        },
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        "@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        "@uniswap/v3-core/=lib/uniswap-v3-core/",
+        "ds-test/=lib/forge-std/lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "morpho-blue/=lib/morpho-blue/src/libraries/",
+        "openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        "openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        "openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        "uniswap-v3-core/=lib/uniswap-v3-core/",
+        "uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        "uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "name": "AaveV3DebtPositionParser",
+    "fullyQualifiedName": "contracts/release/extensions/external-position-manager/external-positions/aave-v3-debt/AaveV3DebtPositionParser.sol:AaveV3DebtPositionParser"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "18731624",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-02-14T21:37:36Z",
+  "match": "match",
+  "chainId": "8453",
+  "address": "0x211B9327C66F621C0b7248bfA6828ea8644f1F7c"
+}
