@@ -56,6 +56,10 @@ def tasks():
 
 def main(retry_failed=False):
     results_file=f.OUT/'submodules.json';results={r['id']:r for r in json.loads(results_file.read_text())} if results_file.exists() else {}
+    recovery_file=f.OUT/'submodule-recoveries.json'
+    if recovery_file.exists():
+        for row in json.loads(recovery_file.read_text()):
+            if row.get('status')=='fetched' and results.get(row['id'],{}).get('status')!='fetched':results[row['id']]=row
     retried=set()
     while True:
         todo=[(k,t) for k,t in tasks().items() if k not in results or (retry_failed and results[k]['status']=='failed' and k not in retried)]
