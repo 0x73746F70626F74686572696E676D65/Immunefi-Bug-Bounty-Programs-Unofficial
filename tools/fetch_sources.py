@@ -445,6 +445,8 @@ BLOCKSCOUT_ALIASES={'optimistic.etherscan.io':'optimism.blockscout.com','explore
 RPC_ENDPOINTS={1:'https://ethereum-rpc.publicnode.com',137:'https://polygon-bor-rpc.publicnode.com',42161:'https://arbitrum-one-rpc.publicnode.com',10:'https://optimism-rpc.publicnode.com',8453:'https://base-rpc.publicnode.com',56:'https://bsc-rpc.publicnode.com',43114:'https://avalanche-c-chain-rpc.publicnode.com',100:'https://gnosis-rpc.publicnode.com',250:'https://fantom-rpc.publicnode.com',146:'https://sonic-rpc.publicnode.com',80094:'https://berachain-rpc.publicnode.com',130:'https://unichain-rpc.publicnode.com',999:'https://rpc.hyperliquid.xyz/evm',4217:'https://rpc.tempo.xyz'}
 RPC_ENDPOINTS.update({42220:'https://forno.celo.org',1030:'https://evm.confluxrpc.com',2818:'https://rpc.morphl2.io',1313161554:'https://mainnet.aurora.dev',30:'https://public-node.rsk.co',196:'https://rpc.xlayer.tech',1284:'https://rpc.api.moonbeam.network',1285:'https://rpc.api.moonriver.moonbeam.network'})
 BLOCKSCOUT_ALIASES.update({'celoscan.io':'celo.blockscout.com','aurorascan.dev':'explorer.aurora.dev','explorer.morph.network':'explorer.morphl2.io'})
+RPC_ENDPOINTS.update({252: 'https://rpc.frax.com', 957: 'https://rpc.derive.xyz', 2741: 'https://api.mainnet.abs.xyz', 5000: 'https://rpc.mantle.xyz', 9745: 'https://rpc.plasma.to', 13371: 'https://rpc.immutable.com', 34443: 'https://mainnet.mode.network', 59144: 'https://rpc.linea.build', 81457: 'https://rpc.blast.io', 167000: 'https://rpc.mainnet.taiko.xyz', 534352: 'https://rpc.scroll.io', 747474: 'https://rpc.katana.network'})
+BLOCKSCOUT_ALIASES['explorer.lyra.finance']='explorer.derive.xyz'
 RPC_VERIFIED={};RPC_LOCKS={};RPC_GUARD=threading.Lock()
 IPFS_CACHE={};IPFS_GUARD=threading.Lock();IPFS_LOCKS={}
 def ipfs_bytes(cid):
