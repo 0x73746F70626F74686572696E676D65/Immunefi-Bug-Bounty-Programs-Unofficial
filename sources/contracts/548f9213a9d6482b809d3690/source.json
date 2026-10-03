@@ -1,0 +1,488 @@
+{
+  "sources": {
+    "src/functions/ConstantProduct2.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\nimport {IBeanstalkWellFunction} from \"src/interfaces/IBeanstalkWellFunction.sol\";\nimport {ProportionalLPToken2} from \"src/functions/ProportionalLPToken2.sol\";\nimport {LibMath} from \"src/libraries/LibMath.sol\";\nimport {Math} from \"oz/utils/math/Math.sol\";\n\n/**\n * @title ConstantProduct2\n * @author Brendan\n * @notice Gas efficient Constant Product pricing function for Wells with 2 tokens.\n * @dev Constant Product Wells with 2 tokens use the formula:\n *  `b_0 * b_1 = s^2`\n *\n * Where:\n *  `s` is the supply of LP tokens\n *  `b_i` is the reserve at index `i`\n */\ncontract ConstantProduct2 is ProportionalLPToken2, IBeanstalkWellFunction {\n    using Math for uint256;\n\n    uint256 constant EXP_PRECISION = 1e12;\n    uint256 constant CALC_RATE_PRECISION = 1e18;\n\n    /**\n     * @dev `s = (b_0 * b_1)^(1/2)`\n     *\n     * When does this function overflow?\n     * ---------------------------------\n     *\n     * Let N be the length of the reserves array, and P be the precision multiplier\n     * defined in `EXP_PRECISION`.\n     *\n     * Assuming all tokens in reserves are at their maximum value simultaneously,\n     * this function will overflow when:\n     *\n     *  (10^X)^N * P >= MAX_UINT256 (~10^77)\n     *  10^(X*N) >= 10^77/P\n     *  (X*N)*ln(10) >= 77*ln(10) - ln(P)\n     *\n     *  ∴ X >= (1/N) * (77 - ln(P)/ln(10))\n     *\n     * ConstantProduct2 sets the constraints `N = 2` and `EXP_PRECISION = 1e12`,\n     * resulting in an upper bound of X = 32.5.\n     *\n     * In other words, {calcLpTokenSupply} overflows if all reserves are simultaneously\n     * >= 10^32.5, or about 100 trillion if tokens are measured to 18 decimal precision.\n     *\n     * The further apart the reserve values, the greater the loss of precision in the `sqrt` function.\n     */\n    function calcLpTokenSupply(\n        uint256[] calldata reserves,\n        bytes calldata\n    ) external pure override returns (uint256 lpTokenSupply) {\n        lpTokenSupply = (reserves[0] * reserves[1] * EXP_PRECISION).sqrt();\n    }\n\n    /// @dev `b_j = s^2 / b_{i | i != j}`\n    /// @dev rounds up\n    function calcReserve(\n        uint256[] calldata reserves,\n        uint256 j,\n        uint256 lpTokenSupply,\n        bytes calldata\n    ) external pure override returns (uint256 reserve) {\n        if (j >= 2) {\n            revert InvalidJArgument();\n        }\n        // Note: potential optimization is to use unchecked math here\n        reserve = lpTokenSupply ** 2;\n        reserve = LibMath.roundUpDiv(reserve, reserves[j == 1 ? 0 : 1] * EXP_PRECISION);\n    }\n\n    function name() external pure override returns (string memory) {\n        return \"Constant Product 2\";\n    }\n\n    function symbol() external pure override returns (string memory) {\n        return \"CP2\";\n    }\n\n    function version() external pure override returns (string memory) {\n        return \"1.2.1\";\n    }\n\n    /// @dev `b_j = (b_0 * b_1 * r_j / r_i)^(1/2)`\n    /// Note: Always rounds down\n    function calcReserveAtRatioSwap(\n        uint256[] calldata reserves,\n        uint256 j,\n        uint256[] calldata ratios,\n        bytes calldata\n    ) external pure override returns (uint256 reserve) {\n        uint256 i = j == 1 ? 0 : 1;\n        // use 512 muldiv for last mul to avoid overflow\n        reserve = (reserves[i] * reserves[j]).mulDiv(ratios[j], ratios[i]).sqrt();\n    }\n\n    /// @dev `b_j = b_i * r_j / r_i`\n    /// Note: Always rounds down\n    function calcReserveAtRatioLiquidity(\n        uint256[] calldata reserves,\n        uint256 j,\n        uint256[] calldata ratios,\n        bytes calldata\n    ) external pure override returns (uint256 reserve) {\n        uint256 i = j == 1 ? 0 : 1;\n        reserve = reserves[i].mulDiv(ratios[j], ratios[i]);\n    }\n\n    function calcRate(\n        uint256[] calldata reserves,\n        uint256 i,\n        uint256 j,\n        bytes calldata\n    ) external pure returns (uint256 rate) {\n        rate = reserves[i].mulDiv(CALC_RATE_PRECISION, reserves[j]);\n    }\n\n    /**\n     * @notice Returns the precision of the ratio at which the pump will cap the reserve at.\n     */\n    function ratioPrecision(uint256, bytes calldata) external pure returns (uint256 precision) {\n        return CALC_RATE_PRECISION;\n    }\n}\n"
+    },
+    "src/interfaces/IBeanstalkWellFunction.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\nimport {IMultiFlowPumpWellFunction} from \"src/interfaces/IMultiFlowPumpWellFunction.sol\";\n\n/**\n * @title IBeanstalkWellFunction\n * @notice Defines all necessary functions for Beanstalk to support a Well Function in addition to functions defined in the primary interface.\n * It extends `IMultiFlowPumpWellFunction` as Beanstalk requires Wells to use MultiFlowPump in order to have access to manipulation resistant oracles.\n * Beanstalk requires 2 functions to solve for a given reserve value such that the average price between\n * the given reserve and all other reserves equals the average of the input ratios.\n * - `calcReserveAtRatioSwap` assumes the target ratios are reached through executing a swap. Note: `calcReserveAtRatioSwap` is included in {IMultiFlowPumpWellFunction}.\n * - `calcReserveAtRatioLiquidity` assumes the target ratios are reached through adding/removing liquidity.\n */\ninterface IBeanstalkWellFunction is IMultiFlowPumpWellFunction {\n    /**\n     * @notice Calculates the `j` reserve such that `π_{i | i != j} (d reserves_j / d reserves_i) = π_{i | i != j}(ratios_j / ratios_i)`.\n     * assumes that reserve_j is being added or removed in exchange for LP Tokens.\n     * @dev used by Beanstalk to calculate the max deltaB that can be converted in/out of a Well.\n     * @param reserves The reserves of the Well\n     * @param j The index of the reserve to solve for\n     * @param ratios The ratios of reserves to solve for\n     * @param data Well function data provided on every call\n     * @return reserve The resulting reserve at the jth index\n     */\n    function calcReserveAtRatioLiquidity(\n        uint256[] calldata reserves,\n        uint256 j,\n        uint256[] calldata ratios,\n        bytes calldata data\n    ) external view returns (uint256 reserve);\n}\n"
+    },
+    "src/functions/ProportionalLPToken2.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\nimport {IWellFunction} from \"src/interfaces/IWellFunction.sol\";\nimport {Math} from \"oz/utils/math/Math.sol\";\n\n/**\n * @title ProportionalLPToken2\n * @notice Defines a proportional relationship between the supply of LP tokens\n * and the amount of each underlying token for a two-token Well.\n * @dev When removing `s` LP tokens with a Well with `S` LP token supply, the user\n * recieves `s * b_i / S` of each underlying token.\n */\nabstract contract ProportionalLPToken2 is IWellFunction {\n    using Math for uint256;\n\n    function calcLPTokenUnderlying(\n        uint256 lpTokenAmount,\n        uint256[] calldata reserves,\n        uint256 lpTokenSupply,\n        bytes calldata\n    ) external pure returns (uint256[] memory underlyingAmounts) {\n        underlyingAmounts = new uint256[](2);\n        underlyingAmounts[0] = lpTokenAmount.mulDiv(reserves[0], lpTokenSupply);\n        underlyingAmounts[1] = lpTokenAmount.mulDiv(reserves[1], lpTokenSupply);\n    }\n}\n"
+    },
+    "src/libraries/LibMath.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\n/**\n * @title Lib Math contains math operations\n */\nlibrary LibMath {\n    /**\n     * @param a numerator\n     * @param b denominator\n     * @dev Division, rounded up\n     */\n    function roundUpDiv(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) return 0;\n        return (a - 1) / b + 1;\n    }\n\n    /**\n     * @notice Computes the `n`th root of a number `a` using the Newton--Raphson method.\n     * @param a The number to compute the root of\n     * @param n The root to compute\n     * @return root The `n`th root of `a`\n     * @dev TODO: more testing - https://ethereum.stackexchange.com/questions\n     * /38468/calculate-the-nth-root-of-an-arbitrary-uint-using-solidity\n     * https://en.wikipedia.org/wiki/Nth_root_algorithm\n     * This is used in {ConstantProduct.Sol}, where the number of tokens are\n     * restricted to 16. even roots are much cheaper to compute than uneven,\n     * thus we recursively call sqrt().\n     *\n     */\n    function nthRoot(uint256 a, uint256 n) internal pure returns (uint256 root) {\n        assert(n > 1);\n        if (a == 0) return 0;\n        // Equivalent to \"i % 2 == 0\" but cheaper.\n        if (n & 1 == 0) {\n            if (n == 2) return sqrt(a); // shortcut for square root\n            if (n == 4) return sqrt(sqrt(a));\n            if (n == 8) return sqrt(sqrt(sqrt(a)));\n            if (n == 16) return sqrt(sqrt(sqrt(sqrt(a))));\n        }\n        // The scale factor is a crude way to turn everything into integer calcs.\n        // Actually do ((10 ^ n) * a) ^ (1/n)\n        uint256 a0 = (10 ** n) * a;\n\n        uint256 xNew = 10;\n        uint256 x;\n        while (xNew != x) {\n            x = xNew;\n            uint256 t0 = x ** (n - 1);\n            if (x * t0 > a0) {\n                xNew = x - (x - a0 / t0) / n;\n            } else {\n                xNew = x + (a0 / t0 - x) / n;\n            }\n        }\n\n        root = (xNew + 5) / 10;\n    }\n\n    /**\n     * @notice computes the square root of a given number\n     * @param a The number to compute the square root of\n     * @return z The square root of a\n     * @dev\n     * This function is based on the Babylonian method of computing square roots\n     * https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method\n     * Implementation from: https://github.com/Gaussian-Process/solidity-sqrt/blob/main/src/FixedPointMathLib.sol\n     * based on https://github.com/transmissions11/solmate/blob/main/src/utils/FixedPointMathLib.sol\n     */\n    function sqrt(uint256 a) internal pure returns (uint256 z) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            let y := a // We start y at a, which will help us make our initial estimate.\n\n            z := 181 // The \"correct\" value is 1, but this saves a multiplication later.\n\n            // This segment is to get a reasonable initial estimate for the Babylonian method. With a bad\n            // start, the correct # of bits increases ~linearly each iteration instead of ~quadratically.\n\n            // We check y >= 2^(k + 8) but shift right by k bits\n            // each branch to ensure that if a >= 256, then y >= 256.\n            if iszero(lt(y, 0x10000000000000000000000000000000000)) {\n                y := shr(128, y)\n                z := shl(64, z)\n            }\n            if iszero(lt(y, 0x1000000000000000000)) {\n                y := shr(64, y)\n                z := shl(32, z)\n            }\n            if iszero(lt(y, 0x10000000000)) {\n                y := shr(32, y)\n                z := shl(16, z)\n            }\n            if iszero(lt(y, 0x1000000)) {\n                y := shr(16, y)\n                z := shl(8, z)\n            }\n\n            // Goal was to get z*z*y within a small factor of a. More iterations could\n            // get y in a tighter range. Currently, we will have y in [256, 256*2^16).\n            // We ensured y >= 256 so that the relative difference between y and y+1 is small.\n            // That's not possible if a < 256 but we can just verify those cases exhaustively.\n\n            // Now, z*z*y <= a < z*z*(y+1), and y <= 2^(16+8), and either y >= 256, or a < 256.\n            // Correctness can be checked exhaustively for a < 256, so we assume y >= 256.\n            // Then z*sqrt(y) is within sqrt(257)/sqrt(256) of sqrt(a), or about 20bps.\n\n            // For s in the range [1/256, 256], the estimate f(s) = (181/1024) * (s+1) is in the range\n            // (1/2.84 * sqrt(s), 2.84 * sqrt(s)), with largest error when s = 1 and when s = 256 or 1/256.\n\n            // Since y is in [256, 256*2^16), let a = y/65536, so that a is in [1/256, 256). Then we can estimate\n            // sqrt(y) using sqrt(65536) * 181/1024 * (a + 1) = 181/4 * (y + 65536)/65536 = 181 * (y + 65536)/2^18.\n\n            // There is no overflow risk here since y < 2^136 after the first branch above.\n            z := shr(18, mul(z, add(y, 65536))) // A mul() is saved from starting z at 181.\n\n            // Given the worst case multiplicative error of 2.84 above, 7 iterations should be enough.\n            z := shr(1, add(z, div(a, z)))\n            z := shr(1, add(z, div(a, z)))\n            z := shr(1, add(z, div(a, z)))\n            z := shr(1, add(z, div(a, z)))\n            z := shr(1, add(z, div(a, z)))\n            z := shr(1, add(z, div(a, z)))\n            z := shr(1, add(z, div(a, z)))\n\n            // If a+1 is a perfect square, the Babylonian method cycles between\n            // floor(sqrt(a)) and ceil(sqrt(a)). This statement ensures we return floor.\n            // See: https://en.wikipedia.org/wiki/Integer_square_root#Using_only_integer_division\n            // Since the ceil is rare, we save gas on the assignment and repeat division in the rare case.\n            // If you don't care whether the floor or ceil square root is returned, you can remove this statement.\n            z := sub(z, lt(div(a, z), z))\n        }\n    }\n\n    /**\n     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0\n     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)\n     * with further edits by Uniswap Labs also under MIT license.\n     */\n    function mulDivOrMax(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {\n        unchecked {\n            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use\n            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256\n            // variables such that product = prod1 * 2^256 + prod0.\n            uint256 prod0; // Least significant 256 bits of the product\n            uint256 prod1; // Most significant 256 bits of the product\n            assembly {\n                let mm := mulmod(x, y, not(0))\n                prod0 := mul(x, y)\n                prod1 := sub(sub(mm, prod0), lt(mm, prod0))\n            }\n\n            // Handle non-overflow cases, 256 by 256 division.\n            if (prod1 == 0) {\n                // Solidity will revert if denominator == 0, unlike the div opcode on its own.\n                // The surrounding unchecked block does not change this fact.\n                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.\n                return prod0 / denominator;\n            }\n\n            // Make sure the result is less than 2^256. Also prevents denominator == 0.\n            if (denominator <= prod1) return type(uint256).max;\n\n            ///////////////////////////////////////////////\n            // 512 by 256 division.\n            ///////////////////////////////////////////////\n\n            // Make division exact by subtracting the remainder from [prod1 prod0].\n            uint256 remainder;\n            assembly {\n                // Compute remainder using mulmod.\n                remainder := mulmod(x, y, denominator)\n\n                // Subtract 256 bit number from 512 bit number.\n                prod1 := sub(prod1, gt(remainder, prod0))\n                prod0 := sub(prod0, remainder)\n            }\n\n            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.\n            // See https://cs.stackexchange.com/q/138556/92363.\n\n            // Does not overflow because the denominator cannot be zero at this stage in the function.\n            uint256 twos = denominator & (~denominator + 1);\n            assembly {\n                // Divide denominator by twos.\n                denominator := div(denominator, twos)\n\n                // Divide [prod1 prod0] by twos.\n                prod0 := div(prod0, twos)\n\n                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.\n                twos := add(div(sub(0, twos), twos), 1)\n            }\n\n            // Shift in bits from prod1 into prod0.\n            prod0 |= prod1 * twos;\n\n            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such\n            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for\n            // four bits. That is, denominator * inv = 1 mod 2^4.\n            uint256 inverse = (3 * denominator) ^ 2;\n\n            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works\n            // in modular arithmetic, doubling the correct bits in each step.\n            inverse *= 2 - denominator * inverse; // inverse mod 2^8\n            inverse *= 2 - denominator * inverse; // inverse mod 2^16\n            inverse *= 2 - denominator * inverse; // inverse mod 2^32\n            inverse *= 2 - denominator * inverse; // inverse mod 2^64\n            inverse *= 2 - denominator * inverse; // inverse mod 2^128\n            inverse *= 2 - denominator * inverse; // inverse mod 2^256\n\n            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.\n            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is\n            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1\n            // is no longer required.\n            result = prod0 * inverse;\n            return result;\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.9.0) (utils/math/Math.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Standard math utilities missing in the Solidity language.\n */\nlibrary Math {\n    enum Rounding {\n        Down, // Toward negative infinity\n        Up, // Toward infinity\n        Zero // Toward zero\n    }\n\n    /**\n     * @dev Returns the largest of two numbers.\n     */\n    function max(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a > b ? a : b;\n    }\n\n    /**\n     * @dev Returns the smallest of two numbers.\n     */\n    function min(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a < b ? a : b;\n    }\n\n    /**\n     * @dev Returns the average of two numbers. The result is rounded towards\n     * zero.\n     */\n    function average(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b) / 2 can overflow.\n        return (a & b) + (a ^ b) / 2;\n    }\n\n    /**\n     * @dev Returns the ceiling of the division of two numbers.\n     *\n     * This differs from standard division with `/` in that it rounds up instead\n     * of rounding down.\n     */\n    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b - 1) / b can overflow on addition, so we distribute.\n        return a == 0 ? 0 : (a - 1) / b + 1;\n    }\n\n    /**\n     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0\n     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)\n     * with further edits by Uniswap Labs also under MIT license.\n     */\n    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {\n        unchecked {\n            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use\n            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256\n            // variables such that product = prod1 * 2^256 + prod0.\n            uint256 prod0; // Least significant 256 bits of the product\n            uint256 prod1; // Most significant 256 bits of the product\n            assembly {\n                let mm := mulmod(x, y, not(0))\n                prod0 := mul(x, y)\n                prod1 := sub(sub(mm, prod0), lt(mm, prod0))\n            }\n\n            // Handle non-overflow cases, 256 by 256 division.\n            if (prod1 == 0) {\n                // Solidity will revert if denominator == 0, unlike the div opcode on its own.\n                // The surrounding unchecked block does not change this fact.\n                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.\n                return prod0 / denominator;\n            }\n\n            // Make sure the result is less than 2^256. Also prevents denominator == 0.\n            require(denominator > prod1, \"Math: mulDiv overflow\");\n\n            ///////////////////////////////////////////////\n            // 512 by 256 division.\n            ///////////////////////////////////////////////\n\n            // Make division exact by subtracting the remainder from [prod1 prod0].\n            uint256 remainder;\n            assembly {\n                // Compute remainder using mulmod.\n                remainder := mulmod(x, y, denominator)\n\n                // Subtract 256 bit number from 512 bit number.\n                prod1 := sub(prod1, gt(remainder, prod0))\n                prod0 := sub(prod0, remainder)\n            }\n\n            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.\n            // See https://cs.stackexchange.com/q/138556/92363.\n\n            // Does not overflow because the denominator cannot be zero at this stage in the function.\n            uint256 twos = denominator & (~denominator + 1);\n            assembly {\n                // Divide denominator by twos.\n                denominator := div(denominator, twos)\n\n                // Divide [prod1 prod0] by twos.\n                prod0 := div(prod0, twos)\n\n                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.\n                twos := add(div(sub(0, twos), twos), 1)\n            }\n\n            // Shift in bits from prod1 into prod0.\n            prod0 |= prod1 * twos;\n\n            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such\n            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for\n            // four bits. That is, denominator * inv = 1 mod 2^4.\n            uint256 inverse = (3 * denominator) ^ 2;\n\n            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works\n            // in modular arithmetic, doubling the correct bits in each step.\n            inverse *= 2 - denominator * inverse; // inverse mod 2^8\n            inverse *= 2 - denominator * inverse; // inverse mod 2^16\n            inverse *= 2 - denominator * inverse; // inverse mod 2^32\n            inverse *= 2 - denominator * inverse; // inverse mod 2^64\n            inverse *= 2 - denominator * inverse; // inverse mod 2^128\n            inverse *= 2 - denominator * inverse; // inverse mod 2^256\n\n            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.\n            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is\n            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1\n            // is no longer required.\n            result = prod0 * inverse;\n            return result;\n        }\n    }\n\n    /**\n     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.\n     */\n    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {\n        uint256 result = mulDiv(x, y, denominator);\n        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {\n            result += 1;\n        }\n        return result;\n    }\n\n    /**\n     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.\n     *\n     * Inspired by Henry S. Warren, Jr.'s \"Hacker's Delight\" (Chapter 11).\n     */\n    function sqrt(uint256 a) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.\n        //\n        // We know that the \"msb\" (most significant bit) of our target number `a` is a power of 2 such that we have\n        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.\n        //\n        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`\n        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`\n        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`\n        //\n        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.\n        uint256 result = 1 << (log2(a) >> 1);\n\n        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,\n        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at\n        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision\n        // into the expected uint128 result.\n        unchecked {\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            return min(result, a / result);\n        }\n    }\n\n    /**\n     * @notice Calculates sqrt(a), following the selected rounding direction.\n     */\n    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = sqrt(a);\n            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 2, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log2(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >> 128 > 0) {\n                value >>= 128;\n                result += 128;\n            }\n            if (value >> 64 > 0) {\n                value >>= 64;\n                result += 64;\n            }\n            if (value >> 32 > 0) {\n                value >>= 32;\n                result += 32;\n            }\n            if (value >> 16 > 0) {\n                value >>= 16;\n                result += 16;\n            }\n            if (value >> 8 > 0) {\n                value >>= 8;\n                result += 8;\n            }\n            if (value >> 4 > 0) {\n                value >>= 4;\n                result += 4;\n            }\n            if (value >> 2 > 0) {\n                value >>= 2;\n                result += 2;\n            }\n            if (value >> 1 > 0) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log2(value);\n            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 10, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log10(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >= 10 ** 64) {\n                value /= 10 ** 64;\n                result += 64;\n            }\n            if (value >= 10 ** 32) {\n                value /= 10 ** 32;\n                result += 32;\n            }\n            if (value >= 10 ** 16) {\n                value /= 10 ** 16;\n                result += 16;\n            }\n            if (value >= 10 ** 8) {\n                value /= 10 ** 8;\n                result += 8;\n            }\n            if (value >= 10 ** 4) {\n                value /= 10 ** 4;\n                result += 4;\n            }\n            if (value >= 10 ** 2) {\n                value /= 10 ** 2;\n                result += 2;\n            }\n            if (value >= 10 ** 1) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log10(value);\n            return result + (rounding == Rounding.Up && 10 ** result < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 256, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     *\n     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.\n     */\n    function log256(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >> 128 > 0) {\n                value >>= 128;\n                result += 16;\n            }\n            if (value >> 64 > 0) {\n                value >>= 64;\n                result += 8;\n            }\n            if (value >> 32 > 0) {\n                value >>= 32;\n                result += 4;\n            }\n            if (value >> 16 > 0) {\n                value >>= 16;\n                result += 2;\n            }\n            if (value >> 8 > 0) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log256(value);\n            return result + (rounding == Rounding.Up && 1 << (result << 3) < value ? 1 : 0);\n        }\n    }\n}\n"
+    },
+    "src/interfaces/IMultiFlowPumpWellFunction.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\nimport {IWellFunction} from \"src/interfaces/IWellFunction.sol\";\n\n/**\n * @title IMultiFlowPumpWellFunction\n * @dev A Well Function must implement IMultiFlowPumpWellFunction to be supported by\n * the Multi Flow Pump.\n */\ninterface IMultiFlowPumpWellFunction is IWellFunction {\n    /**\n     * @notice Calculates the `j` reserve such that `π_{i | i != j} (d reserves_j / d reserves_i) = π_{i | i != j}(ratios_j / ratios_i)`.\n     * assumes that reserve_j is being swapped for other reserves in the Well.\n     * @dev used by Beanstalk to calculate the deltaB every Season\n     * @param reserves The reserves of the Well\n     * @param j The index of the reserve to solve for\n     * @param ratios The ratios of reserves to solve for\n     * @param data Well function data provided on every call\n     * @return reserve The resulting reserve at the jth index\n     */\n    function calcReserveAtRatioSwap(\n        uint256[] calldata reserves,\n        uint256 j,\n        uint256[] calldata ratios,\n        bytes calldata data\n    ) external view returns (uint256 reserve);\n\n    /**\n     * @notice Calculates the rate at which j can be exchanged for i.\n     * @param reserves The reserves of the Well\n     * @param i The index of the token for which the output is being calculated\n     * @param j The index of the token for which 1 token is being exchanged\n     * @param data Well function data provided on every call\n     * @return rate The rate at which j can be exchanged for i\n     * @dev should return with 36 decimal precision\n     */\n    function calcRate(\n        uint256[] calldata reserves,\n        uint256 i,\n        uint256 j,\n        bytes calldata data\n    ) external view returns (uint256 rate);\n\n    /**\n     * @notice Returns the precision of the ratio at which the pump will cap the reserve at.\n     * @param j The index of the reserve to solve for\n     * @param data The data passed to the well function\n     * @return precision The precision of the ratio at which the pump will cap the reserve at\n     */\n    function ratioPrecision(uint256 j, bytes calldata data) external view returns (uint256);\n}\n"
+    },
+    "src/interfaces/IWellFunction.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\n/**\n * @title IWellFunction\n * @notice Defines a relationship between token reserves and LP token supply.\n * @dev Well Functions can contain arbitrary logic, but should be deterministic\n * if expected to be used alongside a Pump. When interacing with a Well or\n * Well Function, always verify that the Well Function is valid.\n */\ninterface IWellFunction {\n    /**\n     * @notice Thrown if the user inputs a `j` value is out of bounds.\n     */\n    error InvalidJArgument();\n\n    /**\n     * @notice Calculates the `j`th reserve given a list of `reserves` and `lpTokenSupply`.\n     * @param reserves A list of token reserves. The jth reserve will be ignored, but a placeholder must be provided.\n     * @param j The index of the reserve to solve for\n     * @param lpTokenSupply The supply of LP tokens\n     * @param data Extra Well function data provided on every call\n     * @return reserve The resulting reserve at the jth index\n     * @dev Should round up to ensure that Well reserves are marginally higher to enforce calcLpTokenSupply(...) >= totalSupply()\n     */\n    function calcReserve(\n        uint256[] memory reserves,\n        uint256 j,\n        uint256 lpTokenSupply,\n        bytes calldata data\n    ) external view returns (uint256 reserve);\n\n    /**\n     * @notice Gets the LP token supply given a list of reserves.\n     * @param reserves A list of token reserves\n     * @param data Extra Well function data provided on every call\n     * @return lpTokenSupply The resulting supply of LP tokens\n     * @dev Should round down to ensure so that the Well Token supply is marignally lower to enforce calcLpTokenSupply(...) >= totalSupply()\n     */\n    function calcLpTokenSupply(\n        uint256[] memory reserves,\n        bytes calldata data\n    ) external view returns (uint256 lpTokenSupply);\n\n    /**\n     * @notice Calculates the amount of each reserve token underlying a given amount of LP tokens.\n     * @param lpTokenAmount An amount of LP tokens\n     * @param reserves A list of token reserves\n     * @param lpTokenSupply The current supply of LP tokens\n     * @param data Extra Well function data provided on every call\n     * @return underlyingAmounts The amount of each reserve token that underlies the LP tokens\n     * @dev The constraint totalSupply() <= calcLPTokenSupply(...) must be held in the case where\n     * `lpTokenAmount` LP tokens are burned in exchanged for `underlyingAmounts`. If the constraint\n     * does not hold, then the Well Function is invalid.\n     */\n    function calcLPTokenUnderlying(\n        uint256 lpTokenAmount,\n        uint256[] memory reserves,\n        uint256 lpTokenSupply,\n        bytes calldata data\n    ) external view returns (uint256[] memory underlyingAmounts);\n\n    /**\n     * @notice Returns the name of the Well function.\n     */\n    function name() external view returns (string memory);\n\n    /**\n     * @notice Returns the symbol of the Well function.\n     */\n    function symbol() external view returns (string memory);\n\n    /**\n     * @notice Returns the version of the Well function.\n     */\n    function version() external view returns (string memory);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.26+commit.8a97fa7a"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [],
+          "name": "InvalidJArgument",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "lpTokenAmount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "reserves",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256",
+              "name": "lpTokenSupply",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "calcLPTokenUnderlying",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "underlyingAmounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "reserves",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "calcLpTokenSupply",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "lpTokenSupply",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "reserves",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256",
+              "name": "i",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "j",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "calcRate",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "rate",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "reserves",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256",
+              "name": "j",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "lpTokenSupply",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "calcReserve",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "reserve",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "reserves",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256",
+              "name": "j",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "ratios",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "calcReserveAtRatioLiquidity",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "reserve",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "reserves",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256",
+              "name": "j",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "ratios",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "calcReserveAtRatioSwap",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "reserve",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "name",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "ratioPrecision",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "precision",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "symbol",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "version",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Brendan",
+        "details": "Constant Product Wells with 2 tokens use the formula:  `b_0 * b_1 = s^2` Where:  `s` is the supply of LP tokens  `b_i` is the reserve at index `i`",
+        "kind": "dev",
+        "methods": {
+          "calcLpTokenSupply(uint256[],bytes)": {
+            "details": "`s = (b_0 * b_1)^(1/2)` When does this function overflow? --------------------------------- Let N be the length of the reserves array, and P be the precision multiplier defined in `EXP_PRECISION`. Assuming all tokens in reserves are at their maximum value simultaneously, this function will overflow when:  (10^X)^N * P >= MAX_UINT256 (~10^77)  10^(X*N) >= 10^77/P  (X*N)*ln(10) >= 77*ln(10) - ln(P)  ∴ X >= (1/N) * (77 - ln(P)/ln(10)) ConstantProduct2 sets the constraints `N = 2` and `EXP_PRECISION = 1e12`, resulting in an upper bound of X = 32.5. In other words, {calcLpTokenSupply} overflows if all reserves are simultaneously >= 10^32.5, or about 100 trillion if tokens are measured to 18 decimal precision. The further apart the reserve values, the greater the loss of precision in the `sqrt` function."
+          },
+          "calcReserve(uint256[],uint256,uint256,bytes)": {
+            "details": "`b_j = s^2 / b_{i | i != j}`rounds up"
+          },
+          "calcReserveAtRatioLiquidity(uint256[],uint256,uint256[],bytes)": {
+            "details": "`b_j = b_i * r_j / r_i` Note: Always rounds down"
+          },
+          "calcReserveAtRatioSwap(uint256[],uint256,uint256[],bytes)": {
+            "details": "`b_j = (b_0 * b_1 * r_j / r_i)^(1/2)` Note: Always rounds down"
+          }
+        },
+        "title": "ConstantProduct2",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "InvalidJArgument()": [
+            {
+              "notice": "Thrown if the user inputs a `j` value is out of bounds."
+            }
+          ]
+        },
+        "kind": "user",
+        "methods": {
+          "name()": {
+            "notice": "Returns the name of the Well function."
+          },
+          "ratioPrecision(uint256,bytes)": {
+            "notice": "Returns the precision of the ratio at which the pump will cap the reserve at."
+          },
+          "symbol()": {
+            "notice": "Returns the symbol of the Well function."
+          },
+          "version()": {
+            "notice": "Returns the version of the Well function."
+          }
+        },
+        "notice": "Gas efficient Constant Product pricing function for Wells with 2 tokens.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/functions/ConstantProduct2.sol": "ConstantProduct2"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":@prb/test/=lib/prb-math/lib/prb-test/src/",
+        ":ds-test/=lib/prb-math/lib/forge-std/lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts-upgradeable/lib/erc4626-tests/",
+        ":forge-std/=lib/forge-std/src/",
+        ":mocks/=mocks/",
+        ":openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/openzeppelin-contracts-upgradeable/contracts/",
+        ":oz/=lib/openzeppelin-contracts/contracts/",
+        ":ozu/=lib/openzeppelin-contracts-upgradeable/contracts/",
+        ":prb-math/=lib/prb-math/src/",
+        ":prb-test/=lib/prb-math/lib/prb-test/src/",
+        ":prb/math/=lib/prb-math/src/",
+        ":src/=src/",
+        ":tests/=tests/",
+        ":utils/=utils/"
+      ]
+    },
+    "sources": {
+      "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+        "keccak256": "0xe4455ac1eb7fc497bb7402579e7b4d64d928b846fce7d2b6fde06d366f21c2b3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://cc8841b3cd48ad125e2f46323c8bad3aa0e88e399ec62acb9e57efa7e7c8058c",
+          "dweb:/ipfs/QmSqE4mXHA2BXW58deDbXE8MTcsL5JSKNDbm23sVQxRLPS"
+        ]
+      },
+      "src/functions/ConstantProduct2.sol": {
+        "keccak256": "0x9377a0bf0788aef5155d9755708f282cf4e0ee350eb0de6586b8f0e88ab2a7c6",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0e9efdba1ee5bc19b01677a908199c848992796a7256e7f65f2b71374275bc91",
+          "dweb:/ipfs/QmQ9jbsNj1ZX4hxjnE5CAXuen8rPDRaukVJdQ2VTHFrkAe"
+        ]
+      },
+      "src/functions/ProportionalLPToken2.sol": {
+        "keccak256": "0x14f9eff542afe981ee36f55fec6fe002d2d3f355c13808cdcf16568dbcf4bec3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c7838fdf7da55f3fc7cb37a930d31da656fd899d4899e56d2b363f1091dd7de2",
+          "dweb:/ipfs/QmaVPcd1oEQX2xV8rdVPKtHUmW47CfgjCGdp6ZcZHPcEEf"
+        ]
+      },
+      "src/interfaces/IBeanstalkWellFunction.sol": {
+        "keccak256": "0xc160616f8e14ab67effaaddabbd83ca1a8543d25d136b9679d928293dd7a6042",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://1e43dce67859c11c7ec7bb992128b2228f89b41fb38e417a9b5a422e29c7e4e7",
+          "dweb:/ipfs/Qmch58vkXC1koPs8y9Q35pGPHQM8RmaptukZHf7jaDtsao"
+        ]
+      },
+      "src/interfaces/IMultiFlowPumpWellFunction.sol": {
+        "keccak256": "0x33c6b38f94208f3275680ea2c57b87a278534e5bd4b9e1c04189fdb7e2e2f176",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://82ca1a9bc85435edc8e7f5500b73bdb3fc78dc0a6286541654ecc8cef906cbcd",
+          "dweb:/ipfs/QmSsxMocjKdmK2sFy5VkkekFFPLw9JUpDxYyiXxu5nna8o"
+        ]
+      },
+      "src/interfaces/IWellFunction.sol": {
+        "keccak256": "0x93d947c621a453e58792a3f64da28e3aeac04d242a3bd742320b918afe2ace0e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8387f6da6ac59de26faac4e36fc97ae2f5413454bbddfdf4c15b4a2812c0d9c6",
+          "dweb:/ipfs/QmYnRWV72ttYb5VSyAZhtXrqddd7m9dTXrnsQHuFc4aL2Y"
+        ]
+      },
+      "src/libraries/LibMath.sol": {
+        "keccak256": "0x63e7b14f0c2b20623bc90ace55ff7dcc3bc08f36cae1610616a0222d3657a00a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://288c60d4a8c00a4ef1555e1c738254de1e83df289c8fc7a1ae49c24c7c43bf82",
+          "dweb:/ipfs/QmbfSFQ5EX6wJ1QSqNc67YXrizjzegH9Tqsko7N6a8wCPr"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.26+commit.8a97fa7a",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        "prb/math/=lib/prb-math/src/",
+        "forge-std/=lib/forge-std/src/",
+        "oz/=lib/openzeppelin-contracts/contracts/",
+        "ozu/=lib/openzeppelin-contracts-upgradeable/contracts/",
+        "src/=src/",
+        "mocks/=mocks/",
+        "tests/=tests/",
+        "utils/=utils/",
+        "@openzeppelin/=node_modules/@openzeppelin/",
+        "@prb/test/=lib/prb-math/lib/prb-test/src/",
+        "ds-test/=lib/prb-math/lib/forge-std/lib/ds-test/src/",
+        "erc4626-tests/=lib/openzeppelin-contracts-upgradeable/lib/erc4626-tests/",
+        "openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        "openzeppelin/=lib/openzeppelin-contracts-upgradeable/contracts/",
+        "prb-math/=lib/prb-math/src/",
+        "prb-test/=lib/prb-math/lib/prb-test/src/"
+      ]
+    },
+    "name": "ConstantProduct2",
+    "fullyQualifiedName": "src/functions/ConstantProduct2.sol:ConstantProduct2"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "9549690",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2025-10-20T17:04:11Z",
+  "match": "exact_match",
+  "chainId": "42161",
+  "address": "0xBA15000450Bf6d48ec50BD6327A9403E401b72b4"
+}

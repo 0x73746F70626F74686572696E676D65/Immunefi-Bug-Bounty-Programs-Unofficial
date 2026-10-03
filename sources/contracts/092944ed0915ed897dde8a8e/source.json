@@ -1,0 +1,309 @@
+{
+  "sources": {
+    "contracts/ecosystem/oracles/LSDChainlinkOracle.sol": {
+      "content": "/**\n * SPDX-License-Identifier: MIT\n **/\npragma solidity ^0.8.20;\n\nimport {LibChainlinkOracle} from \"contracts/libraries/Oracle/LibChainlinkOracle.sol\";\n\n/**\n * @title LSDChainlinkOracle\n * @author Brean\n * @notice An oracle implementation that returns the price of a ETH LSD in USD.\n * @dev This is done by multiplying the price of xETH/ETH by the price of ETH/USD.\n */\ncontract LSDChainlinkOracle {\n    uint256 internal constant PRECISION = 1e6;\n    uint256 internal constant ETH_DECIMALS = 18;\n\n    /**\n     * @notice decodes data using the same format that the getPrice function uses.\n     * Used to verify the data is encoded correctly.\n     */\n    function decodeData(\n        bytes memory data\n    )\n        external\n        pure\n        returns (\n            address ethChainlinkOracle,\n            uint256 ethTimeout,\n            address xEthChainlinkOracle,\n            uint256 xEthTimeout\n        )\n    {\n        (ethChainlinkOracle, ethTimeout, xEthChainlinkOracle, xEthTimeout) = abi.decode(\n            data,\n            (address, uint256, address, uint256)\n        );\n    }\n\n    /**\n     * @notice returns the price of the token.\n     * if decimals are greater than 0, return the USD/TOKEN price.\n     * else, return the TOKEN/USD price.\n     * TOKEN/USD has 6 decimal precision, whereas USD/TOKEN has the token's decimal precision.\n     * @dev if lookback is set to 0, use the instanteous price, else use the TWAP.\n     */\n    function getPrice(\n        uint256 decimals,\n        uint256 lookback,\n        bytes memory data\n    ) external view returns (uint256) {\n        (\n            address ethChainlinkOracle,\n            uint256 ethTimeout,\n            address xEthChainlinkOracle,\n            uint256 xEthTimeout\n        ) = abi.decode(data, (address, uint256, address, uint256));\n\n        // get the price of xETH/ETH or ETH/xETH, depending on decimals.\n        uint256 xEthEthPrice = LibChainlinkOracle.getTokenPrice(\n            xEthChainlinkOracle,\n            xEthTimeout,\n            decimals,\n            lookback\n        );\n\n        // get the price of ETH/USD or USD/ETH. (note: ETH has 18 decimals.)\n        uint256 ethUsdPrice = LibChainlinkOracle.getTokenPrice(\n            ethChainlinkOracle,\n            ethTimeout,\n            decimals == 0 ? 0 : ETH_DECIMALS,\n            lookback\n        );\n\n        if (decimals == 0) {\n            // xETH/ETH (6 decimals) * ETH/USD (6 decimals) / PRECISION = xETH/USD (6 decimals)\n            return (xEthEthPrice * ethUsdPrice) / PRECISION;\n        } else {\n            // USD/ETH (n decimals) * ETH/xETH (18 decimals) / 10 ** ETH_DECIMALS = USD/xETH (n decimals)\n            return (xEthEthPrice * ethUsdPrice) / (10 ** ETH_DECIMALS);\n        }\n    }\n}\n"
+    },
+    "contracts/libraries/Oracle/LibChainlinkOracle.sol": {
+      "content": "/**\n * SPDX-License-Identifier: MIT\n **/\n\npragma solidity ^0.8.20;\n\nimport {C} from \"contracts/C.sol\";\nimport {IChainlinkAggregator} from \"contracts/interfaces/chainlink/IChainlinkAggregator.sol\";\nimport {LibRedundantMath256} from \"contracts/libraries/LibRedundantMath256.sol\";\n\n/**\n * @title Chainlink Oracle Library\n * @notice Contains functionalty to fetch prices from Chainlink price feeds.\n * @dev currently supports:\n * - ETH/USD price feed\n **/\nlibrary LibChainlinkOracle {\n    using LibRedundantMath256 for uint256;\n\n    uint256 constant PRECISION = 1e6; // use 6 decimal precision.\n\n    // timeout for Oracles with a 1 hour heartbeat.\n    uint256 constant FOUR_HOUR_TIMEOUT = 14400;\n    // timeout for Oracles with a 1 day heartbeat.\n    uint256 constant FOUR_DAY_TIMEOUT = 345600;\n\n    struct TwapVariables {\n        uint256 cumulativePrice;\n        uint256 endTimestamp;\n        uint256 lastTimestamp;\n    }\n\n    /**\n     * @dev Returns the TOKEN1/TOKEN2, or TOKEN2/TOKEN1 price with the option of using a TWA lookback.\n     * Use `lookback = 0` for the instantaneous price. `lookback > 0` for a TWAP.\n     * Use `tokenDecimals = 0` for TOKEN1/TOKEN2 price. `tokenDecimals > 0` for TOKEN2/TOKEN1 price.\n     * Return value has 6 decimal precision if using TOKEN1/TOKEN2, and `tokenDecimals` if using TOKEN2/TOKEN1.\n     * Returns 0 if `priceAggregatorAddress` is broken or frozen.\n     **/\n    function getTokenPrice(\n        address priceAggregatorAddress,\n        uint256 maxTimeout,\n        uint256 tokenDecimals,\n        uint256 lookback,\n        bool isMillion\n    ) internal view returns (uint256 price) {\n        return\n            lookback > 0\n                ? getTwap(priceAggregatorAddress, maxTimeout, tokenDecimals, lookback, isMillion)\n                : getPrice(priceAggregatorAddress, maxTimeout, tokenDecimals, isMillion);\n    }\n\n    function getTokenPrice(\n        address priceAggregatorAddress,\n        uint256 maxTimeout,\n        uint256 tokenDecimals,\n        uint256 lookback\n    ) internal view returns (uint256 price) {\n        return getTokenPrice(priceAggregatorAddress, maxTimeout, tokenDecimals, lookback, false);\n    }\n\n    /**\n     * @dev Returns the price of a given `priceAggregator`\n     * Use `tokenDecimals = 0` for TOKEN1/TOKEN2 price. `tokenDecimals > 0` for TOKEN2/TOKEN1 price\n     * where TOKEN1 is the numerator asset and TOKEN2 is the asset the oracle is denominated in.\n     * Return value has 6 decimal precision if using TOKEN1/TOKEN2, and `tokenDecimals` if using TOKEN2/TOKEN1.\n     * Returns 0 if Chainlink's price feed is broken or frozen.\n     **/\n    function getPrice(\n        address priceAggregatorAddress,\n        uint256 maxTimeout,\n        uint256 tokenDecimals,\n        bool isMillion\n    ) internal view returns (uint256 price) {\n        IChainlinkAggregator priceAggregator = IChainlinkAggregator(priceAggregatorAddress);\n        // First, try to get current decimal precision:\n        uint8 decimals;\n        try priceAggregator.decimals() returns (uint8 _decimals) {\n            // If call to Chainlink succeeds, record the current decimal precision\n            decimals = _decimals;\n        } catch {\n            // If call to Chainlink aggregator reverts, return a price of 0 indicating failure\n            return 0;\n        }\n\n        // Secondly, try to get latest price data:\n        try priceAggregator.latestRoundData() returns (\n            uint80 roundId,\n            int256 answer,\n            uint256 /* startedAt */,\n            uint256 timestamp,\n            uint80 /* answeredInRound */\n        ) {\n            // Check for an invalid roundId that is 0\n            if (roundId == 0) return 0;\n            if (checkForInvalidTimestampOrAnswer(timestamp, answer, block.timestamp, maxTimeout)) {\n                return 0;\n            }\n\n            // if token decimals is greater than 0, return the TOKEN2/TOKEN1 price instead (i.e invert the price).\n            if (tokenDecimals > 0) {\n                // if `isMillion` is set, return `MillionTOKEN2/TOKEN1` Price instead\n                // (i.e, the amount of TOKEN1 equal to a million of TOKEN2)\n                if (isMillion) tokenDecimals = tokenDecimals + 6;\n                price = uint256(10 ** (tokenDecimals + decimals)).div(uint256(answer));\n            } else {\n                // Adjust to 6 decimal precision.\n                price = uint256(answer).mul(PRECISION).div(10 ** decimals);\n            }\n        } catch {\n            // If call to Chainlink aggregator reverts, return a price of 0 indicating failure\n            return 0;\n        }\n    }\n\n    /**\n     * @dev Returns the TWAP price from the Chainlink Oracle over the past `lookback` seconds.\n     * Use `tokenDecimals = 0` for TOKEN1/TOKEN2 price. `tokenDecimals > 0` for TOKEN2/TOKEN1 price.\n     * Return value has 6 decimal precision if using TOKEN1/TOKEN2, and `tokenDecimals` if using TOKEN2/TOKEN1.\n     * Returns 0 if Chainlink's price feed is broken or frozen.\n     **/\n    function getTwap(\n        address priceAggregatorAddress,\n        uint256 maxTimeout,\n        uint256 tokenDecimals,\n        uint256 lookback,\n        bool isMillion\n    ) internal view returns (uint256 price) {\n        // First, try to get current decimal precision:\n        uint8 decimals;\n        try IChainlinkAggregator(priceAggregatorAddress).decimals() returns (uint8 _decimals) {\n            // If call to Chainlink succeeds, record the current decimal precision\n            decimals = _decimals;\n        } catch {\n            // If call to Chainlink aggregator reverts, return a price of 0 indicating failure\n            return 0;\n        }\n\n        // Secondly, try to get latest price data:\n        try IChainlinkAggregator(priceAggregatorAddress).latestRoundData() returns (\n            uint80 roundId,\n            int256 answer,\n            uint256 /* startedAt */,\n            uint256 timestamp,\n            uint80 /* answeredInRound */\n        ) {\n            // Check for an invalid roundId that is 0\n            if (roundId == 0) return 0;\n            if (checkForInvalidTimestampOrAnswer(timestamp, answer, block.timestamp, maxTimeout)) {\n                return 0;\n            }\n\n            TwapVariables memory t;\n\n            t.endTimestamp = block.timestamp.sub(lookback);\n\n            if (isMillion) {\n                // if `isMillion` flag is enabled,\n                tokenDecimals = tokenDecimals + 6;\n            }\n            // Check if last round was more than `lookback` ago.\n            if (timestamp <= t.endTimestamp) {\n                if (tokenDecimals > 0) {\n                    return uint256(10 ** (tokenDecimals + decimals)).div(uint256(answer));\n                } else {\n                    // Adjust to 6 decimal precision.\n                    return uint256(answer).mul(PRECISION).div(10 ** decimals);\n                }\n            } else {\n                t.lastTimestamp = block.timestamp;\n                // Loop through previous rounds and compute cumulative sum until\n                // a round at least `lookback` seconds ago is reached.\n                while (timestamp > t.endTimestamp) {\n                    // if token decimals is greater than 0, return the TOKEN2/TOKEN1 price instead (i.e invert the price).\n                    if (tokenDecimals > 0) {\n                        answer = int256((10 ** (tokenDecimals + decimals)) / (uint256(answer)));\n                    }\n                    t.cumulativePrice = t.cumulativePrice.add(\n                        uint256(answer).mul(t.lastTimestamp.sub(timestamp))\n                    );\n                    roundId -= 1;\n                    t.lastTimestamp = timestamp;\n                    (answer, timestamp) = getRoundData(\n                        IChainlinkAggregator(priceAggregatorAddress),\n                        roundId\n                    );\n                    if (\n                        checkForInvalidTimestampOrAnswer(\n                            timestamp,\n                            answer,\n                            t.lastTimestamp,\n                            maxTimeout\n                        )\n                    ) {\n                        return 0;\n                    }\n                }\n                if (tokenDecimals > 0) {\n                    answer = int256((10 ** (tokenDecimals + decimals)) / (uint256(answer)));\n                }\n                t.cumulativePrice = t.cumulativePrice.add(\n                    uint256(answer).mul(t.lastTimestamp.sub(t.endTimestamp))\n                );\n                if (tokenDecimals > 0) {\n                    price = t.cumulativePrice.div(lookback);\n                } else {\n                    price = t.cumulativePrice.mul(PRECISION).div(10 ** decimals).div(lookback);\n                }\n            }\n        } catch {\n            // If call to Chainlink aggregator reverts, return a price of 0 indicating failure\n            return 0;\n        }\n    }\n\n    function getRoundData(\n        IChainlinkAggregator priceAggregator,\n        uint80 roundId\n    ) private view returns (int256, uint256) {\n        try priceAggregator.getRoundData(roundId) returns (\n            uint80 /* roundId */,\n            int256 _answer,\n            uint256 /* startedAt */,\n            uint256 _timestamp,\n            uint80 /* answeredInRound */\n        ) {\n            return (_answer, _timestamp);\n        } catch {\n            return (-1, 0);\n        }\n    }\n\n    function checkForInvalidTimestampOrAnswer(\n        uint256 timestamp,\n        int256 answer,\n        uint256 currentTimestamp,\n        uint256 maxTimeout\n    ) private pure returns (bool) {\n        // Check for an invalid timeStamp that is 0, or in the future\n        if (timestamp == 0 || timestamp > currentTimestamp) return true;\n        // Check if Chainlink's price feed has timed out\n        if (currentTimestamp.sub(timestamp) > maxTimeout) return true;\n        // Check for non-positive price\n        if (answer <= 0) return true;\n\n        return false;\n    }\n}\n"
+    },
+    "contracts/C.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\nimport \"./interfaces/IBean.sol\";\nimport \"./interfaces/IFertilizer.sol\";\nimport \"./interfaces/IProxyAdmin.sol\";\nimport \"./libraries/Decimal.sol\";\nimport \"./interfaces/IPipeline.sol\";\n\n/**\n * @title C\n * @author Publius\n * @notice Contains constants used throughout Beanstalk.\n */\nlibrary C {\n    using Decimal for Decimal.D256;\n\n    //////////////////// Globals ////////////////////\n\n    uint256 internal constant PRECISION = 1e18;\n\n    //////////////////// Reentrancy ////////////////////\n    uint256 internal constant NOT_ENTERED = 1;\n    uint256 internal constant ENTERED = 2;\n\n    //////////////////// Season ////////////////////\n\n    /// @dev The length of a Season meaured in seconds.\n    uint256 internal constant CURRENT_SEASON_PERIOD = 3600; // 1 hour\n    uint256 internal constant SOP_PRECISION = 1e30;\n\n    //////////////////// Silo ////////////////////\n    uint256 internal constant STALK_PER_BEAN = 1e10;\n    uint256 private constant ROOTS_BASE = 1e12;\n\n    //////////////////// Exploit Migration ////////////////////\n\n    uint256 private constant UNRIPE_LP_PER_DOLLAR = 1884592; // 145_113_507_403_282 / 77_000_000\n    uint256 private constant ADD_LP_RATIO = 866616;\n\n    //////////////////// Contracts ////////////////////\n\n    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;\n    address internal constant PIPELINE = 0xb1bE000644bD25996b0d9C2F7a6D6BA3954c91B0;\n\n    //////////////////// Well ////////////////////\n\n    uint256 internal constant WELL_MINIMUM_BEAN_BALANCE = 1000_000_000; // 1,000 Beans\n\n    //////////////////// Tractor ////////////////////\n\n    uint80 internal constant SLOT_SIZE = 32;\n    // Special index to indicate the data to copy is the publisher address.\n    uint80 internal constant PUBLISHER_COPY_INDEX = type(uint80).max;\n    // Special index to indicate the data to copy is the operator address.\n    uint80 internal constant OPERATOR_COPY_INDEX = type(uint80).max - 1;\n\n    function getRootsBase() internal pure returns (uint256) {\n        return ROOTS_BASE;\n    }\n\n    function unripeLPPerDollar() internal pure returns (uint256) {\n        return UNRIPE_LP_PER_DOLLAR;\n    }\n\n    function dollarPerUnripeLP() internal pure returns (uint256) {\n        return 1e12 / UNRIPE_LP_PER_DOLLAR;\n    }\n\n    function exploitAddLPRatio() internal pure returns (uint256) {\n        return ADD_LP_RATIO;\n    }\n\n    function precision() internal pure returns (uint256) {\n        return PRECISION;\n    }\n\n    function pipeline() internal pure returns (IPipeline) {\n        return IPipeline(PIPELINE);\n    }\n}\n"
+    },
+    "contracts/interfaces/chainlink/IChainlinkAggregator.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\ninterface IChainlinkAggregator {\n    function decimals() external view returns (uint8);\n\n    function description() external view returns (string memory);\n\n    function version() external view returns (uint256);\n\n    // getRoundData and latestRoundData should both raise \"No data present\"\n    // if they do not have data to report, instead of returning unset values\n    // which could be misinterpreted as actual reported values.\n    function getRoundData(\n        uint80 _roundId\n    )\n        external\n        view\n        returns (\n            uint80 roundId,\n            int256 answer,\n            uint256 startedAt,\n            uint256 updatedAt,\n            uint80 answeredInRound\n        );\n\n    function latestRoundData()\n        external\n        view\n        returns (\n            uint80 roundId,\n            int256 answer,\n            uint256 startedAt,\n            uint256 updatedAt,\n            uint80 answeredInRound\n        );\n}\n"
+    },
+    "contracts/libraries/LibRedundantMath256.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\n/**\n * @author Publius, funderbrker\n * @title LibRedundantMath variation of Open Zeppelin's Safe Math library for uint256.\n * @dev Newly developed code should not use this library. Instead opt for native arithmetic operators.\n *\n * This library replicates the behavior of 0.7 SafeMath libraries for 0.8. Safe math is unnecessary\n * in solidity ^0.8, so the functionality here is mostly redundant with default arithmetic\n * operators. However, manually updating over 1000 math operations throughout the repo was\n * deemed too likely to introduce logic errors. Instead, the original syntax was kept\n * and the underlying logic updated to be 0.8 appropriate.\n **/\nlibrary LibRedundantMath256 {\n    /**\n     * @dev Returns the addition of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `+` operator.\n     *\n     * Requirements:\n     *\n     * - Addition cannot overflow.\n     */\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a + b;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting on\n     * overflow (when the result is negative).\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a - b;\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `*` operator.\n     *\n     * Requirements:\n     *\n     * - Multiplication cannot overflow.\n     */\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a * b;\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting on\n     * division by zero. The result is rounded towards zero.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a / b;\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting when dividing by zero.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a % b;\n    }\n}\n"
+    },
+    "contracts/interfaces/IBean.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\nimport \"@openzeppelin/contracts/token/ERC20/IERC20.sol\";\n\n/**\n * @title IBean\n * @author Publius\n * @notice Bean Interface\n */\nabstract contract IBean is IERC20 {\n    function burn(uint256 amount) public virtual;\n    function burnFrom(address account, uint256 amount) public virtual;\n    function mint(address account, uint256 amount) public virtual;\n    function symbol() public view virtual returns (string memory);\n}\n"
+    },
+    "contracts/interfaces/IFertilizer.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\n\ninterface IFertilizer {\n    struct Balance {\n        uint128 amount;\n        uint128 lastBpf;\n    }\n    function beanstalkUpdate(\n        address account,\n        uint256[] memory ids,\n        uint128 bpf\n    ) external returns (uint256);\n    function beanstalkMint(address account, uint256 id, uint128 amount, uint128 bpf) external;\n    function balanceOfFertilized(\n        address account,\n        uint256[] memory ids\n    ) external view returns (uint256);\n    function balanceOfUnfertilized(\n        address account,\n        uint256[] memory ids\n    ) external view returns (uint256);\n    function lastBalanceOf(address account, uint256 id) external view returns (Balance memory);\n    function lastBalanceOfBatch(\n        address[] memory account,\n        uint256[] memory id\n    ) external view returns (Balance[] memory);\n    function setURI(string calldata newuri) external;\n}\n"
+    },
+    "contracts/interfaces/IProxyAdmin.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.20;\ninterface IProxyAdmin {\n    function upgrade(address proxy, address implementation) external;\n}\n"
+    },
+    "contracts/libraries/Decimal.sol": {
+      "content": "/*\n SPDX-License-Identifier: MIT\n*/\n\npragma solidity ^0.8.20;\n\nimport {LibRedundantMath256} from \"contracts/libraries/LibRedundantMath256.sol\";\n\n/**\n * @title Decimal\n * @author dYdX\n *\n * Library that defines a fixed-point number with 18 decimal places.\n */\nlibrary Decimal {\n    using LibRedundantMath256 for uint256;\n\n    // ============ Constants ============\n\n    uint256 constant BASE = 10 ** 18;\n\n    // ============ Structs ============\n\n    struct D256 {\n        uint256 value;\n    }\n\n    // ============ Static Functions ============\n\n    function zero() internal pure returns (D256 memory) {\n        return D256({value: 0});\n    }\n\n    function one() internal pure returns (D256 memory) {\n        return D256({value: BASE});\n    }\n\n    function from(uint256 a) internal pure returns (D256 memory) {\n        return D256({value: a.mul(BASE)});\n    }\n\n    function ratio(uint256 a, uint256 b) internal pure returns (D256 memory) {\n        return D256({value: getPartial(a, BASE, b)});\n    }\n\n    // ============ Self Functions ============\n\n    function add(D256 memory self, uint256 b) internal pure returns (D256 memory) {\n        return D256({value: self.value.add(b.mul(BASE))});\n    }\n\n    function sub(D256 memory self, uint256 b) internal pure returns (D256 memory) {\n        return D256({value: self.value.sub(b.mul(BASE))});\n    }\n\n    function sub(\n        D256 memory self,\n        uint256 b,\n        string memory reason\n    ) internal pure returns (D256 memory) {\n        if (b.mul(BASE) > self.value) {\n            revert(reason);\n        }\n        return D256({value: self.value.sub(b.mul(BASE))});\n    }\n\n    function mul(D256 memory self, uint256 b) internal pure returns (D256 memory) {\n        return D256({value: self.value.mul(b)});\n    }\n\n    function div(D256 memory self, uint256 b) internal pure returns (D256 memory) {\n        return D256({value: self.value.div(b)});\n    }\n\n    function pow(D256 memory self, uint256 b) internal pure returns (D256 memory) {\n        if (b == 0) {\n            return one();\n        }\n\n        D256 memory temp = D256({value: self.value});\n        for (uint256 i = 1; i < b; ++i) {\n            temp = mul(temp, self);\n        }\n\n        return temp;\n    }\n\n    function add(D256 memory self, D256 memory b) internal pure returns (D256 memory) {\n        return D256({value: self.value.add(b.value)});\n    }\n\n    function sub(D256 memory self, D256 memory b) internal pure returns (D256 memory) {\n        return D256({value: self.value.sub(b.value)});\n    }\n\n    function sub(\n        D256 memory self,\n        D256 memory b,\n        string memory reason\n    ) internal pure returns (D256 memory) {\n        if (greaterThan(b, self)) {\n            revert(reason);\n        }\n        return D256({value: self.value.sub(b.value)});\n    }\n\n    function mul(D256 memory self, D256 memory b) internal pure returns (D256 memory) {\n        return D256({value: getPartial(self.value, b.value, BASE)});\n    }\n\n    function div(D256 memory self, D256 memory b) internal pure returns (D256 memory) {\n        return D256({value: getPartial(self.value, BASE, b.value)});\n    }\n\n    function equals(D256 memory self, D256 memory b) internal pure returns (bool) {\n        return self.value == b.value;\n    }\n\n    function greaterThan(D256 memory self, D256 memory b) internal pure returns (bool) {\n        return compareTo(self, b) == 2;\n    }\n\n    function lessThan(D256 memory self, D256 memory b) internal pure returns (bool) {\n        return compareTo(self, b) == 0;\n    }\n\n    function greaterThanOrEqualTo(D256 memory self, D256 memory b) internal pure returns (bool) {\n        return compareTo(self, b) > 0;\n    }\n\n    function lessThanOrEqualTo(D256 memory self, D256 memory b) internal pure returns (bool) {\n        return compareTo(self, b) < 2;\n    }\n\n    function isZero(D256 memory self) internal pure returns (bool) {\n        return self.value == 0;\n    }\n\n    function asUint256(D256 memory self) internal pure returns (uint256) {\n        return self.value.div(BASE);\n    }\n\n    // ============ Core Methods ============\n\n    function getPartial(\n        uint256 target,\n        uint256 numerator,\n        uint256 denominator\n    ) private pure returns (uint256) {\n        return target.mul(numerator).div(denominator);\n    }\n\n    function compareTo(D256 memory a, D256 memory b) private pure returns (uint256) {\n        if (a.value == b.value) {\n            return 1;\n        }\n        return a.value > b.value ? 2 : 0;\n    }\n}\n"
+    },
+    "contracts/interfaces/IPipeline.sol": {
+      "content": "//SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n/**\n * @title IPipeline\n * @author Publius\n * @notice Pipeline Interface – Pipeline creates a sandbox to execute any series of function calls on any series of protocols through \\term{Pipe} functions.\n * Any assets left in Pipeline between transactions can be transferred out by any account.\n * Users Pipe a series of PipeCalls that each execute a function call to another protocol through Pipeline.\n **/\n\n// PipeCalls specify a function call to be executed by Pipeline.\n// Pipeline supports 2 types of PipeCalls: PipeCall and AdvancedPipeCall.\n\n// PipeCall makes a function call with a static target address and callData.\nstruct PipeCall {\n    address target;\n    bytes data;\n}\n\n// AdvancedPipeCall makes a function call with a static target address and both static and dynamic callData.\n// AdvancedPipeCalls support sending Ether in calls.\n// [ PipeCall Type | Send Ether Flag | PipeCall Type data | Ether Value (only if flag == 1)]\n// [ 1 byte        | 1 byte          | n bytes        | 0 or 32 bytes                      ]\n// See LibClipboard.useClipboard for more details.\nstruct AdvancedPipeCall {\n    address target;\n    bytes callData;\n    bytes clipboard;\n}\n\ninterface IPipeline {\n    function pipe(PipeCall calldata p) external payable returns (bytes memory result);\n\n    function multiPipe(PipeCall[] calldata pipes) external payable returns (bytes[] memory results);\n\n    function advancedPipe(\n        AdvancedPipeCall[] calldata pipes\n    ) external payable returns (bytes[] memory results);\n}\n"
+    },
+    "node_modules/@openzeppelin/contracts/token/ERC20/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /**\n     * @dev Returns the value of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the value of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves a `value` amount of tokens from the caller's account to `to`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address to, uint256 value) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the\n     * caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 value) external returns (bool);\n\n    /**\n     * @dev Moves a `value` amount of tokens from `from` to `to` using the\n     * allowance mechanism. `value` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.25+commit.b61c2a91"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "decodeData",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "ethChainlinkOracle",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "ethTimeout",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "xEthChainlinkOracle",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "xEthTimeout",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "decimals",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "lookback",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "getPrice",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Brean",
+        "details": "This is done by multiplying the price of xETH/ETH by the price of ETH/USD.",
+        "kind": "dev",
+        "methods": {
+          "getPrice(uint256,uint256,bytes)": {
+            "details": "if lookback is set to 0, use the instanteous price, else use the TWAP."
+          }
+        },
+        "title": "LSDChainlinkOracle",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "decodeData(bytes)": {
+            "notice": "decodes data using the same format that the getPrice function uses. Used to verify the data is encoded correctly."
+          },
+          "getPrice(uint256,uint256,bytes)": {
+            "notice": "returns the price of the token. if decimals are greater than 0, return the USD/TOKEN price. else, return the TOKEN/USD price. TOKEN/USD has 6 decimal precision, whereas USD/TOKEN has the token's decimal precision."
+          }
+        },
+        "notice": "An oracle implementation that returns the price of a ETH LSD in USD.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/ecosystem/oracles/LSDChainlinkOracle.sol": "LSDChainlinkOracle"
+      },
+      "evmVersion": "shanghai",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 100
+      },
+      "remappings": [
+        ":@beanstalk/=node_modules/@beanstalk/",
+        ":@ethereum-waffle/=node_modules/@ethereum-waffle/",
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":@prb/=node_modules/@prb/",
+        ":@uniswap/=node_modules/@uniswap/",
+        ":@wells/=node_modules/@beanstalk/wells1.1/",
+        ":ds-test/=node_modules/@beanstalk/wells/lib/forge-std/lib/ds-test/",
+        ":erc4626-tests/=node_modules/@beanstalk/wells/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":hardhat/=node_modules/hardhat/",
+        ":openzeppelin-contracts-upgradeable/=node_modules/@beanstalk/wells/lib/openzeppelin-contracts-upgradeable/",
+        ":openzeppelin-contracts/=node_modules/@beanstalk/wells/lib/openzeppelin-contracts/",
+        ":prb-math/=node_modules/@beanstalk/wells/lib/prb-math/",
+        ":prb-test/=node_modules/@beanstalk/wells/lib/prb-math/lib/prb-test/",
+        ":uniswap/=node_modules/uniswap/"
+      ]
+    },
+    "sources": {
+      "contracts/C.sol": {
+        "keccak256": "0xf5161c03dd12d20ac64e9ec6904f49e7a93c923bdc77a947ce1f2b1cd05c5b87",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e16d46b8ffcd97dbb5392ea8e2c5e7892dee668fa038cbea41e9ac35f1b40f81",
+          "dweb:/ipfs/QmVuTUhSuWQZpKJBKRHFtEM56XtWhqDhmcygwjnLM6yxUW"
+        ]
+      },
+      "contracts/ecosystem/oracles/LSDChainlinkOracle.sol": {
+        "keccak256": "0x7f8cb3922c2c536119f4d9f51728dcc043b562f6d9a90870a22af383c9b86d99",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5c6ada894e19edcb3c774602b687e5432ad0d40c3e8f43da9e9098a7590b8533",
+          "dweb:/ipfs/QmeuHyNkypCKrqX3Z3VeHfZwwgghag7BYP9iK6ZCRuMRxi"
+        ]
+      },
+      "contracts/interfaces/IBean.sol": {
+        "keccak256": "0x8adb0caaeb8d3d345c036c5dbfd79ddbb86a92bae8cc2f343335f0db16eac435",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6cc0727b95a3d9681ea2439b2e1f68de2e90c3646b4df98c51b630945061662c",
+          "dweb:/ipfs/QmVQ5NQGDtZWoQ9q6RwVAdEVGAHLfNKTxXMqjQWjxiJNV7"
+        ]
+      },
+      "contracts/interfaces/IFertilizer.sol": {
+        "keccak256": "0x4f1d45de215be801930167868632ffca62ccc7e8008624fff6c332be0b79b778",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0db1c7349e91e97b94593a60423af6c7fce12c6d9bcae3da959b71a744e3c57d",
+          "dweb:/ipfs/QmYusqrN3KWK98WPMg5WX6vnnCRMdZhTh4QhcuByrA3N9a"
+        ]
+      },
+      "contracts/interfaces/IPipeline.sol": {
+        "keccak256": "0x39afd5b850712050302b71553163168a0e6c4abdf2ad69b72a7655e09f6f7a30",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f7e477dcd24a033d14a8b9197ff98c0512d728ec3e725d93ab4a51efa997259a",
+          "dweb:/ipfs/QmePq3EWTRmJyohpXUh6yBWHtzsxcZpeNB6K3JVeGP1aFC"
+        ]
+      },
+      "contracts/interfaces/IProxyAdmin.sol": {
+        "keccak256": "0x2aa83c43e3dae42fc0bf65bc6a467e3f1322c9b5b74ebd97cb94fe2763c9d2c2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b7b2e12317a69eaa4af6c2bc51bebe347bfe028c2682b61c1a8f62ec26b82fa4",
+          "dweb:/ipfs/QmPvsvKSTWcwYCaLmUFFZ7fGRqksHSVzJ6ti2kB9yGwZ5B"
+        ]
+      },
+      "contracts/interfaces/chainlink/IChainlinkAggregator.sol": {
+        "keccak256": "0x94fb6d884c4b99d8915368829d0134f5707f723bdfd482e07f31410a6664eab8",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ca12bd4f1cdd47f4de6b638b730cb825273b53b84befb58bab11b4b000b64dbd",
+          "dweb:/ipfs/QmRuyYqP5vuwwxPAXuzCDMHi67nyLrsqzg5ddqELh9JYpB"
+        ]
+      },
+      "contracts/libraries/Decimal.sol": {
+        "keccak256": "0x886aac558ac79337aa40adce85245c8ad4ab2105ab69e5c8d1bb63170bc52dc3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2178d717094f164a8321f5588d9703a565ce36ef390154242320291cf6f1751c",
+          "dweb:/ipfs/QmTv1HQyhmsZiaohbtmLwAtPrZw5gxvUN3kx8gmiwcJ58h"
+        ]
+      },
+      "contracts/libraries/LibRedundantMath256.sol": {
+        "keccak256": "0x560673a4a8dc1bda8dd3db3b7c277f5cb24eede94ad4e2e36e864cbaa58ce9a9",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ec5ae7dfdb285f8fffb3825d4fbd730e975c37eca2e24152481119ac0f8492c1",
+          "dweb:/ipfs/QmdNFYja9hHdCY67DDWMhiSfKjiH2ouUJsZXD7tHEW215n"
+        ]
+      },
+      "contracts/libraries/Oracle/LibChainlinkOracle.sol": {
+        "keccak256": "0x08da17226e59556b0e8aa8d046d026f678c66b312013a390784c406a626ef38d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b0aa544a4317222d1dc4c18acd22d754b171c9a0b7661cb0cb55bf388e81e07c",
+          "dweb:/ipfs/QmYB7UDg518xzAmprE7G9QhKPo5iA1ydkHdgUFGde176iH"
+        ]
+      },
+      "node_modules/@openzeppelin/contracts/token/ERC20/IERC20.sol": {
+        "keccak256": "0xc6a8ff0ea489379b61faa647490411b80102578440ab9d84e9a957cc12164e70",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0ea104e577e63faea3b69c415637e99e755dcbf64c5833d7140c35a714d6d90c",
+          "dweb:/ipfs/Qmau6x4Ns9XdyynRCNNp3RhLqijJjFm7z5fyZazfYFGYdq"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.25+commit.b61c2a91",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 100,
+        "enabled": true
+      },
+      "evmVersion": "shanghai",
+      "remappings": [
+        "forge-std/=lib/forge-std/src/",
+        "@openzeppelin/=node_modules/@openzeppelin/",
+        "@wells/=node_modules/@beanstalk/wells1.1/",
+        "@beanstalk/=node_modules/@beanstalk/",
+        "@ethereum-waffle/=node_modules/@ethereum-waffle/",
+        "@prb/=node_modules/@prb/",
+        "@uniswap/=node_modules/@uniswap/",
+        "ds-test/=node_modules/@beanstalk/wells/lib/forge-std/lib/ds-test/",
+        "erc4626-tests/=node_modules/@beanstalk/wells/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        "eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        "hardhat/=node_modules/hardhat/",
+        "openzeppelin-contracts-upgradeable/=node_modules/@beanstalk/wells/lib/openzeppelin-contracts-upgradeable/",
+        "openzeppelin-contracts/=node_modules/@beanstalk/wells/lib/openzeppelin-contracts/",
+        "prb-math/=node_modules/@beanstalk/wells/lib/prb-math/",
+        "prb-test/=node_modules/@beanstalk/wells/lib/prb-math/lib/prb-test/",
+        "uniswap/=node_modules/uniswap/"
+      ]
+    },
+    "name": "LSDChainlinkOracle",
+    "fullyQualifiedName": "contracts/ecosystem/oracles/LSDChainlinkOracle.sol:LSDChainlinkOracle"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "14262860",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-01-20T23:30:13Z",
+  "match": "exact_match",
+  "chainId": "42161",
+  "address": "0xCCCCCC35b53c8a16404Ae414AFa31F30A5B35626"
+}

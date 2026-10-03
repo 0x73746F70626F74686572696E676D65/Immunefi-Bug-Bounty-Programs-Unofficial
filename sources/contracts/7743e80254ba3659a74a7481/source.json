@@ -1,0 +1,486 @@
+{
+  "sources": {
+    "contracts/Pipeline.sol": {
+      "content": "//SPDX-License-Identifier: MIT\npragma solidity =0.7.6;\npragma experimental ABIEncoderV2;\n\nimport \"./interfaces/IPipeline.sol\";\nimport \"./libraries/LibFunction.sol\";\nimport \"@openzeppelin/contracts/token/ERC1155/ERC1155Holder.sol\";\nimport \"@openzeppelin/contracts/token/ERC721/ERC721Holder.sol\";\n\n/**\n * @title Pipeline\n * @author Publius\n * @notice Pipeline creates a sandbox to execute any series of function calls on any series of protocols through Pipe functions.\n * Any assets left in Pipeline between transactions can be transferred out by any account.\n * Users Pipe a series of PipeCalls that each execute a function call to another protocol through Pipeline.\n * https://evmpipeline.org\n **/\n\ncontract Pipeline is IPipeline, ERC1155Holder, ERC721Holder {\n\n    /**\n     * @dev So Pipeline can receive Ether.\n     */\n    receive() external payable {}\n\n    /**\n     * @dev Returns the current version of Pipeline.\n     */\n    function version() external pure returns (string memory) {\n        return \"1.0.1\";\n    }\n\n    /**\n     * @notice Execute a single PipeCall.\n     * Supports sending Ether through msg.value\n     * @param p PipeCall to execute\n     * @return result return value of PipeCall\n    **/\n    function pipe(PipeCall calldata p)\n        external\n        payable\n        override\n        returns (bytes memory result)\n    {\n        result = _pipe(p.target, p.data, msg.value);\n    }\n    \n    /**\n     * @notice Execute a list of executes a list of PipeCalls.\n     * @param pipes list of PipeCalls to execute\n     * @return results list of return values for each PipeCall\n    **/\n    function multiPipe(PipeCall[] calldata pipes)\n        external\n        payable\n        override\n        returns (bytes[] memory results)\n    {\n        results = new bytes[](pipes.length);\n        for (uint256 i = 0; i < pipes.length; i++) {\n            results[i] = _pipe(pipes[i].target, pipes[i].data, 0);\n        }\n    }\n\n    /**\n     * @notice Execute a list of AdvancedPipeCalls.\n     * @param pipes list of AdvancedPipeCalls to execute\n     * @return results list of return values for each AdvancedPipeCalls\n    **/\n    function advancedPipe(AdvancedPipeCall[] calldata pipes)\n        external\n        payable\n        override\n        returns (bytes[] memory results) {\n            results = new bytes[](pipes.length);\n            for (uint256 i = 0; i < pipes.length; ++i) {\n                results[i] = _advancedPipe(pipes[i], results);\n            }\n        }\n\n    // Execute function call using calldata\n    function _pipe(\n        address target,\n        bytes calldata data,\n        uint256 value\n    ) private returns (bytes memory result) {\n        bool success;\n        (success, result) = target.call{value: value}(data);\n        LibFunction.checkReturn(success, result);\n    }\n\n    // Execute function call using memory\n    function _pipeMem(\n        address target,\n        bytes memory data,\n        uint256 value\n    ) private returns (bytes memory result) {\n        bool success;\n        (success, result) = target.call{value: value}(data);\n        LibFunction.checkReturn(success, result);\n    }\n\n    // Execute an AdvancedPipeCall\n    function _advancedPipe(\n        AdvancedPipeCall calldata p,\n        bytes[] memory returnData\n    ) private returns (bytes memory result) {\n        uint256 value = getEthValue(p.clipboard);\n        // 0x00 -> Normal pipe: Standard function call\n        // else > Advanced pipe: Copy return data into function call through buildAdvancedCalldata\n        if (p.clipboard[0] == 0x00) {\n            result = _pipe(p.target, p.callData, value);\n        } else {\n            result = LibFunction.useClipboard(p.callData, p.clipboard, returnData);\n            result = _pipeMem(p.target, result, value);\n        }\n    }\n\n    // Extracts Ether value from a Clipboard\n    // clipboard[1] indicates whether there is an Ether value in the advanced data\n    // if 0x00 -> No Ether value, return 0\n    // else -> return the last 32 bytes of clipboard\n    function getEthValue(bytes calldata clipboard) private pure returns (uint256 value) {\n        if (clipboard[1] == 0x00) return 0;\n        assembly { value := calldataload(sub(add(clipboard.offset, clipboard.length), 32))}\n    }\n}"
+    },
+    "contracts/interfaces/IPipeline.sol": {
+      "content": "//SPDX-License-Identifier: MIT\npragma solidity =0.7.6;\npragma experimental ABIEncoderV2;\n\n/**\n * @title IPipeline\n * @author Publius\n * @notice Pipeline Interface – Pipeline creates a sandbox to execute any series of function calls on any series of protocols through \\term{Pipe} functions. \n * Any assets left in Pipeline between transactions can be transferred out by any account. \n * Users Pipe a series of PipeCalls that each execute a function call to another protocol through Pipeline. \n **/\n\n// PipeCalls specify a function call to be executed by Pipeline. \n// Pipeline supports 2 types of PipeCalls: PipeCall and AdvancedPipeCall.\n\n// PipeCall makes a function call with a static target address and callData.\nstruct PipeCall {\n    address target;\n    bytes data;\n}\n\n// AdvancedPipeCall makes a function call with a static target address and both static and dynamic callData.\n// AdvancedPipeCalls support sending Ether in calls.\n// [ PipeCall Type | Send Ether Flag | PipeCall Type data | Ether Value (only if flag == 1)]\n// [ 1 byte        | 1 byte          | n bytes        | 0 or 32 bytes                      ]\n// See LibFunction.useClipboard for more details.\nstruct AdvancedPipeCall {\n    address target;\n    bytes callData;\n    bytes clipboard;\n}\n\ninterface IPipeline {\n\n    function pipe(PipeCall calldata p)\n        external\n        payable\n        returns (bytes memory result);\n\n    function multiPipe(PipeCall[] calldata pipes)\n        external\n        payable\n        returns (bytes[] memory results);\n\n    function advancedPipe(AdvancedPipeCall[] calldata pipes)\n        external\n        payable\n        returns (bytes[] memory results);\n\n}\n"
+    },
+    "contracts/libraries/LibFunction.sol": {
+      "content": "/*\n SPDX-License-Identifier: MIT\n*/\n\npragma solidity =0.7.6;\npragma experimental ABIEncoderV2;\n\n/**\n * @title Lib Function\n * @author Publius\n **/\n\nlibrary LibFunction {\n    /**\n     * @notice Checks The return value of a any function call for success, if not returns the error returned in `results`\n     * @param success Whether the corresponding function call succeeded\n     * @param result The return data of the corresponding function call\n    **/\n    function checkReturn(bool success, bytes memory result) internal pure {\n        if (!success) {\n            // Next 5 lines from https://ethereum.stackexchange.com/a/83577\n            // Also, used in Uniswap V3 https://github.com/Uniswap/v3-periphery/blob/main/contracts/base/Multicall.sol#L17\n            if (result.length < 68) revert();\n            assembly {\n                result := add(result, 0x04)\n            }\n            revert(abi.decode(result, (string)));\n        }\n    }\n\n    /** @notice Use a Clipboard on callData to copy return values stored as returnData from any Advanced Calls\n     * that have already been executed and paste them into the callData of the next Advanced Call, in a customizable manner\n     * @param callData The callData bytes of next Advanced Call to paste onto\n     * @param clipboard 0, 1 or n encoded paste operations and encoded ether value if using Pipeline\n     * -------------------------------------------------------------------------------------\n     * Clipboard stores the bytes:\n     * [ Type   | Use Ether Flag*  | Type data      | Ether Value (only if flag == 1)*]\n     * [ 1 byte | 1 byte           | n bytes        | 0 or 32 bytes                   ]\n     * * Use Ether Flag and Ether Value are processed in Pipeline.sol (Not used in Farm). See Pipeline.getEthValue for ussage.\n     * Type: 0x00, 0x01 or 0x002\n     *  - 0x00: 0 Paste Operations (Logic in Pipeline.sol and FarmFacet.sol)\n     *  - 0x01: 1 Paste Operation\n     *  - 0x02: n Paste Operations\n     * Type Data: There are two types with type data: 0x01, 0x02\n     *  Type 1 (0x01): Copy 1 bytes32 from a previous function return value\n     *       [ pasteParams ]\n     *       [ 32 bytes ]\n     *      Note: Should be encoded with ['bytes2', 'uint80', 'uint80', 'uint80']  where the first two bytes are Type and Send Ether Flag if using Pipeline\n     *  Type 2 (0x02): Copy n bytes32 from a previous function return value\n     *       [ Padding      | pasteParams[] ]\n     *       [ 32 bytes     | 32 + 32 * n   ]\n     *        * The first 32 bytes are the length of the array.\n     * -------------------------------------------------------------------------------------\n     * @param returnData A list of return values from previously executed Advanced Calls\n     @return data The function call return datas\n    **/\n    function useClipboard(\n        bytes calldata callData,\n        bytes calldata clipboard,\n        bytes[] memory returnData\n    ) internal pure returns (bytes memory data) {\n        bytes1 typeId = clipboard[0];\n        if (typeId == 0x01) {\n            bytes32 pasteParams = abi.decode(clipboard, (bytes32));\n            data = LibFunction.pasteAdvancedBytes(callData, returnData, pasteParams);\n        } else if (typeId == 0x02) {\n            (, bytes32[] memory pasteParams) = abi.decode(\n                clipboard,\n                (uint256, bytes32[])\n            );\n            data = callData;\n            for (uint256 i; i < pasteParams.length; i++)\n                data = LibFunction.pasteAdvancedBytes(data, returnData, pasteParams[i]);\n        } else {\n            revert(\"Function: Advanced Type not supported\");\n        }\n    }\n\n    /**\n     * @notice Copies 32 bytes from returnData into callData determined by pasteParams\n     * @param callData The callData bytes of the next function call\n     * @param returnData A list of bytes corresponding to return data from previous function calls in the transaction\n     * @param pasteParams Denotes which data should be copied and where it should be pasted\n     * Should be in the following format\n     * [2 bytes | 10 bytes         | 10 bytes  | 10 bytes   ]\n     * [ N/A    | returnDataIndex  | copyIndex | pasteIndex ]\n     * @return pastedData the calldata for the next function call with bytes pasted from returnData\n     **/\n    function pasteAdvancedBytes(\n        bytes memory callData,\n        bytes[] memory returnData,\n        bytes32 pasteParams\n    ) internal pure returns (bytes memory pastedData) {\n        // Shift `pasteParams` right 22 bytes to insolated reduceDataIndex\n        bytes memory copyData = returnData[uint256((pasteParams << 16) >> 176)];\n        pastedData = paste32Bytes(\n            copyData,\n            callData,\n            uint256((pasteParams << 96) >> 176), // Isolate copyIndex\n            uint256((pasteParams << 176) >> 176) // Isolate pasteIndex\n        );\n    }\n\n    /**\n     * @notice Copy 32 Bytes from copyData at copyIndex and paste into pasteData at pasteIndex\n     * @param copyData The data bytes to copy from\n     * @param pasteData The data bytes to paste into\n     * @param copyIndex The index in copyData to copying from\n     * @param pasteIndex The index in pasteData to paste into\n     * @return pastedData The data with the copied with 32 bytes\n    **/\n    function paste32Bytes(\n        bytes memory copyData,\n        bytes memory pasteData,\n        uint256 copyIndex,\n        uint256 pasteIndex\n    ) internal pure returns (bytes memory pastedData) {\n        assembly {\n            mstore(add(pasteData, pasteIndex), mload(add(copyData, copyIndex)))\n        }\n        pastedData = pasteData;\n    }\n}\n"
+    },
+    "node_modules/@openzeppelin/contracts/introspection/ERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\nimport \"./IERC165.sol\";\n\n/**\n * @dev Implementation of the {IERC165} interface.\n *\n * Contracts may inherit from this and call {_registerInterface} to declare\n * their support of an interface.\n */\nabstract contract ERC165 is IERC165 {\n    /*\n     * bytes4(keccak256('supportsInterface(bytes4)')) == 0x01ffc9a7\n     */\n    bytes4 private constant _INTERFACE_ID_ERC165 = 0x01ffc9a7;\n\n    /**\n     * @dev Mapping of interface ids to whether or not it's supported.\n     */\n    mapping(bytes4 => bool) private _supportedInterfaces;\n\n    constructor () internal {\n        // Derived contracts need only register support for their own interfaces,\n        // we register support for ERC165 itself here\n        _registerInterface(_INTERFACE_ID_ERC165);\n    }\n\n    /**\n     * @dev See {IERC165-supportsInterface}.\n     *\n     * Time complexity O(1), guaranteed to always use less than 30 000 gas.\n     */\n    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {\n        return _supportedInterfaces[interfaceId];\n    }\n\n    /**\n     * @dev Registers the contract as an implementer of the interface defined by\n     * `interfaceId`. Support of the actual ERC165 interface is automatic and\n     * registering its interface id is not required.\n     *\n     * See {IERC165-supportsInterface}.\n     *\n     * Requirements:\n     *\n     * - `interfaceId` cannot be the ERC165 invalid interface (`0xffffffff`).\n     */\n    function _registerInterface(bytes4 interfaceId) internal virtual {\n        require(interfaceId != 0xffffffff, \"ERC165: invalid interface id\");\n        _supportedInterfaces[interfaceId] = true;\n    }\n}\n"
+    },
+    "node_modules/@openzeppelin/contracts/introspection/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n    /**\n     * @dev Returns true if this contract implements the interface defined by\n     * `interfaceId`. See the corresponding\n     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n     * to learn more about how these ids are created.\n     *\n     * This function call must use less than 30 000 gas.\n     */\n    function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    },
+    "node_modules/@openzeppelin/contracts/token/ERC721/ERC721Holder.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\nimport \"./IERC721Receiver.sol\";\n\n  /**\n   * @dev Implementation of the {IERC721Receiver} interface.\n   *\n   * Accepts all token transfers. \n   * Make sure the contract is able to use its token with {IERC721-safeTransferFrom}, {IERC721-approve} or {IERC721-setApprovalForAll}.\n   */\ncontract ERC721Holder is IERC721Receiver {\n\n    /**\n     * @dev See {IERC721Receiver-onERC721Received}.\n     *\n     * Always returns `IERC721Receiver.onERC721Received.selector`.\n     */\n    function onERC721Received(address, address, uint256, bytes memory) public virtual override returns (bytes4) {\n        return this.onERC721Received.selector;\n    }\n}\n"
+    },
+    "node_modules/@openzeppelin/contracts/token/ERC1155/ERC1155Holder.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\nimport \"./ERC1155Receiver.sol\";\n\n/**\n * @dev _Available since v3.1._\n */\ncontract ERC1155Holder is ERC1155Receiver {\n    function onERC1155Received(address, address, uint256, uint256, bytes memory) public virtual override returns (bytes4) {\n        return this.onERC1155Received.selector;\n    }\n\n    function onERC1155BatchReceived(address, address, uint256[] memory, uint256[] memory, bytes memory) public virtual override returns (bytes4) {\n        return this.onERC1155BatchReceived.selector;\n    }\n}\n"
+    },
+    "node_modules/@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/**\n * @title ERC721 token receiver interface\n * @dev Interface for any contract that wants to support safeTransfers\n * from ERC721 asset contracts.\n */\ninterface IERC721Receiver {\n    /**\n     * @dev Whenever an {IERC721} `tokenId` token is transferred to this contract via {IERC721-safeTransferFrom}\n     * by `operator` from `from`, this function is called.\n     *\n     * It must return its Solidity selector to confirm the token transfer.\n     * If any other value is returned or the interface is not implemented by the recipient, the transfer will be reverted.\n     *\n     * The selector can be obtained in Solidity with `IERC721.onERC721Received.selector`.\n     */\n    function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata data) external returns (bytes4);\n}\n"
+    },
+    "node_modules/@openzeppelin/contracts/token/ERC1155/ERC1155Receiver.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\nimport \"./IERC1155Receiver.sol\";\nimport \"../../introspection/ERC165.sol\";\n\n/**\n * @dev _Available since v3.1._\n */\nabstract contract ERC1155Receiver is ERC165, IERC1155Receiver {\n    constructor() internal {\n        _registerInterface(\n            ERC1155Receiver(address(0)).onERC1155Received.selector ^\n            ERC1155Receiver(address(0)).onERC1155BatchReceived.selector\n        );\n    }\n}\n"
+    },
+    "node_modules/@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\nimport \"../../introspection/IERC165.sol\";\n\n/**\n * _Available since v3.1._\n */\ninterface IERC1155Receiver is IERC165 {\n\n    /**\n        @dev Handles the receipt of a single ERC1155 token type. This function is\n        called at the end of a `safeTransferFrom` after the balance has been updated.\n        To accept the transfer, this must return\n        `bytes4(keccak256(\"onERC1155Received(address,address,uint256,uint256,bytes)\"))`\n        (i.e. 0xf23a6e61, or its own function selector).\n        @param operator The address which initiated the transfer (i.e. msg.sender)\n        @param from The address which previously owned the token\n        @param id The ID of the token being transferred\n        @param value The amount of tokens being transferred\n        @param data Additional data with no specified format\n        @return `bytes4(keccak256(\"onERC1155Received(address,address,uint256,uint256,bytes)\"))` if transfer is allowed\n    */\n    function onERC1155Received(\n        address operator,\n        address from,\n        uint256 id,\n        uint256 value,\n        bytes calldata data\n    )\n        external\n        returns(bytes4);\n\n    /**\n        @dev Handles the receipt of a multiple ERC1155 token types. This function\n        is called at the end of a `safeBatchTransferFrom` after the balances have\n        been updated. To accept the transfer(s), this must return\n        `bytes4(keccak256(\"onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)\"))`\n        (i.e. 0xbc197c81, or its own function selector).\n        @param operator The address which initiated the batch transfer (i.e. msg.sender)\n        @param from The address which previously owned the token\n        @param ids An array containing ids of each token being transferred (order and length must match values array)\n        @param values An array containing amounts of each token being transferred (order and length must match ids array)\n        @param data Additional data with no specified format\n        @return `bytes4(keccak256(\"onERC1155BatchReceived(address,address,uint256[],uint256[],bytes)\"))` if transfer is allowed\n    */\n    function onERC1155BatchReceived(\n        address operator,\n        address from,\n        uint256[] calldata ids,\n        uint256[] calldata values,\n        bytes calldata data\n    )\n        external\n        returns(bytes4);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.7.6+commit.7338295f"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "target",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "callData",
+                  "type": "bytes"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "clipboard",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct AdvancedPipeCall[]",
+              "name": "pipes",
+              "type": "tuple[]"
+            }
+          ],
+          "name": "advancedPipe",
+          "outputs": [
+            {
+              "internalType": "bytes[]",
+              "name": "results",
+              "type": "bytes[]"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "target",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct PipeCall[]",
+              "name": "pipes",
+              "type": "tuple[]"
+            }
+          ],
+          "name": "multiPipe",
+          "outputs": [
+            {
+              "internalType": "bytes[]",
+              "name": "results",
+              "type": "bytes[]"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "onERC1155BatchReceived",
+          "outputs": [
+            {
+              "internalType": "bytes4",
+              "name": "",
+              "type": "bytes4"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "onERC1155Received",
+          "outputs": [
+            {
+              "internalType": "bytes4",
+              "name": "",
+              "type": "bytes4"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "onERC721Received",
+          "outputs": [
+            {
+              "internalType": "bytes4",
+              "name": "",
+              "type": "bytes4"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "target",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct PipeCall",
+              "name": "p",
+              "type": "tuple"
+            }
+          ],
+          "name": "pipe",
+          "outputs": [
+            {
+              "internalType": "bytes",
+              "name": "result",
+              "type": "bytes"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes4",
+              "name": "interfaceId",
+              "type": "bytes4"
+            }
+          ],
+          "name": "supportsInterface",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "version",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "author": "Publius",
+        "kind": "dev",
+        "methods": {
+          "advancedPipe((address,bytes,bytes)[])": {
+            "params": {
+              "pipes": "list of AdvancedPipeCalls to execute"
+            },
+            "returns": {
+              "results": "list of return values for each AdvancedPipeCalls*"
+            }
+          },
+          "multiPipe((address,bytes)[])": {
+            "params": {
+              "pipes": "list of PipeCalls to execute"
+            },
+            "returns": {
+              "results": "list of return values for each PipeCall*"
+            }
+          },
+          "onERC721Received(address,address,uint256,bytes)": {
+            "details": "See {IERC721Receiver-onERC721Received}. Always returns `IERC721Receiver.onERC721Received.selector`."
+          },
+          "pipe((address,bytes))": {
+            "params": {
+              "p": "PipeCall to execute"
+            },
+            "returns": {
+              "result": "return value of PipeCall*"
+            }
+          },
+          "supportsInterface(bytes4)": {
+            "details": "See {IERC165-supportsInterface}. Time complexity O(1), guaranteed to always use less than 30 000 gas."
+          },
+          "version()": {
+            "details": "Returns the current version of Pipeline."
+          }
+        },
+        "title": "Pipeline",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "advancedPipe((address,bytes,bytes)[])": {
+            "notice": "Execute a list of AdvancedPipeCalls."
+          },
+          "multiPipe((address,bytes)[])": {
+            "notice": "Execute a list of executes a list of PipeCalls."
+          },
+          "pipe((address,bytes))": {
+            "notice": "Execute a single PipeCall. Supports sending Ether through msg.value"
+          }
+        },
+        "notice": "Pipeline creates a sandbox to execute any series of function calls on any series of protocols through Pipe functions. Any assets left in Pipeline between transactions can be transferred out by any account. Users Pipe a series of PipeCalls that each execute a function call to another protocol through Pipeline. https://evmpipeline.org*",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/Pipeline.sol": "Pipeline"
+      },
+      "evmVersion": "istanbul",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":hardhat/=node_modules/hardhat/"
+      ]
+    },
+    "sources": {
+      "contracts/Pipeline.sol": {
+        "keccak256": "0x6d28eca24db8e1e0d601381dede974c014fc098581ffc6e59d7d0fad7cb9e5e1",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d5ce102e7d7d3514b37b92656c4d405484b44b7773dbc500ed9f93d9c43994a0",
+          "dweb:/ipfs/QmRzaSgN2FeNA62cQ4bofGEfcVgyTsNcfXxRVokZKKExqL"
+        ]
+      },
+      "contracts/interfaces/IPipeline.sol": {
+        "keccak256": "0x7177b4a4dcada6f6970419e230831e13645c76e8e7d9dee21474dcb762f73d3a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d9c24ec7790fd9143327e654a339ee64ce7894c6af25b782948206026cb90c46",
+          "dweb:/ipfs/QmX9LUcYWbMrpLhTnvqjFJ3WK82q3GoMVDsXHDzk1VbbYu"
+        ]
+      },
+      "contracts/libraries/LibFunction.sol": {
+        "keccak256": "0x3efab5a39ac04cc974aeb77feefe8e300e738359f6abdbeb127d41b07334a5d6",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ae7509bec01c4abfa8329e16911057c291180c8983730fd7e5a24e0d1c9c3a60",
+          "dweb:/ipfs/QmRo3mZumVthn8K1t2cc7VAVadfHKvHvQhHth7Scp9QVUx"
+        ]
+      },
+      "node_modules/@openzeppelin/contracts/introspection/ERC165.sol": {
+        "keccak256": "0x24141d2f6b98d4cb77a8936eae8cbaad2e261d9062bdc08036096f4550092501",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b710eb003944777135f027500a5a57b479fe857849f5f467c1ef9687401e3c95",
+          "dweb:/ipfs/QmcELzi6KRzAs3DXwxdsoKWRJ13KSeipKQsJgD3unctdZM"
+        ]
+      },
+      "node_modules/@openzeppelin/contracts/introspection/IERC165.sol": {
+        "keccak256": "0xf70bc25d981e4ec9673a995ad2995d5d493ea188d3d8f388bba9c227ce09fb82",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://bd970f51e3a77790c2f02b5b1759827c3b897c3d98c407b3631e8af32e3dc93c",
+          "dweb:/ipfs/QmPF85Amgbqjk3SNZKsPCsqCw8JfwYEPMnnhvMJUyX58je"
+        ]
+      },
+      "node_modules/@openzeppelin/contracts/token/ERC1155/ERC1155Holder.sol": {
+        "keccak256": "0x21428ca879b2437107322dfc1e214d25ecd6b966344961025ee412c3acfd5fc0",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://9747c875899d05823aede28b60ca8d3719b8c28018f397521c4ffb05041e1ac5",
+          "dweb:/ipfs/QmQEQ4jJYEGFNfcngfZ3gPkcrcWYWKbo1Bq2F57scJxbmE"
+        ]
+      },
+      "node_modules/@openzeppelin/contracts/token/ERC1155/ERC1155Receiver.sol": {
+        "keccak256": "0x57a0e246fb1c8f9cccf91c508eafe474e40260a31de3a39019ba8312cfdf9b2d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://652f100749edfc17c4afeecb9fc0941414e2cb30c57fa713736064b71f2462a8",
+          "dweb:/ipfs/QmUw4AbnrnANMBDRs92CHL9rBNBYAYCT8EQxmaNZ3nkcdf"
+        ]
+      },
+      "node_modules/@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol": {
+        "keccak256": "0x2690a9b7f4f7489b8d25a4fc6bffc02ec3971fb41ed6c8b59adef2833bdab07c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8148c99452b6793ac9599abdc8bdaf4eeb47f34590beea8aa01089be14e2990c",
+          "dweb:/ipfs/QmNdenmZ4EDfH9TuBas3pHeGuZvDNo2rsfgUj6ka8vuH37"
+        ]
+      },
+      "node_modules/@openzeppelin/contracts/token/ERC721/ERC721Holder.sol": {
+        "keccak256": "0xdb2133d55b8f3a94313af8f4371ae0501a58e412d471b03d8581214c5ea2ce33",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://cea1e4bf769f27c8c9c1442f1518b49ef6c8b71a4bd4ce88353da9e9a8ba1704",
+          "dweb:/ipfs/QmR1b8sj7fxgeHqDksV4GYTjZS1qajWC3yg9VCMUJus2bF"
+        ]
+      },
+      "node_modules/@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol": {
+        "keccak256": "0x52146049d6709c870e8ddcd988b5155cb6c5d640cfcd8978aee52bc1ba2ec4eb",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ada84513617b7c1b2f890b44503735abaec73a1acd030112a17aac7e6c66a4a1",
+          "dweb:/ipfs/QmaiFwdio67iJrfjAdkMac24eJ5sS1qD7CZW6PhUU6KjiK"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.7.6+commit.7338295f",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "istanbul",
+      "remappings": [
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":hardhat/=node_modules/hardhat/"
+      ]
+    },
+    "name": "Pipeline",
+    "fullyQualifiedName": "contracts/Pipeline.sol:Pipeline"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "2322458",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T15:05:45Z",
+  "match": "exact_match",
+  "chainId": "42161",
+  "address": "0xb1bE000644bD25996b0d9C2F7a6D6BA3954c91B0"
+}
