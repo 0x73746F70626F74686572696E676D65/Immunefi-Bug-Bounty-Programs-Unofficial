@@ -251,7 +251,7 @@ def stacks(entry):
     url=entry['url'];m=re.search(r'contract/([^/?#]+)',url)
     if not m:m=re.search(r'(S[PT][A-Z0-9]+\.[\w-]+)',url)
     if not m:raise RuntimeError('No Stacks contract identifier')
-    contract=m.group(1);endpoint='https://api.hiro.so/extended/v1/contract/'+contract
+    contract=m.group(1);endpoint=('https://api.testnet.hiro.so' if contract.startswith('ST') or 'testnet' in url else 'https://api.hiro.so')+'/extended/v1/contract/'+contract
     obj=get_json(endpoint)
     if not obj.get('source_code'):raise RuntimeError('Stacks API has no source')
     obj['sources']={contract+'.clar':{'content':obj['source_code']}}
@@ -271,6 +271,7 @@ def generic(entry):
     if 'hiro.so' in host:return stacks(entry)
     if host=='tronscan.org':return tron(entry)
     if host=='explorer.zksync.io':return zksync(entry)
+    if host in ('aptoscan.com','explorer.aptoslabs.com'):return aptos(entry)
     if host=='crates.io':return crate(entry)
     if address and any(s in host for s in ('blockscout','explorer.','pacific-explorer.')):
         try:return blockscout(entry,host,address.group())
@@ -352,8 +353,41 @@ def tron(entry):
     if not sources:raise RuntimeError('Tronscan did not return verified source text')
     obj['sources']=sources;return persist_contract(entry,obj,'tron_verified_contract',endpoint)
 
+def aptos(entry):
+    m=re.search(r'0x[a-fA-F0-9]{1,64}(?![a-fA-F0-9])',entry['url'])
+    if not m:raise RuntimeError('No Aptos account address')
+    base='https://fullnode.testnet.aptoslabs.com' if 'testnet' in entry['url'] else 'https://fullnode.mainnet.aptoslabs.com'
+    endpoint=base+'/v1/accounts/'+m.group()+'/resource/0x1::code::PackageRegistry'
+    obj=get_json(endpoint);sources={}
+    for package in obj.get('data',{}).get('packages',[]):
+        for module in package.get('modules') or []:
+            encoded=module.get('source') or ''
+            if not encoded or encoded=='0x':continue
+            data=bytes.fromhex(encoded.removeprefix('0x'))
+            try:data=gzip.decompress(data)
+            except OSError:pass
+            sources[package.get('name','package')+'/'+module.get('name','Module')+'.move']={'content':data.decode('utf-8')}
+    if not sources:raise RuntimeError('The Aptos package registry exposes no published Move source')
+    obj['sources']=sources;return persist_contract(entry,obj,'aptos_published_source',endpoint)
+
+def solana(entry):
+    m=re.search(r'/(?:account|address|token)/([1-9A-HJ-NP-Za-km-z]{32,44})',entry['url'])
+    if not m:raise RuntimeError('No Solana program address')
+    program=m.group(1);endpoint='https://verify.osec.io/status/'+program
+    obj=get_json(endpoint)
+    if not obj.get('is_verified'):raise RuntimeError('No verified source repository for this Solana account')
+    url=obj.get('repo_url') or obj.get('git_url') or obj.get('repository_url')
+    parsed=urllib.parse.urlsplit(url or '')
+    if parsed.netloc!='github.com':raise RuntimeError('Verification registry does not expose a supported GitHub source repository')
+    parts=parsed.path.strip('/').split('/');owner,repo=parts[:2];repo=repo.removesuffix('.git')
+    commit=obj.get('commit') or obj.get('commit_hash') or obj.get('commitHash') or repo_info(owner,repo)['default_branch']
+    snapshot=archive_repo(owner,repo,commit)
+    dest=OUT/'solana'/program/'verification.json';save_json(dest,obj)
+    return {'status':'fetched','kind':'solana_verified_repository','verification':relative(dest),'retrieval_url':endpoint,**snapshot}
+
 CHAIN_IDS = {
  'explorer.immutable.com':13371,'explorer.immutable.com/':13371,'explorer.abstractchain.io':2741,'abscan.org':2741,'opbnb.bscscan.com':204,'explorer.kava.io':2222,'explorer.kroma.network':255,'explorer.metis.io':1088,'explorer.zora.energy':7777777,
+ 'purrsec.com':999,'beratrail.io':80094,
  'explore.tempo.xyz':4217,'cornscan.io':21000000,'flarescan.com':14,'hashscan.io':295,'xdcscan.com':50,'taikoscan.io':167000,'blastscan.io':81457,
  'etherscan.io':1,'polygonscan.com':137,'arbiscan.io':42161,'snowtrace.io':43114,
  'snowscan.xyz':43114,'basescan.org':8453,'bscscan.com':56,'optimistic.etherscan.io':10,
@@ -372,7 +406,10 @@ CHAIN_IDS = {
 BLOCKSCOUT_ALIASES={'optimistic.etherscan.io':'optimism.blockscout.com','explorer.optimism.io':'optimism.blockscout.com','basescan.org':'base.blockscout.com','etherscan.io':'eth.blockscout.com','gnosisscan.io':'gnosis.blockscout.com','polygonscan.com':'polygon.blockscout.com','arbiscan.io':'arbitrum.blockscout.com','scrollscan.com':'scroll.blockscout.com','uniscan.xyz':'unichain.blockscout.com','worldscan.org':'worldchain-mainnet.explorer.alchemy.com'}
 def alternate_contract(entry):
     parsed=urllib.parse.urlsplit(entry['url']);host=parsed.netloc.lower();m=re.search(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])',entry['url'])
-    if not m:raise RuntimeError('No EVM address; no alternate verification endpoint')
+    if not m:
+        if host in ('solscan.io','explorer.solana.com'):return solana(entry)
+        if host in ('aptoscan.com','explorer.aptoslabs.com'):return aptos(entry)
+        raise RuntimeError('No EVM address; no alternate verification endpoint')
     address=m.group();chain=CHAIN_IDS.get(host)
     if host=='www.oklink.com':chain={'x-layer':196,'xlayer':196,'okc':66,'ethereum':1,'polygon':137,'arbitrum':42161}.get(parsed.path.strip('/').split('/')[0])
     if host=='blockscout.com':
