@@ -1,0 +1,781 @@
+{
+  "sources": {
+    "contracts/release/off-chain/FundValueCalculator.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport {SafeMath} from \"openzeppelin-solc-0.6/math/SafeMath.sol\";\nimport {IERC20} from \"../../external-interfaces/IERC20.sol\";\nimport {IFundValueCalculator} from \"../../persistent/off-chain/fund-value-calculator/IFundValueCalculator.sol\";\nimport {IComptroller} from \"../core/fund/comptroller/IComptroller.sol\";\nimport {IVault} from \"../core/fund/vault/IVault.sol\";\nimport {IFeeManager} from \"../extensions/fee-manager/IFeeManager.sol\";\nimport {IProtocolFeeTracker} from \"../infrastructure/protocol-fees/IProtocolFeeTracker.sol\";\nimport {IValueInterpreter} from \"../infrastructure/value-interpreter/IValueInterpreter.sol\";\n\n/// @title FundValueCalculator Contract\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice A peripheral contract for serving fund value calculation requests from the FundValueCalculatorRouter\n/// @dev These are convenience functions intended for off-chain consumption,\n/// some of which involve potentially expensive state transitions.\ncontract FundValueCalculator is IFundValueCalculator {\n    using SafeMath for uint256;\n\n    // Protocol fee-related constants, taken from ProtocolFeeTracker.sol\n    uint256 private constant MAX_BPS = 10000;\n    uint256 private constant SECONDS_IN_YEAR = 31557600; // 60*60*24*365.25\n    // Protocol fee-related constants, taken from ProtocolFeeReserveLib.sol\n    uint256 private constant BUYBACK_DISCOUNT_DIVISOR = 2;\n\n    // Shares-related constants\n    uint256 private constant SHARES_UNIT = 10 ** 18;\n\n    address private immutable FEE_MANAGER;\n    address private immutable PROTOCOL_FEE_TRACKER;\n    address private immutable VALUE_INTERPRETER;\n\n    constructor(address _feeManager, address _protocolFeeTracker, address _valueInterpreter) public {\n        FEE_MANAGER = _feeManager;\n        PROTOCOL_FEE_TRACKER = _protocolFeeTracker;\n        VALUE_INTERPRETER = _valueInterpreter;\n    }\n\n    // EXTERNAL FUNCTIONS\n\n    /// @notice Calculates the GAV for a given fund, quoted in a given asset\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @param _quoteAsset The quote asset\n    /// @return gav_ The GAV quoted in _quoteAsset\n    function calcGavInAsset(address _vaultProxy, address _quoteAsset) external override returns (uint256 gav_) {\n        (address denominationAsset, uint256 valueInDenominationAsset) = calcGav(_vaultProxy);\n\n        return IValueInterpreter(getValueInterpreter()).calcCanonicalAssetValue(\n            denominationAsset, valueInDenominationAsset, _quoteAsset\n        );\n    }\n\n    /// @notice Calculates the gross value of one shares unit (10 ** 18) for a given fund, quoted in a given asset\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @param _quoteAsset The quote asset\n    /// @return grossShareValue_ The gross share value quoted in _quoteAsset\n    function calcGrossShareValueInAsset(address _vaultProxy, address _quoteAsset)\n        external\n        override\n        returns (uint256 grossShareValue_)\n    {\n        (address denominationAsset, uint256 valueInDenominationAsset) = calcGrossShareValue(_vaultProxy);\n\n        return IValueInterpreter(getValueInterpreter()).calcCanonicalAssetValue(\n            denominationAsset, valueInDenominationAsset, _quoteAsset\n        );\n    }\n\n    /// @notice Calculates the NAV for a given fund, quoted in a given asset\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @param _quoteAsset The quote asset\n    /// @return nav_ The NAV quoted in _quoteAsset\n    function calcNavInAsset(address _vaultProxy, address _quoteAsset) external override returns (uint256 nav_) {\n        (address denominationAsset, uint256 valueInDenominationAsset) = calcNav(_vaultProxy);\n\n        return IValueInterpreter(getValueInterpreter()).calcCanonicalAssetValue(\n            denominationAsset, valueInDenominationAsset, _quoteAsset\n        );\n    }\n\n    /// @notice Calculates the net value of one shares unit (10 ** 18) for a given fund, quoted in a given asset\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @param _quoteAsset The quote asset\n    /// @return netShareValue_ The net share value quoted in _quoteAsset\n    function calcNetShareValueInAsset(address _vaultProxy, address _quoteAsset)\n        external\n        override\n        returns (uint256 netShareValue_)\n    {\n        (address denominationAsset, uint256 valueInDenominationAsset) = calcNetShareValue(_vaultProxy);\n\n        return IValueInterpreter(getValueInterpreter()).calcCanonicalAssetValue(\n            denominationAsset, valueInDenominationAsset, _quoteAsset\n        );\n    }\n\n    /// @notice Calculates the net value of all shares held by a specified account, quoted in a given asset\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @param _sharesHolder The account holding shares\n    /// @param _quoteAsset The quote asset\n    /// @return netValue_ The net value of all shares held by _sharesHolder quoted in _quoteAsset\n    function calcNetValueForSharesHolderInAsset(address _vaultProxy, address _sharesHolder, address _quoteAsset)\n        external\n        override\n        returns (uint256 netValue_)\n    {\n        (address denominationAsset, uint256 valueInDenominationAsset) =\n            calcNetValueForSharesHolder(_vaultProxy, _sharesHolder);\n\n        return IValueInterpreter(getValueInterpreter()).calcCanonicalAssetValue(\n            denominationAsset, valueInDenominationAsset, _quoteAsset\n        );\n    }\n\n    // PUBLIC FUNCTIONS\n\n    /// @notice Calculates the GAV for a given fund\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @return denominationAsset_ The denomination asset of the fund\n    /// @return gav_ The GAV quoted in the denomination asset\n    function calcGav(address _vaultProxy) public override returns (address denominationAsset_, uint256 gav_) {\n        IComptroller comptrollerProxyContract = __getComptrollerProxyForVault(_vaultProxy);\n\n        return (comptrollerProxyContract.getDenominationAsset(), comptrollerProxyContract.calcGav());\n    }\n\n    /// @notice Calculates the gross value of one shares unit (10 ** 18) for a given fund\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @return denominationAsset_ The denomination asset of the fund\n    /// @return grossShareValue_ The gross share value quoted in the denomination asset\n    function calcGrossShareValue(address _vaultProxy)\n        public\n        override\n        returns (address denominationAsset_, uint256 grossShareValue_)\n    {\n        IComptroller comptrollerProxyContract = __getComptrollerProxyForVault(_vaultProxy);\n\n        return (comptrollerProxyContract.getDenominationAsset(), comptrollerProxyContract.calcGrossShareValue());\n    }\n\n    /// @notice Calculates the NAV for a given fund\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @return denominationAsset_ The denomination asset of the fund\n    /// @return nav_ The NAV quoted in the denomination asset\n    /// @dev This value should only be consumed from off-chain,\n    /// as the NAV is only valid for the shares quantity prior to the settlement of fees,\n    /// and this function actually settles fund-level fees, so the NAV would no longer be valid\n    function calcNav(address _vaultProxy) public override returns (address denominationAsset_, uint256 nav_) {\n        uint256 preSharesSupply = IERC20(_vaultProxy).totalSupply();\n\n        uint256 netShareValue;\n        (denominationAsset_, netShareValue) = calcNetShareValue(_vaultProxy);\n\n        nav_ = preSharesSupply.mul(netShareValue).div(SHARES_UNIT);\n\n        return (denominationAsset_, nav_);\n    }\n\n    /// @notice Calculates the net value of one shares unit (10 ** 18) for a given fund\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @return denominationAsset_ The denomination asset of the fund\n    /// @return netShareValue_ The net share value quoted in the denomination asset\n    function calcNetShareValue(address _vaultProxy)\n        public\n        override\n        returns (address denominationAsset_, uint256 netShareValue_)\n    {\n        IComptroller comptrollerProxyContract = __getComptrollerProxyForVault(_vaultProxy);\n\n        // Settle Continuous fees\n        comptrollerProxyContract.callOnExtension(getFeeManager(), 0, \"\");\n\n        // Calculate protocol fee shares due\n        uint256 protocolFeeSharesDue = calcProtocolFeeDueForFund(_vaultProxy);\n\n        denominationAsset_ = comptrollerProxyContract.getDenominationAsset();\n        netShareValue_ = __calcShareValue(\n            denominationAsset_,\n            comptrollerProxyContract.calcGav(),\n            IERC20(_vaultProxy).totalSupply().add(protocolFeeSharesDue)\n        );\n\n        return (denominationAsset_, netShareValue_);\n    }\n\n    /// @notice Calculates the net value of all shares held by a specified account\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @param _sharesHolder The account holding shares\n    /// @return denominationAsset_ The denomination asset of the fund\n    /// @return netValue_ The net value of all shares held by _sharesHolder\n    function calcNetValueForSharesHolder(address _vaultProxy, address _sharesHolder)\n        public\n        override\n        returns (address denominationAsset_, uint256 netValue_)\n    {\n        // Does not account for any new shares accrued to the _sharesHolder during calcs\n        uint256 sharesHolderBalance = IERC20(_vaultProxy).balanceOf(_sharesHolder);\n\n        uint256 netShareValue;\n        (denominationAsset_, netShareValue) = calcNetShareValue(_vaultProxy);\n\n        netValue_ = sharesHolderBalance.mul(netShareValue).div(SHARES_UNIT);\n\n        return (denominationAsset_, netValue_);\n    }\n\n    /// @notice Calculates the protocol fee shares currently due for a given fund\n    /// @param _vaultProxy The VaultProxy of the fund\n    /// @return sharesDue_ The protocol fee shares due\n    /// @dev Mostly copy-paste from ProtocolFeeTracker.payFee() and its helpers.\n    /// Includes the 50% buyback discount.\n    function calcProtocolFeeDueForFund(address _vaultProxy) public view returns (uint256 sharesDue_) {\n        // 1. Calc seconds since last payment\n        uint256 lastPaid = IProtocolFeeTracker(getProtocolFeeTracker()).getLastPaidForVault(_vaultProxy);\n        if (lastPaid >= block.timestamp || lastPaid == 0) {\n            return 0;\n        }\n\n        uint256 secondsDue = block.timestamp.sub(lastPaid);\n\n        // 2. Calc shares due as a proportion of annualized fee bps\n        uint256 sharesSupply = IERC20(_vaultProxy).totalSupply();\n\n        uint256 rawSharesDue = sharesSupply.mul(\n            IProtocolFeeTracker(getProtocolFeeTracker()).getFeeBpsForVault(_vaultProxy)\n        ).mul(secondsDue).div(SECONDS_IN_YEAR).div(MAX_BPS);\n\n        uint256 supplyNetRawSharesDue = sharesSupply.sub(rawSharesDue);\n        if (supplyNetRawSharesDue == 0) {\n            return 0;\n        }\n\n        return rawSharesDue.mul(sharesSupply).div(supplyNetRawSharesDue).div(BUYBACK_DISCOUNT_DIVISOR);\n    }\n\n    // PRIVATE FUNCTIONS\n\n    /// @dev Helper for calculating the share value\n    function __calcShareValue(address _denominationAsset, uint256 _assetsValue, uint256 _sharesSupply)\n        private\n        view\n        returns (uint256 shareValue_)\n    {\n        if (_sharesSupply == 0) {\n            return 10 ** uint256(IERC20(_denominationAsset).decimals());\n        }\n\n        return _assetsValue.mul(SHARES_UNIT).div(_sharesSupply);\n    }\n\n    /// @dev Helper to get the ComptrollerProxy for a given VaultProxy\n    function __getComptrollerProxyForVault(address _vaultProxy)\n        private\n        view\n        returns (IComptroller comptrollerProxyContract_)\n    {\n        return IComptroller(IVault(_vaultProxy).getAccessor());\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the `FEE_MANAGER` variable\n    /// @return feeManager_ The `FEE_MANAGER` variable value\n    function getFeeManager() public view returns (address feeManager_) {\n        return FEE_MANAGER;\n    }\n\n    /// @notice Gets the `PROTOCOL_FEE_TRACKER` variable\n    /// @return protocolFeeTracker_ The `PROTOCOL_FEE_TRACKER` variable value\n    function getProtocolFeeTracker() public view returns (address protocolFeeTracker_) {\n        return PROTOCOL_FEE_TRACKER;\n    }\n\n    /// @notice Gets the `VALUE_INTERPRETER` variable\n    /// @return valueInterpreter_ The `VALUE_INTERPRETER` variable value\n    function getValueInterpreter() public view returns (address valueInterpreter_) {\n        return VALUE_INTERPRETER;\n    }\n}\n"
+    },
+    "lib/openzeppelin-solc-0.6/contracts/math/SafeMath.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/**\n * @dev Wrappers over Solidity's arithmetic operations with added overflow\n * checks.\n *\n * Arithmetic operations in Solidity wrap on overflow. This can easily result\n * in bugs, because programmers usually assume that an overflow raises an\n * error, which is the standard behavior in high level programming languages.\n * `SafeMath` restores this intuition by reverting the transaction when an\n * operation overflows.\n *\n * Using this library instead of the unchecked operations eliminates an entire\n * class of bugs, so it's recommended to use it always.\n */\nlibrary SafeMath {\n    /**\n     * @dev Returns the addition of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        uint256 c = a + b;\n        if (c < a) return (false, 0);\n        return (true, c);\n    }\n\n    /**\n     * @dev Returns the substraction of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b > a) return (false, 0);\n        return (true, a - b);\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the\n        // benefit is lost if 'b' is also tested.\n        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522\n        if (a == 0) return (true, 0);\n        uint256 c = a * b;\n        if (c / a != b) return (false, 0);\n        return (true, c);\n    }\n\n    /**\n     * @dev Returns the division of two unsigned integers, with a division by zero flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b == 0) return (false, 0);\n        return (true, a / b);\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b == 0) return (false, 0);\n        return (true, a % b);\n    }\n\n    /**\n     * @dev Returns the addition of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `+` operator.\n     *\n     * Requirements:\n     *\n     * - Addition cannot overflow.\n     */\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        uint256 c = a + b;\n        require(c >= a, \"SafeMath: addition overflow\");\n        return c;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting on\n     * overflow (when the result is negative).\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b <= a, \"SafeMath: subtraction overflow\");\n        return a - b;\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `*` operator.\n     *\n     * Requirements:\n     *\n     * - Multiplication cannot overflow.\n     */\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) return 0;\n        uint256 c = a * b;\n        require(c / a == b, \"SafeMath: multiplication overflow\");\n        return c;\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting on\n     * division by zero. The result is rounded towards zero.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b > 0, \"SafeMath: division by zero\");\n        return a / b;\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting when dividing by zero.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b > 0, \"SafeMath: modulo by zero\");\n        return a % b;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on\n     * overflow (when the result is negative).\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {trySub}.\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b <= a, errorMessage);\n        return a - b;\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting with custom message on\n     * division by zero. The result is rounded towards zero.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryDiv}.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        return a / b;\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting with custom message when dividing by zero.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryMod}.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        return a % b;\n    }\n}\n"
+    },
+    "contracts/external-interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IERC20 Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IERC20 {\n    // IERC20 - strict\n\n    function allowance(address _owner, address _spender) external view returns (uint256 allowance_);\n\n    function approve(address _spender, uint256 _value) external returns (bool approve_);\n\n    function balanceOf(address _account) external view returns (uint256 balanceOf_);\n\n    function totalSupply() external view returns (uint256 totalSupply_);\n\n    function transfer(address _to, uint256 _value) external returns (bool transfer_);\n\n    function transferFrom(address _from, address _to, uint256 _value) external returns (bool transferFrom_);\n\n    // IERC20 - typical\n\n    function decimals() external view returns (uint8 decimals_);\n\n    function name() external view returns (string memory name_);\n\n    function symbol() external view returns (string memory symbol_);\n}\n"
+    },
+    "contracts/persistent/off-chain/fund-value-calculator/IFundValueCalculator.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IFundValueCalculator interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IFundValueCalculator {\n    function calcGav(address _vaultProxy) external returns (address denominationAsset_, uint256 gav_);\n\n    function calcGavInAsset(address _vaultProxy, address _quoteAsset) external returns (uint256 gav_);\n\n    function calcGrossShareValue(address _vaultProxy)\n        external\n        returns (address denominationAsset_, uint256 grossShareValue_);\n\n    function calcGrossShareValueInAsset(address _vaultProxy, address _quoteAsset)\n        external\n        returns (uint256 grossShareValue_);\n\n    function calcNav(address _vaultProxy) external returns (address denominationAsset_, uint256 nav_);\n\n    function calcNavInAsset(address _vaultProxy, address _quoteAsset) external returns (uint256 nav_);\n\n    function calcNetShareValue(address _vaultProxy)\n        external\n        returns (address denominationAsset_, uint256 netShareValue_);\n\n    function calcNetShareValueInAsset(address _vaultProxy, address _quoteAsset)\n        external\n        returns (uint256 netShareValue_);\n\n    function calcNetValueForSharesHolder(address _vaultProxy, address _sharesHolder)\n        external\n        returns (address denominationAsset_, uint256 netValue_);\n\n    function calcNetValueForSharesHolderInAsset(address _vaultProxy, address _sharesHolder, address _quoteAsset)\n        external\n        returns (uint256 netValue_);\n}\n"
+    },
+    "contracts/release/core/fund/comptroller/IComptroller.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\nimport {IVault} from \"../vault/IVault.sol\";\n\n/// @title IComptroller Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IComptroller {\n    struct ConfigInput {\n        // The asset in which the fund's value should be denominated\n        address denominationAsset;\n        // A timelock after the last time shares were bought for an account\n        // that must expire before that account transfers or redeems their shares\n        uint256 sharesActionTimelock;\n        // Encoded data for the fees to be enabled for the fund\n        bytes feeManagerConfigData;\n        // Encoded data for the policies to be enabled for the fund\n        bytes policyManagerConfigData;\n        // Arbitrary extensions to be enabled for the fund\n        ExtensionConfigInput[] extensionsConfig;\n    }\n\n    struct ExtensionConfigInput {\n        // The extension address\n        address extension;\n        // Encoded data for the extension-specific config\n        bytes configData;\n    }\n\n    function activate() external;\n\n    function buyBackProtocolFeeShares(uint256 _sharesAmount) external;\n\n    function buyShares(uint256 _investmentAmount, uint256 _minSharesQuantity)\n        external\n        returns (uint256 sharesReceived_);\n\n    function buySharesOnBehalf(address _buyer, uint256 _investmentAmount, uint256 _minSharesQuantity)\n        external\n        returns (uint256 sharesReceived_);\n\n    function calcGav() external returns (uint256 gav_);\n\n    function calcGrossShareValue() external returns (uint256 grossShareValue_);\n\n    function callOnExtension(address _extension, uint256 _actionId, bytes calldata _callArgs) external;\n\n    function deactivate() external;\n\n    function doesAutoProtocolFeeSharesBuyback() external view returns (bool doesAutoBuyback_);\n\n    function getDenominationAsset() external view returns (address denominationAsset_);\n\n    function getDispatcher() external view returns (address dispatcher_);\n\n    function getExtensions() external view returns (address[] memory extensions_);\n\n    function getFeeManager() external view returns (address feeManager_);\n\n    function getFundDeployer() external view returns (address fundDeployer_);\n\n    function getLastSharesBoughtTimestampForAccount(address _who)\n        external\n        view\n        returns (uint256 lastSharesBoughtTimestamp_);\n\n    function getMlnToken() external view returns (address mlnToken_);\n\n    function getPolicyManager() external view returns (address policyManager_);\n\n    function getProtocolFeeReserve() external view returns (address protocolFeeReserve_);\n\n    function getSharesActionTimelock() external view returns (uint256 sharesActionTimelock_);\n\n    function getValueInterpreter() external view returns (address valueInterpreter_);\n\n    function getVaultProxy() external view returns (address vaultProxy_);\n\n    function getWethToken() external view returns (address wethToken_);\n\n    function init(address _vaultProxy, ConfigInput calldata _config) external;\n\n    function isExtension(address _who) external view returns (bool isExtension_);\n\n    function permissionedVaultAction(IVault.VaultAction _action, bytes calldata _actionData) external;\n\n    function preTransferSharesHook(address _sender, address _recipient, uint256 _amount) external;\n\n    function preTransferSharesHookFreelyTransferable(address _sender) external view;\n\n    function redeemSharesForSpecificAssets(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _payoutAssets,\n        uint256[] calldata _payoutAssetPercentages\n    ) external returns (uint256[] memory payoutAmounts_);\n\n    function redeemSharesInKind(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _additionalAssets,\n        address[] calldata _assetsToSkip\n    ) external returns (address[] memory payoutAssets_, uint256[] memory payoutAmounts_);\n\n    function setAutoProtocolFeeSharesBuyback(bool _nextAutoProtocolFeeSharesBuyback) external;\n\n    function vaultCallOnContract(address _contract, bytes4 _selector, bytes calldata _encodedArgs)\n        external\n        returns (bytes memory returnData_);\n}\n"
+    },
+    "contracts/release/core/fund/vault/IVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport {IExternalPositionVault} from \"../../../../persistent/vault/interfaces/IExternalPositionVault.sol\";\nimport {IFreelyTransferableSharesVault} from\n    \"../../../../persistent/vault/interfaces/IFreelyTransferableSharesVault.sol\";\nimport {IMigratableVault} from \"../../../../persistent/vault/interfaces/IMigratableVault.sol\";\nimport {IVaultCore} from \"../../../../persistent/vault/interfaces/IVaultCore.sol\";\n\n/// @title IVault Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IVault is IVaultCore, IMigratableVault, IFreelyTransferableSharesVault, IExternalPositionVault {\n    enum VaultAction {\n        None,\n        // Shares management\n        BurnShares,\n        MintShares,\n        TransferShares,\n        // Asset management\n        AddTrackedAsset,\n        ApproveAssetSpender,\n        RemoveTrackedAsset,\n        WithdrawAssetTo,\n        // External position management\n        AddExternalPosition,\n        CallOnExternalPosition,\n        RemoveExternalPosition\n    }\n\n    function addAssetManagers(address[] calldata _managers) external;\n\n    function addTrackedAsset(address _asset) external;\n\n    function burnShares(address _target, uint256 _amount) external;\n\n    function buyBackProtocolFeeShares(uint256 _sharesAmount, uint256 _mlnValue, uint256 _gav) external;\n\n    function callOnContract(address _contract, bytes calldata _callData) external returns (bytes memory returnData_);\n\n    function canManageAssets(address _who) external view returns (bool canManageAssets_);\n\n    function canRelayCalls(address _who) external view returns (bool canRelayCalls_);\n\n    function claimOwnership() external;\n\n    function getActiveExternalPositions() external view returns (address[] memory activeExternalPositions_);\n\n    function getExternalPositionManager() external view returns (address externalPositionManager_);\n\n    function getFundDeployer() external view returns (address fundDeployer_);\n\n    function getMlnBurner() external view returns (address mlnBurner_);\n\n    function getMlnToken() external view returns (address mlnToken_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getPositionsLimit() external view returns (uint256 positionsLimit_);\n\n    function getProtocolFeeReserve() external view returns (address protocolFeeReserve_);\n\n    function getProtocolFeeTracker() external view returns (address protocolFeeTracker_);\n\n    function getTrackedAssets() external view returns (address[] memory trackedAssets_);\n\n    function isActiveExternalPosition(address _externalPosition)\n        external\n        view\n        returns (bool isActiveExternalPosition_);\n\n    function isAssetManager(address _who) external view returns (bool isAssetManager_);\n\n    function isTrackedAsset(address _asset) external view returns (bool isTrackedAsset_);\n\n    function mintShares(address _target, uint256 _amount) external;\n\n    function payProtocolFee() external;\n\n    function receiveValidatedVaultAction(VaultAction _action, bytes calldata _actionData) external;\n\n    function removeAssetManagers(address[] calldata _managers) external;\n\n    function removeNominatedOwner() external;\n\n    function setAccessorForFundReconfiguration(address _nextAccessor) external;\n\n    function setFreelyTransferableShares() external;\n\n    function setMigrator(address _nextMigrator) external;\n\n    function setName(string calldata _nextName) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSymbol(string calldata _nextSymbol) external;\n\n    function transferShares(address _from, address _to, uint256 _amount) external;\n\n    function withdrawAssetTo(address _asset, address _target, uint256 _amount) external;\n}\n"
+    },
+    "contracts/release/extensions/fee-manager/IFeeManager.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\n/// @title FeeManager Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Interface for the FeeManager\ninterface IFeeManager {\n    // No fees for the current release are implemented post-redeemShares\n    enum FeeHook {\n        Continuous,\n        PreBuyShares,\n        PostBuyShares,\n        PreRedeemShares\n    }\n    enum SettlementType {\n        None,\n        Direct,\n        Mint,\n        Burn\n    }\n\n    function getEnabledFeesForFund(address _comptrollerProxy) external view returns (address[] memory enabledFees_);\n\n    function invokeHook(FeeHook _hook, bytes calldata _settlementData, uint256 _gav) external;\n}\n"
+    },
+    "contracts/release/infrastructure/protocol-fees/IProtocolFeeTracker.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IProtocolFeeTracker Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\ninterface IProtocolFeeTracker {\n    function getFeeBpsDefault() external view returns (uint256 feeBpsDefault_);\n\n    function getFeeBpsForVault(address _vaultProxy) external view returns (uint256 feeBps_);\n\n    function getFeeBpsOverrideForVault(address _vaultProxy) external view returns (uint256 feeBpsOverride_);\n\n    function getLastPaidForVault(address _vaultProxy) external view returns (uint256 lastPaid_);\n\n    function initializeForVault(address _vaultProxy) external;\n\n    function payFee() external returns (uint256 sharesDue_);\n\n    function setFeeBpsDefault(uint256 _nextFeeBpsDefault) external;\n\n    function setFeeBpsOverrideForVault(address _vaultProxy, uint256 _nextFeeBpsOverride) external;\n\n    function setLastPaidForVault(address _vaultProxy, uint256 _nextTimestamp) external;\n}\n"
+    },
+    "contracts/release/infrastructure/value-interpreter/IValueInterpreter.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport {IAggregatedDerivativePriceFeedMixin} from \"../price-feeds/derivatives/IAggregatedDerivativePriceFeedMixin.sol\";\nimport {IChainlinkPriceFeedMixin} from \"../price-feeds/primitives/IChainlinkPriceFeedMixin.sol\";\n\n/// @title IValueInterpreter interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Interface for ValueInterpreter\ninterface IValueInterpreter is IAggregatedDerivativePriceFeedMixin, IChainlinkPriceFeedMixin {\n    function addDerivatives(address[] calldata _derivatives, address[] calldata _priceFeeds) external;\n\n    function addPrimitives(\n        address[] calldata _primitives,\n        address[] calldata _aggregators,\n        RateAsset[] calldata _rateAssets\n    ) external;\n\n    function calcCanonicalAssetValue(address _baseAsset, uint256 _amount, address _quoteAsset)\n        external\n        returns (uint256 value_);\n\n    function calcCanonicalAssetsTotalValue(address[] memory _baseAssets, uint256[] memory _amounts, address _quoteAsset)\n        external\n        returns (uint256 value_);\n\n    function isSupportedAsset(address _asset) external view returns (bool isSupported_);\n\n    function isSupportedDerivativeAsset(address _asset) external view returns (bool isSupported_);\n\n    function isSupportedPrimitiveAsset(address _asset) external view returns (bool isSupported_);\n\n    function removeDerivatives(address[] calldata _derivatives) external;\n\n    function removePrimitives(address[] calldata _primitives) external;\n\n    function setEthUsdAggregator(address _nextEthUsdAggregator) external;\n\n    function updateDerivatives(address[] calldata _derivatives, address[] calldata _priceFeeds) external;\n\n    function updatePrimitives(\n        address[] calldata _primitives,\n        address[] calldata _aggregators,\n        RateAsset[] calldata _rateAssets\n    ) external;\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IExternalPositionVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IExternalPositionVault interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// Provides an interface to get the externalPositionLib for a given type from the Vault\ninterface IExternalPositionVault {\n    function getExternalPositionLibForType(uint256) external view returns (address);\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IFreelyTransferableSharesVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IFreelyTransferableSharesVault Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Provides the interface for determining whether a vault's shares\n/// are guaranteed to be freely transferable.\n/// @dev DO NOT EDIT CONTRACT\ninterface IFreelyTransferableSharesVault {\n    function sharesAreFreelyTransferable() external view returns (bool sharesAreFreelyTransferable_);\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IMigratableVault Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @dev DO NOT EDIT CONTRACT\ninterface IMigratableVault {\n    function canMigrate(address _who) external view returns (bool canMigrate_);\n\n    function init(address _owner, address _accessor, string calldata _fundName) external;\n\n    function setAccessor(address _nextAccessor) external;\n\n    function setVaultLib(address _nextVaultLib) external;\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IVaultCore.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IVaultCore interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Interface for getters of core vault storage\n/// @dev DO NOT EDIT CONTRACT\ninterface IVaultCore {\n    function getAccessor() external view returns (address accessor_);\n\n    function getCreator() external view returns (address creator_);\n\n    function getMigrator() external view returns (address migrator_);\n\n    function getOwner() external view returns (address owner_);\n}\n"
+    },
+    "contracts/release/infrastructure/price-feeds/derivatives/IAggregatedDerivativePriceFeedMixin.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IAggregatedDerivativePriceFeedMixin Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Interface for AggregatedDerivativePriceFeedMixin\ninterface IAggregatedDerivativePriceFeedMixin {\n    function getPriceFeedForDerivative(address _derivative) external view returns (address priceFeed_);\n}\n"
+    },
+    "contracts/release/infrastructure/price-feeds/primitives/IChainlinkPriceFeedMixin.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Foundation <security@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IChainlinkPriceFeedMixin Interface\n/// @author Enzyme Foundation <security@enzyme.finance>\n/// @notice Interface for ChainlinkPriceFeedMixin\ninterface IChainlinkPriceFeedMixin {\n    enum RateAsset {\n        ETH,\n        USD\n    }\n\n    struct AggregatorInfo {\n        address aggregator;\n        RateAsset rateAsset;\n    }\n\n    function getAggregatorForPrimitive(address _primitive) external view returns (address aggregator_);\n\n    function getEthUsdAggregator() external view returns (address ethUsdAggregator_);\n\n    function getRateAssetForPrimitive(address _primitive) external view returns (RateAsset rateAsset_);\n\n    function getStaleRateThreshold() external view returns (uint256 staleRateThreshold_);\n\n    function getUnitForPrimitive(address _primitive) external view returns (uint256 unit_);\n\n    function getWethToken() external view returns (address wethToken_);\n}\n"
+    },
+    "lib/openzeppelin-solc-0.6/contracts/token/ERC20/ERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\nimport \"../../utils/Context.sol\";\nimport \"./IERC20.sol\";\nimport \"../../math/SafeMath.sol\";\n\n/**\n * @dev Implementation of the {IERC20} interface.\n *\n * This implementation is agnostic to the way tokens are created. This means\n * that a supply mechanism has to be added in a derived contract using {_mint}.\n * For a generic mechanism see {ERC20PresetMinterPauser}.\n *\n * TIP: For a detailed writeup see our guide\n * https://forum.zeppelin.solutions/t/how-to-implement-erc20-supply-mechanisms/226[How\n * to implement supply mechanisms].\n *\n * We have followed general OpenZeppelin guidelines: functions revert instead\n * of returning `false` on failure. This behavior is nonetheless conventional\n * and does not conflict with the expectations of ERC20 applications.\n *\n * Additionally, an {Approval} event is emitted on calls to {transferFrom}.\n * This allows applications to reconstruct the allowance for all accounts just\n * by listening to said events. Other implementations of the EIP may not emit\n * these events, as it isn't required by the specification.\n *\n * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}\n * functions have been added to mitigate the well-known issues around setting\n * allowances. See {IERC20-approve}.\n */\ncontract ERC20 is Context, IERC20 {\n    using SafeMath for uint256;\n\n    mapping (address => uint256) private _balances;\n\n    mapping (address => mapping (address => uint256)) private _allowances;\n\n    uint256 private _totalSupply;\n\n    string private _name;\n    string private _symbol;\n    uint8 private _decimals;\n\n    /**\n     * @dev Sets the values for {name} and {symbol}, initializes {decimals} with\n     * a default value of 18.\n     *\n     * To select a different value for {decimals}, use {_setupDecimals}.\n     *\n     * All three of these values are immutable: they can only be set once during\n     * construction.\n     */\n    constructor (string memory name_, string memory symbol_) public {\n        _name = name_;\n        _symbol = symbol_;\n        _decimals = 18;\n    }\n\n    /**\n     * @dev Returns the name of the token.\n     */\n    function name() public view virtual returns (string memory) {\n        return _name;\n    }\n\n    /**\n     * @dev Returns the symbol of the token, usually a shorter version of the\n     * name.\n     */\n    function symbol() public view virtual returns (string memory) {\n        return _symbol;\n    }\n\n    /**\n     * @dev Returns the number of decimals used to get its user representation.\n     * For example, if `decimals` equals `2`, a balance of `505` tokens should\n     * be displayed to a user as `5,05` (`505 / 10 ** 2`).\n     *\n     * Tokens usually opt for a value of 18, imitating the relationship between\n     * Ether and Wei. This is the value {ERC20} uses, unless {_setupDecimals} is\n     * called.\n     *\n     * NOTE: This information is only used for _display_ purposes: it in\n     * no way affects any of the arithmetic of the contract, including\n     * {IERC20-balanceOf} and {IERC20-transfer}.\n     */\n    function decimals() public view virtual returns (uint8) {\n        return _decimals;\n    }\n\n    /**\n     * @dev See {IERC20-totalSupply}.\n     */\n    function totalSupply() public view virtual override returns (uint256) {\n        return _totalSupply;\n    }\n\n    /**\n     * @dev See {IERC20-balanceOf}.\n     */\n    function balanceOf(address account) public view virtual override returns (uint256) {\n        return _balances[account];\n    }\n\n    /**\n     * @dev See {IERC20-transfer}.\n     *\n     * Requirements:\n     *\n     * - `recipient` cannot be the zero address.\n     * - the caller must have a balance of at least `amount`.\n     */\n    function transfer(address recipient, uint256 amount) public virtual override returns (bool) {\n        _transfer(_msgSender(), recipient, amount);\n        return true;\n    }\n\n    /**\n     * @dev See {IERC20-allowance}.\n     */\n    function allowance(address owner, address spender) public view virtual override returns (uint256) {\n        return _allowances[owner][spender];\n    }\n\n    /**\n     * @dev See {IERC20-approve}.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     */\n    function approve(address spender, uint256 amount) public virtual override returns (bool) {\n        _approve(_msgSender(), spender, amount);\n        return true;\n    }\n\n    /**\n     * @dev See {IERC20-transferFrom}.\n     *\n     * Emits an {Approval} event indicating the updated allowance. This is not\n     * required by the EIP. See the note at the beginning of {ERC20}.\n     *\n     * Requirements:\n     *\n     * - `sender` and `recipient` cannot be the zero address.\n     * - `sender` must have a balance of at least `amount`.\n     * - the caller must have allowance for ``sender``'s tokens of at least\n     * `amount`.\n     */\n    function transferFrom(address sender, address recipient, uint256 amount) public virtual override returns (bool) {\n        _transfer(sender, recipient, amount);\n        _approve(sender, _msgSender(), _allowances[sender][_msgSender()].sub(amount, \"ERC20: transfer amount exceeds allowance\"));\n        return true;\n    }\n\n    /**\n     * @dev Atomically increases the allowance granted to `spender` by the caller.\n     *\n     * This is an alternative to {approve} that can be used as a mitigation for\n     * problems described in {IERC20-approve}.\n     *\n     * Emits an {Approval} event indicating the updated allowance.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     */\n    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {\n        _approve(_msgSender(), spender, _allowances[_msgSender()][spender].add(addedValue));\n        return true;\n    }\n\n    /**\n     * @dev Atomically decreases the allowance granted to `spender` by the caller.\n     *\n     * This is an alternative to {approve} that can be used as a mitigation for\n     * problems described in {IERC20-approve}.\n     *\n     * Emits an {Approval} event indicating the updated allowance.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `spender` must have allowance for the caller of at least\n     * `subtractedValue`.\n     */\n    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {\n        _approve(_msgSender(), spender, _allowances[_msgSender()][spender].sub(subtractedValue, \"ERC20: decreased allowance below zero\"));\n        return true;\n    }\n\n    /**\n     * @dev Moves tokens `amount` from `sender` to `recipient`.\n     *\n     * This is internal function is equivalent to {transfer}, and can be used to\n     * e.g. implement automatic token fees, slashing mechanisms, etc.\n     *\n     * Emits a {Transfer} event.\n     *\n     * Requirements:\n     *\n     * - `sender` cannot be the zero address.\n     * - `recipient` cannot be the zero address.\n     * - `sender` must have a balance of at least `amount`.\n     */\n    function _transfer(address sender, address recipient, uint256 amount) internal virtual {\n        require(sender != address(0), \"ERC20: transfer from the zero address\");\n        require(recipient != address(0), \"ERC20: transfer to the zero address\");\n\n        _beforeTokenTransfer(sender, recipient, amount);\n\n        _balances[sender] = _balances[sender].sub(amount, \"ERC20: transfer amount exceeds balance\");\n        _balances[recipient] = _balances[recipient].add(amount);\n        emit Transfer(sender, recipient, amount);\n    }\n\n    /** @dev Creates `amount` tokens and assigns them to `account`, increasing\n     * the total supply.\n     *\n     * Emits a {Transfer} event with `from` set to the zero address.\n     *\n     * Requirements:\n     *\n     * - `to` cannot be the zero address.\n     */\n    function _mint(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: mint to the zero address\");\n\n        _beforeTokenTransfer(address(0), account, amount);\n\n        _totalSupply = _totalSupply.add(amount);\n        _balances[account] = _balances[account].add(amount);\n        emit Transfer(address(0), account, amount);\n    }\n\n    /**\n     * @dev Destroys `amount` tokens from `account`, reducing the\n     * total supply.\n     *\n     * Emits a {Transfer} event with `to` set to the zero address.\n     *\n     * Requirements:\n     *\n     * - `account` cannot be the zero address.\n     * - `account` must have at least `amount` tokens.\n     */\n    function _burn(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: burn from the zero address\");\n\n        _beforeTokenTransfer(account, address(0), amount);\n\n        _balances[account] = _balances[account].sub(amount, \"ERC20: burn amount exceeds balance\");\n        _totalSupply = _totalSupply.sub(amount);\n        emit Transfer(account, address(0), amount);\n    }\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.\n     *\n     * This internal function is equivalent to `approve`, and can be used to\n     * e.g. set automatic allowances for certain subsystems, etc.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `owner` cannot be the zero address.\n     * - `spender` cannot be the zero address.\n     */\n    function _approve(address owner, address spender, uint256 amount) internal virtual {\n        require(owner != address(0), \"ERC20: approve from the zero address\");\n        require(spender != address(0), \"ERC20: approve to the zero address\");\n\n        _allowances[owner][spender] = amount;\n        emit Approval(owner, spender, amount);\n    }\n\n    /**\n     * @dev Sets {decimals} to a value other than the default one of 18.\n     *\n     * WARNING: This function should only be called from the constructor. Most\n     * applications that interact with token contracts will not expect\n     * {decimals} to ever change, and may work incorrectly if it does.\n     */\n    function _setupDecimals(uint8 decimals_) internal virtual {\n        _decimals = decimals_;\n    }\n\n    /**\n     * @dev Hook that is called before any transfer of tokens. This includes\n     * minting and burning.\n     *\n     * Calling conditions:\n     *\n     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens\n     * will be to transferred to `to`.\n     * - when `from` is zero, `amount` tokens will be minted for `to`.\n     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.\n     * - `from` and `to` are never both zero.\n     *\n     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].\n     */\n    function _beforeTokenTransfer(address from, address to, uint256 amount) internal virtual { }\n}\n"
+    },
+    "lib/openzeppelin-solc-0.6/contracts/utils/Context.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/*\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with GSN meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address payable) {\n        return msg.sender;\n    }\n\n    function _msgData() internal view virtual returns (bytes memory) {\n        this; // silence state mutability warning without generating bytecode - see https://github.com/ethereum/solidity/issues/2691\n        return msg.data;\n    }\n}\n"
+    },
+    "lib/openzeppelin-solc-0.6/contracts/token/ERC20/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `recipient`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address recipient, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `sender` to `recipient` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.6.12+commit.27d51765"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_feeManager",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_protocolFeeTracker",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_valueInterpreter",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "calcGav",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "denominationAsset_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "gav_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_quoteAsset",
+              "type": "address"
+            }
+          ],
+          "name": "calcGavInAsset",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "gav_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "calcGrossShareValue",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "denominationAsset_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "grossShareValue_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_quoteAsset",
+              "type": "address"
+            }
+          ],
+          "name": "calcGrossShareValueInAsset",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "grossShareValue_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "calcNav",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "denominationAsset_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "nav_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_quoteAsset",
+              "type": "address"
+            }
+          ],
+          "name": "calcNavInAsset",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "nav_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "calcNetShareValue",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "denominationAsset_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "netShareValue_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_quoteAsset",
+              "type": "address"
+            }
+          ],
+          "name": "calcNetShareValueInAsset",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "netShareValue_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_sharesHolder",
+              "type": "address"
+            }
+          ],
+          "name": "calcNetValueForSharesHolder",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "denominationAsset_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "netValue_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_sharesHolder",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_quoteAsset",
+              "type": "address"
+            }
+          ],
+          "name": "calcNetValueForSharesHolderInAsset",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "netValue_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "calcProtocolFeeDueForFund",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "sharesDue_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getFeeManager",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "feeManager_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getProtocolFeeTracker",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "protocolFeeTracker_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getValueInterpreter",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "valueInterpreter_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Enzyme Foundation <security@enzyme.finance>",
+        "details": "These are convenience functions intended for off-chain consumption, some of which involve potentially expensive state transitions.",
+        "kind": "dev",
+        "methods": {
+          "calcGav(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "denominationAsset_": "The denomination asset of the fund",
+              "gav_": "The GAV quoted in the denomination asset"
+            }
+          },
+          "calcGavInAsset(address,address)": {
+            "params": {
+              "_quoteAsset": "The quote asset",
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "gav_": "The GAV quoted in _quoteAsset"
+            }
+          },
+          "calcGrossShareValue(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "denominationAsset_": "The denomination asset of the fund",
+              "grossShareValue_": "The gross share value quoted in the denomination asset"
+            }
+          },
+          "calcGrossShareValueInAsset(address,address)": {
+            "params": {
+              "_quoteAsset": "The quote asset",
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "grossShareValue_": "The gross share value quoted in _quoteAsset"
+            }
+          },
+          "calcNav(address)": {
+            "details": "This value should only be consumed from off-chain, as the NAV is only valid for the shares quantity prior to the settlement of fees, and this function actually settles fund-level fees, so the NAV would no longer be valid",
+            "params": {
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "denominationAsset_": "The denomination asset of the fund",
+              "nav_": "The NAV quoted in the denomination asset"
+            }
+          },
+          "calcNavInAsset(address,address)": {
+            "params": {
+              "_quoteAsset": "The quote asset",
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "nav_": "The NAV quoted in _quoteAsset"
+            }
+          },
+          "calcNetShareValue(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "denominationAsset_": "The denomination asset of the fund",
+              "netShareValue_": "The net share value quoted in the denomination asset"
+            }
+          },
+          "calcNetShareValueInAsset(address,address)": {
+            "params": {
+              "_quoteAsset": "The quote asset",
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "netShareValue_": "The net share value quoted in _quoteAsset"
+            }
+          },
+          "calcNetValueForSharesHolder(address,address)": {
+            "params": {
+              "_sharesHolder": "The account holding shares",
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "denominationAsset_": "The denomination asset of the fund",
+              "netValue_": "The net value of all shares held by _sharesHolder"
+            }
+          },
+          "calcNetValueForSharesHolderInAsset(address,address,address)": {
+            "params": {
+              "_quoteAsset": "The quote asset",
+              "_sharesHolder": "The account holding shares",
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "netValue_": "The net value of all shares held by _sharesHolder quoted in _quoteAsset"
+            }
+          },
+          "calcProtocolFeeDueForFund(address)": {
+            "details": "Mostly copy-paste from ProtocolFeeTracker.payFee() and its helpers. Includes the 50% buyback discount.",
+            "params": {
+              "_vaultProxy": "The VaultProxy of the fund"
+            },
+            "returns": {
+              "sharesDue_": "The protocol fee shares due"
+            }
+          },
+          "getFeeManager()": {
+            "returns": {
+              "feeManager_": "The `FEE_MANAGER` variable value"
+            }
+          },
+          "getProtocolFeeTracker()": {
+            "returns": {
+              "protocolFeeTracker_": "The `PROTOCOL_FEE_TRACKER` variable value"
+            }
+          },
+          "getValueInterpreter()": {
+            "returns": {
+              "valueInterpreter_": "The `VALUE_INTERPRETER` variable value"
+            }
+          }
+        },
+        "title": "FundValueCalculator Contract",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "calcGav(address)": {
+            "notice": "Calculates the GAV for a given fund"
+          },
+          "calcGavInAsset(address,address)": {
+            "notice": "Calculates the GAV for a given fund, quoted in a given asset"
+          },
+          "calcGrossShareValue(address)": {
+            "notice": "Calculates the gross value of one shares unit (10 ** 18) for a given fund"
+          },
+          "calcGrossShareValueInAsset(address,address)": {
+            "notice": "Calculates the gross value of one shares unit (10 ** 18) for a given fund, quoted in a given asset"
+          },
+          "calcNav(address)": {
+            "notice": "Calculates the NAV for a given fund"
+          },
+          "calcNavInAsset(address,address)": {
+            "notice": "Calculates the NAV for a given fund, quoted in a given asset"
+          },
+          "calcNetShareValue(address)": {
+            "notice": "Calculates the net value of one shares unit (10 ** 18) for a given fund"
+          },
+          "calcNetShareValueInAsset(address,address)": {
+            "notice": "Calculates the net value of one shares unit (10 ** 18) for a given fund, quoted in a given asset"
+          },
+          "calcNetValueForSharesHolder(address,address)": {
+            "notice": "Calculates the net value of all shares held by a specified account"
+          },
+          "calcNetValueForSharesHolderInAsset(address,address,address)": {
+            "notice": "Calculates the net value of all shares held by a specified account, quoted in a given asset"
+          },
+          "calcProtocolFeeDueForFund(address)": {
+            "notice": "Calculates the protocol fee shares currently due for a given fund"
+          },
+          "getFeeManager()": {
+            "notice": "Gets the `FEE_MANAGER` variable"
+          },
+          "getProtocolFeeTracker()": {
+            "notice": "Gets the `PROTOCOL_FEE_TRACKER` variable"
+          },
+          "getValueInterpreter()": {
+            "notice": "Gets the `VALUE_INTERPRETER` variable"
+          }
+        },
+        "notice": "A peripheral contract for serving fund value calculation requests from the FundValueCalculatorRouter",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/release/off-chain/FundValueCalculator.sol": "FundValueCalculator"
+      },
+      "evmVersion": "istanbul",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "none"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": false
+        },
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":morpho-blue/=lib/morpho-blue/src/libraries/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "sources": {
+      "contracts/external-interfaces/IERC20.sol": {
+        "keccak256": "0x0e3b292dac297f351b4f8147d10e7d8bc870daa4e4651ac12ad78ba6b1f3dfb0",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://06041127874184dc391018da2eefe673636750696c9135bde6bbeab1c7640419",
+          "dweb:/ipfs/QmeNgv1D9NYTGnhEGjujATjsHD1KFxtqehGB1nfnEDy629"
+        ]
+      },
+      "contracts/persistent/off-chain/fund-value-calculator/IFundValueCalculator.sol": {
+        "keccak256": "0xaadda31151dd5a22a5961bd4b7216422b098dddb017723200db7a166f0ea6ef4",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://a380707b27120b821bb4656ac5c834ef6b9368fd98fbd939075abdcd69b7ad48",
+          "dweb:/ipfs/QmaaaxXt3SHTWsjKrJdFCRuoTcxWogT4seE3Uq58qoKkP6"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IExternalPositionVault.sol": {
+        "keccak256": "0xe5c24f0d36a506d9b2989575ee8af0fbc73e7ee75338498dcb3faea3628b5e59",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://140dbc150da0d3cd34df7668f757aefdb9ec88ae21797bc06f437981e4061d7d",
+          "dweb:/ipfs/QmVUBFhMaknPKAxFGY5McDkfuVVwjWJyXxsqYBvwE3NWkW"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IFreelyTransferableSharesVault.sol": {
+        "keccak256": "0x10bccd4a38a117528ce9a94b6d66621429cec5d867521a0deade589bdea88287",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://12ad83d936f1eadab8d185f9106393c6c8d471d233f44e43052a55978a868b57",
+          "dweb:/ipfs/QmZeuXrjTKFLs2Qrdsw9eQJSRgrttYuZ5qkXGuFobAQwYp"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+        "keccak256": "0x65a11d63b562758663992c8f0299a4049f1439b715e2c4a554df62ce63dc1ce7",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://a570a9435fd5a3d09de5166e19d956333970d9376783433f9238fd3f9b0d466f",
+          "dweb:/ipfs/QmbFC9rprc58Q1SGqC8KFaRFabkman75uxGCmQYuwCSssd"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IVaultCore.sol": {
+        "keccak256": "0x66c18f921d2158c0e80e285e72a331de89d3a49fcea7b8ae6aeada21a181afd5",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://4a16d57ba3d19c2793c5754d23765d0de8f0234c16e2cd45135b855afd3aeab4",
+          "dweb:/ipfs/QmcKsw7JadRyrwdrv8dSYxBLikx674yb3bMNzoJcLQEFgQ"
+        ]
+      },
+      "contracts/release/core/fund/comptroller/IComptroller.sol": {
+        "keccak256": "0x0f3c8e7f98a74923823abe12a975fcf68c00f1692dbd5d02e17187ef089eb54b",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://0ef0f927a6d23a7bca3927afeffb592e4f9bebfdef01d1fd6cf2721ccf90c5a4",
+          "dweb:/ipfs/QmceRwtSd7cmbtFLdzFNPcQS5CsAvVVtNEyVKmCDDsSQNF"
+        ]
+      },
+      "contracts/release/core/fund/vault/IVault.sol": {
+        "keccak256": "0x919c843ee1c105c7a8327c771a3b781412ec0f296e27b23737fe341e504053e5",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://cbc6adcafa3bc30a258098c01de034269ae237e77c487c7962a3b5e6722ae0d6",
+          "dweb:/ipfs/QmfHiFpXMzTQC15RNCnpsu56w4kfRXCaGAtQNSF6iAcytZ"
+        ]
+      },
+      "contracts/release/extensions/fee-manager/IFeeManager.sol": {
+        "keccak256": "0x9f80d4ba349a27dd60948c7bb52778baa141bc7ba097ba31909c8c1d5e9f159e",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://f721af96940ba418ceae3ee4e4d881d37aeac0c18ca37c3c0552b723f09a85c7",
+          "dweb:/ipfs/QmYabzyskF9HM98pVGe2o8hSTjgw8cVpoirSjx8g2Gde8i"
+        ]
+      },
+      "contracts/release/infrastructure/price-feeds/derivatives/IAggregatedDerivativePriceFeedMixin.sol": {
+        "keccak256": "0xe6332912ddc5f8470335efd736511ff70d91bbb916a4813787ce8113841503a4",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://1e7bd19f47426eb97b19bd9949df26834dab817719a7ddf7b3c9f93ff43d31f4",
+          "dweb:/ipfs/QmVRRYNoea6Gq1MZ5ABHXXe9gAXTgmCebARZEHZwYde6CV"
+        ]
+      },
+      "contracts/release/infrastructure/price-feeds/primitives/IChainlinkPriceFeedMixin.sol": {
+        "keccak256": "0x5cd4df6e60459989f8f68b86624ee21b235ba864c15e0658e2d3f35d6e4571e8",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://3cee0dd931e8eb576840b360f8e94425c01b34984cc0d0546971764f0167a870",
+          "dweb:/ipfs/QmNYhu2HxiZESXpXPeKPsfQp1XXzKqZnptnYbsPzr57RJt"
+        ]
+      },
+      "contracts/release/infrastructure/protocol-fees/IProtocolFeeTracker.sol": {
+        "keccak256": "0xc9d9a22e9f3480e043a700dd7762229349265230c34b37df4962727c2ce5c83d",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://3035ea71729bd65e2cb25f9d28b8473aeb35bb1934eb2dcbdb4a5928e473f2fd",
+          "dweb:/ipfs/QmNpE2KBCTqZjcXfm9drEQPvw5MAk95DEgNDbxogRn5icc"
+        ]
+      },
+      "contracts/release/infrastructure/value-interpreter/IValueInterpreter.sol": {
+        "keccak256": "0xe665f226444e03c8eef8c20ea580af2ed7ef4a0e10d9cad26512529c9c887815",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://e092d5936d710c7af05f124f6b0e37c28067c3b8e60f8883e86140e87a260eef",
+          "dweb:/ipfs/Qmd1B6XhLNDGfe46y6quTssrKHjotYFRx43Gn8SjcDKPF2"
+        ]
+      },
+      "contracts/release/off-chain/FundValueCalculator.sol": {
+        "keccak256": "0x9d4ce5d680bdfa546abe71b5a4181bbe6cc96bc44843dc2f1feef1f70c4f8508",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://b5ddf672de17b5997db717f9a97383c590e1d44a1756ce5800ae77df97fe4c5b",
+          "dweb:/ipfs/QmR2h3Gn46zHFizeeTqaL5rhXHKpqCRTRiAEt94nZYj5W6"
+        ]
+      },
+      "lib/openzeppelin-solc-0.6/contracts/math/SafeMath.sol": {
+        "keccak256": "0xcc78a17dd88fa5a2edc60c8489e2f405c0913b377216a5b26b35656b2d0dab52",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://526dc85e1f9b9b45830e202568d267d93dde7a4fcccf4ad7798dadcd92304d3c",
+          "dweb:/ipfs/QmaoXMB972J3cSDLtBq3xBo4jLwqD2uzXTwujtSPqkYVhR"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.6.12+commit.27d51765",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "none"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "details": {
+          "cse": true,
+          "yul": false,
+          "peephole": true,
+          "deduplicate": true,
+          "orderLiterals": true,
+          "jumpdestRemover": true,
+          "constantOptimizer": true
+        }
+      },
+      "evmVersion": "istanbul",
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":morpho-blue/=lib/morpho-blue/src/libraries/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "name": "FundValueCalculator",
+    "fullyQualifiedName": "contracts/release/off-chain/FundValueCalculator.sol:FundValueCalculator"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "5799645",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2024-12-16T12:04:57Z",
+  "match": "match",
+  "chainId": "8453",
+  "address": "0xb6257a6C3aef640A7D09E3Dd009A29308D2a321A"
+}
