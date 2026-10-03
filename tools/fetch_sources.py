@@ -404,6 +404,61 @@ CHAIN_IDS = {
  'megaeth.blockscout.com':4326,'explorer.intuition.systems':1155,'explorer.morphl2.io':2818,
 }
 BLOCKSCOUT_ALIASES={'optimistic.etherscan.io':'optimism.blockscout.com','explorer.optimism.io':'optimism.blockscout.com','basescan.org':'base.blockscout.com','etherscan.io':'eth.blockscout.com','gnosisscan.io':'gnosis.blockscout.com','polygonscan.com':'polygon.blockscout.com','arbiscan.io':'arbitrum.blockscout.com','scrollscan.com':'scroll.blockscout.com','uniscan.xyz':'unichain.blockscout.com','worldscan.org':'worldchain-mainnet.explorer.alchemy.com'}
+RPC_ENDPOINTS={1:'https://ethereum-rpc.publicnode.com',137:'https://polygon-bor-rpc.publicnode.com',42161:'https://arbitrum-one-rpc.publicnode.com',10:'https://optimism-rpc.publicnode.com',8453:'https://base-rpc.publicnode.com',56:'https://bsc-rpc.publicnode.com',43114:'https://avalanche-c-chain-rpc.publicnode.com',100:'https://gnosis-rpc.publicnode.com',250:'https://fantom-rpc.publicnode.com',146:'https://sonic-rpc.publicnode.com',80094:'https://berachain-rpc.publicnode.com',130:'https://unichain-rpc.publicnode.com',999:'https://rpc.hyperliquid.xyz/evm',4217:'https://rpc.tempo.xyz'}
+IPFS_CACHE={};IPFS_GUARD=threading.Lock();IPFS_LOCKS={}
+def ipfs_bytes(cid):
+    with IPFS_GUARD:lock=IPFS_LOCKS.setdefault(cid,threading.Lock())
+    with lock:
+        if cid in IPFS_CACHE:
+            result=IPFS_CACHE[cid]
+            if isinstance(result,Exception):raise result
+            return result
+        errors=[]
+        for gateway in ('https://ipfs.io/ipfs/','https://dweb.link/ipfs/'):
+            try:
+                path,_=download(gateway+cid,retries=1,timeout=25);body=path.read_bytes();path.unlink(missing_ok=True);IPFS_CACHE[cid]=body;return body
+            except Exception as e:errors.append(str(e))
+        error=RuntimeError('IPFS source is unavailable: '+'; '.join(errors));IPFS_CACHE[cid]=error;raise error
+
+def bytecode_cid(code):
+    raw=bytes.fromhex(code.removeprefix('0x'))
+    if len(raw)<2:return None
+    length=int.from_bytes(raw[-2:],'big')
+    if length>len(raw)-2:return None
+    metadata=raw[-length-2:-2];marker=b'\x64ipfs\x58\x22';index=metadata.find(marker)
+    if index<0:return None
+    multihash=metadata[index+len(marker):index+len(marker)+34]
+    if len(multihash)!=34 or multihash[:2]!=b'\x12\x20':return None
+    alphabet='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';value=int.from_bytes(multihash,'big');result=''
+    while value:value,rem=divmod(value,58);result=alphabet[rem]+result
+    return result
+
+def bytecode_metadata_source(entry,chain,address):
+    endpoint=RPC_ENDPOINTS.get(chain)
+    if not endpoint:raise RuntimeError('No configured public RPC for bytecode metadata retrieval')
+    code=get_json(endpoint,post_json={'jsonrpc':'2.0','id':1,'method':'eth_getCode','params':[address,'latest']}).get('result')
+    if not isinstance(code,str) or code=='0x':raise RuntimeError('The RPC exposes no deployed contract bytecode')
+    cid=bytecode_cid(code)
+    if not cid:raise RuntimeError('The deployed bytecode has no Solidity IPFS metadata reference')
+    metadata=json.loads(ipfs_bytes(cid));sources={}
+    for name,source in metadata.get('sources',{}).items():
+        if isinstance(source.get('content'),str):sources[name]=source;continue
+        for url in source.get('urls') or []:
+            match=re.search(r'(?:ipfs/|ipfs://)([a-zA-Z0-9]+)',url)
+            if not match:continue
+            try:
+                body=ipfs_bytes(match.group(1));sources[name]={**source,'content':body.decode('utf-8')};break
+            except Exception:pass
+        if name not in sources:raise RuntimeError('Published metadata source file is unavailable: '+name)
+    if not sources:raise RuntimeError('The on-chain metadata contains no source files')
+    obj={'sources':sources,'compiler_metadata':metadata,'metadata_cid':cid,'chain_id':chain,'deployed_address':address,'deployed_bytecode_sha256':hashlib.sha256(bytes.fromhex(code[2:])).hexdigest(),'retrieval_method':'eth_getCode plus the IPFS reference embedded in Solidity CBOR metadata'}
+    if any(re.search(r'contract\s+\w*Proxy\b',v.get('content','')) for v in sources.values()):
+        try:
+            value=get_json(endpoint,post_json={'jsonrpc':'2.0','id':2,'method':'eth_getStorageAt','params':[address,'0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc','latest']}).get('result','0x0')
+            if int(value,16):obj['explorer_implementation_addresses']=['0x'+value[-40:]]
+        except Exception:pass
+    return persist_contract(entry,obj,'bytecode_published_ipfs_source',endpoint)
+
 def alternate_contract(entry):
     parsed=urllib.parse.urlsplit(entry['url']);host=parsed.netloc.lower();m=re.search(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])',entry['url'])
     if not m:
@@ -445,6 +500,9 @@ def alternate_contract(entry):
                 except Exception:obj['sources']={obj.get('ContractName','Contract')+'.sol':{'content':code}}
                 return persist_contract(entry,obj,'routescan_verified_contract',endpoint)
         except Exception as e:errors.append('Routescan: '+str(e))
+    if chain:
+        try:return bytecode_metadata_source(entry,chain,address)
+        except Exception as e:errors.append('Bytecode metadata: '+str(e))
     raise RuntimeError('; '.join(errors) or 'No supported alternate source endpoint for '+host)
 
 def fetch(entry):
