@@ -2,8 +2,10 @@
 """Check archive integrity and report source coverage without hiding failed URLs."""
 import collections, gzip, hashlib, json, pathlib, subprocess
 import fetch_sources as f
+import fetch_submodules as submodules
 
 def main():
+    submodules.main(retry_failed=True)
     inventory=json.loads((f.OUT/'inventory.json').read_text());results=json.loads((f.OUT/'results.json').read_text());by_id={r['id']:r for r in results}
     errors=[];archives=0;total_bytes=0
     for file in (f.OUT/'github').rglob('snapshot.json'):
@@ -52,8 +54,8 @@ def main():
     for name in ('submodules','proxy-sources'):
         manifest=f.OUT/(name+'.json')
         records=json.loads(manifest.read_text()) if manifest.exists() else []
-        auxiliary[name]={'records':len(records),'statuses':dict(collections.Counter(r['status'] for r in records)),'unresolved':[r for r in records if r['status']!='fetched']}
-    source_less=[r for r in results if r['status']!='fetched']
+        auxiliary[name]={'records':len(records),'statuses':dict(collections.Counter(r['status'] for r in records)),'unresolved':[r for r in records if r['status'] not in ('fetched','not_a_submodule')]}
+    source_less=[r for r in results if r['status'] not in ('fetched','not_a_submodule')]
     selection=json.loads((f.OUT/'metadata'/'selection.json').read_text());coverage={}
     for slug in selection['active_programs']:
         urls=[e for e in inventory if slug in e['programs']]

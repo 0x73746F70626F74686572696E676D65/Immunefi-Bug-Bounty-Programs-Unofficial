@@ -16,7 +16,8 @@ def resolve_module(parent, path, configured_url):
             if proc.returncode:raise RuntimeError(proc.stderr[-500:])
             (cache/'ready').touch()
     line=subprocess.check_output(['git','-C',str(cache),'ls-tree',parent['commit'],'--',path],text=True).strip()
-    if not line.startswith('160000 commit '):raise RuntimeError('Configured submodule path is not a Git submodule at the pinned commit: '+path)
+    if not line.startswith('160000 commit '):
+        return {'status':'fetched' if line else 'not_a_submodule','kind':'included_in_parent_snapshot' if line else 'unused_submodule_configuration','parent_snapshot':parent['snapshot'],'path':path,'configured_url':configured_url,'source_snapshot':parent if line else None,'reason':'The configured path is already tracked in the parent archive' if line else 'The .gitmodules entry has no corresponding Git link or source path at the pinned commit'}
     commit=line.split()[2];url=configured_url
     if url.startswith(('./','../')):url=urllib.parse.urljoin(parent['repository']+'.git/',url)
     if url.startswith('git@github.com:'):url='https://github.com/'+url[len('git@github.com:'):]
@@ -51,10 +52,11 @@ def tasks():
             key=f.digest(parent['snapshot']+'|'+path);result[key]=(parent,path,url)
     return result
 
-def main():
+def main(retry_failed=False):
     results_file=f.OUT/'submodules.json';results={r['id']:r for r in json.loads(results_file.read_text())} if results_file.exists() else {}
+    retried=set()
     while True:
-        todo=[(k,t) for k,t in tasks().items() if k not in results]
+        todo=[(k,t) for k,t in tasks().items() if k not in results or (retry_failed and results[k]['status']=='failed' and k not in retried)]
         if not todo:break
         print('Submodules remaining',len(todo),flush=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
@@ -63,7 +65,7 @@ def main():
                 key,task=futures[future]
                 try:r=future.result()
                 except Exception as e:r={'status':'failed','parent_snapshot':task[0]['snapshot'],'path':task[1],'configured_url':task[2],'error':str(e)}
-                r['id']=key;results[key]=r;print(r['status'],r['configured_url'],r.get('error',''),flush=True)
+                retried.add(key);r['id']=key;results[key]=r;print(r['status'],r['configured_url'],r.get('error',''),flush=True)
                 if len(results)%40==0:
                     f.save_json(results_file,list(results.values()));f.push(f'Archive pinned source submodules: {len(results)} resolved')
         f.save_json(results_file,list(results.values()));f.push(f'Archive pinned source submodules: {len(results)} resolved')
