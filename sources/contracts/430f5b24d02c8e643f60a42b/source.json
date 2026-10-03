@@ -1,0 +1,727 @@
+{
+  "sources": {
+    "contracts/Minter.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0-or-later\npragma solidity 0.8.19;\n\nimport {Math} from \"@openzeppelin/contracts/utils/math/Math.sol\";\nimport {IMinter} from \"./interfaces/IMinter.sol\";\nimport {IRewardsDistributor} from \"./interfaces/IRewardsDistributor.sol\";\nimport {IVelo} from \"./interfaces/IVelo.sol\";\nimport {IVoter} from \"./interfaces/IVoter.sol\";\nimport {IVotingEscrow} from \"./interfaces/IVotingEscrow.sol\";\nimport {IEpochGovernor} from \"./interfaces/IEpochGovernor.sol\";\nimport {SafeERC20} from \"@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol\";\n\n/// @title Minter\n/// @author velodrome.finance, @figs999, @pegahcarter\n/// @notice Controls minting of emissions and rebases for Velodrome\ncontract Minter is IMinter {\n    using SafeERC20 for IVelo;\n    IVelo public immutable velo;\n    IVoter public immutable voter;\n    IVotingEscrow public immutable ve;\n    IRewardsDistributor public immutable rewardsDistributor;\n\n    /// @notice Duration of epoch in seconds\n    uint256 public constant WEEK = 1 weeks;\n    /// @notice Decay rate of emissions as percentage of `MAX_BPS`\n    uint256 public constant WEEKLY_DECAY = 9_900;\n    /// @notice Maximum tail emission rate in basis points.\n    uint256 public constant MAXIMUM_TAIL_RATE = 100;\n    /// @notice Minimum tail emission rate in basis points.\n    uint256 public constant MINIMUM_TAIL_RATE = 1;\n    /// @notice Denominator for emissions calculations (as basis points)\n    uint256 public constant MAX_BPS = 10_000;\n    /// @notice Rate change per proposal\n    uint256 public constant NUDGE = 1;\n    /// @notice When emissions fall below this amount, begin tail emissions\n    uint256 public constant TAIL_START = 6_000_000 * 1e18;\n    /// @notice Tail emissions rate in basis points\n    uint256 public tailEmissionRate = 30;\n    /// @notice Starting weekly emission of 15M VELO (VELO has 18 decimals)\n    uint256 public weekly = 15_000_000 * 1e18;\n    /// @notice Start time of currently active epoch\n    uint256 public activePeriod;\n    /// @dev activePeriod => proposal existing, used to enforce one proposal per epoch\n    mapping(uint256 => bool) public proposals;\n\n    constructor(\n        address _voter, // the voting & distribution system\n        address _ve, // the ve(3,3) system that will be locked into\n        address _rewardsDistributor // the distribution system that ensures users aren't diluted\n    ) {\n        velo = IVelo(IVotingEscrow(_ve).token());\n        voter = IVoter(_voter);\n        ve = IVotingEscrow(_ve);\n        rewardsDistributor = IRewardsDistributor(_rewardsDistributor);\n        activePeriod = ((block.timestamp) / WEEK) * WEEK; // allow emissions this coming epoch\n    }\n\n    /// @inheritdoc IMinter\n    function calculateGrowth(uint256 _minted) public view returns (uint256 _growth) {\n        uint256 _veTotal = ve.totalSupplyAt(activePeriod - 1);\n        uint256 _veloTotal = velo.totalSupply();\n        return (((((_minted * _veTotal) / _veloTotal) * _veTotal) / _veloTotal) * _veTotal) / _veloTotal / 2;\n    }\n\n    /// @inheritdoc IMinter\n    function nudge() external {\n        address _epochGovernor = voter.epochGovernor();\n        if (msg.sender != _epochGovernor) revert NotEpochGovernor();\n        IEpochGovernor.ProposalState _state = IEpochGovernor(_epochGovernor).result();\n        if (weekly >= TAIL_START) revert TailEmissionsInactive();\n        uint256 _period = activePeriod;\n        if (proposals[_period]) revert AlreadyNudged();\n        uint256 _newRate = tailEmissionRate;\n        uint256 _oldRate = _newRate;\n\n        if (_state != IEpochGovernor.ProposalState.Expired) {\n            if (_state == IEpochGovernor.ProposalState.Succeeded) {\n                _newRate = _oldRate + NUDGE > MAXIMUM_TAIL_RATE ? MAXIMUM_TAIL_RATE : _oldRate + NUDGE;\n            } else {\n                _newRate = _oldRate - NUDGE < MINIMUM_TAIL_RATE ? MINIMUM_TAIL_RATE : _oldRate - NUDGE;\n            }\n            tailEmissionRate = _newRate;\n        }\n        proposals[_period] = true;\n        emit Nudge(_period, _oldRate, _newRate);\n    }\n\n    /// @inheritdoc IMinter\n    function updatePeriod() external returns (uint256 _period) {\n        _period = activePeriod;\n        if (block.timestamp >= _period + WEEK) {\n            _period = (block.timestamp / WEEK) * WEEK;\n            activePeriod = _period;\n            uint256 _weekly = weekly;\n            uint256 _emission;\n            uint256 _totalSupply = velo.totalSupply();\n            bool _tail = _weekly < TAIL_START;\n\n            if (_tail) {\n                _emission = (_totalSupply * tailEmissionRate) / MAX_BPS;\n            } else {\n                _emission = _weekly;\n                _weekly = (_weekly * WEEKLY_DECAY) / MAX_BPS;\n                weekly = _weekly;\n            }\n\n            uint256 _growth = calculateGrowth(_emission);\n            uint256 _required = _growth + _emission;\n            uint256 _balanceOf = velo.balanceOf(address(this));\n            if (_balanceOf < _required) {\n                velo.mint(address(this), _required - _balanceOf);\n            }\n\n            velo.safeTransfer(address(rewardsDistributor), _growth);\n            rewardsDistributor.checkpointToken(); // checkpoint token balance that was just minted in rewards distributor\n\n            velo.safeApprove(address(voter), _emission);\n            voter.notifyRewardAmount(_emission);\n\n            emit Mint(msg.sender, _emission, velo.totalSupply(), _tail);\n        }\n    }\n}\n"
+    },
+    "contracts/interfaces/IVelo.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport {IERC20} from \"@openzeppelin/contracts/token/ERC20/IERC20.sol\";\n\ninterface IVelo is IERC20 {\n    error NotMinter();\n    error NotOwner();\n    error NotMinterOrSinkManager();\n    error SinkManagerAlreadySet();\n\n    function mint(address, uint256) external returns (bool);\n\n    function minter() external returns (address);\n}\n"
+    },
+    "contracts/governance/IVotes.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity ^0.8.0;\n\n/// Modified IVotes interface for tokenId based voting\ninterface IVotes {\n    /**\n     * @dev Emitted when an account changes their delegate.\n     */\n    event DelegateChanged(address indexed delegator, uint256 indexed fromDelegate, uint256 indexed toDelegate);\n\n    /**\n     * @dev Emitted when a token transfer or delegate change results in changes to a delegate's number of votes.\n     */\n    event DelegateVotesChanged(address indexed delegate, uint256 previousBalance, uint256 newBalance);\n\n    /**\n     * @dev Returns the amount of votes that `tokenId` had at a specific moment in the past.\n     *      If the account passed in is not the owner, returns 0.\n     */\n    function getPastVotes(address account, uint256 tokenId, uint256 timepoint) external view returns (uint256);\n\n    /**\n     * @dev Returns the total supply of votes available at a specific moment in the past. If the `clock()` is\n     * configured to use block numbers, this will return the value the end of the corresponding block.\n     *\n     * NOTE: This value is the sum of all available votes, which is not necessarily the sum of all delegated votes.\n     * Votes that have not been delegated are still part of total supply, even though they would not participate in a\n     * vote.\n     */\n    function getPastTotalSupply(uint256 timepoint) external view returns (uint256);\n\n    /**\n     * @dev Returns the delegate that `tokenId` has chosen. Can never be equal to the delegator's `tokenId`.\n     *      Returns 0 if not delegated.\n     */\n    function delegates(uint256 tokenId) external view returns (uint256);\n\n    /**\n     * @dev Delegates votes from the sender to `delegatee`.\n     */\n    function delegate(uint256 delegator, uint256 delegatee) external;\n\n    /**\n     * @dev Delegates votes from `delegator` to `delegatee`. Signer must own `delegator`.\n     */\n    function delegateBySig(\n        uint256 delegator,\n        uint256 delegatee,\n        uint256 nonce,\n        uint256 expiry,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n}\n"
+    },
+    "contracts/interfaces/IVoter.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IVoter {\n    error AlreadyVotedOrDeposited();\n    error DistributeWindow();\n    error FactoryPathNotApproved();\n    error GaugeAlreadyKilled();\n    error GaugeAlreadyRevived();\n    error GaugeExists();\n    error GaugeDoesNotExist(address _pool);\n    error GaugeNotAlive(address _gauge);\n    error InactiveManagedNFT();\n    error MaximumVotingNumberTooLow();\n    error NonZeroVotes();\n    error NotAPool();\n    error NotApprovedOrOwner();\n    error NotGovernor();\n    error NotEmergencyCouncil();\n    error NotMinter();\n    error NotWhitelistedNFT();\n    error NotWhitelistedToken();\n    error SameValue();\n    error SpecialVotingWindow();\n    error TooManyPools();\n    error UnequalLengths();\n    error ZeroBalance();\n    error ZeroAddress();\n\n    event GaugeCreated(\n        address indexed poolFactory,\n        address indexed votingRewardsFactory,\n        address indexed gaugeFactory,\n        address pool,\n        address bribeVotingReward,\n        address feeVotingReward,\n        address gauge,\n        address creator\n    );\n    event GaugeKilled(address indexed gauge);\n    event GaugeRevived(address indexed gauge);\n    event Voted(\n        address indexed voter,\n        address indexed pool,\n        uint256 indexed tokenId,\n        uint256 weight,\n        uint256 totalWeight,\n        uint256 timestamp\n    );\n    event Abstained(\n        address indexed voter,\n        address indexed pool,\n        uint256 indexed tokenId,\n        uint256 weight,\n        uint256 totalWeight,\n        uint256 timestamp\n    );\n    event NotifyReward(address indexed sender, address indexed reward, uint256 amount);\n    event DistributeReward(address indexed sender, address indexed gauge, uint256 amount);\n    event WhitelistToken(address indexed whitelister, address indexed token, bool indexed _bool);\n    event WhitelistNFT(address indexed whitelister, uint256 indexed tokenId, bool indexed _bool);\n\n    // mappings\n    function gauges(address pool) external view returns (address);\n\n    function poolForGauge(address gauge) external view returns (address);\n\n    function gaugeToFees(address gauge) external view returns (address);\n\n    function gaugeToBribe(address gauge) external view returns (address);\n\n    function weights(address pool) external view returns (uint256);\n\n    function votes(uint256 tokenId, address pool) external view returns (uint256);\n\n    function usedWeights(uint256 tokenId) external view returns (uint256);\n\n    function lastVoted(uint256 tokenId) external view returns (uint256);\n\n    function isGauge(address) external view returns (bool);\n\n    function isWhitelistedToken(address token) external view returns (bool);\n\n    function isWhitelistedNFT(uint256 tokenId) external view returns (bool);\n\n    function isAlive(address gauge) external view returns (bool);\n\n    function ve() external view returns (address);\n\n    function governor() external view returns (address);\n\n    function epochGovernor() external view returns (address);\n\n    function emergencyCouncil() external view returns (address);\n\n    function length() external view returns (uint256);\n\n    /// @notice Called by Minter to distribute weekly emissions rewards for disbursement amongst gauges.\n    /// @dev Assumes totalWeight != 0 (Will never be zero as long as users are voting).\n    ///      Throws if not called by minter.\n    /// @param _amount Amount of rewards to distribute.\n    function notifyRewardAmount(uint256 _amount) external;\n\n    /// @dev Utility to distribute to gauges of pools in range _start to _finish.\n    /// @param _start   Starting index of gauges to distribute to.\n    /// @param _finish  Ending index of gauges to distribute to.\n    function distribute(uint256 _start, uint256 _finish) external;\n\n    /// @dev Utility to distribute to gauges of pools in array.\n    /// @param _gauges Array of gauges to distribute to.\n    function distribute(address[] memory _gauges) external;\n\n    /// @notice Called by users to update voting balances in voting rewards contracts.\n    /// @param _tokenId Id of veNFT whose balance you wish to update.\n    function poke(uint256 _tokenId) external;\n\n    /// @notice Called by users to vote for pools. Votes distributed proportionally based on weights.\n    ///         Can only vote or deposit into a managed NFT once per epoch.\n    ///         Can only vote for gauges that have not been killed.\n    /// @dev Weights are distributed proportional to the sum of the weights in the array.\n    ///      Throws if length of _poolVote and _weights do not match.\n    /// @param _tokenId     Id of veNFT you are voting with.\n    /// @param _poolVote    Array of pools you are voting for.\n    /// @param _weights     Weights of pools.\n    function vote(uint256 _tokenId, address[] calldata _poolVote, uint256[] calldata _weights) external;\n\n    /// @notice Called by users to reset voting state. Required if you wish to make changes to\n    ///         veNFT state (e.g. merge, split, deposit into managed etc).\n    ///         Cannot reset in the same epoch that you voted in.\n    ///         Can vote or deposit into a managed NFT again after reset.\n    /// @param _tokenId Id of veNFT you are reseting.\n    function reset(uint256 _tokenId) external;\n\n    /// @notice Called by users to deposit into a managed NFT.\n    ///         Can only vote or deposit into a managed NFT once per epoch.\n    ///         Note that NFTs deposited into a managed NFT will be re-locked\n    ///         to the maximum lock time on withdrawal.\n    /// @dev Throws if not approved or owner.\n    ///      Throws if managed NFT is inactive.\n    ///      Throws if depositing within privileged window (one hour prior to epoch flip).\n    function depositManaged(uint256 _tokenId, uint256 _mTokenId) external;\n\n    /// @notice Called by users to withdraw from a managed NFT.\n    ///         Cannot do it in the same epoch that you deposited into a managed NFT.\n    ///         Can vote or deposit into a managed NFT again after withdrawing.\n    ///         Note that the NFT withdrawn is re-locked to the maximum lock time.\n    function withdrawManaged(uint256 _tokenId) external;\n\n    /// @notice Claim emissions from gauges.\n    /// @param _gauges Array of gauges to collect emissions from.\n    function claimRewards(address[] memory _gauges) external;\n\n    /// @notice Claim bribes for a given NFT.\n    /// @dev Utility to help batch bribe claims.\n    /// @param _bribes  Array of BribeVotingReward contracts to collect from.\n    /// @param _tokens  Array of tokens that are used as bribes.\n    /// @param _tokenId Id of veNFT that you wish to claim bribes for.\n    function claimBribes(address[] memory _bribes, address[][] memory _tokens, uint256 _tokenId) external;\n\n    /// @notice Claim fees for a given NFT.\n    /// @dev Utility to help batch fee claims.\n    /// @param _fees    Array of FeesVotingReward contracts to collect from.\n    /// @param _tokens  Array of tokens that are used as fees.\n    /// @param _tokenId Id of veNFT that you wish to claim fees for.\n    function claimFees(address[] memory _fees, address[][] memory _tokens, uint256 _tokenId) external;\n\n    /// @notice Set new governor.\n    /// @dev Throws if not called by governor.\n    /// @param _governor .\n    function setGovernor(address _governor) external;\n\n    /// @notice Set new epoch based governor.\n    /// @dev Throws if not called by governor.\n    /// @param _epochGovernor .\n    function setEpochGovernor(address _epochGovernor) external;\n\n    /// @notice Set new emergency council.\n    /// @dev Throws if not called by emergency council.\n    /// @param _emergencyCouncil .\n    function setEmergencyCouncil(address _emergencyCouncil) external;\n\n    /// @notice Whitelist (or unwhitelist) token for use in bribes.\n    /// @dev Throws if not called by governor.\n    /// @param _token .\n    /// @param _bool .\n    function whitelistToken(address _token, bool _bool) external;\n\n    /// @notice Whitelist (or unwhitelist) token id for voting in last hour prior to epoch flip.\n    /// @dev Throws if not called by governor.\n    ///      Throws if already whitelisted.\n    /// @param _tokenId .\n    /// @param _bool .\n    function whitelistNFT(uint256 _tokenId, bool _bool) external;\n\n    /// @notice Create a new gauge (unpermissioned).\n    /// @dev Governor can create a new gauge for a pool with any address.\n    /// @dev V1 gauges can only be created by governor.\n    /// @param _poolFactory .\n    /// @param _pool .\n    function createGauge(address _poolFactory, address _pool) external returns (address);\n\n    /// @notice Kills a gauge. The gauge will not receive any new emissions and cannot be deposited into.\n    ///         Can still withdraw from gauge.\n    /// @dev Throws if not called by emergency council.\n    ///      Throws if gauge already killed.\n    /// @param _gauge .\n    function killGauge(address _gauge) external;\n\n    /// @notice Revives a killed gauge. Gauge will can receive emissions and deposits again.\n    /// @dev Throws if not called by emergency council.\n    ///      Throws if gauge is not killed.\n    /// @param _gauge .\n    function reviveGauge(address _gauge) external;\n\n    /// @dev Update claims to emissions for an array of gauges.\n    /// @param _gauges Array of gauges to update emissions for.\n    function updateFor(address[] memory _gauges) external;\n\n    /// @dev Update claims to emissions for gauges based on their pool id as stored in Voter.\n    /// @param _start   Starting index of pools.\n    /// @param _end     Ending index of pools.\n    function updateFor(uint256 _start, uint256 _end) external;\n\n    /// @dev Update claims to emissions for single gauge\n    /// @param _gauge .\n    function updateFor(address _gauge) external;\n}\n"
+    },
+    "contracts/interfaces/IMinter.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IMinter {\n    error AlreadyNudged();\n    error NotEpochGovernor();\n    error TailEmissionsInactive();\n\n    event Mint(address indexed _sender, uint256 _weekly, uint256 _circulating_supply, bool indexed _tail);\n    event Nudge(uint256 indexed _period, uint256 _oldRate, uint256 _newRate);\n\n    /// @notice Timestamp of start of epoch that updatePeriod was last called in\n    function activePeriod() external returns (uint256);\n\n    /// @notice Allows epoch governor to modify the tail emission rate by at most 1 basis point\n    ///         per epoch to a maximum of 100 basis points or to a minimum of 1 basis point.\n    ///         Note: the very first nudge proposal must take place the week prior\n    ///         to the tail emission schedule starting.\n    /// @dev Throws if not epoch governor.\n    ///      Throws if not currently in tail emission schedule.\n    ///      Throws if already nudged this epoch.\n    ///      Throws if nudging above maximum rate.\n    ///      Throws if nudging below minimum rate.\n    ///      This contract is coupled to EpochGovernor as it requires three option simple majority voting.\n    function nudge() external;\n\n    /// @notice Calculates rebases according to the formula\n    ///         weekly * (ve.totalSupply / velo.totalSupply) ^ 3 / 2\n    ///         Note that ve.totalSupply is the locked ve supply\n    ///         velo.totalSupply is the total ve supply minted\n    /// @param _minted Amount of VELO minted this epoch\n    /// @return _growth Rebases\n    function calculateGrowth(uint256 _minted) external view returns (uint256 _growth);\n\n    /// @notice Processes emissions and rebases. Callable once per epoch (1 week).\n    /// @return _period Start of current epoch.\n    function updatePeriod() external returns (uint256 _period);\n}\n"
+    },
+    "contracts/interfaces/IVotingEscrow.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport {IERC721, IERC721Metadata} from \"@openzeppelin/contracts/token/ERC721/extensions/IERC721Metadata.sol\";\nimport {IERC4906} from \"@openzeppelin/contracts/interfaces/IERC4906.sol\";\nimport {IVotes} from \"../governance/IVotes.sol\";\n\ninterface IVotingEscrow is IVotes, IERC4906, IERC721Metadata {\n    struct LockedBalance {\n        int128 amount;\n        uint256 end;\n        bool isPermanent;\n    }\n\n    struct UserPoint {\n        int128 bias;\n        int128 slope; // # -dweight / dt\n        uint256 ts;\n        uint256 blk; // block\n        uint256 permanent;\n    }\n\n    struct GlobalPoint {\n        int128 bias;\n        int128 slope; // # -dweight / dt\n        uint256 ts;\n        uint256 blk; // block\n        uint256 permanentLockBalance;\n    }\n\n    /// @notice A checkpoint for recorded delegated voting weights at a certain timestamp\n    struct Checkpoint {\n        uint256 fromTimestamp;\n        address owner;\n        uint256 delegatedBalance;\n        uint256 delegatee;\n    }\n\n    enum DepositType {\n        DEPOSIT_FOR_TYPE,\n        CREATE_LOCK_TYPE,\n        INCREASE_LOCK_AMOUNT,\n        INCREASE_UNLOCK_TIME\n    }\n\n    /// @dev Different types of veNFTs:\n    /// NORMAL  - typical veNFT\n    /// LOCKED  - veNFT which is locked into a MANAGED veNFT\n    /// MANAGED - veNFT which can accept the deposit of NORMAL veNFTs\n    enum EscrowType {\n        NORMAL,\n        LOCKED,\n        MANAGED\n    }\n\n    error AlreadyVoted();\n    error AmountTooBig();\n    error ERC721ReceiverRejectedTokens();\n    error ERC721TransferToNonERC721ReceiverImplementer();\n    error InvalidNonce();\n    error InvalidSignature();\n    error InvalidSignatureS();\n    error InvalidManagedNFTId();\n    error LockDurationNotInFuture();\n    error LockDurationTooLong();\n    error LockExpired();\n    error LockNotExpired();\n    error NoLockFound();\n    error NonExistentToken();\n    error NotApprovedOrOwner();\n    error NotDistributor();\n    error NotEmergencyCouncilOrGovernor();\n    error NotGovernor();\n    error NotGovernorOrManager();\n    error NotManagedNFT();\n    error NotManagedOrNormalNFT();\n    error NotLockedNFT();\n    error NotNormalNFT();\n    error NotPermanentLock();\n    error NotOwner();\n    error NotTeam();\n    error NotVoter();\n    error OwnershipChange();\n    error PermanentLock();\n    error SameAddress();\n    error SameNFT();\n    error SameState();\n    error SplitNoOwner();\n    error SplitNotAllowed();\n    error SignatureExpired();\n    error TooManyTokenIDs();\n    error ZeroAddress();\n    error ZeroAmount();\n    error ZeroBalance();\n\n    event Deposit(\n        address indexed provider,\n        uint256 indexed tokenId,\n        DepositType indexed depositType,\n        uint256 value,\n        uint256 locktime,\n        uint256 ts\n    );\n    event Withdraw(address indexed provider, uint256 indexed tokenId, uint256 value, uint256 ts);\n    event LockPermanent(address indexed _owner, uint256 indexed _tokenId, uint256 amount, uint256 _ts);\n    event UnlockPermanent(address indexed _owner, uint256 indexed _tokenId, uint256 amount, uint256 _ts);\n    event Supply(uint256 prevSupply, uint256 supply);\n    event Merge(\n        address indexed _sender,\n        uint256 indexed _from,\n        uint256 indexed _to,\n        uint256 _amountFrom,\n        uint256 _amountTo,\n        uint256 _amountFinal,\n        uint256 _locktime,\n        uint256 _ts\n    );\n    event Split(\n        uint256 indexed _from,\n        uint256 indexed _tokenId1,\n        uint256 indexed _tokenId2,\n        address _sender,\n        uint256 _splitAmount1,\n        uint256 _splitAmount2,\n        uint256 _locktime,\n        uint256 _ts\n    );\n    event CreateManaged(\n        address indexed _to,\n        uint256 indexed _mTokenId,\n        address indexed _from,\n        address _lockedManagedReward,\n        address _freeManagedReward\n    );\n    event DepositManaged(\n        address indexed _owner,\n        uint256 indexed _tokenId,\n        uint256 indexed _mTokenId,\n        uint256 _weight,\n        uint256 _ts\n    );\n    event WithdrawManaged(\n        address indexed _owner,\n        uint256 indexed _tokenId,\n        uint256 indexed _mTokenId,\n        uint256 _weight,\n        uint256 _ts\n    );\n    event SetAllowedManager(address indexed _allowedManager);\n\n    // State variables\n    function factoryRegistry() external view returns (address);\n\n    function token() external view returns (address);\n\n    function distributor() external view returns (address);\n\n    function voter() external view returns (address);\n\n    function team() external view returns (address);\n\n    function artProxy() external view returns (address);\n\n    function allowedManager() external view returns (address);\n\n    function tokenId() external view returns (uint256);\n\n    /*///////////////////////////////////////////////////////////////\n                            MANAGED NFT STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    /// @dev Mapping of token id to escrow type\n    ///      Takes advantage of the fact default value is EscrowType.NORMAL\n    function escrowType(uint256 tokenId) external view returns (EscrowType);\n\n    /// @dev Mapping of token id to managed id\n    function idToManaged(uint256 tokenId) external view returns (uint256 managedTokenId);\n\n    /// @dev Mapping of user token id to managed token id to weight of token id\n    function weights(uint256 tokenId, uint256 managedTokenId) external view returns (uint256 weight);\n\n    /// @dev Mapping of managed id to deactivated state\n    function deactivated(uint256 tokenId) external view returns (bool inactive);\n\n    /// @dev Mapping from managed nft id to locked managed rewards\n    ///      `token` denominated rewards (rebases/rewards) stored in locked managed rewards contract\n    ///      to prevent co-mingling of assets\n    function managedToLocked(uint256 tokenId) external view returns (address);\n\n    /// @dev Mapping from managed nft id to free managed rewards contract\n    ///      these rewards can be freely withdrawn by users\n    function managedToFree(uint256 tokenId) external view returns (address);\n\n    /*///////////////////////////////////////////////////////////////\n                            MANAGED NFT LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    /// @notice Create managed NFT (a permanent lock) for use within ecosystem.\n    /// @dev Throws if address already owns a managed NFT.\n    /// @return _mTokenId managed token id.\n    function createManagedLockFor(address _to) external returns (uint256 _mTokenId);\n\n    /// @notice Delegates balance to managed nft\n    ///         Note that NFTs deposited into a managed NFT will be re-locked\n    ///         to the maximum lock time on withdrawal.\n    ///         Permanent locks that are deposited will automatically unlock.\n    /// @dev Managed nft will remain max-locked as long as there is at least one\n    ///      deposit or withdrawal per week.\n    ///      Throws if deposit nft is managed.\n    ///      Throws if recipient nft is not managed.\n    ///      Throws if deposit nft is already locked.\n    ///      Throws if not called by voter.\n    /// @param _tokenId tokenId of NFT being deposited\n    /// @param _mTokenId tokenId of managed NFT that will receive the deposit\n    function depositManaged(uint256 _tokenId, uint256 _mTokenId) external;\n\n    /// @notice Retrieves locked rewards and withdraws balance from managed nft.\n    ///         Note that the NFT withdrawn is re-locked to the maximum lock time.\n    /// @dev Throws if NFT not locked.\n    ///      Throws if not called by voter.\n    /// @param _tokenId tokenId of NFT being deposited.\n    function withdrawManaged(uint256 _tokenId) external;\n\n    /// @notice Permit one address to call createManagedLockFor() that is not Voter.governor()\n    function setAllowedManager(address _allowedManager) external;\n\n    /// @notice Set Managed NFT state. Inactive NFTs cannot be deposited into.\n    /// @param _mTokenId managed nft state to set\n    /// @param _state true => inactive, false => active\n    function setManagedState(uint256 _mTokenId, bool _state) external;\n\n    /*///////////////////////////////////////////////////////////////\n                             METADATA STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    function name() external view returns (string memory);\n\n    function symbol() external view returns (string memory);\n\n    function version() external view returns (string memory);\n\n    function decimals() external view returns (uint8);\n\n    function setTeam(address _team) external;\n\n    function setArtProxy(address _proxy) external;\n\n    /// @inheritdoc IERC721Metadata\n    function tokenURI(uint256 tokenId) external view returns (string memory);\n\n    /*//////////////////////////////////////////////////////////////\n                      ERC721 BALANCE/OWNER STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    /// @dev Mapping from owner address to mapping of index to tokenId\n    function ownerToNFTokenIdList(address _owner, uint256 _index) external view returns (uint256 _tokenId);\n\n    /// @inheritdoc IERC721\n    function ownerOf(uint256 tokenId) external view returns (address owner);\n\n    /// @inheritdoc IERC721\n    function balanceOf(address owner) external view returns (uint256 balance);\n\n    /*//////////////////////////////////////////////////////////////\n                         ERC721 APPROVAL STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    /// @inheritdoc IERC721\n    function getApproved(uint256 _tokenId) external view returns (address operator);\n\n    /// @inheritdoc IERC721\n    function isApprovedForAll(address owner, address operator) external view returns (bool);\n\n    /// @notice Check whether spender is owner or an approved user for a given veNFT\n    /// @param _spender .\n    /// @param _tokenId .\n    function isApprovedOrOwner(address _spender, uint256 _tokenId) external returns (bool);\n\n    /*//////////////////////////////////////////////////////////////\n                              ERC721 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    /// @inheritdoc IERC721\n    function approve(address to, uint256 tokenId) external;\n\n    /// @inheritdoc IERC721\n    function setApprovalForAll(address operator, bool approved) external;\n\n    /// @inheritdoc IERC721\n    function transferFrom(address from, address to, uint256 tokenId) external;\n\n    /// @inheritdoc IERC721\n    function safeTransferFrom(address from, address to, uint256 tokenId) external;\n\n    /// @inheritdoc IERC721\n    function safeTransferFrom(address from, address to, uint256 tokenId, bytes calldata data) external;\n\n    /*//////////////////////////////////////////////////////////////\n                              ERC165 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function supportsInterface(bytes4 _interfaceID) external view returns (bool);\n\n    /*//////////////////////////////////////////////////////////////\n                             ESCROW STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    function epoch() external view returns (uint256);\n\n    function supply() external view returns (uint256);\n\n    function userPointEpoch(uint256 _tokenId) external view returns (uint256 _epoch);\n\n    /// @notice time -> signed slope change\n    function slopeChanges(uint256 _timestamp) external view returns (int128);\n\n    /// @notice account -> can split\n    function canSplit(address _account) external view returns (bool);\n\n    /// @notice Global point history at a given index\n    function pointHistory(uint256 _loc) external view returns (GlobalPoint memory);\n\n    /// @notice Get the LockedBalance (amount, end) of a _tokenId\n    /// @param _tokenId .\n    /// @return LockedBalance of _tokenId\n    function locked(uint256 _tokenId) external view returns (LockedBalance memory);\n\n    /// @notice User -> UserPoint[userEpoch]\n    function userPointHistory(uint256 _tokenId, uint256 _loc) external view returns (UserPoint memory);\n\n    /*//////////////////////////////////////////////////////////////\n                              ESCROW LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    /// @notice Record global data to checkpoint\n    function checkpoint() external;\n\n    /// @notice Deposit `_value` tokens for `_tokenId` and add to the lock\n    /// @dev Anyone (even a smart contract) can deposit for someone else, but\n    ///      cannot extend their locktime and deposit for a brand new user\n    /// @param _tokenId lock NFT\n    /// @param _value Amount to add to user's lock\n    function depositFor(uint256 _tokenId, uint256 _value) external;\n\n    /// @notice Deposit `_value` tokens for `msg.sender` and lock for `_lockDuration`\n    /// @param _value Amount to deposit\n    /// @param _lockDuration Number of seconds to lock tokens for (rounded down to nearest week)\n    /// @return TokenId of created veNFT\n    function createLock(uint256 _value, uint256 _lockDuration) external returns (uint256);\n\n    /// @notice Deposit `_value` tokens for `_to` and lock for `_lockDuration`\n    /// @param _value Amount to deposit\n    /// @param _lockDuration Number of seconds to lock tokens for (rounded down to nearest week)\n    /// @param _to Address to deposit\n    /// @return TokenId of created veNFT\n    function createLockFor(uint256 _value, uint256 _lockDuration, address _to) external returns (uint256);\n\n    /// @notice Deposit `_value` additional tokens for `_tokenId` without modifying the unlock time\n    /// @param _value Amount of tokens to deposit and add to the lock\n    function increaseAmount(uint256 _tokenId, uint256 _value) external;\n\n    /// @notice Extend the unlock time for `_tokenId`\n    ///         Cannot extend lock time of permanent locks\n    /// @param _lockDuration New number of seconds until tokens unlock\n    function increaseUnlockTime(uint256 _tokenId, uint256 _lockDuration) external;\n\n    /// @notice Withdraw all tokens for `_tokenId`\n    /// @dev Only possible if the lock is both expired and not permanent\n    ///      This will burn the veNFT. Any rebases or rewards that are unclaimed\n    ///      will no longer be claimable. Claim all rebases and rewards prior to calling this.\n    function withdraw(uint256 _tokenId) external;\n\n    /// @notice Merges `_from` into `_to`.\n    /// @dev Cannot merge `_from` locks that are permanent or have already voted this epoch.\n    ///      Cannot merge `_to` locks that have already expired.\n    ///      This will burn the veNFT. Any rebases or rewards that are unclaimed\n    ///      will no longer be claimable. Claim all rebases and rewards prior to calling this.\n    /// @param _from VeNFT to merge from.\n    /// @param _to VeNFT to merge into.\n    function merge(uint256 _from, uint256 _to) external;\n\n    /// @notice Splits veNFT into two new veNFTS - one with oldLocked.amount - `_amount`, and the second with `_amount`\n    /// @dev    This burns the tokenId of the target veNFT\n    ///         Callable by approved or owner\n    ///         If this is called by approved, approved will not have permissions to manipulate the newly created veNFTs\n    ///         Returns the two new split veNFTs to owner\n    ///         If `from` is permanent, will automatically dedelegate.\n    ///         This will burn the veNFT. Any rebases or rewards that are unclaimed\n    ///         will no longer be claimable. Claim all rebases and rewards prior to calling this.\n    /// @param _from VeNFT to split.\n    /// @param _amount Amount to split from veNFT.\n    /// @return _tokenId1 Return tokenId of veNFT with oldLocked.amount - `_amount`.\n    /// @return _tokenId2 Return tokenId of veNFT with `_amount`.\n    function split(uint256 _from, uint256 _amount) external returns (uint256 _tokenId1, uint256 _tokenId2);\n\n    /// @notice Toggle split for a specific veNFT.\n    /// @dev Toggle split for address(0) to enable or disable for all.\n    /// @param _account Address to toggle split permissions\n    /// @param _bool True to allow, false to disallow\n    function toggleSplit(address _account, bool _bool) external;\n\n    /// @notice Permanently lock a veNFT. Voting power will be equal to\n    ///         `LockedBalance.amount` with no decay. Required to delegate.\n    /// @dev Only callable by unlocked normal veNFTs.\n    /// @param _tokenId tokenId to lock.\n    function lockPermanent(uint256 _tokenId) external;\n\n    /// @notice Unlock a permanently locked veNFT. Voting power will decay.\n    ///         Will automatically dedelegate if delegated.\n    /// @dev Only callable by permanently locked veNFTs.\n    ///      Cannot unlock if already voted this epoch.\n    /// @param _tokenId tokenId to unlock.\n    function unlockPermanent(uint256 _tokenId) external;\n\n    /*///////////////////////////////////////////////////////////////\n                           GAUGE VOTING STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    /// @notice Get the voting power for _tokenId at the current timestamp\n    /// @dev Returns 0 if called in the same block as a transfer.\n    /// @param _tokenId .\n    /// @return Voting power\n    function balanceOfNFT(uint256 _tokenId) external view returns (uint256);\n\n    /// @notice Get the voting power for _tokenId at a given timestamp\n    /// @param _tokenId .\n    /// @param _t Timestamp to query voting power\n    /// @return Voting power\n    function balanceOfNFTAt(uint256 _tokenId, uint256 _t) external view returns (uint256);\n\n    /// @notice Calculate total voting power at current timestamp\n    /// @return Total voting power at current timestamp\n    function totalSupply() external view returns (uint256);\n\n    /// @notice Calculate total voting power at a given timestamp\n    /// @param _t Timestamp to query total voting power\n    /// @return Total voting power at given timestamp\n    function totalSupplyAt(uint256 _t) external view returns (uint256);\n\n    /*///////////////////////////////////////////////////////////////\n                            GAUGE VOTING LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    /// @notice See if a queried _tokenId has actively voted\n    /// @param _tokenId .\n    /// @return True if voted, else false\n    function voted(uint256 _tokenId) external view returns (bool);\n\n    /// @notice Set the global state voter and distributor\n    /// @dev This is only called once, at setup\n    function setVoterAndDistributor(address _voter, address _distributor) external;\n\n    /// @notice Set `voted` for _tokenId to true or false\n    /// @dev Only callable by voter\n    /// @param _tokenId .\n    /// @param _voted .\n    function voting(uint256 _tokenId, bool _voted) external;\n\n    /*///////////////////////////////////////////////////////////////\n                            DAO VOTING STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    /// @notice The number of checkpoints for each tokenId\n    function numCheckpoints(uint256 tokenId) external view returns (uint48);\n\n    /// @notice A record of states for signing / validating signatures\n    function nonces(address account) external view returns (uint256);\n\n    /// @inheritdoc IVotes\n    function delegates(uint256 delegator) external view returns (uint256);\n\n    /// @notice A record of delegated token checkpoints for each account, by index\n    /// @param tokenId .\n    /// @param index .\n    /// @return Checkpoint\n    function checkpoints(uint256 tokenId, uint48 index) external view returns (Checkpoint memory);\n\n    /// @inheritdoc IVotes\n    function getPastVotes(address account, uint256 tokenId, uint256 timestamp) external view returns (uint256);\n\n    /// @inheritdoc IVotes\n    function getPastTotalSupply(uint256 timestamp) external view returns (uint256);\n\n    /*///////////////////////////////////////////////////////////////\n                             DAO VOTING LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    /// @inheritdoc IVotes\n    function delegate(uint256 delegator, uint256 delegatee) external;\n\n    /// @inheritdoc IVotes\n    function delegateBySig(\n        uint256 delegator,\n        uint256 delegatee,\n        uint256 nonce,\n        uint256 expiry,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n}\n"
+    },
+    "contracts/interfaces/IEpochGovernor.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IEpochGovernor {\n    enum ProposalState {\n        Pending,\n        Active,\n        Canceled,\n        Defeated,\n        Succeeded,\n        Queued,\n        Expired,\n        Executed\n    }\n\n    function result() external returns (ProposalState);\n}\n"
+    },
+    "contracts/interfaces/IRewardsDistributor.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IRewardsDistributor {\n    event CheckpointToken(uint256 time, uint256 tokens);\n    event Claimed(uint256 indexed tokenId, uint256 indexed epochStart, uint256 indexed epochEnd, uint256 amount);\n\n    error NotMinter();\n    error NotManagedOrNormalNFT();\n    error UpdatePeriod();\n\n    /// @notice Called by Minter to notify Distributor of rebases\n    function checkpointToken() external;\n\n    /// @notice Returns the amount of rebases claimable for a given token ID\n    /// @dev Allows claiming of rebases up to 50 epochs old\n    /// @param tokenId The token ID to check\n    /// @return The amount of rebases claimable for the given token ID\n    function claimable(uint256 tokenId) external view returns (uint256);\n\n    /// @notice Claims rebases for a given token ID\n    /// @dev Allows claiming of rebases up to 50 epochs old\n    ///      `Minter.updatePeriod()` must be called before claiming\n    /// @param tokenId The token ID to claim for\n    /// @return The amount of rebases claimed\n    function claim(uint256 tokenId) external returns (uint256);\n\n    /// @notice Claims rebases for a list of token IDs\n    /// @dev    `Minter.updatePeriod()` must be called before claiming\n    /// @param tokenIds The token IDs to claim for\n    /// @return Whether or not the claim succeeded\n    function claimMany(uint256[] calldata tokenIds) external returns (bool);\n\n    /// @notice Used to set minter once on initialization\n    /// @dev Callable once by Minter only, Minter is immutable\n    function setMinter(address _minter) external;\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/Address.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (utils/Address.sol)\n\npragma solidity ^0.8.1;\n\n/**\n * @dev Collection of functions related to the address type\n */\nlibrary Address {\n    /**\n     * @dev Returns true if `account` is a contract.\n     *\n     * [IMPORTANT]\n     * ====\n     * It is unsafe to assume that an address for which this function returns\n     * false is an externally-owned account (EOA) and not a contract.\n     *\n     * Among others, `isContract` will return false for the following\n     * types of addresses:\n     *\n     *  - an externally-owned account\n     *  - a contract in construction\n     *  - an address where a contract will be created\n     *  - an address where a contract lived, but was destroyed\n     *\n     * Furthermore, `isContract` will also return true if the target contract within\n     * the same transaction is already scheduled for destruction by `SELFDESTRUCT`,\n     * which only has an effect at the end of a transaction.\n     * ====\n     *\n     * [IMPORTANT]\n     * ====\n     * You shouldn't rely on `isContract` to protect against flash loan attacks!\n     *\n     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets\n     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract\n     * constructor.\n     * ====\n     */\n    function isContract(address account) internal view returns (bool) {\n        // This method relies on extcodesize/address.code.length, which returns 0\n        // for contracts in construction, since the code is only stored at the end\n        // of the constructor execution.\n\n        return account.code.length > 0;\n    }\n\n    /**\n     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to\n     * `recipient`, forwarding all available gas and reverting on errors.\n     *\n     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost\n     * of certain opcodes, possibly making contracts go over the 2300 gas limit\n     * imposed by `transfer`, making them unable to receive funds via\n     * `transfer`. {sendValue} removes this limitation.\n     *\n     * https://consensys.net/diligence/blog/2019/09/stop-using-soliditys-transfer-now/[Learn more].\n     *\n     * IMPORTANT: because control is transferred to `recipient`, care must be\n     * taken to not create reentrancy vulnerabilities. Consider using\n     * {ReentrancyGuard} or the\n     * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].\n     */\n    function sendValue(address payable recipient, uint256 amount) internal {\n        require(address(this).balance >= amount, \"Address: insufficient balance\");\n\n        (bool success, ) = recipient.call{value: amount}(\"\");\n        require(success, \"Address: unable to send value, recipient may have reverted\");\n    }\n\n    /**\n     * @dev Performs a Solidity function call using a low level `call`. A\n     * plain `call` is an unsafe replacement for a function call: use this\n     * function instead.\n     *\n     * If `target` reverts with a revert reason, it is bubbled up by this\n     * function (like regular Solidity function calls).\n     *\n     * Returns the raw returned data. To convert to the expected return value,\n     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].\n     *\n     * Requirements:\n     *\n     * - `target` must be a contract.\n     * - calling `target` with `data` must not revert.\n     *\n     * _Available since v3.1._\n     */\n    function functionCall(address target, bytes memory data) internal returns (bytes memory) {\n        return functionCallWithValue(target, data, 0, \"Address: low-level call failed\");\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with\n     * `errorMessage` as a fallback revert reason when `target` reverts.\n     *\n     * _Available since v3.1._\n     */\n    function functionCall(\n        address target,\n        bytes memory data,\n        string memory errorMessage\n    ) internal returns (bytes memory) {\n        return functionCallWithValue(target, data, 0, errorMessage);\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],\n     * but also transferring `value` wei to `target`.\n     *\n     * Requirements:\n     *\n     * - the calling contract must have an ETH balance of at least `value`.\n     * - the called Solidity function must be `payable`.\n     *\n     * _Available since v3.1._\n     */\n    function functionCallWithValue(address target, bytes memory data, uint256 value) internal returns (bytes memory) {\n        return functionCallWithValue(target, data, value, \"Address: low-level call with value failed\");\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but\n     * with `errorMessage` as a fallback revert reason when `target` reverts.\n     *\n     * _Available since v3.1._\n     */\n    function functionCallWithValue(\n        address target,\n        bytes memory data,\n        uint256 value,\n        string memory errorMessage\n    ) internal returns (bytes memory) {\n        require(address(this).balance >= value, \"Address: insufficient balance for call\");\n        (bool success, bytes memory returndata) = target.call{value: value}(data);\n        return verifyCallResultFromTarget(target, success, returndata, errorMessage);\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],\n     * but performing a static call.\n     *\n     * _Available since v3.3._\n     */\n    function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {\n        return functionStaticCall(target, data, \"Address: low-level static call failed\");\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],\n     * but performing a static call.\n     *\n     * _Available since v3.3._\n     */\n    function functionStaticCall(\n        address target,\n        bytes memory data,\n        string memory errorMessage\n    ) internal view returns (bytes memory) {\n        (bool success, bytes memory returndata) = target.staticcall(data);\n        return verifyCallResultFromTarget(target, success, returndata, errorMessage);\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],\n     * but performing a delegate call.\n     *\n     * _Available since v3.4._\n     */\n    function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {\n        return functionDelegateCall(target, data, \"Address: low-level delegate call failed\");\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],\n     * but performing a delegate call.\n     *\n     * _Available since v3.4._\n     */\n    function functionDelegateCall(\n        address target,\n        bytes memory data,\n        string memory errorMessage\n    ) internal returns (bytes memory) {\n        (bool success, bytes memory returndata) = target.delegatecall(data);\n        return verifyCallResultFromTarget(target, success, returndata, errorMessage);\n    }\n\n    /**\n     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling\n     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.\n     *\n     * _Available since v4.8._\n     */\n    function verifyCallResultFromTarget(\n        address target,\n        bool success,\n        bytes memory returndata,\n        string memory errorMessage\n    ) internal view returns (bytes memory) {\n        if (success) {\n            if (returndata.length == 0) {\n                // only check isContract if the call was successful and the return data is empty\n                // otherwise we already know that it was a contract\n                require(isContract(target), \"Address: call to non-contract\");\n            }\n            return returndata;\n        } else {\n            _revert(returndata, errorMessage);\n        }\n    }\n\n    /**\n     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the\n     * revert reason or using the provided one.\n     *\n     * _Available since v4.3._\n     */\n    function verifyCallResult(\n        bool success,\n        bytes memory returndata,\n        string memory errorMessage\n    ) internal pure returns (bytes memory) {\n        if (success) {\n            return returndata;\n        } else {\n            _revert(returndata, errorMessage);\n        }\n    }\n\n    function _revert(bytes memory returndata, string memory errorMessage) private pure {\n        // Look for revert reason and bubble it up if present\n        if (returndata.length > 0) {\n            // The easiest way to bubble the revert reason is using memory via assembly\n            /// @solidity memory-safe-assembly\n            assembly {\n                let returndata_size := mload(returndata)\n                revert(add(32, returndata), returndata_size)\n            }\n        } else {\n            revert(errorMessage);\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (utils/math/Math.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Standard math utilities missing in the Solidity language.\n */\nlibrary Math {\n    enum Rounding {\n        Down, // Toward negative infinity\n        Up, // Toward infinity\n        Zero // Toward zero\n    }\n\n    /**\n     * @dev Returns the largest of two numbers.\n     */\n    function max(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a > b ? a : b;\n    }\n\n    /**\n     * @dev Returns the smallest of two numbers.\n     */\n    function min(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a < b ? a : b;\n    }\n\n    /**\n     * @dev Returns the average of two numbers. The result is rounded towards\n     * zero.\n     */\n    function average(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b) / 2 can overflow.\n        return (a & b) + (a ^ b) / 2;\n    }\n\n    /**\n     * @dev Returns the ceiling of the division of two numbers.\n     *\n     * This differs from standard division with `/` in that it rounds up instead\n     * of rounding down.\n     */\n    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b - 1) / b can overflow on addition, so we distribute.\n        return a == 0 ? 0 : (a - 1) / b + 1;\n    }\n\n    /**\n     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0\n     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)\n     * with further edits by Uniswap Labs also under MIT license.\n     */\n    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {\n        unchecked {\n            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use\n            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256\n            // variables such that product = prod1 * 2^256 + prod0.\n            uint256 prod0; // Least significant 256 bits of the product\n            uint256 prod1; // Most significant 256 bits of the product\n            assembly {\n                let mm := mulmod(x, y, not(0))\n                prod0 := mul(x, y)\n                prod1 := sub(sub(mm, prod0), lt(mm, prod0))\n            }\n\n            // Handle non-overflow cases, 256 by 256 division.\n            if (prod1 == 0) {\n                return prod0 / denominator;\n            }\n\n            // Make sure the result is less than 2^256. Also prevents denominator == 0.\n            require(denominator > prod1, \"Math: mulDiv overflow\");\n\n            ///////////////////////////////////////////////\n            // 512 by 256 division.\n            ///////////////////////////////////////////////\n\n            // Make division exact by subtracting the remainder from [prod1 prod0].\n            uint256 remainder;\n            assembly {\n                // Compute remainder using mulmod.\n                remainder := mulmod(x, y, denominator)\n\n                // Subtract 256 bit number from 512 bit number.\n                prod1 := sub(prod1, gt(remainder, prod0))\n                prod0 := sub(prod0, remainder)\n            }\n\n            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.\n            // See https://cs.stackexchange.com/q/138556/92363.\n\n            // Does not overflow because the denominator cannot be zero at this stage in the function.\n            uint256 twos = denominator & (~denominator + 1);\n            assembly {\n                // Divide denominator by twos.\n                denominator := div(denominator, twos)\n\n                // Divide [prod1 prod0] by twos.\n                prod0 := div(prod0, twos)\n\n                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.\n                twos := add(div(sub(0, twos), twos), 1)\n            }\n\n            // Shift in bits from prod1 into prod0.\n            prod0 |= prod1 * twos;\n\n            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such\n            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for\n            // four bits. That is, denominator * inv = 1 mod 2^4.\n            uint256 inverse = (3 * denominator) ^ 2;\n\n            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works\n            // in modular arithmetic, doubling the correct bits in each step.\n            inverse *= 2 - denominator * inverse; // inverse mod 2^8\n            inverse *= 2 - denominator * inverse; // inverse mod 2^16\n            inverse *= 2 - denominator * inverse; // inverse mod 2^32\n            inverse *= 2 - denominator * inverse; // inverse mod 2^64\n            inverse *= 2 - denominator * inverse; // inverse mod 2^128\n            inverse *= 2 - denominator * inverse; // inverse mod 2^256\n\n            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.\n            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is\n            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1\n            // is no longer required.\n            result = prod0 * inverse;\n            return result;\n        }\n    }\n\n    /**\n     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.\n     */\n    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {\n        uint256 result = mulDiv(x, y, denominator);\n        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {\n            result += 1;\n        }\n        return result;\n    }\n\n    /**\n     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.\n     *\n     * Inspired by Henry S. Warren, Jr.'s \"Hacker's Delight\" (Chapter 11).\n     */\n    function sqrt(uint256 a) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.\n        //\n        // We know that the \"msb\" (most significant bit) of our target number `a` is a power of 2 such that we have\n        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.\n        //\n        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`\n        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`\n        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`\n        //\n        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.\n        uint256 result = 1 << (log2(a) >> 1);\n\n        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,\n        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at\n        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision\n        // into the expected uint128 result.\n        unchecked {\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            return min(result, a / result);\n        }\n    }\n\n    /**\n     * @notice Calculates sqrt(a), following the selected rounding direction.\n     */\n    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = sqrt(a);\n            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 2, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log2(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >> 128 > 0) {\n                value >>= 128;\n                result += 128;\n            }\n            if (value >> 64 > 0) {\n                value >>= 64;\n                result += 64;\n            }\n            if (value >> 32 > 0) {\n                value >>= 32;\n                result += 32;\n            }\n            if (value >> 16 > 0) {\n                value >>= 16;\n                result += 16;\n            }\n            if (value >> 8 > 0) {\n                value >>= 8;\n                result += 8;\n            }\n            if (value >> 4 > 0) {\n                value >>= 4;\n                result += 4;\n            }\n            if (value >> 2 > 0) {\n                value >>= 2;\n                result += 2;\n            }\n            if (value >> 1 > 0) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log2(value);\n            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 10, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log10(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >= 10 ** 64) {\n                value /= 10 ** 64;\n                result += 64;\n            }\n            if (value >= 10 ** 32) {\n                value /= 10 ** 32;\n                result += 32;\n            }\n            if (value >= 10 ** 16) {\n                value /= 10 ** 16;\n                result += 16;\n            }\n            if (value >= 10 ** 8) {\n                value /= 10 ** 8;\n                result += 8;\n            }\n            if (value >= 10 ** 4) {\n                value /= 10 ** 4;\n                result += 4;\n            }\n            if (value >= 10 ** 2) {\n                value /= 10 ** 2;\n                result += 2;\n            }\n            if (value >= 10 ** 1) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log10(value);\n            return result + (rounding == Rounding.Up && 10 ** result < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 256, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     *\n     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.\n     */\n    function log256(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >> 128 > 0) {\n                value >>= 128;\n                result += 16;\n            }\n            if (value >> 64 > 0) {\n                value >>= 64;\n                result += 8;\n            }\n            if (value >> 32 > 0) {\n                value >>= 32;\n                result += 4;\n            }\n            if (value >> 16 > 0) {\n                value >>= 16;\n                result += 2;\n            }\n            if (value >> 8 > 0) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log256(value);\n            return result + (rounding == Rounding.Up && 1 << (result << 3) < value ? 1 : 0);\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/interfaces/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (interfaces/IERC165.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../utils/introspection/IERC165.sol\";\n"
+    },
+    "lib/openzeppelin-contracts/contracts/interfaces/IERC721.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (interfaces/IERC721.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../token/ERC721/IERC721.sol\";\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `to`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `from` to `to` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(address from, address to, uint256 amount) external returns (bool);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/interfaces/IERC4906.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.0;\n\nimport \"./IERC165.sol\";\nimport \"./IERC721.sol\";\n\n/// @title EIP-721 Metadata Update Extension\ninterface IERC4906 is IERC165, IERC721 {\n    /// @dev This event emits when the metadata of a token is changed.\n    /// So that the third-party platforms such as NFT market could\n    /// timely update the images and related attributes of the NFT.\n    event MetadataUpdate(uint256 _tokenId);\n\n    /// @dev This event emits when the metadata of a range of tokens is changed.\n    /// So that the third-party platforms such as NFT market could\n    /// timely update the images and related attributes of the NFTs.\n    event BatchMetadataUpdate(uint256 _fromTokenId, uint256 _toTokenId);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (token/ERC721/IERC721.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../../utils/introspection/IERC165.sol\";\n\n/**\n * @dev Required interface of an ERC721 compliant contract.\n */\ninterface IERC721 is IERC165 {\n    /**\n     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);\n\n    /**\n     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.\n     */\n    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);\n\n    /**\n     * @dev Emitted when `owner` enables or disables (`approved`) `operator` to manage all of its assets.\n     */\n    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);\n\n    /**\n     * @dev Returns the number of tokens in ``owner``'s account.\n     */\n    function balanceOf(address owner) external view returns (uint256 balance);\n\n    /**\n     * @dev Returns the owner of the `tokenId` token.\n     *\n     * Requirements:\n     *\n     * - `tokenId` must exist.\n     */\n    function ownerOf(uint256 tokenId) external view returns (address owner);\n\n    /**\n     * @dev Safely transfers `tokenId` token from `from` to `to`.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must exist and be owned by `from`.\n     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.\n     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.\n     *\n     * Emits a {Transfer} event.\n     */\n    function safeTransferFrom(address from, address to, uint256 tokenId, bytes calldata data) external;\n\n    /**\n     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients\n     * are aware of the ERC721 protocol to prevent tokens from being forever locked.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must exist and be owned by `from`.\n     * - If the caller is not `from`, it must have been allowed to move this token by either {approve} or {setApprovalForAll}.\n     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon a safe transfer.\n     *\n     * Emits a {Transfer} event.\n     */\n    function safeTransferFrom(address from, address to, uint256 tokenId) external;\n\n    /**\n     * @dev Transfers `tokenId` token from `from` to `to`.\n     *\n     * WARNING: Note that the caller is responsible to confirm that the recipient is capable of receiving ERC721\n     * or else they may be permanently lost. Usage of {safeTransferFrom} prevents loss, though the caller must\n     * understand this adds an external call which potentially creates a reentrancy vulnerability.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must be owned by `from`.\n     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(address from, address to, uint256 tokenId) external;\n\n    /**\n     * @dev Gives permission to `to` to transfer `tokenId` token to another account.\n     * The approval is cleared when the token is transferred.\n     *\n     * Only a single account can be approved at a time, so approving the zero address clears previous approvals.\n     *\n     * Requirements:\n     *\n     * - The caller must own the token or be an approved operator.\n     * - `tokenId` must exist.\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address to, uint256 tokenId) external;\n\n    /**\n     * @dev Approve or remove `operator` as an operator for the caller.\n     * Operators can call {transferFrom} or {safeTransferFrom} for any token owned by the caller.\n     *\n     * Requirements:\n     *\n     * - The `operator` cannot be the caller.\n     *\n     * Emits an {ApprovalForAll} event.\n     */\n    function setApprovalForAll(address operator, bool approved) external;\n\n    /**\n     * @dev Returns the account approved for `tokenId` token.\n     *\n     * Requirements:\n     *\n     * - `tokenId` must exist.\n     */\n    function getApproved(uint256 tokenId) external view returns (address operator);\n\n    /**\n     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.\n     *\n     * See {setApprovalForAll}\n     */\n    function isApprovedForAll(address owner, address operator) external view returns (bool);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (token/ERC20/utils/SafeERC20.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../IERC20.sol\";\nimport \"../extensions/IERC20Permit.sol\";\nimport \"../../../utils/Address.sol\";\n\n/**\n * @title SafeERC20\n * @dev Wrappers around ERC20 operations that throw on failure (when the token\n * contract returns false). Tokens that return no value (and instead revert or\n * throw on failure) are also supported, non-reverting calls are assumed to be\n * successful.\n * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,\n * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.\n */\nlibrary SafeERC20 {\n    using Address for address;\n\n    function safeTransfer(IERC20 token, address to, uint256 value) internal {\n        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));\n    }\n\n    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {\n        _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));\n    }\n\n    /**\n     * @dev Deprecated. This function has issues similar to the ones found in\n     * {IERC20-approve}, and its usage is discouraged.\n     *\n     * Whenever possible, use {safeIncreaseAllowance} and\n     * {safeDecreaseAllowance} instead.\n     */\n    function safeApprove(IERC20 token, address spender, uint256 value) internal {\n        // safeApprove should only be called when setting an initial allowance,\n        // or when resetting it to zero. To increase and decrease it, use\n        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'\n        require(\n            (value == 0) || (token.allowance(address(this), spender) == 0),\n            \"SafeERC20: approve from non-zero to non-zero allowance\"\n        );\n        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));\n    }\n\n    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {\n        uint256 newAllowance = token.allowance(address(this), spender) + value;\n        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));\n    }\n\n    function safeDecreaseAllowance(IERC20 token, address spender, uint256 value) internal {\n        unchecked {\n            uint256 oldAllowance = token.allowance(address(this), spender);\n            require(oldAllowance >= value, \"SafeERC20: decreased allowance below zero\");\n            uint256 newAllowance = oldAllowance - value;\n            _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));\n        }\n    }\n\n    function safePermit(\n        IERC20Permit token,\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal {\n        uint256 nonceBefore = token.nonces(owner);\n        token.permit(owner, spender, value, deadline, v, r, s);\n        uint256 nonceAfter = token.nonces(owner);\n        require(nonceAfter == nonceBefore + 1, \"SafeERC20: permit did not succeed\");\n    }\n\n    /**\n     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement\n     * on the return value: the return value is optional (but if data is returned, it must not be false).\n     * @param token The token targeted by the call.\n     * @param data The call data (encoded using abi.encode or one of its variants).\n     */\n    function _callOptionalReturn(IERC20 token, bytes memory data) private {\n        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since\n        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that\n        // the target address contains contract code and also asserts for success in the low-level call.\n\n        bytes memory returndata = address(token).functionCall(data, \"SafeERC20: low-level call failed\");\n        if (returndata.length > 0) {\n            // Return data is optional\n            require(abi.decode(returndata, (bool)), \"SafeERC20: ERC20 operation did not succeed\");\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n    /**\n     * @dev Returns true if this contract implements the interface defined by\n     * `interfaceId`. See the corresponding\n     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n     * to learn more about how these ids are created.\n     *\n     * This function call must use less than 30 000 gas.\n     */\n    function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Permit.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n */\ninterface IERC20Permit {\n    /**\n     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,\n     * given ``owner``'s signed approval.\n     *\n     * IMPORTANT: The same issues {IERC20-approve} has related to transaction\n     * ordering also apply here.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `deadline` must be a timestamp in the future.\n     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`\n     * over the EIP712-formatted function arguments.\n     * - the signature must use ``owner``'s current nonce (see {nonces}).\n     *\n     * For more information on the signature format, see the\n     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP\n     * section].\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n\n    /**\n     * @dev Returns the current nonce for `owner`. This value must be\n     * included whenever a signature is generated for {permit}.\n     *\n     * Every successful call to {permit} increases ``owner``'s nonce by one. This\n     * prevents a signature from being used multiple times.\n     */\n    function nonces(address owner) external view returns (uint256);\n\n    /**\n     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC721/extensions/IERC721Metadata.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (token/ERC721/extensions/IERC721Metadata.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../IERC721.sol\";\n\n/**\n * @title ERC-721 Non-Fungible Token Standard, optional metadata extension\n * @dev See https://eips.ethereum.org/EIPS/eip-721\n */\ninterface IERC721Metadata is IERC721 {\n    /**\n     * @dev Returns the token collection name.\n     */\n    function name() external view returns (string memory);\n\n    /**\n     * @dev Returns the token collection symbol.\n     */\n    function symbol() external view returns (string memory);\n\n    /**\n     * @dev Returns the Uniform Resource Identifier (URI) for `tokenId` token.\n     */\n    function tokenURI(uint256 tokenId) external view returns (string memory);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.19+commit.7dd6d404"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_voter",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_ve",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_rewardsDistributor",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "AlreadyNudged",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotEpochGovernor",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TailEmissionsInactive",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_weekly",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_circulating_supply",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "bool",
+              "name": "_tail",
+              "type": "bool"
+            }
+          ],
+          "name": "Mint",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "_period",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_oldRate",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_newRate",
+              "type": "uint256"
+            }
+          ],
+          "name": "Nudge",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "MAXIMUM_TAIL_RATE",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_BPS",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MINIMUM_TAIL_RATE",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "NUDGE",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "TAIL_START",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "WEEK",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "WEEKLY_DECAY",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "activePeriod",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_minted",
+              "type": "uint256"
+            }
+          ],
+          "name": "calculateGrowth",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "_growth",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "nudge",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "proposals",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "rewardsDistributor",
+          "outputs": [
+            {
+              "internalType": "contract IRewardsDistributor",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "tailEmissionRate",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "updatePeriod",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "_period",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ve",
+          "outputs": [
+            {
+              "internalType": "contract IVotingEscrow",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "velo",
+          "outputs": [
+            {
+              "internalType": "contract IVelo",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "voter",
+          "outputs": [
+            {
+              "internalType": "contract IVoter",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "weekly",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "velodrome.finance, @figs999, @pegahcarter",
+        "kind": "dev",
+        "methods": {
+          "calculateGrowth(uint256)": {
+            "params": {
+              "_minted": "Amount of VELO minted this epoch"
+            },
+            "returns": {
+              "_growth": "Rebases"
+            }
+          },
+          "nudge()": {
+            "details": "Throws if not epoch governor.      Throws if not currently in tail emission schedule.      Throws if already nudged this epoch.      Throws if nudging above maximum rate.      Throws if nudging below minimum rate.      This contract is coupled to EpochGovernor as it requires three option simple majority voting."
+          },
+          "updatePeriod()": {
+            "returns": {
+              "_period": "Start of current epoch."
+            }
+          }
+        },
+        "stateVariables": {
+          "proposals": {
+            "details": "activePeriod => proposal existing, used to enforce one proposal per epoch"
+          }
+        },
+        "title": "Minter",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "MAXIMUM_TAIL_RATE()": {
+            "notice": "Maximum tail emission rate in basis points."
+          },
+          "MAX_BPS()": {
+            "notice": "Denominator for emissions calculations (as basis points)"
+          },
+          "MINIMUM_TAIL_RATE()": {
+            "notice": "Minimum tail emission rate in basis points."
+          },
+          "NUDGE()": {
+            "notice": "Rate change per proposal"
+          },
+          "TAIL_START()": {
+            "notice": "When emissions fall below this amount, begin tail emissions"
+          },
+          "WEEK()": {
+            "notice": "Duration of epoch in seconds"
+          },
+          "WEEKLY_DECAY()": {
+            "notice": "Decay rate of emissions as percentage of `MAX_BPS`"
+          },
+          "activePeriod()": {
+            "notice": "Start time of currently active epoch"
+          },
+          "calculateGrowth(uint256)": {
+            "notice": "Calculates rebases according to the formula         weekly * (ve.totalSupply / velo.totalSupply) ^ 3 / 2         Note that ve.totalSupply is the locked ve supply         velo.totalSupply is the total ve supply minted"
+          },
+          "nudge()": {
+            "notice": "Allows epoch governor to modify the tail emission rate by at most 1 basis point         per epoch to a maximum of 100 basis points or to a minimum of 1 basis point.         Note: the very first nudge proposal must take place the week prior         to the tail emission schedule starting."
+          },
+          "tailEmissionRate()": {
+            "notice": "Tail emissions rate in basis points"
+          },
+          "updatePeriod()": {
+            "notice": "Processes emissions and rebases. Callable once per epoch (1 week)."
+          },
+          "weekly()": {
+            "notice": "Starting weekly emission of 15M VELO (VELO has 18 decimals)"
+          }
+        },
+        "notice": "Controls minting of emissions and rebases for Velodrome",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/Minter.sol": "Minter"
+      },
+      "evmVersion": "paris",
+      "libraries": {
+        "contracts/art/PerlinNoise.sol:PerlinNoise": "0x08947e304064b3f3ef2b99fca7e549c5fc3f75d4",
+        "contracts/art/Trig.sol:Trig": "0xbdd6f9662e904a9176aafcbdded45d076b5170ef",
+        "contracts/libraries/BalanceLogicLibrary.sol:BalanceLogicLibrary": "0x79bca9bcc19e157cb5f8c5a2f4d6cb951b1f8dce",
+        "contracts/libraries/DelegationLogicLibrary.sol:DelegationLogicLibrary": "0x73746410b0dd4526e1fa00d0854e99ba54aefd30"
+      },
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@opengsn/=lib/gsn/packages/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@uniswap/v3-core/=lib/v3-core/",
+        ":concentrated-liquidity/=lib/concentrated-liquidity/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":gsn/=lib/gsn/",
+        ":hardhat-deploy/=node_modules/hardhat-deploy/",
+        ":hardhat/=node_modules/hardhat/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":utils/=test/utils/",
+        ":v3-core/=lib/v3-core/"
+      ]
+    },
+    "sources": {
+      "contracts/Minter.sol": {
+        "keccak256": "0xaebfe17760125ca66fd1867745b1c6fe4e6a0623287d2b16405fa64af89976d4",
+        "license": "GPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://20ddea53fee4ffe4ada3b3152d5a9881e5366ed86e70d570ad04a4a40c8507f8",
+          "dweb:/ipfs/QmaepE4SQ1S5ydGQBF6epM52iHyMAwPjFFRySNXbdPxMMX"
+        ]
+      },
+      "contracts/governance/IVotes.sol": {
+        "keccak256": "0xe8e442e8dbcb52d105c44572f513378026b076c8c851905e0e05d97357f1cbcc",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://176a23ababdb0f0c767f4f6e39771f8cf6409ec6726d98e52d3d793d5d6ce488",
+          "dweb:/ipfs/QmSe2NJ4A7Y77G16sBb6bUFbLf3FV4DYsmgtteEJWMLMVF"
+        ]
+      },
+      "contracts/interfaces/IEpochGovernor.sol": {
+        "keccak256": "0x8cbad7a3bc914745c7f80b61090aa1337acad58551a3b774201d18f8fa8a3d62",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://bd9a23a5d40f3e34b4f6bee7455703c740399ac02cde2ea8acd9f202e4e4bbdb",
+          "dweb:/ipfs/QmTCAV6zyzTKSXiPRDbEDRcUCad9K11Gww2eEwuqxdvtgP"
+        ]
+      },
+      "contracts/interfaces/IMinter.sol": {
+        "keccak256": "0x4c1318f6e83f3ee26da88c387a020f286428c45df87ce956441ebbe1ff1d999e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://dd5bb2dff6a8a0f94313768eaff44a154033284e642699577b9536452a54bca2",
+          "dweb:/ipfs/QmfZBoBYCnA4hhNKWLegq1kbFsjGVScrse1mEp2q1L8AJX"
+        ]
+      },
+      "contracts/interfaces/IRewardsDistributor.sol": {
+        "keccak256": "0x301590847b840a693cf96ca6acc6a191d147603663a8d5f8df445ce09a939af3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://90ebbbd678989aba8edeef95bcf4805b864e0d8d8420f42660b85964ecfbec6f",
+          "dweb:/ipfs/QmPH5V4TS4arNR371AqJmYnmjQp6K6EsbsnctXsxiaZECU"
+        ]
+      },
+      "contracts/interfaces/IVelo.sol": {
+        "keccak256": "0x1f7675cc61f8d41f7c4f6544ed3d3af0d6850e38a2de63743a4e38662e7d45c4",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://aa7501dfbb52ee87f8a7a434fc59a2a2578c98508118fd262e3d5fc8b0c76eaa",
+          "dweb:/ipfs/QmUmwthh6kGQuLtTNtoEMMzUBQU3hXvdAVAnCopgEFjB1J"
+        ]
+      },
+      "contracts/interfaces/IVoter.sol": {
+        "keccak256": "0x4a644b909cdc558310e1e0110b7748faf0c0d65d126713ab0a46a0685c22ca8e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://37f4f7de864368cb85f6b86abe36f9891a8a36ac9e4d4cc8db3e5cc4e9a6527e",
+          "dweb:/ipfs/QmVthu32tuNthnSqAZ8XNHFuin8MDCJia2XD2gMkHCSvMK"
+        ]
+      },
+      "contracts/interfaces/IVotingEscrow.sol": {
+        "keccak256": "0xc2ecf202c6cfd7ad9dbe42ef349f28eaf0a61215b5929e311005b90d7b47735d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://20513e0ec9918b6a7cda4dfee9d9c70efe1f87059d4e6bf1d879de42de8b669f",
+          "dweb:/ipfs/QmYFSw4YDKDHx4nX4C6i2E8756mYFEHPxYVKDKBpy8y3WU"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/interfaces/IERC165.sol": {
+        "keccak256": "0xd04b0f06e0666f29cf7cccc82894de541e19bb30a765b107b1e40bb7fe5f7d7a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7b652499d098e88d8d878374616bb58434301061cae2253298b3f374044e0ddb",
+          "dweb:/ipfs/QmbhAzctqo5jrSKU6idHdVyqfmzCcDbNUPvmx4GiXxfA6q"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/interfaces/IERC4906.sol": {
+        "keccak256": "0x57a2cf3544afc13eba3ad57a4f71d229da29f13ad9c365f31eda05e26a5f810c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://06c7ba983e1c10b02070776f07495cd28906570923290f193fad3f127d8ecb64",
+          "dweb:/ipfs/Qmdb7sqnyafGzbdnzx7GVutiHyMQH9WpKu581sjpCXkwJb"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/interfaces/IERC721.sol": {
+        "keccak256": "0xaf297d12d8d4a57fe01a70f0ef38908f208e3faedc577056d0b728fa2f3ccf0c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://fbfaf37123958822a2720a4ea29651be00edab787540b770f73d3e025d286ff8",
+          "dweb:/ipfs/QmbzgWeTm8hJVUqWrNAwFjshqbYVyeGpQA8D1huzxQdmw6"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol": {
+        "keccak256": "0x00c839ff53d07d19db2e7cfa1e5133f9ee90a8d64b0e2e57f50446a2d1a3a0e0",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://3dac621d015a68a5251b1e5d41dda0faf252699bf6e8bcf46a958b29964d9dd1",
+          "dweb:/ipfs/QmP9axjgZv4cezAhALoTemM62sdLtMDJ9MGTxECnNwHgSJ"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol": {
+        "keccak256": "0x35e258421ae206f3db37281cea70871b4c3553914734aa76139a41af60ac1abb",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2ef94b6bc4ee356db612a1849c615f7dd4b15542d6c8584c86bb9243a7913cf0",
+          "dweb:/ipfs/QmaxFj5NFpAjjitZtHPNS9PPtCuBATaRz9ktDDRCQCQ83y"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol": {
+        "keccak256": "0x41506aed9d344097236aaff05216674af38e177288787519d49b71f6396c4af8",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://47a4a1d11e3e7c610b12da694f3d406527027e7963cfb7bf302af0b902615d7e",
+          "dweb:/ipfs/QmeDwStpqytetvjaq7KA7cQRVPDwxmZySYdEXkvw2DDxsr"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol": {
+        "keccak256": "0x41bbb2c41036ca64b2f6c9e973e8cfaa113ebc42af86702cd0d267f915a7e886",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6bf6699c55e82c7af6ae90b61ea9643ca0c905097da9a31269319f1b5a2a696a",
+          "dweb:/ipfs/QmRJZa2UmWcRo6W8JnuomwzfjVtAS21QC8HKggxBhoPsU4"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC721/extensions/IERC721Metadata.sol": {
+        "keccak256": "0x75b829ff2f26c14355d1cba20e16fe7b29ca58eb5fef665ede48bc0f9c6c74b9",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://a0a107160525724f9e1bbbab031defc2f298296dd9e331f16a6f7130cec32146",
+          "dweb:/ipfs/QmemujxSd7gX8A9M8UwmNbz4Ms3U9FG9QfudUgxwvTmPWf"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/Address.sol": {
+        "keccak256": "0x2e53602b96c1bf97c731ed3e2a981b4f85e23a9410a5ebd36e549a4cc93340dc",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://523f47b3ecc6d4e47b4b998d3356199988eef8a42a10dff5a3660d5f9e76cc71",
+          "dweb:/ipfs/QmRLH8CNvDsuLzNCjsbpLM3RHD9he5ESXroYoDT3tpaTCA"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol": {
+        "keccak256": "0x447a5f3ddc18419d41ff92b3773fb86471b1db25773e07f877f548918a185bf1",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://be161e54f24e5c6fae81a12db1a8ae87bc5ae1b0ddc805d82a1440a68455088f",
+          "dweb:/ipfs/QmP7C3CHdY9urF4dEMb9wmsp1wMxHF6nhA2yQE5SKiPAdy"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+        "keccak256": "0x3546b156d97633f7f8cad536d5454c81d1d604687c02b2eb105fdc33cb962b41",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://fc373869014f80e7ad928ae44bb7678a2d7aacf213fb0ce36bcbbb3166845903",
+          "dweb:/ipfs/QmUaRPa2Nm2WfKeCq8yRCR94JZFCnfr4xw9LJADWxhTcwt"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.19+commit.7dd6d404",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {
+        "contracts/art/Trig.sol": {
+          "Trig": "0xbdd6f9662e904a9176aafcbdded45d076b5170ef"
+        },
+        "contracts/art/PerlinNoise.sol": {
+          "PerlinNoise": "0x08947e304064b3f3ef2b99fca7e549c5fc3f75d4"
+        },
+        "contracts/libraries/BalanceLogicLibrary.sol": {
+          "BalanceLogicLibrary": "0x79bca9bcc19e157cb5f8c5a2f4d6cb951b1f8dce"
+        },
+        "contracts/libraries/DelegationLogicLibrary.sol": {
+          "DelegationLogicLibrary": "0x73746410b0dd4526e1fa00d0854e99ba54aefd30"
+        }
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        ":@opengsn/=lib/gsn/packages/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@uniswap/v3-core/=lib/v3-core/",
+        ":concentrated-liquidity/=lib/concentrated-liquidity/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":gsn/=lib/gsn/",
+        ":hardhat-deploy/=node_modules/hardhat-deploy/",
+        ":hardhat/=node_modules/hardhat/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":utils/=test/utils/",
+        ":v3-core/=lib/v3-core/"
+      ]
+    },
+    "name": "Minter",
+    "fullyQualifiedName": "contracts/Minter.sol:Minter"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "2857799",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2024-08-08T16:44:59Z",
+  "match": "match",
+  "chainId": "10",
+  "address": "0x6dc9E1C04eE59ed3531d73a72256C0da46D10982"
+}

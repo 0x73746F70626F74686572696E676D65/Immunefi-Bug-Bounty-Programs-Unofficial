@@ -1,0 +1,996 @@
+{
+  "sources": {
+    "contracts/interfaces/IPool.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IPool {\n    error DepositsNotEqual();\n    error BelowMinimumK();\n    error FactoryAlreadySet();\n    error InsufficientLiquidity();\n    error InsufficientLiquidityMinted();\n    error InsufficientLiquidityBurned();\n    error InsufficientOutputAmount();\n    error InsufficientInputAmount();\n    error IsPaused();\n    error InvalidTo();\n    error K();\n    error NotEmergencyCouncil();\n\n    event Fees(address indexed sender, uint256 amount0, uint256 amount1);\n    event Mint(address indexed sender, uint256 amount0, uint256 amount1);\n    event Burn(address indexed sender, address indexed to, uint256 amount0, uint256 amount1);\n    event Swap(\n        address indexed sender,\n        address indexed to,\n        uint256 amount0In,\n        uint256 amount1In,\n        uint256 amount0Out,\n        uint256 amount1Out\n    );\n    event Sync(uint256 reserve0, uint256 reserve1);\n    event Claim(address indexed sender, address indexed recipient, uint256 amount0, uint256 amount1);\n\n    function metadata()\n        external\n        view\n        returns (uint256 dec0, uint256 dec1, uint256 r0, uint256 r1, bool st, address t0, address t1);\n\n    function claimFees() external returns (uint256, uint256);\n\n    function tokens() external view returns (address, address);\n\n    function token0() external view returns (address);\n\n    function token1() external view returns (address);\n\n    function stable() external view returns (bool);\n\n    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;\n\n    function burn(address to) external returns (uint256 amount0, uint256 amount1);\n\n    function mint(address to) external returns (uint256 liquidity);\n\n    function getReserves() external view returns (uint256 _reserve0, uint256 _reserve1, uint256 _blockTimestampLast);\n\n    function getAmountOut(uint256, address) external view returns (uint256);\n\n    function skim(address to) external;\n\n    function initialize(address _token0, address _token1, bool _stable) external;\n}\n"
+    },
+    "contracts/factories/PoolFactory.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.19;\n\nimport {IPoolFactory} from \"../interfaces/factories/IPoolFactory.sol\";\nimport {IPool} from \"../interfaces/IPool.sol\";\nimport {Clones} from \"@openzeppelin/contracts/proxy/Clones.sol\";\n\ncontract PoolFactory is IPoolFactory {\n    address public immutable implementation;\n\n    bool public isPaused;\n    address public pauser;\n\n    uint256 public stableFee;\n    uint256 public volatileFee;\n    uint256 public constant MAX_FEE = 100; // 1%\n    // Override to indicate there is custom 0% fee - as a 0 value in the customFee mapping indicates\n    // that no custom fee rate has been set\n    uint256 public constant ZERO_FEE_INDICATOR = 420;\n    address public feeManager;\n\n    /// @dev used to change the name/symbol of the pool by calling emergencyCouncil\n    address public voter;\n\n    /// @dev used to enable Router conversion of v1 => v2 VEL0\n    address public velo;\n    address public veloV2;\n    address public sinkConverter;\n\n    mapping(address => mapping(address => mapping(bool => address))) private _getPool;\n    address[] public allPools;\n    mapping(address => bool) private _isPool; // simplified check if its a pool, given that `stable` flag might not be available in peripherals\n    mapping(address => uint256) public customFee; // override for custom fees\n\n    address internal _temp0;\n    address internal _temp1;\n    bool internal _temp;\n\n    constructor(address _implementation) {\n        implementation = _implementation;\n        voter = msg.sender;\n        pauser = msg.sender;\n        feeManager = msg.sender;\n        sinkConverter = msg.sender;\n        isPaused = false;\n        stableFee = 5; // 0.05%\n        volatileFee = 30; // 0.3%\n    }\n\n    /// @inheritdoc IPoolFactory\n    function allPoolsLength() external view returns (uint256) {\n        return allPools.length;\n    }\n\n    /// @inheritdoc IPoolFactory\n    function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address) {\n        return fee > 1 ? address(0) : fee == 1 ? _getPool[tokenA][tokenB][true] : _getPool[tokenA][tokenB][false];\n    }\n\n    /// @inheritdoc IPoolFactory\n    function getPool(address tokenA, address tokenB, bool stable) external view returns (address) {\n        return _getPool[tokenA][tokenB][stable];\n    }\n\n    /// @inheritdoc IPoolFactory\n    function getPair(address tokenA, address tokenB, bool stable) external view returns (address) {\n        return _getPool[tokenA][tokenB][stable];\n    }\n\n    /// @inheritdoc IPoolFactory\n    function isPool(address pool) external view returns (bool) {\n        return _isPool[pool];\n    }\n\n    /// @inheritdoc IPoolFactory\n    function isPair(address pool) external view returns (bool) {\n        return _isPool[pool];\n    }\n\n    /// @inheritdoc IPoolFactory\n    function setVoter(address _voter) external {\n        if (msg.sender != voter) revert NotVoter();\n        voter = _voter;\n        emit SetVoter(_voter);\n    }\n\n    /// @inheritdoc IPoolFactory\n    function setSinkConverter(address _sinkConverter, address _velo, address _veloV2) external {\n        if (msg.sender != sinkConverter) revert NotSinkConverter();\n        sinkConverter = _sinkConverter;\n        velo = _velo;\n        veloV2 = _veloV2;\n\n        // Follow logic of createPool() - except add getPool values for both volatile\n        // and stable so there is no way to create an additional velo => veloV2 pool\n        (address token0, address token1) = _velo < _veloV2 ? (_velo, _veloV2) : (_veloV2, _velo);\n        _getPool[token0][token1][true] = sinkConverter;\n        _getPool[token1][token0][true] = sinkConverter;\n        _getPool[token0][token1][false] = sinkConverter;\n        _getPool[token1][token0][false] = sinkConverter;\n        allPools.push(sinkConverter);\n        _isPool[sinkConverter] = true;\n\n        // emit two events - for both the \"stable\" and \"volatile\" pool being created\n        emit PoolCreated(token0, token1, true, sinkConverter, allPools.length);\n        emit PoolCreated(token0, token1, false, sinkConverter, allPools.length);\n    }\n\n    function setPauser(address _pauser) external {\n        if (msg.sender != pauser) revert NotPauser();\n        if (_pauser == address(0)) revert ZeroAddress();\n        pauser = _pauser;\n        emit SetPauser(_pauser);\n    }\n\n    function setPauseState(bool _state) external {\n        if (msg.sender != pauser) revert NotPauser();\n        isPaused = _state;\n        emit SetPauseState(_state);\n    }\n\n    function setFeeManager(address _feeManager) external {\n        if (msg.sender != feeManager) revert NotFeeManager();\n        if (_feeManager == address(0)) revert ZeroAddress();\n        feeManager = _feeManager;\n        emit SetFeeManager(_feeManager);\n    }\n\n    /// @inheritdoc IPoolFactory\n    function setFee(bool _stable, uint256 _fee) external {\n        if (msg.sender != feeManager) revert NotFeeManager();\n        if (_fee > MAX_FEE) revert FeeTooHigh();\n        if (_fee == 0) revert ZeroFee();\n        if (_stable) {\n            stableFee = _fee;\n        } else {\n            volatileFee = _fee;\n        }\n    }\n\n    /// @inheritdoc IPoolFactory\n    function setCustomFee(address pool, uint256 fee) external {\n        if (msg.sender != feeManager) revert NotFeeManager();\n        if (fee > MAX_FEE && fee != ZERO_FEE_INDICATOR) revert FeeTooHigh();\n        if (!_isPool[pool]) revert InvalidPool();\n\n        customFee[pool] = fee;\n        emit SetCustomFee(pool, fee);\n    }\n\n    /// @inheritdoc IPoolFactory\n    function getFee(address pool, bool _stable) public view returns (uint256) {\n        uint256 fee = customFee[pool];\n        return fee == ZERO_FEE_INDICATOR ? 0 : fee != 0 ? fee : _stable ? stableFee : volatileFee;\n    }\n\n    /// @inheritdoc IPoolFactory\n    function createPool(address tokenA, address tokenB, uint24 fee) external returns (address pool) {\n        if (fee > 1) revert FeeInvalid();\n        bool stable = fee == 1;\n        return createPool(tokenA, tokenB, stable);\n    }\n\n    /// @inheritdoc IPoolFactory\n    function createPool(address tokenA, address tokenB, bool stable) public returns (address pool) {\n        if (tokenA == tokenB) revert SameAddress();\n        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);\n        if (token0 == address(0)) revert ZeroAddress();\n        if (_getPool[token0][token1][stable] != address(0)) revert PoolAlreadyExists();\n        bytes32 salt = keccak256(abi.encodePacked(token0, token1, stable)); // salt includes stable as well, 3 parameters\n        pool = Clones.cloneDeterministic(implementation, salt);\n        IPool(pool).initialize(token0, token1, stable);\n        _getPool[token0][token1][stable] = pool;\n        _getPool[token1][token0][stable] = pool; // populate mapping in the reverse direction\n        allPools.push(pool);\n        _isPool[pool] = true;\n        emit PoolCreated(token0, token1, stable, pool, allPools.length);\n    }\n\n    /// @inheritdoc IPoolFactory\n    function createPair(address tokenA, address tokenB, bool stable) external returns (address pool) {\n        return createPool(tokenA, tokenB, stable);\n    }\n}\n"
+    },
+    "contracts/interfaces/factories/IPoolFactory.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IPoolFactory {\n    event SetFeeManager(address feeManager);\n    event SetPauser(address pauser);\n    event SetPauseState(bool state);\n    event SetVoter(address voter);\n    event PoolCreated(address indexed token0, address indexed token1, bool indexed stable, address pool, uint256);\n    event SetCustomFee(address indexed pool, uint256 fee);\n\n    error FeeInvalid();\n    error FeeTooHigh();\n    error InvalidPool();\n    error NotFeeManager();\n    error NotPauser();\n    error NotSinkConverter();\n    error NotVoter();\n    error PoolAlreadyExists();\n    error SameAddress();\n    error ZeroFee();\n    error ZeroAddress();\n\n    /// @notice returns the number of pools created from this factory\n    function allPoolsLength() external view returns (uint256);\n\n    /// @notice Is a valid pool created by this factory.\n    /// @param .\n    function isPool(address pool) external view returns (bool);\n\n    /// @notice Support for Velodrome v1 which wraps around isPool(pool);\n    /// @param .\n    function isPair(address pool) external view returns (bool);\n\n    /// @notice Return address of pool created by this factory\n    /// @param tokenA .\n    /// @param tokenB .\n    /// @param stable True if stable, false if volatile\n    function getPool(address tokenA, address tokenB, bool stable) external view returns (address);\n\n    /// @notice Support for v3-style pools which wraps around getPool(tokenA,tokenB,stable)\n    /// @dev fee is converted to stable boolean.\n    /// @param tokenA .\n    /// @param tokenB .\n    /// @param fee  1 if stable, 0 if volatile, else returns address(0)\n    function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address);\n\n    /// @notice Support for Velodrome v1 pools as a \"pool\" was previously referenced as \"pair\"\n    /// @notice Wraps around getPool(tokenA,tokenB,stable)\n    function getPair(address tokenA, address tokenB, bool stable) external view returns (address);\n\n    /// @dev Only called once to set to Voter.sol - Voter does not have a function\n    ///      to call this contract method, so once set it's immutable.\n    ///      This also follows convention of setVoterAndDistributor() in VotingEscrow.sol\n    /// @param _voter .\n    function setVoter(address _voter) external;\n\n    function setSinkConverter(address _sinkConvert, address _velo, address _veloV2) external;\n\n    function setPauser(address _pauser) external;\n\n    function setPauseState(bool _state) external;\n\n    function setFeeManager(address _feeManager) external;\n\n    /// @notice Set default fee for stable and volatile pools.\n    /// @dev Throws if higher than maximum fee.\n    ///      Throws if fee is zero.\n    /// @param _stable Stable or volatile pool.\n    /// @param _fee .\n    function setFee(bool _stable, uint256 _fee) external;\n\n    /// @notice Set overriding fee for a pool from the default\n    /// @dev A custom fee of zero means the default fee will be used.\n    function setCustomFee(address _pool, uint256 _fee) external;\n\n    /// @notice Returns fee for a pool, as custom fees are possible.\n    function getFee(address _pool, bool _stable) external view returns (uint256);\n\n    /// @notice Create a pool given two tokens and if they're stable/volatile\n    /// @dev token order does not matter\n    /// @param tokenA .\n    /// @param tokenB .\n    /// @param stable .\n    function createPool(address tokenA, address tokenB, bool stable) external returns (address pool);\n\n    /// @notice Support for v3-style pools which wraps around createPool(tokena,tokenB,stable)\n    /// @dev fee is converted to stable boolean\n    /// @dev token order does not matter\n    /// @param tokenA .\n    /// @param tokenB .\n    /// @param fee 1 if stable, 0 if volatile, else revert\n    function createPool(address tokenA, address tokenB, uint24 fee) external returns (address pool);\n\n    /// @notice Support for Velodrome v1 which wraps around createPool(tokenA,tokenB,stable)\n    function createPair(address tokenA, address tokenB, bool stable) external returns (address pool);\n\n    function isPaused() external view returns (bool);\n\n    function velo() external view returns (address);\n\n    function veloV2() external view returns (address);\n\n    function voter() external view returns (address);\n\n    function sinkConverter() external view returns (address);\n\n    function implementation() external view returns (address);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/proxy/Clones.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (proxy/Clones.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-1167[EIP 1167] is a standard for\n * deploying minimal proxy contracts, also known as \"clones\".\n *\n * > To simply and cheaply clone contract functionality in an immutable way, this standard specifies\n * > a minimal bytecode implementation that delegates all calls to a known, fixed address.\n *\n * The library includes functions to deploy a proxy using either `create` (traditional deployment) or `create2`\n * (salted deterministic deployment). It also includes functions to predict the addresses of clones deployed using the\n * deterministic method.\n *\n * _Available since v3.4._\n */\nlibrary Clones {\n    /**\n     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.\n     *\n     * This function uses the create opcode, which should never revert.\n     */\n    function clone(address implementation) internal returns (address instance) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes\n            // of the `implementation` address with the bytecode before the address.\n            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))\n            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.\n            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))\n            instance := create(0, 0x09, 0x37)\n        }\n        require(instance != address(0), \"ERC1167: create failed\");\n    }\n\n    /**\n     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.\n     *\n     * This function uses the create2 opcode and a `salt` to deterministically deploy\n     * the clone. Using the same `implementation` and `salt` multiple time will revert, since\n     * the clones cannot be deployed twice at the same address.\n     */\n    function cloneDeterministic(address implementation, bytes32 salt) internal returns (address instance) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Cleans the upper 96 bits of the `implementation` word, then packs the first 3 bytes\n            // of the `implementation` address with the bytecode before the address.\n            mstore(0x00, or(shr(0xe8, shl(0x60, implementation)), 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000))\n            // Packs the remaining 17 bytes of `implementation` with the bytecode after the address.\n            mstore(0x20, or(shl(0x78, implementation), 0x5af43d82803e903d91602b57fd5bf3))\n            instance := create2(0, 0x09, 0x37, salt)\n        }\n        require(instance != address(0), \"ERC1167: create2 failed\");\n    }\n\n    /**\n     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.\n     */\n    function predictDeterministicAddress(\n        address implementation,\n        bytes32 salt,\n        address deployer\n    ) internal pure returns (address predicted) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            let ptr := mload(0x40)\n            mstore(add(ptr, 0x38), deployer)\n            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)\n            mstore(add(ptr, 0x14), implementation)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)\n            mstore(add(ptr, 0x58), salt)\n            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))\n            predicted := keccak256(add(ptr, 0x43), 0x55)\n        }\n    }\n\n    /**\n     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.\n     */\n    function predictDeterministicAddress(\n        address implementation,\n        bytes32 salt\n    ) internal view returns (address predicted) {\n        return predictDeterministicAddress(implementation, salt, address(this));\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.19+commit.7dd6d404"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_implementation",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "FeeInvalid",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "FeeTooHigh",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidPool",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotFeeManager",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotPauser",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotSinkConverter",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotVoter",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "PoolAlreadyExists",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "SameAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroFee",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token0",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token1",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "bool",
+              "name": "stable",
+              "type": "bool"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "PoolCreated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "fee",
+              "type": "uint256"
+            }
+          ],
+          "name": "SetCustomFee",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "feeManager",
+              "type": "address"
+            }
+          ],
+          "name": "SetFeeManager",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "state",
+              "type": "bool"
+            }
+          ],
+          "name": "SetPauseState",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "pauser",
+              "type": "address"
+            }
+          ],
+          "name": "SetPauser",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "voter",
+              "type": "address"
+            }
+          ],
+          "name": "SetVoter",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_FEE",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ZERO_FEE_INDICATOR",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "allPools",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "allPoolsLength",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "stable",
+              "type": "bool"
+            }
+          ],
+          "name": "createPair",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "stable",
+              "type": "bool"
+            }
+          ],
+          "name": "createPool",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "uint24",
+              "name": "fee",
+              "type": "uint24"
+            }
+          ],
+          "name": "createPool",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "customFee",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "feeManager",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "_stable",
+              "type": "bool"
+            }
+          ],
+          "name": "getFee",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "stable",
+              "type": "bool"
+            }
+          ],
+          "name": "getPair",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "uint24",
+              "name": "fee",
+              "type": "uint24"
+            }
+          ],
+          "name": "getPool",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "stable",
+              "type": "bool"
+            }
+          ],
+          "name": "getPool",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "implementation",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            }
+          ],
+          "name": "isPair",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isPaused",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            }
+          ],
+          "name": "isPool",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pauser",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "pool",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "fee",
+              "type": "uint256"
+            }
+          ],
+          "name": "setCustomFee",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bool",
+              "name": "_stable",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_fee",
+              "type": "uint256"
+            }
+          ],
+          "name": "setFee",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_feeManager",
+              "type": "address"
+            }
+          ],
+          "name": "setFeeManager",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bool",
+              "name": "_state",
+              "type": "bool"
+            }
+          ],
+          "name": "setPauseState",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_pauser",
+              "type": "address"
+            }
+          ],
+          "name": "setPauser",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_sinkConverter",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_velo",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_veloV2",
+              "type": "address"
+            }
+          ],
+          "name": "setSinkConverter",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_voter",
+              "type": "address"
+            }
+          ],
+          "name": "setVoter",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "sinkConverter",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "stableFee",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "velo",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "veloV2",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "volatileFee",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "voter",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "createPool(address,address,bool)": {
+            "details": "token order does not matter",
+            "params": {
+              "stable": ".",
+              "tokenA": ".",
+              "tokenB": "."
+            }
+          },
+          "createPool(address,address,uint24)": {
+            "details": "fee is converted to stable booleantoken order does not matter",
+            "params": {
+              "fee": "1 if stable, 0 if volatile, else revert",
+              "tokenA": ".",
+              "tokenB": "."
+            }
+          },
+          "getPool(address,address,bool)": {
+            "params": {
+              "stable": "True if stable, false if volatile",
+              "tokenA": ".",
+              "tokenB": "."
+            }
+          },
+          "getPool(address,address,uint24)": {
+            "details": "fee is converted to stable boolean.",
+            "params": {
+              "fee": "1 if stable, 0 if volatile, else returns address(0)",
+              "tokenA": ".",
+              "tokenB": "."
+            }
+          },
+          "isPair(address)": {
+            "params": {
+              "": "."
+            }
+          },
+          "isPool(address)": {
+            "params": {
+              "": "."
+            }
+          },
+          "setCustomFee(address,uint256)": {
+            "details": "A custom fee of zero means the default fee will be used."
+          },
+          "setFee(bool,uint256)": {
+            "details": "Throws if higher than maximum fee.      Throws if fee is zero.",
+            "params": {
+              "_fee": ".",
+              "_stable": "Stable or volatile pool."
+            }
+          },
+          "setVoter(address)": {
+            "details": "Only called once to set to Voter.sol - Voter does not have a function      to call this contract method, so once set it's immutable.      This also follows convention of setVoterAndDistributor() in VotingEscrow.sol",
+            "params": {
+              "_voter": "."
+            }
+          }
+        },
+        "stateVariables": {
+          "velo": {
+            "details": "used to enable Router conversion of v1 => v2 VEL0"
+          },
+          "voter": {
+            "details": "used to change the name/symbol of the pool by calling emergencyCouncil"
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "allPoolsLength()": {
+            "notice": "returns the number of pools created from this factory"
+          },
+          "createPair(address,address,bool)": {
+            "notice": "Support for Velodrome v1 which wraps around createPool(tokenA,tokenB,stable)"
+          },
+          "createPool(address,address,bool)": {
+            "notice": "Create a pool given two tokens and if they're stable/volatile"
+          },
+          "createPool(address,address,uint24)": {
+            "notice": "Support for v3-style pools which wraps around createPool(tokena,tokenB,stable)"
+          },
+          "getFee(address,bool)": {
+            "notice": "Returns fee for a pool, as custom fees are possible."
+          },
+          "getPair(address,address,bool)": {
+            "notice": "Support for Velodrome v1 pools as a \"pool\" was previously referenced as \"pair\"Wraps around getPool(tokenA,tokenB,stable)"
+          },
+          "getPool(address,address,bool)": {
+            "notice": "Return address of pool created by this factory"
+          },
+          "getPool(address,address,uint24)": {
+            "notice": "Support for v3-style pools which wraps around getPool(tokenA,tokenB,stable)"
+          },
+          "isPair(address)": {
+            "notice": "Support for Velodrome v1 which wraps around isPool(pool);"
+          },
+          "isPool(address)": {
+            "notice": "Is a valid pool created by this factory."
+          },
+          "setCustomFee(address,uint256)": {
+            "notice": "Set overriding fee for a pool from the default"
+          },
+          "setFee(bool,uint256)": {
+            "notice": "Set default fee for stable and volatile pools."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/factories/PoolFactory.sol": "PoolFactory"
+      },
+      "evmVersion": "paris",
+      "libraries": {
+        "contracts/art/PerlinNoise.sol:PerlinNoise": "0x08947e304064b3f3ef2b99fca7e549c5fc3f75d4",
+        "contracts/art/Trig.sol:Trig": "0xbdd6f9662e904a9176aafcbdded45d076b5170ef",
+        "contracts/libraries/BalanceLogicLibrary.sol:BalanceLogicLibrary": "0x79bca9bcc19e157cb5f8c5a2f4d6cb951b1f8dce",
+        "contracts/libraries/DelegationLogicLibrary.sol:DelegationLogicLibrary": "0x73746410b0dd4526e1fa00d0854e99ba54aefd30"
+      },
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@opengsn/=lib/gsn/packages/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@uniswap/v3-core/=lib/v3-core/",
+        ":concentrated-liquidity/=lib/concentrated-liquidity/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":gsn/=lib/gsn/",
+        ":hardhat-deploy/=node_modules/hardhat-deploy/",
+        ":hardhat/=node_modules/hardhat/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":utils/=test/utils/",
+        ":v3-core/=lib/v3-core/"
+      ]
+    },
+    "sources": {
+      "contracts/factories/PoolFactory.sol": {
+        "keccak256": "0x11464b0edd1af07baa00443d98cca3a01d66bf65cae76d48992eb94005262999",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://74ac371e282bf7b3198705f446f9e3777b8fc2539edca3c2090f37209b1791ea",
+          "dweb:/ipfs/QmY3RkxX95ptURsKNC5rceAjbthTJaFZtN4jHiyaeDHuEx"
+        ]
+      },
+      "contracts/interfaces/IPool.sol": {
+        "keccak256": "0x5a452792e649cc12981a22759ee2af6c01c39620a1f47424df2e1929fc3fb80c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0d083253daf6785c8ceca39c8d214420fedc2936eba209b78e2f4f790856f93c",
+          "dweb:/ipfs/Qmcf5Ayoyo7kWFAzWQCkLyDZBanyqKzuj6BLyZkzMoBoB2"
+        ]
+      },
+      "contracts/interfaces/factories/IPoolFactory.sol": {
+        "keccak256": "0x92c6afe6040b98bd89fa55f8ecaee526a6a4b45670aecd9b0ecff1ca96d460e8",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://3993a6372707671c599d0af29594530f467a05d8caa609db278ba3db6c21c1f2",
+          "dweb:/ipfs/QmRJoYe5FKk8Bvq1Zbue8EmXst8tqKmDWaLpG46maZfmaS"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/proxy/Clones.sol": {
+        "keccak256": "0x0e1fe02da411a6293004e5ee85bdd1facef5f1b6ef2aab8d36c73f0d77b448db",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c5bfd474499866fe24ac6b88eb92969395baf1e644a0f0b0054e66f9ae90c00e",
+          "dweb:/ipfs/QmS5j268UauZARToNJazEBJDWvWM35j8kHx779PF3c5rib"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.19+commit.7dd6d404",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {
+        "contracts/art/Trig.sol": {
+          "Trig": "0xbdd6f9662e904a9176aafcbdded45d076b5170ef"
+        },
+        "contracts/art/PerlinNoise.sol": {
+          "PerlinNoise": "0x08947e304064b3f3ef2b99fca7e549c5fc3f75d4"
+        },
+        "contracts/libraries/BalanceLogicLibrary.sol": {
+          "BalanceLogicLibrary": "0x79bca9bcc19e157cb5f8c5a2f4d6cb951b1f8dce"
+        },
+        "contracts/libraries/DelegationLogicLibrary.sol": {
+          "DelegationLogicLibrary": "0x73746410b0dd4526e1fa00d0854e99ba54aefd30"
+        }
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        ":@opengsn/=lib/gsn/packages/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@uniswap/v3-core/=lib/v3-core/",
+        ":concentrated-liquidity/=lib/concentrated-liquidity/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":gsn/=lib/gsn/",
+        ":hardhat-deploy/=node_modules/hardhat-deploy/",
+        ":hardhat/=node_modules/hardhat/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":utils/=test/utils/",
+        ":v3-core/=lib/v3-core/"
+      ]
+    },
+    "name": "PoolFactory",
+    "fullyQualifiedName": "contracts/factories/PoolFactory.sol:PoolFactory"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "3740890",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2024-08-08T21:51:59Z",
+  "match": "match",
+  "chainId": "10",
+  "address": "0xF1046053aa5682b4F9a81b5481394DA16BE5FF5a"
+}

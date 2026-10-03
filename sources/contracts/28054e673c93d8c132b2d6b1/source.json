@@ -1,0 +1,427 @@
+{
+  "sources": {
+    "src/root/rewards/RootVotingRewardsFactory.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity >=0.8.19 <0.9.0;\n\nimport {IRootVotingRewardsFactory} from \"../../interfaces/root/rewards/IRootVotingRewardsFactory.sol\";\n\nimport {RootIncentiveVotingReward} from \"./RootIncentiveVotingReward.sol\";\nimport {RootFeesVotingReward} from \"./RootFeesVotingReward.sol\";\n\n/// @title Velodrome Superchain Root Voting Rewards Factory\n/// @notice Creates root voting rewards contracts that forward messages to the corresponding reward contracts on the leaf chain\ncontract RootVotingRewardsFactory is IRootVotingRewardsFactory {\n    /// @inheritdoc IRootVotingRewardsFactory\n    address public immutable bridge;\n    /// @inheritdoc IRootVotingRewardsFactory\n    mapping(address => mapping(uint256 => address)) public recipient;\n\n    constructor(address _bridge) {\n        bridge = _bridge;\n    }\n\n    /// @inheritdoc IRootVotingRewardsFactory\n    function setRecipient(uint256 _chainid, address _recipient) external {\n        recipient[msg.sender][_chainid] = _recipient;\n        emit RecipientSet({_caller: msg.sender, _chainid: _chainid, _recipient: _recipient});\n    }\n\n    /// @inheritdoc IRootVotingRewardsFactory\n    function createRewards(address, address[] memory _rewards)\n        external\n        returns (address feesVotingReward, address incentiveVotingReward)\n    {\n        incentiveVotingReward =\n            address(new RootIncentiveVotingReward({_bridge: bridge, _voter: msg.sender, _rewards: _rewards}));\n        feesVotingReward = address(\n            new RootFeesVotingReward({\n                _bridge: bridge,\n                _voter: msg.sender,\n                _incentiveVotingReward: incentiveVotingReward,\n                _rewards: _rewards\n            })\n        );\n    }\n}\n"
+    },
+    "src/interfaces/root/rewards/IRootVotingRewardsFactory.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IRootVotingRewardsFactory {\n    event RecipientSet(address indexed _caller, uint256 indexed _chainid, address indexed _recipient);\n\n    /// @notice Address of bridge contract used to forward rewards messages\n    /// @return Address of the bridge contract\n    function bridge() external view returns (address);\n\n    /// @notice Returns the recipient of the rewards for a given user and chain\n    /// @param _owner Address of the owner\n    /// @param _chainid Chain id\n    /// @return Address of the recipient\n    function recipient(address _owner, uint256 _chainid) external view returns (address);\n\n    /// @notice Sets the recipient of the rewards for a given user and chain\n    /// @param _chainid Chain id\n    /// @param _recipient Address of the recipient\n    function setRecipient(uint256 _chainid, address _recipient) external;\n\n    /// @notice creates an incentiveVotingReward and a FeesVotingReward contract for a gauge\n    /// @param _forwarder Address of the forwarder -- unused\n    /// @param _rewards Addresses of pool tokens to be used as valid rewards tokens\n    /// @return feesVotingReward Address of FeesVotingReward contract created\n    /// @return incentiveVotingReward Address of IncentiveVotingReward contract created\n    function createRewards(address _forwarder, address[] memory _rewards)\n        external\n        returns (address feesVotingReward, address incentiveVotingReward);\n}\n"
+    },
+    "src/root/rewards/RootIncentiveVotingReward.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity >=0.8.19 <0.9.0;\n\nimport {IRootVotingRewardsFactory} from \"../../interfaces/root/rewards/IRootVotingRewardsFactory.sol\";\nimport {IRootIncentiveVotingReward} from \"../../interfaces/root/rewards/IRootIncentiveVotingReward.sol\";\nimport {IRootMessageBridge} from \"../../interfaces/root/bridge/IRootMessageBridge.sol\";\nimport {IRootGauge} from \"../../interfaces/root/gauges/IRootGauge.sol\";\nimport {IVotingEscrow} from \"../../interfaces/external/IVotingEscrow.sol\";\nimport {IVoter} from \"../../interfaces/external/IVoter.sol\";\n\nimport {Commands} from \"../../libraries/Commands.sol\";\n\n/// @title Velodrome Superchain Root Incentive Reward Contract\n/// @notice Reward contract that forwards claim messages to the corresponding Incentives contract on the leaf chain\ncontract RootIncentiveVotingReward is IRootIncentiveVotingReward {\n    /// @inheritdoc IRootIncentiveVotingReward\n    address public immutable factory;\n    /// @inheritdoc IRootIncentiveVotingReward\n    address public immutable bridge;\n    /// @inheritdoc IRootIncentiveVotingReward\n    address public immutable voter;\n    /// @inheritdoc IRootIncentiveVotingReward\n    address public immutable ve;\n    /// @inheritdoc IRootIncentiveVotingReward\n    address public gauge;\n    /// @inheritdoc IRootIncentiveVotingReward\n    uint256 public chainid;\n    /// @inheritdoc IRootIncentiveVotingReward\n    uint256 public constant MAX_REWARDS = 5;\n\n    constructor(address _bridge, address _voter, address[] memory _rewards) {\n        factory = msg.sender;\n        voter = _voter;\n        bridge = _bridge;\n        ve = IVoter(_voter).ve();\n    }\n\n    /// @inheritdoc IRootIncentiveVotingReward\n    function initialize(address _gauge) external {\n        if (gauge != address(0)) revert AlreadyInitialized();\n        gauge = _gauge;\n        chainid = IRootGauge(_gauge).chainid();\n    }\n\n    /// @inheritdoc IRootIncentiveVotingReward\n    function getReward(uint256 _tokenId, address[] memory _tokens) external override {\n        if (!IVotingEscrow(ve).isApprovedOrOwner(msg.sender, _tokenId) && msg.sender != voter) revert NotAuthorized();\n        if (_tokens.length > MAX_REWARDS) revert MaxTokensExceeded();\n\n        address recipient = IVotingEscrow(ve).ownerOf(_tokenId);\n        address cachedRecipient = IRootVotingRewardsFactory(factory).recipient({_owner: recipient, _chainid: chainid});\n\n        if (cachedRecipient == address(0)) {\n            if (recipient.code.length > 0) {\n                revert RecipientNotSet();\n            }\n        } else {\n            recipient = cachedRecipient;\n        }\n\n        bytes memory message =\n            abi.encodePacked(uint8(Commands.GET_INCENTIVES), gauge, recipient, _tokenId, uint8(_tokens.length), _tokens);\n\n        IRootMessageBridge(bridge).sendMessage({_chainid: chainid, _message: message});\n    }\n\n    /// @inheritdoc IRootIncentiveVotingReward\n    function _deposit(uint256, uint256) external {}\n\n    /// @inheritdoc IRootIncentiveVotingReward\n    function _withdraw(uint256, uint256) external {}\n}\n"
+    },
+    "src/root/rewards/RootFeesVotingReward.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity >=0.8.19 <0.9.0;\n\nimport {IRootVotingRewardsFactory} from \"../../interfaces/root/rewards/IRootVotingRewardsFactory.sol\";\nimport {IRootFeesVotingReward} from \"../../interfaces/root/rewards/IRootFeesVotingReward.sol\";\nimport {IRootMessageBridge} from \"../../interfaces/root/bridge/IRootMessageBridge.sol\";\nimport {IRootGauge} from \"../../interfaces/root/gauges/IRootGauge.sol\";\nimport {IVotingEscrow} from \"../../interfaces/external/IVotingEscrow.sol\";\nimport {IVoter} from \"../../interfaces/external/IVoter.sol\";\n\nimport {Commands} from \"../../libraries/Commands.sol\";\n\n/// @title Velodrome Superchain Root Fees Reward Contract\n/// @notice Reward contract that forwards messages to the corresponding contracts on the leaf chain\n/// @dev Deposit and Withdraw update voting weights on both the Fees & Incentives contracts on Leaf\ncontract RootFeesVotingReward is IRootFeesVotingReward {\n    /// @inheritdoc IRootFeesVotingReward\n    address public immutable factory;\n    /// @inheritdoc IRootFeesVotingReward\n    address public immutable bridge;\n    /// @inheritdoc IRootFeesVotingReward\n    address public immutable voter;\n    /// @inheritdoc IRootFeesVotingReward\n    address public immutable ve;\n    /// @inheritdoc IRootFeesVotingReward\n    address public immutable incentiveVotingReward;\n    /// @inheritdoc IRootFeesVotingReward\n    address public gauge;\n    /// @inheritdoc IRootFeesVotingReward\n    uint256 public chainid;\n    /// @inheritdoc IRootFeesVotingReward\n    uint256 public constant MAX_REWARDS = 5;\n\n    constructor(address _bridge, address _voter, address _incentiveVotingReward, address[] memory _rewards) {\n        factory = msg.sender;\n        voter = _voter;\n        bridge = _bridge;\n        ve = IVoter(_voter).ve();\n        incentiveVotingReward = _incentiveVotingReward;\n    }\n\n    /// @inheritdoc IRootFeesVotingReward\n    function initialize(address _gauge) external {\n        if (gauge != address(0)) revert AlreadyInitialized();\n        gauge = _gauge;\n        chainid = IRootGauge(_gauge).chainid();\n    }\n\n    /// @inheritdoc IRootFeesVotingReward\n    function _deposit(uint256 _amount, uint256 _tokenId) external {\n        if (msg.sender != voter) revert NotAuthorized();\n\n        _checkRecipient({_recipient: IVotingEscrow(ve).ownerOf(_tokenId)});\n\n        bytes memory message =\n            abi.encodePacked(uint8(Commands.DEPOSIT), gauge, _amount, _tokenId, uint40(block.timestamp));\n        IRootMessageBridge(bridge).sendMessage({_chainid: chainid, _message: message});\n    }\n\n    /// @inheritdoc IRootFeesVotingReward\n    function _withdraw(uint256 _amount, uint256 _tokenId) external {\n        if (msg.sender != voter) revert NotAuthorized();\n\n        bytes memory message =\n            abi.encodePacked(uint8(Commands.WITHDRAW), gauge, _amount, _tokenId, uint40(block.timestamp));\n        IRootMessageBridge(bridge).sendMessage({_chainid: chainid, _message: message});\n    }\n\n    /// @inheritdoc IRootFeesVotingReward\n    function getReward(uint256 _tokenId, address[] memory _tokens) external override {\n        if (!IVotingEscrow(ve).isApprovedOrOwner(msg.sender, _tokenId) && msg.sender != voter) revert NotAuthorized();\n        if (_tokens.length > MAX_REWARDS) revert MaxTokensExceeded();\n\n        address recipient = _checkRecipient({_recipient: IVotingEscrow(ve).ownerOf(_tokenId)});\n\n        bytes memory message =\n            abi.encodePacked(uint8(Commands.GET_FEES), gauge, recipient, _tokenId, uint8(_tokens.length), _tokens);\n\n        IRootMessageBridge(bridge).sendMessage({_chainid: chainid, _message: message});\n    }\n\n    function _checkRecipient(address _recipient) internal view returns (address recipient) {\n        address cachedRecipient = IRootVotingRewardsFactory(factory).recipient(_recipient, chainid);\n        if (cachedRecipient == address(0)) {\n            if (_recipient.code.length > 0) {\n                revert RecipientNotSet();\n            }\n            recipient = _recipient;\n        } else {\n            recipient = cachedRecipient;\n        }\n    }\n}\n"
+    },
+    "src/interfaces/root/rewards/IRootIncentiveVotingReward.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IRootIncentiveVotingReward {\n    error AlreadyInitialized();\n    error MaxTokensExceeded();\n    error NotAuthorized();\n    error RecipientNotSet();\n\n    /// @notice Address of root voting rewards factory that created this contract\n    function factory() external view returns (address);\n\n    /// @notice Address of bridge contract used to forward messages\n    function bridge() external view returns (address);\n\n    /// @notice Address of voter contract that sets voting power\n    function voter() external view returns (address);\n\n    /// @notice Address of voting escrow contract that manages locked tokens\n    function ve() external view returns (address);\n\n    /// @notice Address of gauge contract corresponding to this contract\n    /// @dev Settable once on deploy only\n    function gauge() external view returns (address);\n\n    /// @notice Chain id associated with the gauge / this contract\n    /// @dev Settable once on deploy only\n    function chainid() external view returns (uint256);\n\n    /// @notice Maximum number of tokens that can be claimed in `getReward()`\n    function MAX_REWARDS() external view returns (uint256);\n\n    /// @notice Initializes the contract with the gauge address and chain id\n    /// @dev Called during voter.createGauge() only\n    /// @dev Not protected as tx is atomic\n    function initialize(address _gauge) external;\n\n    /// @notice Deposits voting power to leaf contract corresponding to gauge\n    /// @dev Not implemented as deposits are handled by the Fees contract\n    /// @param _amount Amount of voting power to deposit\n    /// @param _tokenId token id to deposit voting power to\n    function _deposit(uint256 _amount, uint256 _tokenId) external;\n\n    /// @notice Withdraws voting power from leaf contract corresponding to gauge\n    /// @dev Not implemented as withdraws are handled by the Fees contract\n    /// @param _amount Amount of voting power to withdraw\n    /// @param _tokenId token id to withdraw voting power from\n    function _withdraw(uint256 _amount, uint256 _tokenId) external;\n\n    /// @notice Claims rewards from leaf incentive reward contract corresponding to gauge\n    /// @param _tokenId  token id to claim rewards from\n    /// @param _tokens   Array of tokens to claim rewards of\n    function getReward(uint256 _tokenId, address[] memory _tokens) external;\n}\n"
+    },
+    "src/interfaces/root/bridge/IRootMessageBridge.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IRootMessageBridge {\n    error InvalidCommand();\n    error NotAuthorized(uint256 command);\n    error NotValidGauge();\n    error NotWETH();\n\n    /// @notice Returns the address of the xERC20 token that is bridged by this contract\n    function xerc20() external view returns (address);\n\n    /// @notice Returns the address of the voter contract\n    /// @dev Used to verify the sender of a message\n    function voter() external view returns (address);\n\n    /// @notice Returns the address of the factory registry contract\n    function factoryRegistry() external view returns (address);\n\n    /// @notice Returns the address of the WETH contract\n    function weth() external view returns (address);\n\n    /// @notice Sends a message to the msg.sender via the module contract\n    /// @param _message The message\n    /// @param _chainid The chain id of chain the recipient contract is on\n    function sendMessage(uint256 _chainid, bytes calldata _message) external;\n}\n"
+    },
+    "src/interfaces/root/gauges/IRootGauge.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IRootGauge {\n    error NotVoter();\n    error ZeroAmount();\n    error ZeroRewardRate();\n    error NotAuthorized();\n\n    event NotifyReward(address indexed _sender, uint256 _amount);\n\n    /// @notice Root gauge factory that created this gauge\n    function gaugeFactory() external view returns (address);\n\n    /// @notice Reward token supported by this gauge\n    function rewardToken() external view returns (address);\n\n    /// @notice XERC20 token corresponding to reward token\n    function xerc20() external view returns (address);\n\n    /// @notice Address of voter contract that sets voting power\n    function voter() external view returns (address);\n\n    /// @notice Lockbox to wrap and unwrap reward token to and from XERC20\n    function lockbox() external view returns (address);\n\n    /// @notice Bridge contract used to communicate x-chain\n    function bridge() external view returns (address);\n\n    /// @notice Minter contract used to mint emissions\n    function minter() external view returns (address);\n\n    /// @notice Chain id associated with this pool / gauge\n    function chainid() external view returns (uint256);\n\n    /// @notice Helper used by Voter\n    function left() external view returns (uint256);\n\n    /// @notice Used by voter to deposit rewards to the gauge\n    /// @param _amount Amount of rewards to be deposited into gauge\n    function notifyRewardAmount(uint256 _amount) external;\n\n    /// @notice Used by notify admin to deposit rewards to the gauge without distributing fees\n    /// @param _amount Amount of rewards to be deposited into gauge\n    function notifyRewardWithoutClaim(uint256 _amount) external;\n}\n"
+    },
+    "src/interfaces/external/IVotingEscrow.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport {IERC721} from \"@openzeppelin5/contracts/token/ERC721/IERC721.sol\";\n\ninterface IVotingEscrow is IERC721 {\n    /// @notice Check whether spender is owner or an approved user for a given veNFT\n    /// @param _spender .\n    /// @param _tokenId .\n    function isApprovedOrOwner(address _spender, uint256 _tokenId) external returns (bool);\n\n    /// @notice Deposit `_value` tokens for `msg.sender` and lock for `_lockDuration`\n    /// @param _value Amount to deposit\n    /// @param _lockDuration Number of seconds to lock tokens for (rounded down to nearest week)\n    /// @return TokenId of created veNFT\n    function createLock(uint256 _value, uint256 _lockDuration) external returns (uint256);\n\n    /// @notice Get the voting power for _tokenId at the current timestamp\n    /// @dev Returns 0 if called in the same block as a transfer.\n    /// @param _tokenId .\n    /// @return Voting power\n    function balanceOfNFT(uint256 _tokenId) external view returns (uint256);\n\n    /// @notice Set Managed NFT state. Inactive NFTs cannot be deposited into.\n    /// @param _mTokenId managed nft state to set\n    /// @param _state true => inactive, false => active\n    function setManagedState(uint256 _mTokenId, bool _state) external;\n\n    function deactivated(uint256 _mTokenId) external view returns (bool);\n}\n"
+    },
+    "src/interfaces/external/IVoter.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport {IFactoryRegistry} from \"src/interfaces/external/IFactoryRegistry.sol\";\n\ninterface IVoter {\n    error AlreadyVotedOrDeposited();\n    error DistributeWindow();\n    error GaugeAlreadyKilled();\n    error GaugeAlreadyRevived();\n    error NotEmergencyCouncil();\n    error ZeroAddress();\n\n    event GaugeKilled(address indexed gauge);\n    event GaugeRevived(address indexed gauge);\n\n    /// @dev Gauge => Amount claimable\n    function claimable(address gauge) external view returns (uint256);\n\n    /// @notice Address of Minter.sol\n    function minter() external view returns (address);\n\n    /// @notice Set new emergency council.\n    /// @dev Throws if not called by emergency council.\n    /// @param _emergencyCouncil .\n    function setEmergencyCouncil(address _emergencyCouncil) external;\n\n    function vote(uint256 _tokenId, address[] calldata _poolVote, uint256[] calldata _weights) external;\n\n    function gauges(address _pool) external view returns (address);\n\n    function isGauge(address _gauge) external view returns (bool);\n\n    function gaugeToFees(address _gauge) external view returns (address);\n\n    function gaugeToBribe(address _gauge) external view returns (address);\n\n    /// @dev Nft => Timestamp of last vote (ensures single vote per epoch)\n    function lastVoted(uint256 tokenId) external view returns (uint256);\n\n    function createGauge(address _poolFactory, address _pool) external returns (address);\n\n    function factoryRegistry() external view returns (address);\n\n    /// @dev Utility to distribute to gauges of pools in array.\n    /// @param _gauges Array of gauges to distribute to.\n    function distribute(address[] memory _gauges) external;\n\n    function isAlive(address _gauge) external view returns (bool);\n\n    function killGauge(address _gauge) external;\n\n    /// @notice Revives a killed gauge. Gauge will can receive emissions and deposits again.\n    /// @dev Throws if not called by emergency council.\n    ///      Throws if gauge is not killed.\n    /// @param _gauge .\n    function reviveGauge(address _gauge) external;\n\n    function isWhitelistedToken(address _token) external view returns (bool);\n\n    function emergencyCouncil() external view returns (address);\n\n    function ve() external view returns (address);\n\n    /// @notice Claim emissions from gauges.\n    /// @param _gauges Array of gauges to collect emissions from.\n    // function claimRewards(address[] memory _gauges) external;\n\n    /// @notice Claim fees for a given NFT.\n    /// @dev Utility to help batch fee claims.\n    /// @param _fees    Array of FeesVotingReward contracts to collect from.\n    /// @param _tokens  Array of tokens that are used as fees.\n    /// @param _tokenId Id of veNFT that you wish to claim fees for.\n    function claimFees(address[] memory _fees, address[][] memory _tokens, uint256 _tokenId) external;\n\n    /// @notice Called by users to update voting balances in voting rewards contracts.\n    /// @param _tokenId Id of veNFT whose balance you wish to update.\n    function poke(uint256 _tokenId) external;\n\n    /// @notice Called by users to reset voting state. Required if you wish to make changes to\n    ///         veNFT state (e.g. merge, split, deposit into managed etc).\n    ///         Cannot reset in the same epoch that you voted in.\n    ///         Can vote or deposit into a managed NFT again after reset.\n    /// @param _tokenId Id of veNFT you are reseting.\n    function reset(uint256 _tokenId) external;\n\n    /// @notice Standard OZ IGovernor using ve for vote weights.\n    function governor() external view returns (address);\n\n    /// @notice Whitelist (or unwhitelist) token for use in incentives.\n    /// @dev Throws if not called by governor.\n    /// @param _token .\n    /// @param _bool .\n    function whitelistToken(address _token, bool _bool) external;\n}\n"
+    },
+    "src/libraries/Commands.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity >=0.8.19 <0.9.0;\n\n/// @notice Commands for x-chain interactions\n/// @dev Existing commands cannot be modified but new commands can be added\nlibrary Commands {\n    uint256 public constant NOTIFY = 0x00;\n    uint256 public constant NOTIFY_WITHOUT_CLAIM = 0x01;\n    uint256 public constant GET_INCENTIVES = 0x02;\n    uint256 public constant GET_FEES = 0x03;\n    uint256 public constant DEPOSIT = 0x04;\n    uint256 public constant WITHDRAW = 0x05;\n    uint256 public constant CREATE_GAUGE = 0x06;\n    uint256 public constant KILL_GAUGE = 0x07;\n    uint256 public constant REVIVE_GAUGE = 0x08;\n\n    uint256 private constant COMMAND_OFFSET = 0;\n    uint256 private constant ADDRESS_OFFSET = 1;\n    /// @dev Second and Third offset are used in messages with multiple consecutive addresses\n    uint256 private constant SECOND_OFFSET = ADDRESS_OFFSET + 20;\n    uint256 private constant THIRD_OFFSET = SECOND_OFFSET + 20;\n    // Offsets for Create Gauge Command\n    uint256 private constant TOKEN0_OFFSET = THIRD_OFFSET + 20;\n    uint256 private constant TOKEN1_OFFSET = TOKEN0_OFFSET + 20;\n    uint256 private constant POOL_PARAM_OFFSET = TOKEN1_OFFSET + 20;\n    // Offsets for Reward Claims\n    uint256 private constant LENGTH_OFFSET = THIRD_OFFSET + 32;\n    uint256 private constant TOKENS_OFFSET = LENGTH_OFFSET + 1;\n    // Offset for Deposit/Withdraw\n    uint256 private constant TOKEN_ID_OFFSET = ADDRESS_OFFSET + 20 + 32;\n    uint256 private constant TIMESTAMP_OFFSET = TOKEN_ID_OFFSET + 32;\n    // Offset for Send Token amount\n    uint256 private constant AMOUNT_OFFSET = COMMAND_OFFSET + 20;\n\n    /// @notice Returns the command encoded in the message\n    /// @dev Assumes message is encoded as (command, ...)\n    /// @param _message The message to be decoded\n    function command(bytes calldata _message) internal pure returns (uint256) {\n        return uint256(uint8(bytes1(_message[COMMAND_OFFSET:COMMAND_OFFSET + 1])));\n    }\n\n    /// @notice Returns the address encoded in the message\n    /// @dev Assumes message is encoded as (command, address, ...)\n    /// @param _message The message to be decoded\n    function toAddress(bytes calldata _message) internal pure returns (address) {\n        return address(bytes20(_message[ADDRESS_OFFSET:ADDRESS_OFFSET + 20]));\n    }\n\n    /// @notice Returns the message without the encoded command\n    /// @dev Assumes message is encoded as (command, message)\n    /// @param _message The message to be decoded\n    function messageWithoutCommand(bytes calldata _message) internal pure returns (bytes calldata) {\n        return bytes(_message[COMMAND_OFFSET + 1:]);\n    }\n\n    /// @notice Returns the amount encoded in the message\n    /// @dev Assumes message is encoded as (command, amount, ...)\n    /// @param _message The message to be decoded\n    function amount(bytes calldata _message) internal pure returns (uint256) {\n        return uint256(bytes32(_message[SECOND_OFFSET:SECOND_OFFSET + 32]));\n    }\n\n    /// @notice Returns the amount, tokenId and timestamp encoded in the message\n    /// @dev Assumes message is encoded as (command, amount, tokenId, timestamp, ...)\n    /// @param _message The message to be decoded\n    function voteParams(bytes calldata _message) internal pure returns (uint256, uint256, uint256) {\n        return (\n            uint256(bytes32(_message[SECOND_OFFSET:SECOND_OFFSET + 32])),\n            uint256(bytes32(_message[TOKEN_ID_OFFSET:TIMESTAMP_OFFSET])),\n            uint256(uint40(bytes5(_message[TIMESTAMP_OFFSET:TIMESTAMP_OFFSET + 5])))\n        );\n    }\n\n    /// @notice Returns the recipient and amount encoded in the message\n    /// @dev Assumes no command is encoded and message is encoded as (address, amount)\n    /// @param _message The message to be decoded\n    function recipientAndAmount(bytes calldata _message) internal pure returns (address, uint256) {\n        return (\n            address(bytes20(_message[COMMAND_OFFSET:COMMAND_OFFSET + 20])),\n            uint256(bytes32(_message[AMOUNT_OFFSET:AMOUNT_OFFSET + 32]))\n        );\n    }\n\n    /// @notice Returns the parameters necessary for gauge creation, encoded in the message\n    /// @dev Assumes message is encoded as (command, address, address, address, address, uint24)\n    /// @param _message The message to be decoded\n    function createGaugeParams(bytes calldata _message)\n        internal\n        pure\n        returns (address, address, address, address, address, uint24)\n    {\n        return (\n            address(bytes20(_message[ADDRESS_OFFSET:ADDRESS_OFFSET + 20])),\n            address(bytes20(_message[SECOND_OFFSET:SECOND_OFFSET + 20])),\n            address(bytes20(_message[THIRD_OFFSET:THIRD_OFFSET + 20])),\n            address(bytes20(_message[TOKEN0_OFFSET:TOKEN0_OFFSET + 20])),\n            address(bytes20(_message[TOKEN1_OFFSET:TOKEN1_OFFSET + 20])),\n            uint24(bytes3(_message[POOL_PARAM_OFFSET:POOL_PARAM_OFFSET + 3]))\n        );\n    }\n\n    /// @notice Returns the owner encoded in the message\n    /// @dev Assumes message is encoded as (command, address, owner, ...)\n    /// @param _message The message to be decoded\n    function owner(bytes calldata _message) internal pure returns (address) {\n        return address(bytes20(_message[SECOND_OFFSET:SECOND_OFFSET + 20]));\n    }\n\n    /// @notice Returns the tokenId encoded in a reward claiming message\n    /// @dev Assumes message is encoded as (command, address, tokenId, ...)\n    /// @param _message The message to be decoded\n    function tokenId(bytes calldata _message) internal pure returns (uint256) {\n        return uint256(bytes32(_message[THIRD_OFFSET:THIRD_OFFSET + 32]));\n    }\n\n    /// @notice Returns the token addresses encoded in the message\n    /// @dev Assumes message has length and token addresses encoded\n    /// @param _message The message to be decoded\n    function tokens(bytes calldata _message) internal pure returns (address[] memory _tokens) {\n        uint256 length = uint8(bytes1(_message[LENGTH_OFFSET:LENGTH_OFFSET + 1]));\n\n        _tokens = new address[](length);\n        for (uint256 i = 0; i < length; i++) {\n            _tokens[i] =\n                address(uint160(uint256(bytes32(_message[TOKENS_OFFSET + (i * 32):TOKENS_OFFSET + ((i + 1) * 32)]))));\n        }\n    }\n}\n"
+    },
+    "src/interfaces/root/rewards/IRootFeesVotingReward.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IRootFeesVotingReward {\n    error AlreadyInitialized();\n    error MaxTokensExceeded();\n    error RecipientNotSet();\n    error NotAuthorized();\n    error InvalidGauge();\n\n    /// @notice Address of root voting rewards factory that created this contract\n    function factory() external view returns (address);\n\n    /// @notice Address of bridge contract used to forward messages\n    function bridge() external view returns (address);\n\n    /// @notice Address of voter contract that sets voting power\n    function voter() external view returns (address);\n\n    /// @notice Address of voting escrow contract that manages locked tokens\n    function ve() external view returns (address);\n\n    /// @notice Address of incentive voting reward contract associated with the gauge\n    function incentiveVotingReward() external view returns (address);\n\n    /// @notice Address of gauge contract corresponding to this contract\n    /// @dev Settable once on deploy only\n    function gauge() external view returns (address);\n\n    /// @notice Chain id associated with the gauge / this contract\n    /// @dev Settable once on deploy only\n    function chainid() external view returns (uint256);\n\n    /// @notice Maximum number of tokens that can be claimed in `getReward()`\n    function MAX_REWARDS() external view returns (uint256);\n\n    /// @notice Initializes the contract with the gauge address and chain id\n    /// @dev Called during voter.createGauge() only\n    /// @dev Not protected as tx is atomic\n    function initialize(address _gauge) external;\n\n    /// @notice Deposits voting power to leaf fees & incentive reward contracts corresponding to gauge\n    /// @param _amount Amount of voting power to deposit\n    /// @param _tokenId token id to deposit voting power to\n    function _deposit(uint256 _amount, uint256 _tokenId) external;\n\n    /// @notice Withdraws voting power from leaf fees & incentive reward contracts corresponding to gauge\n    /// @param _amount Amount of voting power to withdraw\n    /// @param _tokenId token id to withdraw voting power from\n    function _withdraw(uint256 _amount, uint256 _tokenId) external;\n\n    /// @notice Claims rewards from leaf fees reward contract corresponding to gauge\n    /// @param _tokenId  token id to claim rewards from\n    /// @param _tokens   Array of tokens to claim rewards of\n    function getReward(uint256 _tokenId, address[] memory _tokens) external;\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC721/IERC721.sol)\n\npragma solidity ^0.8.20;\n\nimport {IERC165} from \"../../utils/introspection/IERC165.sol\";\n\n/**\n * @dev Required interface of an ERC721 compliant contract.\n */\ninterface IERC721 is IERC165 {\n    /**\n     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);\n\n    /**\n     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.\n     */\n    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);\n\n    /**\n     * @dev Emitted when `owner` enables or disables (`approved`) `operator` to manage all of its assets.\n     */\n    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);\n\n    /**\n     * @dev Returns the number of tokens in ``owner``'s account.\n     */\n    function balanceOf(address owner) external view returns (uint256 balance);\n\n    /**\n     * @dev Returns the owner of the `tokenId` token.\n     *\n     * Requirements:\n     *\n     * - `tokenId` must exist.\n     */\n    function ownerOf(uint256 tokenId) external view returns (address owner);\n\n    /**\n     * @dev Safely transfers `tokenId` token from `from` to `to`.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must exist and be owned by `from`.\n     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.\n     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon\n     *   a safe transfer.\n     *\n     * Emits a {Transfer} event.\n     */\n    function safeTransferFrom(address from, address to, uint256 tokenId, bytes calldata data) external;\n\n    /**\n     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients\n     * are aware of the ERC721 protocol to prevent tokens from being forever locked.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must exist and be owned by `from`.\n     * - If the caller is not `from`, it must have been allowed to move this token by either {approve} or\n     *   {setApprovalForAll}.\n     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon\n     *   a safe transfer.\n     *\n     * Emits a {Transfer} event.\n     */\n    function safeTransferFrom(address from, address to, uint256 tokenId) external;\n\n    /**\n     * @dev Transfers `tokenId` token from `from` to `to`.\n     *\n     * WARNING: Note that the caller is responsible to confirm that the recipient is capable of receiving ERC721\n     * or else they may be permanently lost. Usage of {safeTransferFrom} prevents loss, though the caller must\n     * understand this adds an external call which potentially creates a reentrancy vulnerability.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must be owned by `from`.\n     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(address from, address to, uint256 tokenId) external;\n\n    /**\n     * @dev Gives permission to `to` to transfer `tokenId` token to another account.\n     * The approval is cleared when the token is transferred.\n     *\n     * Only a single account can be approved at a time, so approving the zero address clears previous approvals.\n     *\n     * Requirements:\n     *\n     * - The caller must own the token or be an approved operator.\n     * - `tokenId` must exist.\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address to, uint256 tokenId) external;\n\n    /**\n     * @dev Approve or remove `operator` as an operator for the caller.\n     * Operators can call {transferFrom} or {safeTransferFrom} for any token owned by the caller.\n     *\n     * Requirements:\n     *\n     * - The `operator` cannot be the address zero.\n     *\n     * Emits an {ApprovalForAll} event.\n     */\n    function setApprovalForAll(address operator, bool approved) external;\n\n    /**\n     * @dev Returns the account approved for `tokenId` token.\n     *\n     * Requirements:\n     *\n     * - `tokenId` must exist.\n     */\n    function getApproved(uint256 tokenId) external view returns (address operator);\n\n    /**\n     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.\n     *\n     * See {setApprovalForAll}\n     */\n    function isApprovedForAll(address owner, address operator) external view returns (bool);\n}\n"
+    },
+    "src/interfaces/external/IFactoryRegistry.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IFactoryRegistry {\n    error FallbackFactory();\n    error InvalidFactoriesToPoolFactory();\n    error PathAlreadyApproved();\n    error PathNotApproved();\n    error SameAddress();\n    error ZeroAddress();\n\n    event Approve(address indexed poolFactory, address indexed votingRewardsFactory, address indexed gaugeFactory);\n    event Unapprove(address indexed poolFactory, address indexed votingRewardsFactory, address indexed gaugeFactory);\n    event SetManagedRewardsFactory(address indexed _newRewardsFactory);\n\n    /// @notice Approve a set of factories used in Velodrome Protocol.\n    ///         Router.sol is able to swap any poolFactories currently approved.\n    ///         Cannot approve address(0) factories.\n    ///         Cannot approve path that is already approved.\n    ///         Each poolFactory has one unique set and maintains state.  In the case a poolFactory is unapproved\n    ///             and then re-approved, the same set of factories must be used.  In other words, you cannot overwrite\n    ///             the factories tied to a poolFactory address.\n    ///         VotingRewardsFactories and GaugeFactories may use the same address across multiple poolFactories.\n    /// @dev Callable by onlyOwner\n    /// @param poolFactory .\n    /// @param votingRewardsFactory .\n    /// @param gaugeFactory .\n    function approve(address poolFactory, address votingRewardsFactory, address gaugeFactory) external;\n\n    /// @notice Get the factories correlated to a poolFactory.\n    ///         Once set, this can never be modified.\n    ///         Returns the correlated factories even after an approved poolFactory is unapproved.\n    function factoriesToPoolFactory(address poolFactory)\n        external\n        view\n        returns (address votingRewardsFactory, address gaugeFactory);\n\n    /// @notice Check if a PoolFactory is approved within the factory registry.  Router uses this method to\n    ///         ensure a pool swapped from is approved.\n    /// @param poolFactory .\n    /// @return True if PoolFactory is approved, else false\n    function isPoolFactoryApproved(address poolFactory) external view returns (bool);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n    /**\n     * @dev Returns true if this contract implements the interface defined by\n     * `interfaceId`. See the corresponding\n     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n     * to learn more about how these ids are created.\n     *\n     * This function call must use less than 30 000 gas.\n     */\n    function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.27+commit.40a35a09"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_bridge",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "_chainid",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_recipient",
+              "type": "address"
+            }
+          ],
+          "name": "RecipientSet",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "bridge",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address[]",
+              "name": "_rewards",
+              "type": "address[]"
+            }
+          ],
+          "name": "createRewards",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "feesVotingReward",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "incentiveVotingReward",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "recipient",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_chainid",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "_recipient",
+              "type": "address"
+            }
+          ],
+          "name": "setRecipient",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "createRewards(address,address[])": {
+            "params": {
+              "_forwarder": "Address of the forwarder -- unused",
+              "_rewards": "Addresses of pool tokens to be used as valid rewards tokens"
+            },
+            "returns": {
+              "feesVotingReward": "Address of FeesVotingReward contract created",
+              "incentiveVotingReward": "Address of IncentiveVotingReward contract created"
+            }
+          },
+          "setRecipient(uint256,address)": {
+            "params": {
+              "_chainid": "Chain id",
+              "_recipient": "Address of the recipient"
+            }
+          }
+        },
+        "stateVariables": {
+          "bridge": {
+            "return": "Address of the bridge contract",
+            "returns": {
+              "_0": "Address of the bridge contract"
+            }
+          },
+          "recipient": {
+            "params": {
+              "_chainid": "Chain id",
+              "_owner": "Address of the owner"
+            },
+            "return": "Address of the recipient",
+            "returns": {
+              "_0": "Address of the recipient"
+            }
+          }
+        },
+        "title": "Velodrome Superchain Root Voting Rewards Factory",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "bridge()": {
+            "notice": "Address of bridge contract used to forward rewards messages"
+          },
+          "createRewards(address,address[])": {
+            "notice": "creates an incentiveVotingReward and a FeesVotingReward contract for a gauge"
+          },
+          "recipient(address,uint256)": {
+            "notice": "Returns the recipient of the rewards for a given user and chain"
+          },
+          "setRecipient(uint256,address)": {
+            "notice": "Sets the recipient of the rewards for a given user and chain"
+          }
+        },
+        "notice": "Creates root voting rewards contracts that forward messages to the corresponding reward contracts on the leaf chain",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/root/rewards/RootVotingRewardsFactory.sol": "RootVotingRewardsFactory"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@hyperlane/=node_modules/@hyperlane-xyz/",
+        ":@nomad-xyz/=lib/ExcessivelySafeCall/",
+        ":@openzeppelin/contracts-upgradeable/=node_modules/@openzeppelin/contracts-upgradeable/",
+        ":@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+        ":@openzeppelin5/contracts/=lib/openzeppelin-contracts/contracts/",
+        ":ExcessivelySafeCall/=lib/ExcessivelySafeCall/src/",
+        ":createX/=lib/createX/src/",
+        ":ds-test/=lib/openzeppelin-contracts/lib/forge-std/lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-gas-snapshot/=lib/forge-gas-snapshot/src/",
+        ":forge-std/src/=lib/forge-std/src/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/createX/lib/openzeppelin-contracts/contracts/",
+        ":solady/=lib/createX/lib/solady/"
+      ]
+    },
+    "sources": {
+      "lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol": {
+        "keccak256": "0x5ef46daa3b58ef2702279d514780316efaa952915ee1aa3396f041ee2982b0b4",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2f8f2a76e23b02fc69e8cd24c3cb47da6c7af3a2d6c3a382f8ac25c6e094ade7",
+          "dweb:/ipfs/QmPV4ZS4tPVv4mTCf9ejyZ1ai57EEibDRj7mN2ARDCLV5n"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol": {
+        "keccak256": "0x4296879f55019b23e135000eb36896057e7101fb7fb859c5ef690cf14643757b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://87b3541437c8c443ccd36795e56a338ed12855eec17f8da624511b8d1a7e14df",
+          "dweb:/ipfs/QmeJQCtZrQjtJLr6u7ZHWeH3pBnjtLWzvRrKViAi7UZqxL"
+        ]
+      },
+      "src/interfaces/external/IFactoryRegistry.sol": {
+        "keccak256": "0xdb44b3cc18113207ab7959898a36e9e505162850655029b0110c8f4777a0eec5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4d276dc44e779152e3a9550e988c7036aeb72739c2fc945165373fad62ac7c1f",
+          "dweb:/ipfs/QmdGXdKVqC7HrXfYtyMJ5ZHKG6wULAFwDS9yW8x6pTzB2j"
+        ]
+      },
+      "src/interfaces/external/IVoter.sol": {
+        "keccak256": "0x6900cbbde4378a40613648157298f6cdf765aefb72df388ee14a0413cb1f6f36",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://566cc71b16eb961e64d46afa2c032545e7c5069b080e55b9d44eb2a37d0904dc",
+          "dweb:/ipfs/QmX91otgmBwscou6AqcTcuKwyD665MPPeTS6Sr9581dKVh"
+        ]
+      },
+      "src/interfaces/external/IVotingEscrow.sol": {
+        "keccak256": "0xfc912e553d01378191726bfb44cfd946542d14afc5d4b8c3c7abc6f8cd7452b4",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e30e961919e9285b5a85d9a71cc40c000211b155710176bd6e1ec9abbc4c7e69",
+          "dweb:/ipfs/QmbCkhCAZ8g1ZbN1GUcKScoNxUupDfNXaDcsRAwLFa8tdG"
+        ]
+      },
+      "src/interfaces/root/bridge/IRootMessageBridge.sol": {
+        "keccak256": "0xefd91611e2506352fcd10fc8159c88f2f90354247e714500f58597d64efb2784",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4d44e52f695de9a5d16768b070199cb5ebef37757b1666e57c9ea4f82f83c312",
+          "dweb:/ipfs/QmQ1wZ1QpapbjbWA7qqGt7ckJBGCHpQ9avxNYSG3xiHRnJ"
+        ]
+      },
+      "src/interfaces/root/gauges/IRootGauge.sol": {
+        "keccak256": "0xed33e6340bba011402162ee281a6fc750c29c66e92d50d34d00cdcaf593dc693",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://36ccd916cea787825fcb120dc5f5c45c0dba0333df2ed0a0444ae6c2d2d38ba5",
+          "dweb:/ipfs/QmeV89gcvi35dAR8Z6FpPZoCU62QPjuB2E1WUaJ2s6s8cY"
+        ]
+      },
+      "src/interfaces/root/rewards/IRootFeesVotingReward.sol": {
+        "keccak256": "0x6529f87508c0f62a59a11a14b3fe9b40272f1cb4d148e2b46737c0061d926cd2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://56d0d17633366a6a331ac88b452ab2be7cbaade82ffc6fa2182c77a3424d158b",
+          "dweb:/ipfs/QmQ1xoCCF59KaxT3sWjiAF16syBgZ1jmBSNBtFLtV5Edde"
+        ]
+      },
+      "src/interfaces/root/rewards/IRootIncentiveVotingReward.sol": {
+        "keccak256": "0xb6dc4c3f8b89bbd54d8b5172005dcf9d583e5d91554ced89a2eafa55ddd06f35",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://a1748b33420cd4cf34e79c4d7320fb062e80747de375e0aabc77a83d9cdecdd2",
+          "dweb:/ipfs/QmatotxX5Ser1xiL9aS37hQGGQ9C6sXYjKe2A8y2L9tq42"
+        ]
+      },
+      "src/interfaces/root/rewards/IRootVotingRewardsFactory.sol": {
+        "keccak256": "0x20648974ea542e78a4534d9e9cd1c948c0e7fe30a4a26fa798daecdfde78478b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://261adefdb731395645703bfa9a6e358e5765de41d7db5f2c80aeb0014d1ff621",
+          "dweb:/ipfs/QmaRd8gcrfKiPcz3NGQXoq8LMmxuhbNZ5XCTiG5ybbK5FB"
+        ]
+      },
+      "src/libraries/Commands.sol": {
+        "keccak256": "0x20aec3ac6c71feab2e214f976dcfbeb0c6a6d475c42338f307d751558a3e3831",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://b607cdd7f1a2d2b4793751db17f309343a32e218426b7a1d3f0734218b4e50a2",
+          "dweb:/ipfs/QmY4ivH7fDusip1RTbHZEA9NTLD8L6MBSC3PaMrRmmhshV"
+        ]
+      },
+      "src/root/rewards/RootFeesVotingReward.sol": {
+        "keccak256": "0x58680b47cd90eca844a710d17dbb031fbf74d34ec9d12177d3a6e771df60a230",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://5957d55284dd943833e298e3b3cbd7b0ef3dcec06e96d7efb9bccef2df051945",
+          "dweb:/ipfs/QmdnevB3TYcBbBLdKfQTUHMWNwegEUh5pzaL4nKzKQeeuK"
+        ]
+      },
+      "src/root/rewards/RootIncentiveVotingReward.sol": {
+        "keccak256": "0x7e50edf51b716a531d6de7d82b86b26444bf0de1d387287206b595275bb12050",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://646ced14f922b20d27a4a3cd63d8936a55d79139a1f66657741440cf50021aa4",
+          "dweb:/ipfs/QmXzgMe85dduMFe4wsszZ5pFRfirtB6TzE2ZqJiETi9Wed"
+        ]
+      },
+      "src/root/rewards/RootVotingRewardsFactory.sol": {
+        "keccak256": "0xef3bf7f98d5caf9664642914db1821e911f1f61fbce432e4f5419c31b786a548",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://ab2102ceb05f29b7aab5da720e405bd417559f68593125e35d14c84eab245ec6",
+          "dweb:/ipfs/QmQjYX5zfEfSuZG3wE9tqn5vXgyFmsSnFZtzQmGsWw6ERU"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.27+commit.40a35a09",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        ":@hyperlane/=node_modules/@hyperlane-xyz/",
+        ":@nomad-xyz/=lib/ExcessivelySafeCall/",
+        ":@openzeppelin/contracts-upgradeable/=node_modules/@openzeppelin/contracts-upgradeable/",
+        ":@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+        ":@openzeppelin5/contracts/=lib/openzeppelin-contracts/contracts/",
+        ":ExcessivelySafeCall/=lib/ExcessivelySafeCall/src/",
+        ":createX/=lib/createX/src/",
+        ":ds-test/=lib/openzeppelin-contracts/lib/forge-std/lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-gas-snapshot/=lib/forge-gas-snapshot/src/",
+        ":forge-std/src/=lib/forge-std/src/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/createX/lib/openzeppelin-contracts/contracts/",
+        ":solady/=lib/createX/lib/solady/"
+      ]
+    },
+    "name": "RootVotingRewardsFactory",
+    "fullyQualifiedName": "src/root/rewards/RootVotingRewardsFactory.sol:RootVotingRewardsFactory"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "5793974",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-12-15T20:54:16Z",
+  "match": "exact_match",
+  "chainId": "10",
+  "address": "0x7dc9fd82f91B36F416A89f5478375e4a79f4Fb2F"
+}
