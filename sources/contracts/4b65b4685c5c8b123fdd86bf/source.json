@@ -1,0 +1,1310 @@
+{
+  "file_path": "src/child/ChildERC20Bridge.sol",
+  "creation_status": "success",
+  "source_code": "// Copyright Immutable Pty Ltd 2018 - 2023\n// SPDX-License-Identifier: Apache 2.0\npragma solidity 0.8.19;\n\nimport {Clones} from \"@openzeppelin/contracts/proxy/Clones.sol\";\nimport {Address} from \"@openzeppelin/contracts/utils/Address.sol\";\nimport {\n    IChildERC20BridgeEvents,\n    IChildERC20BridgeErrors,\n    IChildERC20Bridge\n} from \"../interfaces/child/IChildERC20Bridge.sol\";\nimport {IChildBridgeAdaptor} from \"../interfaces/child/IChildBridgeAdaptor.sol\";\nimport {IChildERC20} from \"../interfaces/child/IChildERC20.sol\";\nimport {ReentrancyGuardUpgradeable} from \"@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol\";\nimport {IWIMX} from \"../interfaces/child/IWIMX.sol\";\nimport {BridgeRoles} from \"../common/BridgeRoles.sol\";\n\n/**\n * @title Child ERC20 Bridge\n * @notice ChildERC20Bridge is a bridge contract for the child chain, which enables bridging of standard ERC20 tokens, ETH, wETH, IMX and wIMX from the root chain to the child chain and back.\n * @dev Features:\n *      - Map: A token that is originally created on the root chain, can be mapped to the child chain, where a representation of the token is created and managed by the bridge.\n *      - Deposit: Standard ERC20 tokens, native ETH, wrapped ETH or IMX that can be deposited on the root chain, and wrapped version of the tokens are issued on the child chain.\n *      - Withdraw: Bridged wrapped tokens can be withdrawn, so that they can be redeemed for their original tokens on the root chain.\n *      - Manage Role Based Access Control\n *\n * @dev Design:\n *      This contract follows a pattern of using a bridge adaptor to communicate with the child chain. This is because the underlying communication protocol may change,\n *      and also allows us to decouple vendor-specific messaging logic from the bridge logic.\n *      Because of this pattern, any checks or logic that is agnostic to the messaging protocol should be done in this contract.\n *      Any checks or logic that is specific to the underlying messaging protocol should be done in the bridge adaptor.\n *\n * @dev Roles:\n *      - An account with a PAUSER_ROLE can pause the contract.\n *      - An account with an UNPAUSER_ROLE can unpause the contract.\n *      - An account with an ADAPTOR_MANAGER_ROLE can update the root bridge adaptor address.\n *      - An account with a DEFAULT_ADMIN_ROLE can grant and revoke roles.\n *\n * @dev Caution:\n *      - When withdrawing ETH (L2 -> L1), it's crucial to make sure that the receiving address on the root chain,\n *        if it's a contract, has a receive or fallback function that allows it to accept native ETH on the root chain.\n *        If this isn't the case, the transaction on the root chain could revert, potentially locking the user's funds indefinitely.\n *      - There is undefined behaviour for bridging non-standard ERC20 tokens (e.g. rebasing tokens). Please approach such cases with great care.\n *      - The initialize function is susceptible to front running, so precautions should be taken to account for this scenario.\n *\n * @dev Note:\n *      - This is an upgradeable contract that should be operated behind OpenZeppelin's TransparentUpgradeableProxy.\n */\ncontract ChildERC20Bridge is\n    BridgeRoles,\n    ReentrancyGuardUpgradeable,\n    IChildERC20BridgeErrors,\n    IChildERC20Bridge,\n    IChildERC20BridgeEvents\n{\n    /// @dev leave this as the first param for the integration tests.\n    mapping(address => address) public rootTokenToChildToken;\n\n    /// @dev Role identifier for those who can directly deposit native IMX to the bridge.\n    bytes32 public constant PRIVILEGED_DEPOSITOR_ROLE = keccak256(\"PRIVILEGED_DEPOSITOR\");\n\n    bytes32 public constant MAP_TOKEN_SIG = keccak256(\"MAP_TOKEN\");\n    bytes32 public constant DEPOSIT_SIG = keccak256(\"DEPOSIT\");\n    bytes32 public constant WITHDRAW_SIG = keccak256(\"WITHDRAW\");\n    address public constant NATIVE_ETH = address(0xeee);\n    address public constant NATIVE_IMX = address(0xfff);\n\n    /// @dev The address of the bridge adapter used to send and receive messages to and from the root chain.\n    IChildBridgeAdaptor public childBridgeAdaptor;\n\n    /// @dev The address of the token template that will be cloned to create tokens.\n    address public childTokenTemplate;\n    /// @dev The address of the IMX ERC20 token on L1.\n    address public rootIMXToken;\n    /// @dev The address of the ETH ERC20 token on L2.\n    address public childETHToken;\n    /// @dev The address of the wrapped IMX token on L2.\n    address public wIMXToken;\n    /// @dev Address of the authorized initializer.\n    address public immutable initializerAddress;\n\n    /**\n     * @notice Modifier to ensure that the caller is the registered child bridge adaptor.\n     */\n    modifier onlyBridgeAdaptor() {\n        if (msg.sender != address(childBridgeAdaptor)) {\n            revert NotBridgeAdaptor();\n        }\n        _;\n    }\n\n    /**\n     * @notice Constructs the ChildERC20Bridge contract.\n     * @param _initializerAddress The address of the authorized initializer.\n     */\n    constructor(address _initializerAddress) {\n        if (_initializerAddress == address(0)) {\n            revert ZeroAddress();\n        }\n        initializerAddress = _initializerAddress;\n    }\n\n    /**\n     * @notice Initialization function for ChildERC20Bridge.\n     * @param newRoles Struct containing addresses of roles.\n     * @param newBridgeAdaptor Address of StateSender to send deposit information to.\n     * @param newChildTokenTemplate Address of child token template to clone.\n     * @param newRootIMXToken Address of ECR20 IMX on the root chain.\n     * @param newWIMXToken Address of wrapped IMX on the child chain.\n     * @dev Can only be called once.\n     */\n    function initialize(\n        InitializationRoles memory newRoles,\n        address newBridgeAdaptor,\n        address newChildTokenTemplate,\n        address newRootIMXToken,\n        address newWIMXToken\n    ) public initializer {\n        if (msg.sender != initializerAddress) {\n            revert UnauthorizedInitializer();\n        }\n        if (\n            newBridgeAdaptor == address(0) || newChildTokenTemplate == address(0) || newRootIMXToken == address(0)\n                || newRoles.defaultAdmin == address(0) || newRoles.pauser == address(0) || newRoles.unpauser == address(0)\n                || newRoles.adaptorManager == address(0) || newRoles.treasuryManager == address(0)\n                || newWIMXToken == address(0)\n        ) {\n            revert ZeroAddress();\n        }\n\n        __AccessControl_init();\n        __Pausable_init();\n        __ReentrancyGuard_init();\n\n        _grantRole(DEFAULT_ADMIN_ROLE, newRoles.defaultAdmin);\n        _grantRole(PAUSER_ROLE, newRoles.pauser);\n        _grantRole(UNPAUSER_ROLE, newRoles.unpauser);\n        _grantRole(ADAPTOR_MANAGER_ROLE, newRoles.adaptorManager);\n        _grantRole(PRIVILEGED_DEPOSITOR_ROLE, newRoles.initialDepositor);\n        _grantRole(PRIVILEGED_DEPOSITOR_ROLE, newRoles.treasuryManager);\n\n        childTokenTemplate = newChildTokenTemplate;\n        childBridgeAdaptor = IChildBridgeAdaptor(newBridgeAdaptor);\n        rootIMXToken = newRootIMXToken;\n        wIMXToken = newWIMXToken;\n\n        // NOTE: how will this behave in an updgrade scenario?\n        // e.g. this clone may already be deployed and we could deploy to the same address if the salt is the same.\n        // Clone childERC20 for native eth\n        IChildERC20 clonedETHToken =\n            IChildERC20(Clones.cloneDeterministic(childTokenTemplate, keccak256(abi.encodePacked(NATIVE_ETH))));\n        // Initialize\n        clonedETHToken.initialize(NATIVE_ETH, \"Ethereum\", \"ETH\", 18);\n        childETHToken = address(clonedETHToken);\n\n        // Map the supported tokens by default\n        rootTokenToChildToken[NATIVE_ETH] = childETHToken;\n    }\n\n    /**\n     * @notice Method to receive IMX back from the WIMX contract when it is unwrapped\n     * @dev When a user deposits wIMX, it must first be unwrapped.\n     *      This allows the bridge to store the underlying native IMX, rather than the wrapped version.\n     *      The unwrapping is done through the WIMX contract's `withdraw()` function, which sends the native IMX to this bridge contract.\n     *      The only reason this `receive()` function is needed is for this process, hence the validation ensures that the sender is the WIMX contract.\n     */\n    receive() external payable whenNotPaused {\n        // Revert if sender is not the WIMX token address\n        if (msg.sender != wIMXToken) {\n            revert NonWrappedNativeTransfer();\n        }\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function privilegedDeposit() external payable onlyRole(PRIVILEGED_DEPOSITOR_ROLE) {\n        if (msg.value == 0) {\n            revert ZeroValue();\n        }\n        emit PrivilegedDeposit(msg.sender, msg.value);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function updateChildBridgeAdaptor(address newBridgeAdaptor) external onlyRole(ADAPTOR_MANAGER_ROLE) {\n        if (newBridgeAdaptor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        emit ChildBridgeAdaptorUpdated(address(childBridgeAdaptor), newBridgeAdaptor);\n        childBridgeAdaptor = IChildBridgeAdaptor(newBridgeAdaptor);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     * @dev This is only callable by the child chain bridge adaptor.\n     *      This method assumes that the adaptor will have performed all\n     *      validations relating to the source of the message, prior to calling this method.\n     */\n    function onMessageReceive(bytes calldata data) external whenNotPaused onlyBridgeAdaptor {\n        if (data.length <= 32) {\n            // Data must always be greater than 32.\n            // 32 bytes for the signature, and at least some information for the payload\n            revert InvalidData(\"Data too short\");\n        }\n\n        bytes32 sig = bytes32(data[:32]);\n        if (sig == MAP_TOKEN_SIG) {\n            _mapToken(data);\n        } else if (sig == DEPOSIT_SIG) {\n            _deposit(data[32:]);\n        } else {\n            revert InvalidData(\"Unsupported action signature\");\n        }\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdraw(IChildERC20 childToken, uint256 amount) external payable {\n        _withdraw(address(childToken), msg.sender, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawTo(IChildERC20 childToken, address receiver, uint256 amount) external payable {\n        _withdraw(address(childToken), receiver, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawIMX(uint256 amount) external payable {\n        _withdraw(NATIVE_IMX, msg.sender, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawIMXTo(address receiver, uint256 amount) external payable {\n        _withdraw(NATIVE_IMX, receiver, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawWIMX(uint256 amount) external payable {\n        _withdraw(wIMXToken, msg.sender, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawWIMXTo(address receiver, uint256 amount) external payable {\n        _withdraw(wIMXToken, receiver, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     * @dev Caution:\n     *      When withdrawing ETH, it's crucial to make sure that the receiving address (`msg.sender`) on the root chain,\n     *      if it's a contract, has a receive or fallback function that allows it to accept native ETH.\n     *      If this isn't the case, the transaction on the root chain could revert, potentially locking the user's funds indefinitely.\n     */\n    function withdrawETH(uint256 amount) external payable {\n        _withdraw(childETHToken, msg.sender, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     * @dev Caution:\n     *      When withdrawing ETH, it's crucial to make sure that the receiving address (`receiver`) on the root chain,\n     *      if it's a contract, has a receive or fallback function that allows it to accept native ETH.\n     *      If this isn't the case, the transaction on the root chain could revert, potentially locking the user's funds indefinitely.\n     */\n    function withdrawETHTo(address receiver, uint256 amount) external payable {\n        _withdraw(childETHToken, receiver, amount);\n    }\n\n    /**\n     * @notice Private function to handle withdrawal process for all ERC20 and native token types.\n     * @param childTokenAddr The address of the child token to withdraw.\n     * @param receiver The address to withdraw the tokens to.\n     * @param amount The amount of tokens to withdraw.\n     *\n     * Requirements:\n     *\n     * - `childTokenAddr` must not be the zero address.\n     * - `receiver` must not be the zero address.\n     * - `amount` must be greater than zero.\n     * - `msg.value` must be greater than zero.\n     * - `childToken` must exist.\n     * - `childToken` must be mapped.\n     * - `childToken` must have a the bridge set.\n     */\n    function _withdraw(address childTokenAddr, address receiver, uint256 amount) private nonReentrant whenNotPaused {\n        if (childTokenAddr == address(0) || receiver == address(0)) {\n            revert ZeroAddress();\n        }\n        if (amount == 0) {\n            revert ZeroAmount();\n        }\n        if (msg.value == 0) {\n            revert NoGas();\n        }\n\n        address rootToken;\n        if (childTokenAddr == NATIVE_IMX) {\n            rootToken = _withdrawIMX(amount);\n        } else if (childTokenAddr == wIMXToken) {\n            rootToken = _withdrawWIMX(amount);\n        } else if (childTokenAddr == childETHToken) {\n            rootToken = _withdrawETH(amount);\n        } else {\n            rootToken = _withdrawERC20(childTokenAddr, amount);\n        }\n\n        // Encode the message payload\n        bytes memory payload = abi.encode(WITHDRAW_SIG, rootToken, msg.sender, receiver, amount);\n\n        // Account for fee amount\n        uint256 feeAmount = (childTokenAddr == NATIVE_IMX) ? msg.value - amount : msg.value;\n\n        // Send the message to the bridge adaptor and up to root chain\n        childBridgeAdaptor.sendMessage{value: feeAmount}(payload, msg.sender);\n\n        _emitWithdrawEvent(rootToken, childTokenAddr, msg.sender, receiver, amount);\n    }\n\n    /**\n     * @notice Private function to handle withdrawal of L2 native IMX.\n     */\n    function _withdrawIMX(uint256 amount) private returns (address) {\n        if (msg.value < amount) {\n            revert InsufficientValue();\n        }\n        return rootIMXToken;\n    }\n\n    /**\n     * @notice Private function to handle withdrawal of L1 native ETH.\n     */\n    function _withdrawETH(uint256 amount) private returns (address) {\n        try IChildERC20(childETHToken).burn(msg.sender, amount) returns (bool success) {\n            if (!success) revert BurnFailed();\n        } catch {\n            revert BurnFailed();\n        }\n\n        return NATIVE_ETH;\n    }\n\n    /**\n     * @notice Private function to handle withdrawal of native IMX.\n     */\n    function _withdrawWIMX(uint256 amount) private returns (address) {\n        // Calculate expected balance\n        uint256 expectedBalance = address(this).balance + amount;\n\n        IWIMX wIMX = IWIMX(wIMXToken);\n\n        // Transfer to contract\n        try wIMX.transferFrom(msg.sender, address(this), amount) returns (bool success) {\n            if (!success) revert TransferWIMXFailed();\n        } catch {\n            revert TransferWIMXFailed();\n        }\n\n        // Withdraw\n        wIMX.withdraw(amount);\n\n        // Assert balance\n        if (address(this).balance != expectedBalance) {\n            revert BalanceInvariantCheckFailed(address(this).balance, expectedBalance);\n        }\n\n        return rootIMXToken;\n    }\n\n    /**\n     * @notice Private function to handle withdrawal of ERC20 tokens.\n     */\n    function _withdrawERC20(address childToken, uint256 amount) private returns (address) {\n        // Validate code existence\n        if (address(childToken).code.length == 0) {\n            revert EmptyTokenContract();\n        }\n\n        address rootToken = IChildERC20(childToken).rootToken();\n\n        // A mapped token should never have root token unset\n        if (rootToken == address(0)) {\n            revert ZeroAddressRootToken();\n        }\n\n        // Assert mapping\n        if (rootTokenToChildToken[rootToken] != address(childToken)) {\n            revert NotMapped();\n        }\n\n        // A mapped token should never have the bridge unset\n        if (IChildERC20(childToken).bridge() != address(this)) {\n            revert IncorrectBridgeAddress();\n        }\n\n        // Burn tokens\n        try IChildERC20(childToken).burn(msg.sender, amount) returns (bool success) {\n            if (!success) revert BurnFailed();\n        } catch {\n            revert BurnFailed();\n        }\n\n        return rootToken;\n    }\n\n    /**\n     * @notice Private function to emit withdraw events.\n     */\n    function _emitWithdrawEvent(address rootToken, address childToken, address sender, address receiver, uint256 amount)\n        private\n    {\n        if (childToken == NATIVE_IMX) {\n            emit ChildChainNativeIMXWithdraw(rootToken, sender, receiver, amount);\n        } else if (childToken == wIMXToken) {\n            emit ChildChainWrappedIMXWithdraw(rootToken, sender, receiver, amount);\n        } else if (childToken == childETHToken) {\n            emit ChildChainEthWithdraw(sender, receiver, amount);\n        } else {\n            emit ChildChainERC20Withdraw(rootToken, childToken, sender, receiver, amount);\n        }\n    }\n\n    /**\n     * @notice Private function to handle mapping of root ERC20 tokens to child ERC20 tokens.\n     * @param data The data payload of the message.\n     *\n     * Requirements:\n     *\n     * - `rootToken` must not be the zero address.\n     * - `rootToken` must not be the root IMX token.\n     * - `rootToken` must not be native ETH.\n     * - `rootToken` must not already be mapped.\n     */\n    function _mapToken(bytes calldata data) private {\n        (, address rootToken, string memory name, string memory symbol, uint8 decimals) =\n            abi.decode(data, (bytes32, address, string, string, uint8));\n\n        if (rootToken == address(0)) {\n            revert ZeroAddress();\n        }\n\n        if (address(rootToken) == rootIMXToken) {\n            revert CantMapIMX();\n        }\n\n        if (address(rootToken) == NATIVE_ETH) {\n            revert CantMapETH();\n        }\n\n        if (rootTokenToChildToken[rootToken] != address(0)) {\n            revert AlreadyMapped();\n        }\n\n        // Deploy child chain token\n        IChildERC20 childToken =\n            IChildERC20(Clones.cloneDeterministic(childTokenTemplate, keccak256(abi.encodePacked(rootToken))));\n        // Map token\n        rootTokenToChildToken[rootToken] = address(childToken);\n\n        // Intialize token\n        childToken.initialize(rootToken, name, symbol, decimals);\n\n        emit L2TokenMapped(rootToken, address(childToken));\n    }\n\n    /**\n     * @notice Private function to handle depositing of ERC20 and native tokens to the child chain.\n     * @param data The data payload of the message.\n     *\n     * Requirements:\n     *\n     * - `rootToken` must not be the zero address.\n     * - `receiver` must not be the zero address.\n     * - `childToken` must be mapped.\n     * - `childToken` must exist.\n     *\n     */\n    function _deposit(bytes calldata data) private {\n        (address rootToken, address sender, address receiver, uint256 amount) =\n            abi.decode(data, (address, address, address, uint256));\n\n        if (rootToken == address(0) || receiver == address(0)) {\n            revert ZeroAddress();\n        }\n\n        _transferTokensAndEmitEvent(rootToken, rootTokenToChildToken[rootToken], sender, receiver, amount);\n    }\n\n    function _transferTokensAndEmitEvent(\n        address rootToken,\n        address childToken,\n        address sender,\n        address receiver,\n        uint256 amount\n    ) private {\n        if (rootToken == rootIMXToken) {\n            if (address(this).balance < amount) {\n                revert InsufficientIMX();\n            }\n            Address.sendValue(payable(receiver), amount);\n            emit IMXDeposit(rootToken, sender, receiver, amount);\n            return;\n        }\n\n        if (childToken == address(0)) {\n            revert NotMapped();\n        }\n\n        if (childToken.code.length == 0) {\n            revert EmptyTokenContract();\n        }\n\n        try IChildERC20(childToken).mint(receiver, amount) returns (bool success) {\n            if (!success) revert MintFailed();\n        } catch {\n            revert MintFailed();\n        }\n\n        if (rootToken == NATIVE_ETH) {\n            emit NativeEthDeposit(rootToken, address(childToken), sender, receiver, amount);\n        } else {\n            emit ChildChainERC20Deposit(rootToken, address(childToken), sender, receiver, amount);\n        }\n    }\n\n    // slither-disable-next-line unused-state,naming-convention\n    uint256[50] private __gapChildERC20Bridge;\n}\n",
+  "deployed_bytecode": "0x60806040526004361061026b5760003560e01c806389c65d4111610144578063d6dc0b0d116100b6578063f14210a61161007a578063f14210a614610771578063f3dfce1d14610784578063f3fef3a3146107a4578063f6451255146107b7578063f865af08146107eb578063fb1bb9de1461080b57600080fd5b8063d6dc0b0d146106c5578063da51c71e146106f9578063de65c2e41461071b578063dee1ef0d1461072e578063e63ab1e91461074f57600080fd5b8063a217fddf11610108578063a217fddf146105f4578063b176806514610609578063b68ad1e41461063d578063c3b35a7e1461065e578063d41f177114610671578063d547741f146106a557600080fd5b806389c65d41146105605780638c956990146105805780638f70121f146105a157806391d14854146105c157806392ffd2e2146105e157600080fd5b80633f4ba83a116101dd5780636c11c21c116101a15780636c11c21c1461049c5780637248c77c146104bc57806377907d1d146104dc5780637ab5e3ae146104fe5780637efab4f5146105145780638456cb591461054b57600080fd5b80633f4ba83a1461042857806352b61e361461043d5780635c975abb1461045057806369053ed014610468578063697b894a1461048957600080fd5b80632540e2da1161022f5780632540e2da14610374578063274346b91461039457806329529c0e146103a75780632f2ff15d146103c857806332968782146103e857806336568abe1461040857600080fd5b8063011e1167146102ab57806301ffc9a7146102de5780630765c4051461030e57806318428c501461032e578063248a9ca31461033657600080fd5b366102a65761027861082d565b610132546001600160a01b031633146102a457604051630402506f60e01b815260040160405180910390fd5b005b600080fd5b3480156102b757600080fd5b506102c1610eee81565b6040516001600160a01b0390911681526020015b60405180910390f35b3480156102ea57600080fd5b506102fe6102f9366004612572565b61087a565b60405190151581526020016102d5565b34801561031a57600080fd5b506102a46103293660046125c1565b6108b1565b6102a461095c565b34801561034257600080fd5b506103666103513660046125de565b60009081526065602052604090206001015490565b6040519081526020016102d5565b34801561038057600080fd5b506102a461038f3660046125c1565b6109cd565b6102a46103a23660046125f7565b6109f4565b3480156103b357600080fd5b5061012e546102c1906001600160a01b031681565b3480156103d457600080fd5b506102a46103e3366004612623565b610a0c565b3480156103f457600080fd5b506102a46104033660046125c1565b610a36565b34801561041457600080fd5b506102a4610423366004612623565b610a59565b34801561043457600080fd5b506102a4610ad3565b6102a461044b3660046125de565b610af6565b34801561045c57600080fd5b5060975460ff166102fe565b34801561047457600080fd5b50610132546102c1906001600160a01b031681565b6102a46104973660046125f7565b610b0e565b3480156104a857600080fd5b506102a46104b73660046125c1565b610b26565b3480156104c857600080fd5b506102a46104d7366004612653565b610b49565b3480156104e857600080fd5b50610366600080516020612c6183398151915281565b34801561050a57600080fd5b506102c1610fff81565b34801561052057600080fd5b506102c161052f3660046125c1565b61012d602052600090815260409020546001600160a01b031681565b34801561055757600080fd5b506102a4610c8f565b34801561056c57600080fd5b506102a461057b3660046125c1565b610caf565b34801561058c57600080fd5b50610130546102c1906001600160a01b031681565b3480156105ad57600080fd5b506102a46105bc3660046125c1565b610cd2565b3480156105cd57600080fd5b506102fe6105dc366004612623565b610cf5565b6102a46105ef3660046125f7565b610d20565b34801561060057600080fd5b50610366600081565b34801561061557600080fd5b506103667f7a8dc26796a1e50e6e190b70259f58f6a4edd5b22280ceecc82b687b8e98286981565b34801561064957600080fd5b5061012f546102c1906001600160a01b031681565b6102a461066c3660046126c5565b610d2d565b34801561067d57600080fd5b506103667f87a7811f4bfedea3d341ad165680ae306b01aaeacc205d227629cf157dd9f82181565b3480156106b157600080fd5b506102a46106c0366004612623565b610d38565b3480156106d157600080fd5b506102c17f000000000000000000000000dda0d9448ebe3ea43afece5fa6401f5795c1933381565b34801561070557600080fd5b50610366600080516020612c4183398151915281565b6102a46107293660046125de565b610d5d565b34801561073a57600080fd5b50610131546102c1906001600160a01b031681565b34801561075b57600080fd5b50610366600080516020612ca183398151915281565b6102a461077f3660046125de565b610d6a565b34801561079057600080fd5b506102a461079f366004612745565b610d82565b6102a46107b23660046125f7565b6111cb565b3480156107c357600080fd5b506103667f2cef46a936bdc5b7e6e8c71aa04560c41cf7d88bb26901a7e7f4936ff02accad81565b3480156107f757600080fd5b506102a46108063660046125c1565b6111d6565b34801561081757600080fd5b50610366600080516020612c8183398151915281565b60975460ff16156108785760405162461bcd60e51b815260206004820152601060248201526f14185d5cd8589b194e881c185d5cd95960821b60448201526064015b60405180910390fd5b565b60006001600160e01b03198216637965db0b60e01b14806108ab57506301ffc9a760e01b6001600160e01b03198316145b92915050565b600080516020612c418339815191526108c9816111f9565b6001600160a01b0382166108f05760405163d92e233d60e01b815260040160405180910390fd5b61012e54604080516001600160a01b03928316815291841660208301527f6295d9d82f5000a9dcc9019e6308fec486f74ee3f43489208a0e83b0f17fb1f6910160405180910390a15061012e80546001600160a01b0319166001600160a01b0392909216919091179055565b600080516020612c61833981519152610974816111f9565b3460000361099557604051637c946ed760e01b815260040160405180910390fd5b60405134815233907fed5ccca9e28db55e91a5eee6654c6ab321485b9586583e9f511dd0d65e3d95619060200160405180910390a250565b60006109d8816111f9565b6109f0600080516020612c8183398151915283610d38565b5050565b610132546109f0906001600160a01b03168383611203565b600082815260656020526040902060010154610a27816111f9565b610a318383611403565b505050565b6000610a41816111f9565b6109f0600080516020612c8183398151915283610a0c565b6001600160a01b0381163314610ac95760405162461bcd60e51b815260206004820152602f60248201527f416363657373436f6e74726f6c3a2063616e206f6e6c792072656e6f756e636560448201526e103937b632b9903337b91039b2b63360891b606482015260840161086f565b6109f08282611489565b600080516020612c81833981519152610aeb816111f9565b610af36114f0565b50565b61013254610af3906001600160a01b03163383611203565b610131546109f0906001600160a01b03168383611203565b6000610b31816111f9565b6109f0600080516020612ca183398151915283610a0c565b610b5161082d565b61012e546001600160a01b03163314610b7d5760405163122d54c760e11b815260040160405180910390fd5b60208111610bbf5760405163180a097760e01b815260206004820152600e60248201526d11185d18481d1bdbc81cda1bdc9d60921b604482015260640161086f565b6000610bce6020828486612828565b610bd791612852565b90507f2cef46a936bdc5b7e6e8c71aa04560c41cf7d88bb26901a7e7f4936ff02accad8103610c0a57610a318383611542565b7f87a7811f4bfedea3d341ad165680ae306b01aaeacc205d227629cf157dd9f8218103610c4657610a31610c418360208187612828565b61172e565b60405163180a097760e01b815260206004820152601c60248201527f556e737570706f7274656420616374696f6e207369676e617475726500000000604482015260640161086f565b600080516020612ca1833981519152610ca7816111f9565b610af36117ae565b6000610cba816111f9565b6109f0600080516020612c4183398151915283610d38565b6000610cdd816111f9565b6109f0600080516020612c4183398151915283610a0c565b60009182526065602090815260408084206001600160a01b0393909316845291905290205460ff1690565b6109f0610fff8383611203565b610a31838383611203565b600082815260656020526040902060010154610d53816111f9565b610a318383611489565b610af3610fff3383611203565b61013154610af3906001600160a01b03163383611203565b600054610100900460ff1615808015610da25750600054600160ff909116105b80610dbc5750303b158015610dbc575060005460ff166001145b610e1f5760405162461bcd60e51b815260206004820152602e60248201527f496e697469616c697a61626c653a20636f6e747261637420697320616c72656160448201526d191e481a5b9a5d1a585b1a5e995960921b606482015260840161086f565b6000805460ff191660011790558015610e42576000805461ff0019166101001790555b336001600160a01b037f000000000000000000000000dda0d9448ebe3ea43afece5fa6401f5795c193331614610e8b57604051630d622feb60e01b815260040160405180910390fd5b6001600160a01b0385161580610ea857506001600160a01b038416155b80610eba57506001600160a01b038316155b80610ecd575085516001600160a01b0316155b80610ee3575060208601516001600160a01b0316155b80610ef9575060408601516001600160a01b0316155b80610f0f575060608601516001600160a01b0316155b80610f25575060a08601516001600160a01b0316155b80610f3757506001600160a01b038216155b15610f555760405163d92e233d60e01b815260040160405180910390fd5b610f5d6117eb565b610f65611812565b610f6d611841565b8551610f7b90600090611403565b610f97600080516020612ca18339815191528760200151611403565b610fb3600080516020612c818339815191528760400151611403565b610fcf600080516020612c418339815191528760600151611403565b610feb600080516020612c618339815191528760800151611403565b611007600080516020612c618339815191528760a00151611403565b61012f80546001600160a01b038681166001600160a01b0319928316811790935561012e8054898316908416179055610130805487831690841617905561013280549186169190921617905560405161077760611b6020820152600091611087916034015b60405160208183030381529060405280519060200120611870565b604051637b69774360e11b8152610eee6004820152608060248201526008608482015267457468657265756d60c01b60a482015260c06044820152600360c48201526208aa8960eb1b60e4820152601260648201529091506001600160a01b0382169063f6d2ee869061010401600060405180830381600087803b15801561110e57600080fd5b505af1158015611122573d6000803e3d6000fd5b505061013180546001600160a01b039094166001600160a01b03199485168117909155610eee60005261012d6020527fad76b4044bfa734d1658e7587c3fd33991772c4284f450d12a829695b2e0bd04805490941617909255505080156111c3576000805461ff0019169055604051600181527f7f26b83ff96e1f2b6a682f133852f6798a09c465da95921460cefb38474024989060200160405180910390a15b505050505050565b6109f0823383611203565b60006111e1816111f9565b6109f0600080516020612ca183398151915283610d38565b610af3813361190d565b61120b611966565b61121361082d565b6001600160a01b038316158061123057506001600160a01b038216155b1561124e5760405163d92e233d60e01b815260040160405180910390fd5b8060000361126f57604051631f2a200560e01b815260040160405180910390fd5b3460000361129057604051631d3e008d60e21b815260040160405180910390fd5b6000610ffe196001600160a01b038516016112b5576112ae826119bf565b9050611302565b610132546001600160a01b03908116908516036112d5576112ae826119f4565b610131546001600160a01b03908116908516036112f5576112ae82611b4c565b6112ff8483611c00565b90505b604080517f7a8dc26796a1e50e6e190b70259f58f6a4edd5b22280ceecc82b687b8e98286960208201526001600160a01b0383811682840152336060830152858116608083015260a08083018690528351808403909101815260c0909201909252906000908616610fff146113775734611381565b6113818434612886565b61012e54604051637903aadd60e11b81529192506001600160a01b03169063f20755ba9083906113b790869033906004016128e9565b6000604051808303818588803b1580156113d057600080fd5b505af11580156113e4573d6000803e3d6000fd5b50505050506113f68387338888611e38565b505050610a31600160fb55565b61140d8282610cf5565b6109f05760008281526065602090815260408083206001600160a01b03851684529091529020805460ff191660011790556114453390565b6001600160a01b0316816001600160a01b0316837f2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d60405160405180910390a45050565b6114938282610cf5565b156109f05760008281526065602090815260408083206001600160a01b0385168085529252808320805460ff1916905551339285917ff6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b9190a45050565b6114f8611fd5565b6097805460ff191690557f5db9ee0a495bf2e6ff9c91a7834c1ba4fdd244a5e8aa4e537bd38aeae4b073aa335b6040516001600160a01b03909116815260200160405180910390a1565b6000808080611553858701876129a0565b92975090955093509150506001600160a01b0384166115855760405163d92e233d60e01b815260040160405180910390fd5b610130546001600160a01b03908116908516036115b55760405163a9a43cf960e01b815260040160405180910390fd5b610eed196001600160a01b038516016115e15760405163e9edc9b360e01b815260040160405180910390fd5b6001600160a01b03848116600090815261012d6020526040902054161561161b57604051632a431ae760e11b815260040160405180910390fd5b61012f546040516bffffffffffffffffffffffff19606087901b166020820152600091611656916001600160a01b039091169060340161106c565b6001600160a01b03868116600090815261012d60205260409081902080546001600160a01b031916928416928317905551637b69774360e11b81529192509063f6d2ee86906116af908890889088908890600401612a3b565b600060405180830381600087803b1580156116c957600080fd5b505af11580156116dd573d6000803e3d6000fd5b5050604080516001600160a01b03808a168252851660208201527f46bd56f98e1b14fd35691959270a6e1edf7cb8fcd489e0f9dda89e46c0d1ff0d935001905060405180910390a150505050505050565b600080808061173f85870187612a86565b929650909450925090506001600160a01b038416158061176657506001600160a01b038216155b156117845760405163d92e233d60e01b815260040160405180910390fd5b6001600160a01b03808516600090815261012d60205260409020546111c39186911685858561201e565b6117b661082d565b6097805460ff191660011790557f62e78cea01bee320cd4e420270b5ea74000d11b0c9f74754ebdbfc544b05a2586115253390565b600054610100900460ff166108785760405162461bcd60e51b815260040161086f90612ad7565b600054610100900460ff166118395760405162461bcd60e51b815260040161086f90612ad7565b610878612251565b600054610100900460ff166118685760405162461bcd60e51b815260040161086f90612ad7565b610878612284565b6000763d602d80600a3d3981f3363d3d373d3d3d363d730000008360601b60e81c176000526e5af43d82803e903d91602b57fd5bf38360781b1760205281603760096000f590506001600160a01b0381166108ab5760405162461bcd60e51b815260206004820152601760248201527f455243313136373a2063726561746532206661696c6564000000000000000000604482015260640161086f565b6119178282610cf5565b6109f057611924816122ab565b61192f8360206122bd565b604051602001611940929190612b22565b60408051601f198184030181529082905262461bcd60e51b825261086f91600401612b97565b600260fb54036119b85760405162461bcd60e51b815260206004820152601f60248201527f5265656e7472616e637947756172643a207265656e7472616e742063616c6c00604482015260640161086f565b600260fb55565b6000813410156119e25760405163044044a560e21b815260040160405180910390fd5b5050610130546001600160a01b031690565b600080611a018347612baa565b610132546040516323b872dd60e01b8152336004820152306024820152604481018690529192506001600160a01b03169081906323b872dd906064016020604051808303816000875af1925050508015611a78575060408051601f3d908101601f19168201909252611a7591810190612bbd565b60015b611a95576040516395047e5b60e01b815260040160405180910390fd5b80611ab3576040516395047e5b60e01b815260040160405180910390fd5b50604051632e1a7d4d60e01b8152600481018590526001600160a01b03821690632e1a7d4d90602401600060405180830381600087803b158015611af657600080fd5b505af1158015611b0a573d6000803e3d6000fd5b50505050814714611b3757604051637244981560e11b81524760048201526024810183905260440161086f565b5050610130546001600160a01b031692915050565b61013154604051632770a7eb60e21b8152336004820152602481018390526000916001600160a01b031690639dc29fac906044016020604051808303816000875af1925050508015611bbb575060408051601f3d908101601f19168201909252611bb891810190612bbd565b60015b611bd857604051631bc5aabf60e21b815260040160405180910390fd5b80611bf657604051631bc5aabf60e21b815260040160405180910390fd5b5050610eee919050565b6000826001600160a01b03163b600003611c2d576040516323ed03c160e01b815260040160405180910390fd5b6000836001600160a01b0316631f2d00656040518163ffffffff1660e01b8152600401602060405180830381865afa158015611c6d573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190611c919190612bdf565b90506001600160a01b038116611cba57604051634aa5ba3d60e11b815260040160405180910390fd5b6001600160a01b03818116600090815261012d6020526040902054811690851614611cf857604051633a3c22ef60e11b815260040160405180910390fd5b306001600160a01b0316846001600160a01b031663e78cea926040518163ffffffff1660e01b8152600401602060405180830381865afa158015611d40573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190611d649190612bdf565b6001600160a01b031614611d8b5760405163356be02f60e21b815260040160405180910390fd5b604051632770a7eb60e21b8152336004820152602481018490526001600160a01b03851690639dc29fac906044016020604051808303816000875af1925050508015611df4575060408051601f3d908101601f19168201909252611df191810190612bbd565b60015b611e1157604051631bc5aabf60e21b815260040160405180910390fd5b80611e2f57604051631bc5aabf60e21b815260040160405180910390fd5b505b9392505050565b610ffe196001600160a01b03851601611ea757816001600160a01b0316836001600160a01b0316866001600160a01b03167f3e4d9c687d8d20e243edc9ad6a15250d794842c784344c271b3ed94ae88f076584604051611e9a91815260200190565b60405180910390a4611fc7565b610132546001600160a01b0390811690851603611f0d57816001600160a01b0316836001600160a01b0316866001600160a01b03167f01f445551c40ec1a713933e4fac6d7781f367bce8e456b301bf2029aa3033d7784604051611e9a91815260200190565b610131546001600160a01b0390811690851603611f7657816001600160a01b0316836001600160a01b03167fc90fe32d7d4db065e2824f5cfd3ea5a1d07f2c233a7a6580e9abb4300a0f905b83604051611f6991815260200190565b60405180910390a3611fc7565b604080516001600160a01b038581168252602082018490528085169287821692918916917f551b24e30eba08b2d4d57d1c6345eb47e4c49327402afff270e6591af43cc00091015b60405180910390a45b5050505050565b600160fb55565b60975460ff166108785760405162461bcd60e51b815260206004820152601460248201527314185d5cd8589b194e881b9bdd081c185d5cd95960621b604482015260640161086f565b610130546001600160a01b03908116908616036120af57804710156120565760405163c7532eaf60e01b815260040160405180910390fd5b6120608282612459565b816001600160a01b0316836001600160a01b0316866001600160a01b03167f8294ebca1c2aada95b98b62a8d705ba5d7be4bdb75901d3f0eeb35062b706c7984604051611e9a91815260200190565b6001600160a01b0384166120d657604051633a3c22ef60e11b815260040160405180910390fd5b836001600160a01b03163b600003612101576040516323ed03c160e01b815260040160405180910390fd5b6040516340c10f1960e01b81526001600160a01b038381166004830152602482018390528516906340c10f19906044016020604051808303816000875af192505050801561216c575060408051601f3d908101601f1916820190925261216991810190612bbd565b60015b6121885760405162ec6f7b60e31b815260040160405180910390fd5b806121a55760405162ec6f7b60e31b815260040160405180910390fd5b50610eed196001600160a01b0386160161220557604080516001600160a01b038581168252602082018490528085169287821692918916917fd1b4e24e81f1c901551420568a9447fd105593af143ae8b096c6385e4fb7ec869101611e9a565b604080516001600160a01b038581168252602082018490528085169287821692918916917f3207f1f801a6ba9b6005cb9dc97d8498df3407dc7b1c7a644c7b57997f4f03c59101611fbe565b600054610100900460ff166122785760405162461bcd60e51b815260040161086f90612ad7565b6097805460ff19169055565b600054610100900460ff16611fce5760405162461bcd60e51b815260040161086f90612ad7565b60606108ab6001600160a01b03831660145b606060006122cc836002612bfc565b6122d7906002612baa565b67ffffffffffffffff8111156122ef576122ef612706565b6040519080825280601f01601f191660200182016040528015612319576020820181803683370190505b509050600360fc1b8160008151811061233457612334612c13565b60200101906001600160f81b031916908160001a905350600f60fb1b8160018151811061236357612363612c13565b60200101906001600160f81b031916908160001a9053506000612387846002612bfc565b612392906001612baa565b90505b600181111561240a576f181899199a1a9b1b9c1cb0b131b232b360811b85600f16601081106123c6576123c6612c13565b1a60f81b8282815181106123dc576123dc612c13565b60200101906001600160f81b031916908160001a90535060049490941c9361240381612c29565b9050612395565b508315611e315760405162461bcd60e51b815260206004820181905260248201527f537472696e67733a20686578206c656e67746820696e73756666696369656e74604482015260640161086f565b804710156124a95760405162461bcd60e51b815260206004820152601d60248201527f416464726573733a20696e73756666696369656e742062616c616e6365000000604482015260640161086f565b6000826001600160a01b03168260405160006040518083038185875af1925050503d80600081146124f6576040519150601f19603f3d011682016040523d82523d6000602084013e6124fb565b606091505b5050905080610a315760405162461bcd60e51b815260206004820152603a60248201527f416464726573733a20756e61626c6520746f2073656e642076616c75652c207260448201527f6563697069656e74206d61792068617665207265766572746564000000000000606482015260840161086f565b60006020828403121561258457600080fd5b81356001600160e01b031981168114611e3157600080fd5b6001600160a01b0381168114610af357600080fd5b80356125bc8161259c565b919050565b6000602082840312156125d357600080fd5b8135611e318161259c565b6000602082840312156125f057600080fd5b5035919050565b6000806040838503121561260a57600080fd5b82356126158161259c565b946020939093013593505050565b6000806040838503121561263657600080fd5b8235915060208301356126488161259c565b809150509250929050565b6000806020838503121561266657600080fd5b823567ffffffffffffffff8082111561267e57600080fd5b818501915085601f83011261269257600080fd5b8135818111156126a157600080fd5b8660208285010111156126b357600080fd5b60209290920196919550909350505050565b6000806000606084860312156126da57600080fd5b83356126e58161259c565b925060208401356126f58161259c565b929592945050506040919091013590565b634e487b7160e01b600052604160045260246000fd5b60405160c0810167ffffffffffffffff8111828210171561273f5761273f612706565b60405290565b600080600080600085870361014081121561275f57600080fd5b60c081121561276d57600080fd5b5061277661271c565b86356127818161259c565b815260208701356127918161259c565b602082015260408701356127a48161259c565b604082015260608701356127b78161259c565b606082015260808701356127ca8161259c565b608082015260a08701356127dd8161259c565b60a082015294506127f060c087016125b1565b93506127fe60e087016125b1565b925061280d61010087016125b1565b915061281c61012087016125b1565b90509295509295909350565b6000808585111561283857600080fd5b8386111561284557600080fd5b5050820193919092039150565b803560208310156108ab57600019602084900360031b1b1692915050565b634e487b7160e01b600052601160045260246000fd5b818103818111156108ab576108ab612870565b60005b838110156128b457818101518382015260200161289c565b50506000910152565b600081518084526128d5816020860160208601612899565b601f01601f19169290920160200192915050565b6040815260006128fc60408301856128bd565b905060018060a01b03831660208301529392505050565b600082601f83011261292457600080fd5b813567ffffffffffffffff8082111561293f5761293f612706565b604051601f8301601f19908116603f0116810190828211818310171561296757612967612706565b8160405283815286602085880101111561298057600080fd5b836020870160208301376000602085830101528094505050505092915050565b600080600080600060a086880312156129b857600080fd5b8535945060208601356129ca8161259c565b9350604086013567ffffffffffffffff808211156129e757600080fd5b6129f389838a01612913565b94506060880135915080821115612a0957600080fd5b50612a1688828901612913565b925050608086013560ff81168114612a2d57600080fd5b809150509295509295909350565b6001600160a01b0385168152608060208201819052600090612a5f908301866128bd565b8281036040840152612a7181866128bd565b91505060ff8316606083015295945050505050565b60008060008060808587031215612a9c57600080fd5b8435612aa78161259c565b93506020850135612ab78161259c565b92506040850135612ac78161259c565b9396929550929360600135925050565b6020808252602b908201527f496e697469616c697a61626c653a20636f6e7472616374206973206e6f74206960408201526a6e697469616c697a696e6760a81b606082015260800190565b7f416363657373436f6e74726f6c3a206163636f756e7420000000000000000000815260008351612b5a816017850160208801612899565b7001034b99036b4b9b9b4b733903937b6329607d1b6017918401918201528351612b8b816028840160208801612899565b01602801949350505050565b602081526000611e3160208301846128bd565b808201808211156108ab576108ab612870565b600060208284031215612bcf57600080fd5b81518015158114611e3157600080fd5b600060208284031215612bf157600080fd5b8151611e318161259c565b80820281158282048414176108ab576108ab612870565b634e487b7160e01b600052603260045260246000fd5b600081612c3857612c38612870565b50600019019056fea6d0b532cacea090bc411482cd491720e2eac14d48ce5d0402b8851e0bb2aec10c91b50b605fcbfb31133354bdc6661ee7d4bee7add1ae6c16ec4a6cca22f7f882b32d9ab5100db08aeb9a0e08b422d14851ec118736590462bf9c085a6e9448539440820030c4994db4e31b6b800deafd503688728f932addfe7a410515c14ca26469706673582212200123223deb9275a196ecec48e4bace1a21a2d5c367ad89469606bc975069adac64736f6c63430008130033",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "evmVersion": "paris",
+    "libraries": {},
+    "metadata": {
+      "appendCBOR": true,
+      "bytecodeHash": "ipfs",
+      "useLiteralContent": false
+    },
+    "optimizer": {
+      "enabled": true,
+      "runs": 200
+    },
+    "outputSelection": {
+      "*": {
+        "": [
+          "*"
+        ],
+        "*": [
+          "*"
+        ]
+      }
+    },
+    "remappings": [
+      "@axelar-cgp-solidity/=lib/axelar-cgp-solidity/",
+      "@axelar-gmp-sdk-solidity/=lib/axelar-gmp-sdk-solidity/",
+      "@axelar-network/axelar-gmp-sdk-solidity/=lib/axelar-gmp-sdk-solidity/",
+      "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+      "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+      "axelar-cgp-solidity/=lib/axelar-cgp-solidity/contracts/",
+      "axelar-gmp-sdk-solidity/=lib/axelar-gmp-sdk-solidity/contracts/",
+      "ds-test/=lib/forge-std/lib/ds-test/src/",
+      "erc4626-tests/=lib/openzeppelin-contracts-upgradeable/lib/erc4626-tests/",
+      "forge-std/=lib/forge-std/src/",
+      "openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/",
+      "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+      "openzeppelin/=lib/openzeppelin-contracts-upgradeable/contracts/"
+    ]
+  },
+  "optimization_runs": 200,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "0xdDA0d9448Ebe3eA43aFecE5Fa6401F5795c19333",
+      {
+        "internalType": "address",
+        "name": "_initializerAddress",
+        "type": "address"
+      }
+    ]
+  ],
+  "compiler_version": "v0.8.19+commit.7dd6d404",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2023-12-19T05:01:46.139914Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x60a06040523480156200001157600080fd5b5060405162002db938038062002db983398101604081905262000034916200006e565b6001600160a01b0381166200005c5760405163d92e233d60e01b815260040160405180910390fd5b6001600160a01b0316608052620000a0565b6000602082840312156200008157600080fd5b81516001600160a01b03811681146200009957600080fd5b9392505050565b608051612cf6620000c3600039600081816106d70152610e4d0152612cf66000f3fe60806040526004361061026b5760003560e01c806389c65d4111610144578063d6dc0b0d116100b6578063f14210a61161007a578063f14210a614610771578063f3dfce1d14610784578063f3fef3a3146107a4578063f6451255146107b7578063f865af08146107eb578063fb1bb9de1461080b57600080fd5b8063d6dc0b0d146106c5578063da51c71e146106f9578063de65c2e41461071b578063dee1ef0d1461072e578063e63ab1e91461074f57600080fd5b8063a217fddf11610108578063a217fddf146105f4578063b176806514610609578063b68ad1e41461063d578063c3b35a7e1461065e578063d41f177114610671578063d547741f146106a557600080fd5b806389c65d41146105605780638c956990146105805780638f70121f146105a157806391d14854146105c157806392ffd2e2146105e157600080fd5b80633f4ba83a116101dd5780636c11c21c116101a15780636c11c21c1461049c5780637248c77c146104bc57806377907d1d146104dc5780637ab5e3ae146104fe5780637efab4f5146105145780638456cb591461054b57600080fd5b80633f4ba83a1461042857806352b61e361461043d5780635c975abb1461045057806369053ed014610468578063697b894a1461048957600080fd5b80632540e2da1161022f5780632540e2da14610374578063274346b91461039457806329529c0e146103a75780632f2ff15d146103c857806332968782146103e857806336568abe1461040857600080fd5b8063011e1167146102ab57806301ffc9a7146102de5780630765c4051461030e57806318428c501461032e578063248a9ca31461033657600080fd5b366102a65761027861082d565b610132546001600160a01b031633146102a457604051630402506f60e01b815260040160405180910390fd5b005b600080fd5b3480156102b757600080fd5b506102c1610eee81565b6040516001600160a01b0390911681526020015b60405180910390f35b3480156102ea57600080fd5b506102fe6102f9366004612572565b61087a565b60405190151581526020016102d5565b34801561031a57600080fd5b506102a46103293660046125c1565b6108b1565b6102a461095c565b34801561034257600080fd5b506103666103513660046125de565b60009081526065602052604090206001015490565b6040519081526020016102d5565b34801561038057600080fd5b506102a461038f3660046125c1565b6109cd565b6102a46103a23660046125f7565b6109f4565b3480156103b357600080fd5b5061012e546102c1906001600160a01b031681565b3480156103d457600080fd5b506102a46103e3366004612623565b610a0c565b3480156103f457600080fd5b506102a46104033660046125c1565b610a36565b34801561041457600080fd5b506102a4610423366004612623565b610a59565b34801561043457600080fd5b506102a4610ad3565b6102a461044b3660046125de565b610af6565b34801561045c57600080fd5b5060975460ff166102fe565b34801561047457600080fd5b50610132546102c1906001600160a01b031681565b6102a46104973660046125f7565b610b0e565b3480156104a857600080fd5b506102a46104b73660046125c1565b610b26565b3480156104c857600080fd5b506102a46104d7366004612653565b610b49565b3480156104e857600080fd5b50610366600080516020612c6183398151915281565b34801561050a57600080fd5b506102c1610fff81565b34801561052057600080fd5b506102c161052f3660046125c1565b61012d602052600090815260409020546001600160a01b031681565b34801561055757600080fd5b506102a4610c8f565b34801561056c57600080fd5b506102a461057b3660046125c1565b610caf565b34801561058c57600080fd5b50610130546102c1906001600160a01b031681565b3480156105ad57600080fd5b506102a46105bc3660046125c1565b610cd2565b3480156105cd57600080fd5b506102fe6105dc366004612623565b610cf5565b6102a46105ef3660046125f7565b610d20565b34801561060057600080fd5b50610366600081565b34801561061557600080fd5b506103667f7a8dc26796a1e50e6e190b70259f58f6a4edd5b22280ceecc82b687b8e98286981565b34801561064957600080fd5b5061012f546102c1906001600160a01b031681565b6102a461066c3660046126c5565b610d2d565b34801561067d57600080fd5b506103667f87a7811f4bfedea3d341ad165680ae306b01aaeacc205d227629cf157dd9f82181565b3480156106b157600080fd5b506102a46106c0366004612623565b610d38565b3480156106d157600080fd5b506102c17f000000000000000000000000000000000000000000000000000000000000000081565b34801561070557600080fd5b50610366600080516020612c4183398151915281565b6102a46107293660046125de565b610d5d565b34801561073a57600080fd5b50610131546102c1906001600160a01b031681565b34801561075b57600080fd5b50610366600080516020612ca183398151915281565b6102a461077f3660046125de565b610d6a565b34801561079057600080fd5b506102a461079f366004612745565b610d82565b6102a46107b23660046125f7565b6111cb565b3480156107c357600080fd5b506103667f2cef46a936bdc5b7e6e8c71aa04560c41cf7d88bb26901a7e7f4936ff02accad81565b3480156107f757600080fd5b506102a46108063660046125c1565b6111d6565b34801561081757600080fd5b50610366600080516020612c8183398151915281565b60975460ff16156108785760405162461bcd60e51b815260206004820152601060248201526f14185d5cd8589b194e881c185d5cd95960821b60448201526064015b60405180910390fd5b565b60006001600160e01b03198216637965db0b60e01b14806108ab57506301ffc9a760e01b6001600160e01b03198316145b92915050565b600080516020612c418339815191526108c9816111f9565b6001600160a01b0382166108f05760405163d92e233d60e01b815260040160405180910390fd5b61012e54604080516001600160a01b03928316815291841660208301527f6295d9d82f5000a9dcc9019e6308fec486f74ee3f43489208a0e83b0f17fb1f6910160405180910390a15061012e80546001600160a01b0319166001600160a01b0392909216919091179055565b600080516020612c61833981519152610974816111f9565b3460000361099557604051637c946ed760e01b815260040160405180910390fd5b60405134815233907fed5ccca9e28db55e91a5eee6654c6ab321485b9586583e9f511dd0d65e3d95619060200160405180910390a250565b60006109d8816111f9565b6109f0600080516020612c8183398151915283610d38565b5050565b610132546109f0906001600160a01b03168383611203565b600082815260656020526040902060010154610a27816111f9565b610a318383611403565b505050565b6000610a41816111f9565b6109f0600080516020612c8183398151915283610a0c565b6001600160a01b0381163314610ac95760405162461bcd60e51b815260206004820152602f60248201527f416363657373436f6e74726f6c3a2063616e206f6e6c792072656e6f756e636560448201526e103937b632b9903337b91039b2b63360891b606482015260840161086f565b6109f08282611489565b600080516020612c81833981519152610aeb816111f9565b610af36114f0565b50565b61013254610af3906001600160a01b03163383611203565b610131546109f0906001600160a01b03168383611203565b6000610b31816111f9565b6109f0600080516020612ca183398151915283610a0c565b610b5161082d565b61012e546001600160a01b03163314610b7d5760405163122d54c760e11b815260040160405180910390fd5b60208111610bbf5760405163180a097760e01b815260206004820152600e60248201526d11185d18481d1bdbc81cda1bdc9d60921b604482015260640161086f565b6000610bce6020828486612828565b610bd791612852565b90507f2cef46a936bdc5b7e6e8c71aa04560c41cf7d88bb26901a7e7f4936ff02accad8103610c0a57610a318383611542565b7f87a7811f4bfedea3d341ad165680ae306b01aaeacc205d227629cf157dd9f8218103610c4657610a31610c418360208187612828565b61172e565b60405163180a097760e01b815260206004820152601c60248201527f556e737570706f7274656420616374696f6e207369676e617475726500000000604482015260640161086f565b600080516020612ca1833981519152610ca7816111f9565b610af36117ae565b6000610cba816111f9565b6109f0600080516020612c4183398151915283610d38565b6000610cdd816111f9565b6109f0600080516020612c4183398151915283610a0c565b60009182526065602090815260408084206001600160a01b0393909316845291905290205460ff1690565b6109f0610fff8383611203565b610a31838383611203565b600082815260656020526040902060010154610d53816111f9565b610a318383611489565b610af3610fff3383611203565b61013154610af3906001600160a01b03163383611203565b600054610100900460ff1615808015610da25750600054600160ff909116105b80610dbc5750303b158015610dbc575060005460ff166001145b610e1f5760405162461bcd60e51b815260206004820152602e60248201527f496e697469616c697a61626c653a20636f6e747261637420697320616c72656160448201526d191e481a5b9a5d1a585b1a5e995960921b606482015260840161086f565b6000805460ff191660011790558015610e42576000805461ff0019166101001790555b336001600160a01b037f00000000000000000000000000000000000000000000000000000000000000001614610e8b57604051630d622feb60e01b815260040160405180910390fd5b6001600160a01b0385161580610ea857506001600160a01b038416155b80610eba57506001600160a01b038316155b80610ecd575085516001600160a01b0316155b80610ee3575060208601516001600160a01b0316155b80610ef9575060408601516001600160a01b0316155b80610f0f575060608601516001600160a01b0316155b80610f25575060a08601516001600160a01b0316155b80610f3757506001600160a01b038216155b15610f555760405163d92e233d60e01b815260040160405180910390fd5b610f5d6117eb565b610f65611812565b610f6d611841565b8551610f7b90600090611403565b610f97600080516020612ca18339815191528760200151611403565b610fb3600080516020612c818339815191528760400151611403565b610fcf600080516020612c418339815191528760600151611403565b610feb600080516020612c618339815191528760800151611403565b611007600080516020612c618339815191528760a00151611403565b61012f80546001600160a01b038681166001600160a01b0319928316811790935561012e8054898316908416179055610130805487831690841617905561013280549186169190921617905560405161077760611b6020820152600091611087916034015b60405160208183030381529060405280519060200120611870565b604051637b69774360e11b8152610eee6004820152608060248201526008608482015267457468657265756d60c01b60a482015260c06044820152600360c48201526208aa8960eb1b60e4820152601260648201529091506001600160a01b0382169063f6d2ee869061010401600060405180830381600087803b15801561110e57600080fd5b505af1158015611122573d6000803e3d6000fd5b505061013180546001600160a01b039094166001600160a01b03199485168117909155610eee60005261012d6020527fad76b4044bfa734d1658e7587c3fd33991772c4284f450d12a829695b2e0bd04805490941617909255505080156111c3576000805461ff0019169055604051600181527f7f26b83ff96e1f2b6a682f133852f6798a09c465da95921460cefb38474024989060200160405180910390a15b505050505050565b6109f0823383611203565b60006111e1816111f9565b6109f0600080516020612ca183398151915283610d38565b610af3813361190d565b61120b611966565b61121361082d565b6001600160a01b038316158061123057506001600160a01b038216155b1561124e5760405163d92e233d60e01b815260040160405180910390fd5b8060000361126f57604051631f2a200560e01b815260040160405180910390fd5b3460000361129057604051631d3e008d60e21b815260040160405180910390fd5b6000610ffe196001600160a01b038516016112b5576112ae826119bf565b9050611302565b610132546001600160a01b03908116908516036112d5576112ae826119f4565b610131546001600160a01b03908116908516036112f5576112ae82611b4c565b6112ff8483611c00565b90505b604080517f7a8dc26796a1e50e6e190b70259f58f6a4edd5b22280ceecc82b687b8e98286960208201526001600160a01b0383811682840152336060830152858116608083015260a08083018690528351808403909101815260c0909201909252906000908616610fff146113775734611381565b6113818434612886565b61012e54604051637903aadd60e11b81529192506001600160a01b03169063f20755ba9083906113b790869033906004016128e9565b6000604051808303818588803b1580156113d057600080fd5b505af11580156113e4573d6000803e3d6000fd5b50505050506113f68387338888611e38565b505050610a31600160fb55565b61140d8282610cf5565b6109f05760008281526065602090815260408083206001600160a01b03851684529091529020805460ff191660011790556114453390565b6001600160a01b0316816001600160a01b0316837f2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d60405160405180910390a45050565b6114938282610cf5565b156109f05760008281526065602090815260408083206001600160a01b0385168085529252808320805460ff1916905551339285917ff6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b9190a45050565b6114f8611fd5565b6097805460ff191690557f5db9ee0a495bf2e6ff9c91a7834c1ba4fdd244a5e8aa4e537bd38aeae4b073aa335b6040516001600160a01b03909116815260200160405180910390a1565b6000808080611553858701876129a0565b92975090955093509150506001600160a01b0384166115855760405163d92e233d60e01b815260040160405180910390fd5b610130546001600160a01b03908116908516036115b55760405163a9a43cf960e01b815260040160405180910390fd5b610eed196001600160a01b038516016115e15760405163e9edc9b360e01b815260040160405180910390fd5b6001600160a01b03848116600090815261012d6020526040902054161561161b57604051632a431ae760e11b815260040160405180910390fd5b61012f546040516bffffffffffffffffffffffff19606087901b166020820152600091611656916001600160a01b039091169060340161106c565b6001600160a01b03868116600090815261012d60205260409081902080546001600160a01b031916928416928317905551637b69774360e11b81529192509063f6d2ee86906116af908890889088908890600401612a3b565b600060405180830381600087803b1580156116c957600080fd5b505af11580156116dd573d6000803e3d6000fd5b5050604080516001600160a01b03808a168252851660208201527f46bd56f98e1b14fd35691959270a6e1edf7cb8fcd489e0f9dda89e46c0d1ff0d935001905060405180910390a150505050505050565b600080808061173f85870187612a86565b929650909450925090506001600160a01b038416158061176657506001600160a01b038216155b156117845760405163d92e233d60e01b815260040160405180910390fd5b6001600160a01b03808516600090815261012d60205260409020546111c39186911685858561201e565b6117b661082d565b6097805460ff191660011790557f62e78cea01bee320cd4e420270b5ea74000d11b0c9f74754ebdbfc544b05a2586115253390565b600054610100900460ff166108785760405162461bcd60e51b815260040161086f90612ad7565b600054610100900460ff166118395760405162461bcd60e51b815260040161086f90612ad7565b610878612251565b600054610100900460ff166118685760405162461bcd60e51b815260040161086f90612ad7565b610878612284565b6000763d602d80600a3d3981f3363d3d373d3d3d363d730000008360601b60e81c176000526e5af43d82803e903d91602b57fd5bf38360781b1760205281603760096000f590506001600160a01b0381166108ab5760405162461bcd60e51b815260206004820152601760248201527f455243313136373a2063726561746532206661696c6564000000000000000000604482015260640161086f565b6119178282610cf5565b6109f057611924816122ab565b61192f8360206122bd565b604051602001611940929190612b22565b60408051601f198184030181529082905262461bcd60e51b825261086f91600401612b97565b600260fb54036119b85760405162461bcd60e51b815260206004820152601f60248201527f5265656e7472616e637947756172643a207265656e7472616e742063616c6c00604482015260640161086f565b600260fb55565b6000813410156119e25760405163044044a560e21b815260040160405180910390fd5b5050610130546001600160a01b031690565b600080611a018347612baa565b610132546040516323b872dd60e01b8152336004820152306024820152604481018690529192506001600160a01b03169081906323b872dd906064016020604051808303816000875af1925050508015611a78575060408051601f3d908101601f19168201909252611a7591810190612bbd565b60015b611a95576040516395047e5b60e01b815260040160405180910390fd5b80611ab3576040516395047e5b60e01b815260040160405180910390fd5b50604051632e1a7d4d60e01b8152600481018590526001600160a01b03821690632e1a7d4d90602401600060405180830381600087803b158015611af657600080fd5b505af1158015611b0a573d6000803e3d6000fd5b50505050814714611b3757604051637244981560e11b81524760048201526024810183905260440161086f565b5050610130546001600160a01b031692915050565b61013154604051632770a7eb60e21b8152336004820152602481018390526000916001600160a01b031690639dc29fac906044016020604051808303816000875af1925050508015611bbb575060408051601f3d908101601f19168201909252611bb891810190612bbd565b60015b611bd857604051631bc5aabf60e21b815260040160405180910390fd5b80611bf657604051631bc5aabf60e21b815260040160405180910390fd5b5050610eee919050565b6000826001600160a01b03163b600003611c2d576040516323ed03c160e01b815260040160405180910390fd5b6000836001600160a01b0316631f2d00656040518163ffffffff1660e01b8152600401602060405180830381865afa158015611c6d573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190611c919190612bdf565b90506001600160a01b038116611cba57604051634aa5ba3d60e11b815260040160405180910390fd5b6001600160a01b03818116600090815261012d6020526040902054811690851614611cf857604051633a3c22ef60e11b815260040160405180910390fd5b306001600160a01b0316846001600160a01b031663e78cea926040518163ffffffff1660e01b8152600401602060405180830381865afa158015611d40573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190611d649190612bdf565b6001600160a01b031614611d8b5760405163356be02f60e21b815260040160405180910390fd5b604051632770a7eb60e21b8152336004820152602481018490526001600160a01b03851690639dc29fac906044016020604051808303816000875af1925050508015611df4575060408051601f3d908101601f19168201909252611df191810190612bbd565b60015b611e1157604051631bc5aabf60e21b815260040160405180910390fd5b80611e2f57604051631bc5aabf60e21b815260040160405180910390fd5b505b9392505050565b610ffe196001600160a01b03851601611ea757816001600160a01b0316836001600160a01b0316866001600160a01b03167f3e4d9c687d8d20e243edc9ad6a15250d794842c784344c271b3ed94ae88f076584604051611e9a91815260200190565b60405180910390a4611fc7565b610132546001600160a01b0390811690851603611f0d57816001600160a01b0316836001600160a01b0316866001600160a01b03167f01f445551c40ec1a713933e4fac6d7781f367bce8e456b301bf2029aa3033d7784604051611e9a91815260200190565b610131546001600160a01b0390811690851603611f7657816001600160a01b0316836001600160a01b03167fc90fe32d7d4db065e2824f5cfd3ea5a1d07f2c233a7a6580e9abb4300a0f905b83604051611f6991815260200190565b60405180910390a3611fc7565b604080516001600160a01b038581168252602082018490528085169287821692918916917f551b24e30eba08b2d4d57d1c6345eb47e4c49327402afff270e6591af43cc00091015b60405180910390a45b5050505050565b600160fb55565b60975460ff166108785760405162461bcd60e51b815260206004820152601460248201527314185d5cd8589b194e881b9bdd081c185d5cd95960621b604482015260640161086f565b610130546001600160a01b03908116908616036120af57804710156120565760405163c7532eaf60e01b815260040160405180910390fd5b6120608282612459565b816001600160a01b0316836001600160a01b0316866001600160a01b03167f8294ebca1c2aada95b98b62a8d705ba5d7be4bdb75901d3f0eeb35062b706c7984604051611e9a91815260200190565b6001600160a01b0384166120d657604051633a3c22ef60e11b815260040160405180910390fd5b836001600160a01b03163b600003612101576040516323ed03c160e01b815260040160405180910390fd5b6040516340c10f1960e01b81526001600160a01b038381166004830152602482018390528516906340c10f19906044016020604051808303816000875af192505050801561216c575060408051601f3d908101601f1916820190925261216991810190612bbd565b60015b6121885760405162ec6f7b60e31b815260040160405180910390fd5b806121a55760405162ec6f7b60e31b815260040160405180910390fd5b50610eed196001600160a01b0386160161220557604080516001600160a01b038581168252602082018490528085169287821692918916917fd1b4e24e81f1c901551420568a9447fd105593af143ae8b096c6385e4fb7ec869101611e9a565b604080516001600160a01b038581168252602082018490528085169287821692918916917f3207f1f801a6ba9b6005cb9dc97d8498df3407dc7b1c7a644c7b57997f4f03c59101611fbe565b600054610100900460ff166122785760405162461bcd60e51b815260040161086f90612ad7565b6097805460ff19169055565b600054610100900460ff16611fce5760405162461bcd60e51b815260040161086f90612ad7565b60606108ab6001600160a01b03831660145b606060006122cc836002612bfc565b6122d7906002612baa565b67ffffffffffffffff8111156122ef576122ef612706565b6040519080825280601f01601f191660200182016040528015612319576020820181803683370190505b509050600360fc1b8160008151811061233457612334612c13565b60200101906001600160f81b031916908160001a905350600f60fb1b8160018151811061236357612363612c13565b60200101906001600160f81b031916908160001a9053506000612387846002612bfc565b612392906001612baa565b90505b600181111561240a576f181899199a1a9b1b9c1cb0b131b232b360811b85600f16601081106123c6576123c6612c13565b1a60f81b8282815181106123dc576123dc612c13565b60200101906001600160f81b031916908160001a90535060049490941c9361240381612c29565b9050612395565b508315611e315760405162461bcd60e51b815260206004820181905260248201527f537472696e67733a20686578206c656e67746820696e73756666696369656e74604482015260640161086f565b804710156124a95760405162461bcd60e51b815260206004820152601d60248201527f416464726573733a20696e73756666696369656e742062616c616e6365000000604482015260640161086f565b6000826001600160a01b03168260405160006040518083038185875af1925050503d80600081146124f6576040519150601f19603f3d011682016040523d82523d6000602084013e6124fb565b606091505b5050905080610a315760405162461bcd60e51b815260206004820152603a60248201527f416464726573733a20756e61626c6520746f2073656e642076616c75652c207260448201527f6563697069656e74206d61792068617665207265766572746564000000000000606482015260840161086f565b60006020828403121561258457600080fd5b81356001600160e01b031981168114611e3157600080fd5b6001600160a01b0381168114610af357600080fd5b80356125bc8161259c565b919050565b6000602082840312156125d357600080fd5b8135611e318161259c565b6000602082840312156125f057600080fd5b5035919050565b6000806040838503121561260a57600080fd5b82356126158161259c565b946020939093013593505050565b6000806040838503121561263657600080fd5b8235915060208301356126488161259c565b809150509250929050565b6000806020838503121561266657600080fd5b823567ffffffffffffffff8082111561267e57600080fd5b818501915085601f83011261269257600080fd5b8135818111156126a157600080fd5b8660208285010111156126b357600080fd5b60209290920196919550909350505050565b6000806000606084860312156126da57600080fd5b83356126e58161259c565b925060208401356126f58161259c565b929592945050506040919091013590565b634e487b7160e01b600052604160045260246000fd5b60405160c0810167ffffffffffffffff8111828210171561273f5761273f612706565b60405290565b600080600080600085870361014081121561275f57600080fd5b60c081121561276d57600080fd5b5061277661271c565b86356127818161259c565b815260208701356127918161259c565b602082015260408701356127a48161259c565b604082015260608701356127b78161259c565b606082015260808701356127ca8161259c565b608082015260a08701356127dd8161259c565b60a082015294506127f060c087016125b1565b93506127fe60e087016125b1565b925061280d61010087016125b1565b915061281c61012087016125b1565b90509295509295909350565b6000808585111561283857600080fd5b8386111561284557600080fd5b5050820193919092039150565b803560208310156108ab57600019602084900360031b1b1692915050565b634e487b7160e01b600052601160045260246000fd5b818103818111156108ab576108ab612870565b60005b838110156128b457818101518382015260200161289c565b50506000910152565b600081518084526128d5816020860160208601612899565b601f01601f19169290920160200192915050565b6040815260006128fc60408301856128bd565b905060018060a01b03831660208301529392505050565b600082601f83011261292457600080fd5b813567ffffffffffffffff8082111561293f5761293f612706565b604051601f8301601f19908116603f0116810190828211818310171561296757612967612706565b8160405283815286602085880101111561298057600080fd5b836020870160208301376000602085830101528094505050505092915050565b600080600080600060a086880312156129b857600080fd5b8535945060208601356129ca8161259c565b9350604086013567ffffffffffffffff808211156129e757600080fd5b6129f389838a01612913565b94506060880135915080821115612a0957600080fd5b50612a1688828901612913565b925050608086013560ff81168114612a2d57600080fd5b809150509295509295909350565b6001600160a01b0385168152608060208201819052600090612a5f908301866128bd565b8281036040840152612a7181866128bd565b91505060ff8316606083015295945050505050565b60008060008060808587031215612a9c57600080fd5b8435612aa78161259c565b93506020850135612ab78161259c565b92506040850135612ac78161259c565b9396929550929360600135925050565b6020808252602b908201527f496e697469616c697a61626c653a20636f6e7472616374206973206e6f74206960408201526a6e697469616c697a696e6760a81b606082015260800190565b7f416363657373436f6e74726f6c3a206163636f756e7420000000000000000000815260008351612b5a816017850160208801612899565b7001034b99036b4b9b9b4b733903937b6329607d1b6017918401918201528351612b8b816028840160208801612899565b01602801949350505050565b602081526000611e3160208301846128bd565b808201808211156108ab576108ab612870565b600060208284031215612bcf57600080fd5b81518015158114611e3157600080fd5b600060208284031215612bf157600080fd5b8151611e318161259c565b80820281158282048414176108ab576108ab612870565b634e487b7160e01b600052603260045260246000fd5b600081612c3857612c38612870565b50600019019056fea6d0b532cacea090bc411482cd491720e2eac14d48ce5d0402b8851e0bb2aec10c91b50b605fcbfb31133354bdc6661ee7d4bee7add1ae6c16ec4a6cca22f7f882b32d9ab5100db08aeb9a0e08b422d14851ec118736590462bf9c085a6e9448539440820030c4994db4e31b6b800deafd503688728f932addfe7a410515c14ca26469706673582212200123223deb9275a196ecec48e4bace1a21a2d5c367ad89469606bc975069adac64736f6c63430008130033000000000000000000000000dda0d9448ebe3ea43afece5fa6401f5795c19333",
+  "name": "ChildERC20Bridge",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": true,
+  "is_verified_via_eth_bytecode_db": true,
+  "language": "solidity",
+  "evm_version": "paris",
+  "can_be_visualized_via_sol2uml": true,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_initializerAddress",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [],
+      "name": "AlreadyMapped",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "actualBalance",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "expectedBalance",
+          "type": "uint256"
+        }
+      ],
+      "name": "BalanceInvariantCheckFailed",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "BridgeNotSet",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "BurnFailed",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "CantMapETH",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "CantMapIMX",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "EmptyTokenContract",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "IncorrectBridgeAddress",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "InsufficientIMX",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "InsufficientValue",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "string",
+          "name": "reason",
+          "type": "string"
+        }
+      ],
+      "name": "InvalidData",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "MintFailed",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NoGas",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NonWrappedNativeTransfer",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotBridgeAdaptor",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotMapped",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "TransferWIMXFailed",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "UnauthorizedInitializer",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddress",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAddressRootToken",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroAmount",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ZeroValue",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "oldChildBridgeAdaptor",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "newChildBridgeAdaptor",
+          "type": "address"
+        }
+      ],
+      "name": "ChildBridgeAdaptorUpdated",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "rootToken",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "childToken",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ChildChainERC20Deposit",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "rootToken",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "childToken",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ChildChainERC20Withdraw",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ChildChainEthWithdraw",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "rootToken",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ChildChainNativeIMXWithdraw",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "rootToken",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ChildChainWrappedIMXWithdraw",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "rootToken",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "IMXDeposit",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "uint8",
+          "name": "version",
+          "type": "uint8"
+        }
+      ],
+      "name": "Initialized",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "rootToken",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "childToken",
+          "type": "address"
+        }
+      ],
+      "name": "L2TokenMapped",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "rootToken",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "childToken",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "NativeEthDeposit",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "Paused",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "depositor",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "PrivilegedDeposit",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "role",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "previousAdminRole",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "newAdminRole",
+          "type": "bytes32"
+        }
+      ],
+      "name": "RoleAdminChanged",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "role",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "sender",
+          "type": "address"
+        }
+      ],
+      "name": "RoleGranted",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "bytes32",
+          "name": "role",
+          "type": "bytes32"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "sender",
+          "type": "address"
+        }
+      ],
+      "name": "RoleRevoked",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "Unpaused",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "ADAPTOR_MANAGER_ROLE",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "DEFAULT_ADMIN_ROLE",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "DEPOSIT_SIG",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "MAP_TOKEN_SIG",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "NATIVE_ETH",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "NATIVE_IMX",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "PAUSER_ROLE",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "PRIVILEGED_DEPOSITOR_ROLE",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "UNPAUSER_ROLE",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "WITHDRAW_SIG",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "childBridgeAdaptor",
+      "outputs": [
+        {
+          "internalType": "contract IChildBridgeAdaptor",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "childETHToken",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "childTokenTemplate",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "role",
+          "type": "bytes32"
+        }
+      ],
+      "name": "getRoleAdmin",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "grantAdaptorManagerRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "grantPauserRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "role",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "grantRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "grantUnpauserRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "role",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "hasRole",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "components": [
+            {
+              "internalType": "address",
+              "name": "defaultAdmin",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "pauser",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "unpauser",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "adaptorManager",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "initialDepositor",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "treasuryManager",
+              "type": "address"
+            }
+          ],
+          "internalType": "struct IChildERC20Bridge.InitializationRoles",
+          "name": "newRoles",
+          "type": "tuple"
+        },
+        {
+          "internalType": "address",
+          "name": "newBridgeAdaptor",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "newChildTokenTemplate",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "newRootIMXToken",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "newWIMXToken",
+          "type": "address"
+        }
+      ],
+      "name": "initialize",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "initializerAddress",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes",
+          "name": "data",
+          "type": "bytes"
+        }
+      ],
+      "name": "onMessageReceive",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pause",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "paused",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "privilegedDeposit",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "role",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "renounceRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "revokeAdaptorManagerRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "revokePauserRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes32",
+          "name": "role",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "revokeRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "account",
+          "type": "address"
+        }
+      ],
+      "name": "revokeUnpauserRole",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "rootIMXToken",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "rootTokenToChildToken",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes4",
+          "name": "interfaceId",
+          "type": "bytes4"
+        }
+      ],
+      "name": "supportsInterface",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "unpause",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "newBridgeAdaptor",
+          "type": "address"
+        }
+      ],
+      "name": "updateChildBridgeAdaptor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "wIMXToken",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "contract IChildERC20",
+          "name": "childToken",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdraw",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdrawETH",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdrawETHTo",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdrawIMX",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdrawIMXTo",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "contract IChildERC20",
+          "name": "childToken",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdrawTo",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdrawWIMX",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "receiver",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "withdrawWIMXTo",
+      "outputs": [],
+      "stateMutability": "payable",
+      "type": "function"
+    },
+    {
+      "stateMutability": "payable",
+      "type": "receive"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": false,
+  "constructor_args": "000000000000000000000000dda0d9448ebe3ea43afece5fa6401f5795c19333",
+  "sources": {
+    "src/child/ChildERC20Bridge.sol": {
+      "content": "// Copyright Immutable Pty Ltd 2018 - 2023\n// SPDX-License-Identifier: Apache 2.0\npragma solidity 0.8.19;\n\nimport {Clones} from \"@openzeppelin/contracts/proxy/Clones.sol\";\nimport {Address} from \"@openzeppelin/contracts/utils/Address.sol\";\nimport {\n    IChildERC20BridgeEvents,\n    IChildERC20BridgeErrors,\n    IChildERC20Bridge\n} from \"../interfaces/child/IChildERC20Bridge.sol\";\nimport {IChildBridgeAdaptor} from \"../interfaces/child/IChildBridgeAdaptor.sol\";\nimport {IChildERC20} from \"../interfaces/child/IChildERC20.sol\";\nimport {ReentrancyGuardUpgradeable} from \"@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol\";\nimport {IWIMX} from \"../interfaces/child/IWIMX.sol\";\nimport {BridgeRoles} from \"../common/BridgeRoles.sol\";\n\n/**\n * @title Child ERC20 Bridge\n * @notice ChildERC20Bridge is a bridge contract for the child chain, which enables bridging of standard ERC20 tokens, ETH, wETH, IMX and wIMX from the root chain to the child chain and back.\n * @dev Features:\n *      - Map: A token that is originally created on the root chain, can be mapped to the child chain, where a representation of the token is created and managed by the bridge.\n *      - Deposit: Standard ERC20 tokens, native ETH, wrapped ETH or IMX that can be deposited on the root chain, and wrapped version of the tokens are issued on the child chain.\n *      - Withdraw: Bridged wrapped tokens can be withdrawn, so that they can be redeemed for their original tokens on the root chain.\n *      - Manage Role Based Access Control\n *\n * @dev Design:\n *      This contract follows a pattern of using a bridge adaptor to communicate with the child chain. This is because the underlying communication protocol may change,\n *      and also allows us to decouple vendor-specific messaging logic from the bridge logic.\n *      Because of this pattern, any checks or logic that is agnostic to the messaging protocol should be done in this contract.\n *      Any checks or logic that is specific to the underlying messaging protocol should be done in the bridge adaptor.\n *\n * @dev Roles:\n *      - An account with a PAUSER_ROLE can pause the contract.\n *      - An account with an UNPAUSER_ROLE can unpause the contract.\n *      - An account with an ADAPTOR_MANAGER_ROLE can update the root bridge adaptor address.\n *      - An account with a DEFAULT_ADMIN_ROLE can grant and revoke roles.\n *\n * @dev Caution:\n *      - When withdrawing ETH (L2 -> L1), it's crucial to make sure that the receiving address on the root chain,\n *        if it's a contract, has a receive or fallback function that allows it to accept native ETH on the root chain.\n *        If this isn't the case, the transaction on the root chain could revert, potentially locking the user's funds indefinitely.\n *      - There is undefined behaviour for bridging non-standard ERC20 tokens (e.g. rebasing tokens). Please approach such cases with great care.\n *      - The initialize function is susceptible to front running, so precautions should be taken to account for this scenario.\n *\n * @dev Note:\n *      - This is an upgradeable contract that should be operated behind OpenZeppelin's TransparentUpgradeableProxy.\n */\ncontract ChildERC20Bridge is\n    BridgeRoles,\n    ReentrancyGuardUpgradeable,\n    IChildERC20BridgeErrors,\n    IChildERC20Bridge,\n    IChildERC20BridgeEvents\n{\n    /// @dev leave this as the first param for the integration tests.\n    mapping(address => address) public rootTokenToChildToken;\n\n    /// @dev Role identifier for those who can directly deposit native IMX to the bridge.\n    bytes32 public constant PRIVILEGED_DEPOSITOR_ROLE = keccak256(\"PRIVILEGED_DEPOSITOR\");\n\n    bytes32 public constant MAP_TOKEN_SIG = keccak256(\"MAP_TOKEN\");\n    bytes32 public constant DEPOSIT_SIG = keccak256(\"DEPOSIT\");\n    bytes32 public constant WITHDRAW_SIG = keccak256(\"WITHDRAW\");\n    address public constant NATIVE_ETH = address(0xeee);\n    address public constant NATIVE_IMX = address(0xfff);\n\n    /// @dev The address of the bridge adapter used to send and receive messages to and from the root chain.\n    IChildBridgeAdaptor public childBridgeAdaptor;\n\n    /// @dev The address of the token template that will be cloned to create tokens.\n    address public childTokenTemplate;\n    /// @dev The address of the IMX ERC20 token on L1.\n    address public rootIMXToken;\n    /// @dev The address of the ETH ERC20 token on L2.\n    address public childETHToken;\n    /// @dev The address of the wrapped IMX token on L2.\n    address public wIMXToken;\n    /// @dev Address of the authorized initializer.\n    address public immutable initializerAddress;\n\n    /**\n     * @notice Modifier to ensure that the caller is the registered child bridge adaptor.\n     */\n    modifier onlyBridgeAdaptor() {\n        if (msg.sender != address(childBridgeAdaptor)) {\n            revert NotBridgeAdaptor();\n        }\n        _;\n    }\n\n    /**\n     * @notice Constructs the ChildERC20Bridge contract.\n     * @param _initializerAddress The address of the authorized initializer.\n     */\n    constructor(address _initializerAddress) {\n        if (_initializerAddress == address(0)) {\n            revert ZeroAddress();\n        }\n        initializerAddress = _initializerAddress;\n    }\n\n    /**\n     * @notice Initialization function for ChildERC20Bridge.\n     * @param newRoles Struct containing addresses of roles.\n     * @param newBridgeAdaptor Address of StateSender to send deposit information to.\n     * @param newChildTokenTemplate Address of child token template to clone.\n     * @param newRootIMXToken Address of ECR20 IMX on the root chain.\n     * @param newWIMXToken Address of wrapped IMX on the child chain.\n     * @dev Can only be called once.\n     */\n    function initialize(\n        InitializationRoles memory newRoles,\n        address newBridgeAdaptor,\n        address newChildTokenTemplate,\n        address newRootIMXToken,\n        address newWIMXToken\n    ) public initializer {\n        if (msg.sender != initializerAddress) {\n            revert UnauthorizedInitializer();\n        }\n        if (\n            newBridgeAdaptor == address(0) || newChildTokenTemplate == address(0) || newRootIMXToken == address(0)\n                || newRoles.defaultAdmin == address(0) || newRoles.pauser == address(0) || newRoles.unpauser == address(0)\n                || newRoles.adaptorManager == address(0) || newRoles.treasuryManager == address(0)\n                || newWIMXToken == address(0)\n        ) {\n            revert ZeroAddress();\n        }\n\n        __AccessControl_init();\n        __Pausable_init();\n        __ReentrancyGuard_init();\n\n        _grantRole(DEFAULT_ADMIN_ROLE, newRoles.defaultAdmin);\n        _grantRole(PAUSER_ROLE, newRoles.pauser);\n        _grantRole(UNPAUSER_ROLE, newRoles.unpauser);\n        _grantRole(ADAPTOR_MANAGER_ROLE, newRoles.adaptorManager);\n        _grantRole(PRIVILEGED_DEPOSITOR_ROLE, newRoles.initialDepositor);\n        _grantRole(PRIVILEGED_DEPOSITOR_ROLE, newRoles.treasuryManager);\n\n        childTokenTemplate = newChildTokenTemplate;\n        childBridgeAdaptor = IChildBridgeAdaptor(newBridgeAdaptor);\n        rootIMXToken = newRootIMXToken;\n        wIMXToken = newWIMXToken;\n\n        // NOTE: how will this behave in an updgrade scenario?\n        // e.g. this clone may already be deployed and we could deploy to the same address if the salt is the same.\n        // Clone childERC20 for native eth\n        IChildERC20 clonedETHToken =\n            IChildERC20(Clones.cloneDeterministic(childTokenTemplate, keccak256(abi.encodePacked(NATIVE_ETH))));\n        // Initialize\n        clonedETHToken.initialize(NATIVE_ETH, \"Ethereum\", \"ETH\", 18);\n        childETHToken = address(clonedETHToken);\n\n        // Map the supported tokens by default\n        rootTokenToChildToken[NATIVE_ETH] = childETHToken;\n    }\n\n    /**\n     * @notice Method to receive IMX back from the WIMX contract when it is unwrapped\n     * @dev When a user deposits wIMX, it must first be unwrapped.\n     *      This allows the bridge to store the underlying native IMX, rather than the wrapped version.\n     *      The unwrapping is done through the WIMX contract's `withdraw()` function, which sends the native IMX to this bridge contract.\n     *      The only reason this `receive()` function is needed is for this process, hence the validation ensures that the sender is the WIMX contract.\n     */\n    receive() external payable whenNotPaused {\n        // Revert if sender is not the WIMX token address\n        if (msg.sender != wIMXToken) {\n            revert NonWrappedNativeTransfer();\n        }\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function privilegedDeposit() external payable onlyRole(PRIVILEGED_DEPOSITOR_ROLE) {\n        if (msg.value == 0) {\n            revert ZeroValue();\n        }\n        emit PrivilegedDeposit(msg.sender, msg.value);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function updateChildBridgeAdaptor(address newBridgeAdaptor) external onlyRole(ADAPTOR_MANAGER_ROLE) {\n        if (newBridgeAdaptor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        emit ChildBridgeAdaptorUpdated(address(childBridgeAdaptor), newBridgeAdaptor);\n        childBridgeAdaptor = IChildBridgeAdaptor(newBridgeAdaptor);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     * @dev This is only callable by the child chain bridge adaptor.\n     *      This method assumes that the adaptor will have performed all\n     *      validations relating to the source of the message, prior to calling this method.\n     */\n    function onMessageReceive(bytes calldata data) external whenNotPaused onlyBridgeAdaptor {\n        if (data.length <= 32) {\n            // Data must always be greater than 32.\n            // 32 bytes for the signature, and at least some information for the payload\n            revert InvalidData(\"Data too short\");\n        }\n\n        bytes32 sig = bytes32(data[:32]);\n        if (sig == MAP_TOKEN_SIG) {\n            _mapToken(data);\n        } else if (sig == DEPOSIT_SIG) {\n            _deposit(data[32:]);\n        } else {\n            revert InvalidData(\"Unsupported action signature\");\n        }\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdraw(IChildERC20 childToken, uint256 amount) external payable {\n        _withdraw(address(childToken), msg.sender, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawTo(IChildERC20 childToken, address receiver, uint256 amount) external payable {\n        _withdraw(address(childToken), receiver, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawIMX(uint256 amount) external payable {\n        _withdraw(NATIVE_IMX, msg.sender, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawIMXTo(address receiver, uint256 amount) external payable {\n        _withdraw(NATIVE_IMX, receiver, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawWIMX(uint256 amount) external payable {\n        _withdraw(wIMXToken, msg.sender, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     */\n    function withdrawWIMXTo(address receiver, uint256 amount) external payable {\n        _withdraw(wIMXToken, receiver, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     * @dev Caution:\n     *      When withdrawing ETH, it's crucial to make sure that the receiving address (`msg.sender`) on the root chain,\n     *      if it's a contract, has a receive or fallback function that allows it to accept native ETH.\n     *      If this isn't the case, the transaction on the root chain could revert, potentially locking the user's funds indefinitely.\n     */\n    function withdrawETH(uint256 amount) external payable {\n        _withdraw(childETHToken, msg.sender, amount);\n    }\n\n    /**\n     * @inheritdoc IChildERC20Bridge\n     * @dev Caution:\n     *      When withdrawing ETH, it's crucial to make sure that the receiving address (`receiver`) on the root chain,\n     *      if it's a contract, has a receive or fallback function that allows it to accept native ETH.\n     *      If this isn't the case, the transaction on the root chain could revert, potentially locking the user's funds indefinitely.\n     */\n    function withdrawETHTo(address receiver, uint256 amount) external payable {\n        _withdraw(childETHToken, receiver, amount);\n    }\n\n    /**\n     * @notice Private function to handle withdrawal process for all ERC20 and native token types.\n     * @param childTokenAddr The address of the child token to withdraw.\n     * @param receiver The address to withdraw the tokens to.\n     * @param amount The amount of tokens to withdraw.\n     *\n     * Requirements:\n     *\n     * - `childTokenAddr` must not be the zero address.\n     * - `receiver` must not be the zero address.\n     * - `amount` must be greater than zero.\n     * - `msg.value` must be greater than zero.\n     * - `childToken` must exist.\n     * - `childToken` must be mapped.\n     * - `childToken` must have a the bridge set.\n     */\n    function _withdraw(address childTokenAddr, address receiver, uint256 amount) private nonReentrant whenNotPaused {\n        if (childTokenAddr == address(0) || receiver == address(0)) {\n            revert ZeroAddress();\n        }\n        if (amount == 0) {\n            revert ZeroAmount();\n        }\n        if (msg.value == 0) {\n            revert NoGas();\n        }\n\n        address rootToken;\n        if (childTokenAddr == NATIVE_IMX) {\n            rootToken = _withdrawIMX(amount);\n        } else if (childTokenAddr == wIMXToken) {\n            rootToken = _withdrawWIMX(amount);\n        } else if (childTokenAddr == childETHToken) {\n            rootToken = _withdrawETH(amount);\n        } else {\n            rootToken = _withdrawERC20(childTokenAddr, amount);\n        }\n\n        // Encode the message payload\n        bytes memory payload = abi.encode(WITHDRAW_SIG, rootToken, msg.sender, receiver, amount);\n\n        // Account for fee amount\n        uint256 feeAmount = (childTokenAddr == NATIVE_IMX) ? msg.value - amount : msg.value;\n\n        // Send the message to the bridge adaptor and up to root chain\n        childBridgeAdaptor.sendMessage{value: feeAmount}(payload, msg.sender);\n\n        _emitWithdrawEvent(rootToken, childTokenAddr, msg.sender, receiver, amount);\n    }\n\n    /**\n     * @notice Private function to handle withdrawal of L2 native IMX.\n     */\n    function _withdrawIMX(uint256 amount) private returns (address) {\n        if (msg.value < amount) {\n            revert InsufficientValue();\n        }\n        return rootIMXToken;\n    }\n\n    /**\n     * @notice Private function to handle withdrawal of L1 native ETH.\n     */\n    function _withdrawETH(uint256 amount) private returns (address) {\n        try IChildERC20(childETHToken).burn(msg.sender, amount) returns (bool success) {\n            if (!success) revert BurnFailed();\n        } catch {\n            revert BurnFailed();\n        }\n\n        return NATIVE_ETH;\n    }\n\n    /**\n     * @notice Private function to handle withdrawal of native IMX.\n     */\n    function _withdrawWIMX(uint256 amount) private returns (address) {\n        // Calculate expected balance\n        uint256 expectedBalance = address(this).balance + amount;\n\n        IWIMX wIMX = IWIMX(wIMXToken);\n\n        // Transfer to contract\n        try wIMX.transferFrom(msg.sender, address(this), amount) returns (bool success) {\n            if (!success) revert TransferWIMXFailed();\n        } catch {\n            revert TransferWIMXFailed();\n        }\n\n        // Withdraw\n        wIMX.withdraw(amount);\n\n        // Assert balance\n        if (address(this).balance != expectedBalance) {\n            revert BalanceInvariantCheckFailed(address(this).balance, expectedBalance);\n        }\n\n        return rootIMXToken;\n    }\n\n    /**\n     * @notice Private function to handle withdrawal of ERC20 tokens.\n     */\n    function _withdrawERC20(address childToken, uint256 amount) private returns (address) {\n        // Validate code existence\n        if (address(childToken).code.length == 0) {\n            revert EmptyTokenContract();\n        }\n\n        address rootToken = IChildERC20(childToken).rootToken();\n\n        // A mapped token should never have root token unset\n        if (rootToken == address(0)) {\n            revert ZeroAddressRootToken();\n        }\n\n        // Assert mapping\n        if (rootTokenToChildToken[rootToken] != address(childToken)) {\n            revert NotMapped();\n        }\n\n        // A mapped token should never have the bridge unset\n        if (IChildERC20(childToken).bridge() != address(this)) {\n            revert IncorrectBridgeAddress();\n        }\n\n        // Burn tokens\n        try IChildERC20(childToken).burn(msg.sender, amount) returns (bool success) {\n            if (!success) revert BurnFailed();\n        } catch {\n            revert BurnFailed();\n        }\n\n        return rootToken;\n    }\n\n    /**\n     * @notice Private function to emit withdraw events.\n     */\n    function _emitWithdrawEvent(address rootToken, address childToken, address sender, address receiver, uint256 amount)\n        private\n    {\n        if (childToken == NATIVE_IMX) {\n            emit ChildChainNativeIMXWithdraw(rootToken, sender, receiver, amount);\n        } else if (childToken == wIMXToken) {\n            emit ChildChainWrappedIMXWithdraw(rootToken, sender, receiver, amount);\n        } else if (childToken == childETHToken) {\n            emit ChildChainEthWithdraw(sender, receiver, amount);\n        } else {\n            emit ChildChainERC20Withdraw(rootToken, childToken, sender, receiver, amount);\n        }\n    }\n\n    /**\n     * @notice Private function to handle mapping of root ERC20 tokens to child ERC20 tokens.\n     * @param data The data payload of the message.\n     *\n     * Requirements:\n     *\n     * - `rootToken` must not be the zero address.\n     * - `rootToken` must not be the root IMX token.\n     * - `rootToken` must not be native ETH.\n     * - `rootToken` must not already be mapped.\n     */\n    function _mapToken(bytes calldata data) private {\n        (, address rootToken, string memory name, string memory symbol, uint8 decimals) =\n            abi.decode(data, (bytes32, address, string, string, uint8));\n\n        if (rootToken == address(0)) {\n            revert ZeroAddress();\n        }\n\n        if (address(rootToken) == rootIMXToken) {\n            revert CantMapIMX();\n        }\n\n        if (address(rootToken) == NATIVE_ETH) {\n            revert CantMapETH();\n        }\n\n        if (rootTokenToChildToken[rootToken] != address(0)) {\n            revert AlreadyMapped();\n        }\n\n        // Deploy child chain token\n        IChildERC20 childToken =\n            IChildERC20(Clones.cloneDeterministic(childTokenTemplate, keccak256(abi.encodePacked(rootToken))));\n        // Map token\n        rootTokenToChildToken[rootToken] = address(childToken);\n\n        // Intialize token\n        childToken.initialize(rootToken, name, symbol, decimals);\n\n        emit L2TokenMapped(rootToken, address(childToken));\n    }\n\n    /**\n     * @notice Private function to handle depositing of ERC20 and native tokens to the child chain.\n     * @param data The data payload of the message.\n     *\n     * Requirements:\n     *\n     * - `rootToken` must not be the zero address.\n     * - `receiver` must not be the zero address.\n     * - `childToken` must be mapped.\n     * - `childToken` must exist.\n     *\n     */\n    function _deposit(bytes calldata data) private {\n        (address rootToken, address sender, address receiver, uint256 amount) =\n            abi.decode(data, (address, address, address, uint256));\n\n        if (rootToken == address(0) || receiver == address(0)) {\n            revert ZeroAddress();\n        }\n\n        _transferTokensAndEmitEvent(rootToken, rootTokenToChildToken[rootToken], sender, receiver, amount);\n    }\n\n    function _transferTokensAndEmitEvent(\n        address rootToken,\n        address childToken,\n        address sender,\n        address receiver,\n        uint256 amount\n    ) private {\n        if (rootToken == rootIMXToken) {\n            if (address(this).balance < amount) {\n                revert InsufficientIMX();\n            }\n            Address.sendValue(payable(receiver), amount);\n            emit IMXDeposit(rootToken, sender, receiver, amount);\n            return;\n        }\n\n        if (childToken == address(0)) {\n            revert NotMapped();\n        }\n\n        if (childToken.code.length == 0) {\n            revert EmptyTokenContract();\n        }\n\n        try IChildERC20(childToken).mint(receiver, amount) returns (bool success) {\n            if (!success) revert MintFailed();\n        } catch {\n            revert MintFailed();\n        }\n\n        if (rootToken == NATIVE_ETH) {\n            emit NativeEthDeposit(rootToken, address(childToken), sender, receiver, amount);\n        } else {\n            emit ChildChainERC20Deposit(rootToken, address(childToken), sender, receiver, amount);\n        }\n    }\n\n    // slither-disable-next-line unused-state,naming-convention\n    uint256[50] private __gapChildERC20Bridge;\n}\n"
+    }
+  }
+}
