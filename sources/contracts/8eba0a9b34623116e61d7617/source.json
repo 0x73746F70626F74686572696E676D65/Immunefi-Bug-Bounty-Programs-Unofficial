@@ -1,0 +1,1490 @@
+{
+  "sources": {
+    "contracts/Governable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\n/**\n * @title OUSD Governable Contract\n * @dev Copy of the openzeppelin Ownable.sol contract with nomenclature change\n *      from owner to governor and renounce methods removed. Does not use\n *      Context.sol like Ownable.sol does for simplification.\n * @author Origin Protocol Inc\n */\nabstract contract Governable {\n    // Storage position of the owner and pendingOwner of the contract\n    // keccak256(\"OUSD.governor\");\n    bytes32 private constant governorPosition = 0x7bea13895fa79d2831e0a9e28edede30099005a50d652d8957cf8a607ee6ca4a;\n\n    // keccak256(\"OUSD.pending.governor\");\n    bytes32 private constant pendingGovernorPosition =\n        0x44c4d30b2eaad5130ad70c3ba6972730566f3e6359ab83e800d905c61b1c51db;\n\n    // keccak256(\"OUSD.reentry.status\");\n    bytes32 private constant reentryStatusPosition = 0x53bf423e48ed90e97d02ab0ebab13b2a235a6bfbe9c321847d5c175333ac4535;\n\n    // See OpenZeppelin ReentrancyGuard implementation\n    uint256 constant _NOT_ENTERED = 1;\n    uint256 constant _ENTERED = 2;\n\n    event PendingGovernorshipTransfer(address indexed previousGovernor, address indexed newGovernor);\n\n    event GovernorshipTransferred(address indexed previousGovernor, address indexed newGovernor);\n\n    /**\n     * @dev Initializes the contract setting the deployer as the initial Governor.\n     */\n    constructor() {\n        _setGovernor(msg.sender);\n        emit GovernorshipTransferred(address(0), _governor());\n    }\n\n    /**\n     * @dev Returns the address of the current Governor.\n     */\n    function governor() public view returns (address) {\n        return _governor();\n    }\n\n    /**\n     * @dev Returns the address of the current Governor.\n     */\n    function _governor() internal view returns (address governorOut) {\n        bytes32 position = governorPosition;\n        assembly {\n            governorOut := sload(position)\n        }\n    }\n\n    /**\n     * @dev Returns the address of the pending Governor.\n     */\n    function _pendingGovernor() internal view returns (address pendingGovernor) {\n        bytes32 position = pendingGovernorPosition;\n        assembly {\n            pendingGovernor := sload(position)\n        }\n    }\n\n    /**\n     * @dev Throws if called by any account other than the Governor.\n     */\n    modifier onlyGovernor() {\n        require(isGovernor(), \"Caller is not the Governor\");\n        _;\n    }\n\n    /**\n     * @dev Returns true if the caller is the current Governor.\n     */\n    function isGovernor() public view returns (bool) {\n        return msg.sender == _governor();\n    }\n\n    function _setGovernor(address newGovernor) internal {\n        bytes32 position = governorPosition;\n        assembly {\n            sstore(position, newGovernor)\n        }\n    }\n\n    /**\n     * @dev Prevents a contract from calling itself, directly or indirectly.\n     * Calling a `nonReentrant` function from another `nonReentrant`\n     * function is not supported. It is possible to prevent this from happening\n     * by making the `nonReentrant` function external, and make it call a\n     * `private` function that does the actual work.\n     */\n    modifier nonReentrant() {\n        bytes32 position = reentryStatusPosition;\n        uint256 _reentry_status;\n        assembly {\n            _reentry_status := sload(position)\n        }\n\n        // On the first call to nonReentrant, _notEntered will be true\n        require(_reentry_status != _ENTERED, \"Reentrant call\");\n\n        // Any calls to nonReentrant after this point will fail\n        assembly {\n            sstore(position, _ENTERED)\n        }\n\n        _;\n\n        // By storing the original value once again, a refund is triggered (see\n        // https://eips.ethereum.org/EIPS/eip-2200)\n        assembly {\n            sstore(position, _NOT_ENTERED)\n        }\n    }\n\n    function _setPendingGovernor(address newGovernor) internal {\n        bytes32 position = pendingGovernorPosition;\n        assembly {\n            sstore(position, newGovernor)\n        }\n    }\n\n    /**\n     * @dev Transfers Governance of the contract to a new account (`newGovernor`).\n     * Can only be called by the current Governor. Must be claimed for this to complete\n     * @param _newGovernor Address of the new Governor\n     */\n    function transferGovernance(address _newGovernor) external onlyGovernor {\n        _setPendingGovernor(_newGovernor);\n        emit PendingGovernorshipTransfer(_governor(), _newGovernor);\n    }\n\n    /**\n     * @dev Claim Governance of the contract to a new account (`newGovernor`).\n     * Can only be called by the new Governor.\n     */\n    function claimGovernance() external {\n        require(msg.sender == _pendingGovernor(), \"Only the pending Governor can complete the claim\");\n        _changeGovernor(msg.sender);\n    }\n\n    /**\n     * @dev Change Governance of the contract to a new account (`newGovernor`).\n     * @param _newGovernor Address of the new Governor\n     */\n    function _changeGovernor(address _newGovernor) internal {\n        require(_newGovernor != address(0), \"New Governor is address(0)\");\n        emit GovernorshipTransferred(_governor(), _newGovernor);\n        _setGovernor(_newGovernor);\n    }\n}\n"
+    },
+    "contracts/RewardsSource.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.10;\n\nimport {Governable} from \"./Governable.sol\";\n\ninterface Mintable {\n    function mint(address to, uint256 amount) external;\n    function balanceOf(address owner) external view returns (uint256);\n    function transfer(address to, uint256 amount) external returns (bool);\n}\n\n/// @title OGV Inflation and Rewards\n/// @author Daniel Von Fange\ncontract RewardsSource is Governable {\n    address public immutable ogv;\n    address public rewardsTarget; // Contract that receives rewards\n    uint256 public lastRewardTime; // Start of the time to calculate rewards over\n    uint256 private currentSlopeIndex = 0; // Allows us to start with the correct slope\n\n    struct Slope {\n        uint64 start; // uint64 = billions and billions of years\n        uint64 end; // Internal use only. By duplicating the start of the next slope, we can save a slot read\n        uint128 ratePerDay;\n    }\n\n    Slope[] public inflationSlopes;\n\n    uint256 constant MAX_KNEES = 48;\n    uint256 constant MAX_INFLATION_PER_DAY = (5 * 1e6 * 1e18);\n\n    event InflationChanged();\n    event RewardsTargetChange(address target, address previousTarget);\n\n    constructor(address ogv_) {\n        require(ogv_ != address(0), \"Rewards: OGV must be set\");\n        ogv = ogv_;\n    }\n\n    /// @notice Collect rewards.\n    ///\n    /// Can only be called by the contract that will receive the rewards.\n    ///\n    /// @return rewards OGV collected\n    function collectRewards() external returns (uint256) {\n        require(msg.sender == rewardsTarget, \"Rewards: Not rewardsTarget\");\n        require(lastRewardTime > 0, \"Rewards: lastRewardTime is zero\"); // Ensures initialization\n        if (block.timestamp <= lastRewardTime) {\n            return 0;\n        }\n        (uint256 inflation, uint256 _nextSlopeIndex) = _calculateInflation();\n        if (_nextSlopeIndex != 0) {\n            currentSlopeIndex = _nextSlopeIndex;\n        }\n        lastRewardTime = block.timestamp;\n\n        if (inflation > 0) {\n            // Mint the inflation\n            Mintable(ogv).mint(rewardsTarget, inflation);\n        }\n\n        // OGV Balance of this contract\n        uint256 balance = Mintable(ogv).balanceOf(address(this));\n        if (balance > 0) {\n            // Transfer the balance\n            Mintable(ogv).transfer(rewardsTarget, balance);\n        }\n\n        return inflation + balance;\n    }\n\n    /// @notice Preview the amount of rewards that would be returned if rewards\n    /// were collected now.\n    ///\n    /// @return rewards OGV that would be collected\n    function previewRewards() external view returns (uint256) {\n        (uint256 rewards,) = _calculateInflation();\n\n        // When previewing rewards, check contract's own OGV balance,\n        // and if present, send that along as part of the rewards\n        rewards += Mintable(ogv).balanceOf(address(this));\n\n        return rewards;\n    }\n\n    /// @dev Determine the amount of inflation / rewards that will have accrued\n    /// between the lastRewardTime and now.\n    ///\n    /// @return total OGV rewards accrued in the time period\n    /// @return slopeIndex a value to be cached, if non-zero, to speed up\n    ///   computing rewards in the future.\n    function _calculateInflation() internal view returns (uint256, uint256) {\n        uint256 last = lastRewardTime;\n        if (last >= block.timestamp) {\n            return (0, 0); // A zero slopeIndex here results in no change to stored state\n        }\n        if (inflationSlopes.length == 0) {\n            return (0, 0); // Save a slot read by returning a zero constant\n        }\n        uint256 total = 0;\n        uint256 nextSlopeIndex = 0; // Zero means no change\n        uint256 _currentSlopeIndex = currentSlopeIndex;\n        uint256 i;\n        for (i = _currentSlopeIndex; i < inflationSlopes.length; i++) {\n            Slope memory slope = inflationSlopes[i];\n            uint256 slopeStart = slope.start;\n            uint256 slopeEnd = slope.end;\n            uint256 rangeStart = last;\n            uint256 rangeEnd = block.timestamp;\n            if (rangeEnd < slopeStart) {\n                break; // No current or future slope could match\n            }\n            if (rangeStart < slopeStart) {\n                rangeStart = slopeStart; // trim to slope edge\n            }\n            if (rangeEnd > slopeEnd) {\n                rangeEnd = slopeEnd; // trim to slope edge\n            }\n            uint256 duration = rangeEnd - rangeStart;\n            total += (duration * slope.ratePerDay) / 1 days;\n            if (i > _currentSlopeIndex && duration > 0) {\n                nextSlopeIndex = i; // We have moved into a new slope\n            }\n            if (rangeEnd < slopeEnd) {\n                break; // No future slope could match\n            }\n        }\n\n        return (total, nextSlopeIndex);\n    }\n\n    /// @notice Set inflation schedule.\n    ///\n    /// Inflation slopes use start times and ratePerDay. End times are\n    /// overwritten to be either the start of the next slope, or in the case of\n    /// the last slope, a max int64. The rate of the last slope then becomes\n    /// the inflation rate held into the future.\n    ///\n    /// The first slope start time may be defined into the future. In this case\n    /// there will be no inflation until that first start time is reached.\n    ///\n    /// @param slopes inflation slope configuration\n    function setInflation(Slope[] memory slopes) external onlyGovernor {\n        // slope ends intentionally are overwritten\n        uint256 length = slopes.length;\n        require(length <= MAX_KNEES, \"Rewards: Too many slopes\");\n        delete inflationSlopes; // Delete all before rebuilding\n        currentSlopeIndex = 0; // Reset\n        uint256 minSlopeStart = 0;\n        if (length == 0) {\n            return;\n        }\n        slopes[length - 1].end = type(uint64).max;\n        for (uint256 i = 0; i < length; i++) {\n            require(slopes[i].ratePerDay <= MAX_INFLATION_PER_DAY, \"Rewards: RatePerDay too high\");\n            require(slopes[i].start > minSlopeStart, \"Rewards: Start times must increase\");\n            if (i < length - 1) {\n                slopes[i].end = slopes[i + 1].start;\n                minSlopeStart = slopes[i].start;\n            }\n            inflationSlopes.push(slopes[i]);\n        }\n        // No rewards can accrue before first setInflation\n        if (lastRewardTime == 0) {\n            lastRewardTime = block.timestamp;\n        }\n        emit InflationChanged();\n    }\n\n    /// @notice Set the address of the contract than can collect rewards\n    /// @param rewardsTarget_ contract address that can collect rewards\n    function setRewardsTarget(address rewardsTarget_) external onlyGovernor {\n        address previousTarget = rewardsTarget;\n        rewardsTarget = rewardsTarget_; // Okay to be zero, just disables collecting rewards\n        emit RewardsTargetChange(rewardsTarget_, previousTarget);\n    }\n}\n"
+    },
+    "contracts/ExponentialStaking.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.10;\n\nimport {ERC20Votes} from \"OpenZeppelin/openzeppelin-contracts@4.6.0/contracts/token/ERC20/extensions/ERC20Votes.sol\";\nimport {ERC20Permit} from\n    \"OpenZeppelin/openzeppelin-contracts@4.6.0/contracts/token/ERC20/extensions/draft-ERC20Permit.sol\";\nimport {ERC20} from \"OpenZeppelin/openzeppelin-contracts@4.6.0/contracts/token/ERC20/ERC20.sol\";\nimport {PRBMathUD60x18} from \"paulrberg/prb-math@2.5.0/contracts/PRBMathUD60x18.sol\";\nimport {RewardsSource} from \"./RewardsSource.sol\";\n\n/// @title ExponentialStaking\n/// @author Daniel Von Fange\n/// @notice Provides staking, vote power history, vote delegation, and rewards\n/// distribution.\n///\n/// The balance received for staking (and thus the voting power and rewards\n/// distribution) goes up exponentially by the end of the staked period.\ncontract ExponentialStaking is ERC20Votes {\n    uint256 public immutable epoch; // Start of staking program - timestamp\n    ERC20 public immutable asset; // Must not allow reentrancy\n    RewardsSource public immutable rewardsSource;\n    uint256 public immutable minStakeDuration; // in seconds\n    uint256 public constant maxStakeDuration = 365 days;\n    uint256 constant YEAR_BASE = 14e17;\n    int256 constant NEW_STAKE = -1;\n\n    // 2. Staking and Lockup Storage\n    struct Lockup {\n        uint128 amount;\n        uint128 end;\n        uint256 points;\n    }\n\n    mapping(address => Lockup[]) public lockups;\n\n    // 3. Reward Storage\n    mapping(address => uint256) public rewardDebtPerShare;\n    uint256 public accRewardPerShare;\n\n    // Events\n    event Stake(address indexed user, uint256 lockupId, uint256 amount, uint256 end, uint256 points);\n    event Unstake(address indexed user, uint256 lockupId, uint256 amount, uint256 end, uint256 points);\n    event Reward(address indexed user, uint256 amount);\n    event Penalty(address indexed user, uint256 amount);\n\n    // Core ERC20 Functions\n\n    constructor(address asset_, uint256 epoch_, uint256 minStakeDuration_, address rewardsSource_)\n        ERC20(\"\", \"\")\n        ERC20Permit(\"xOGN\")\n    {\n        asset = ERC20(asset_);\n        epoch = epoch_;\n        minStakeDuration = minStakeDuration_;\n        rewardsSource = RewardsSource(rewardsSource_);\n    }\n\n    function name() public pure override returns (string memory) {\n        return \"Staked OGN\";\n    }\n\n    function symbol() public pure override returns (string memory) {\n        return \"xOGN\";\n    }\n\n    function transfer(address, uint256) public override returns (bool) {\n        revert(\"Staking: Transfers disabled\");\n    }\n\n    function transferFrom(address, address, uint256) public override returns (bool) {\n        revert(\"Staking: Transfers disabled\");\n    }\n\n    // Staking Functions\n\n    /// @notice Stake asset to an address that may not be the same as the\n    /// sender of the funds. This can be used to give staked funds to someone\n    /// else.\n    ///\n    /// If staking before the start of staking (epoch), then the lockup start\n    /// and end dates are shifted forward so that the lockup starts at the\n    /// epoch.\n    ///\n    /// Any rewards previously earned will be paid out or rolled into the stake.\n    ///\n    /// @param amountIn asset to lockup in the stake\n    /// @param duration in seconds for the stake\n    /// @param to address to receive ownership of the stake\n    /// @param stakeRewards should pending user rewards be added to the stake\n    /// @param lockupId previous stake to extend / add funds to. -1 to create a new stake.\n    function stake(uint256 amountIn, uint256 duration, address to, bool stakeRewards, int256 lockupId) external {\n        require(to != address(0), \"Staking: To the zero address\");\n        require(duration >= minStakeDuration, \"Staking: Too short\");\n        // Too long checked in preview points\n\n        uint256 newAmount = amountIn;\n        uint256 oldPoints = 0;\n        uint256 oldEnd = 0;\n        Lockup memory lockup;\n\n        // Allow gifts, but not control of other's accounts\n        if (to != msg.sender) {\n            require(stakeRewards == false, \"Staking: Self only\");\n            require(lockupId == NEW_STAKE, \"Staking: Self only\");\n        }\n\n        // Collect funds from user\n        if (amountIn > 0) {\n            // Important that `msg.sender` aways pays, not the `to` address.\n            asset.transferFrom(msg.sender, address(this), amountIn);\n            // amountIn already added into newAmount during initialization\n        }\n\n        // Collect funds from old stake (optional)\n        if (lockupId != NEW_STAKE) {\n            lockup = lockups[to][uint256(lockupId)];\n            uint256 oldAmount = lockup.amount;\n            oldEnd = lockup.end;\n            oldPoints = lockup.points;\n            require(oldAmount > 1, \"Staking: Already closed stake\");\n            emit Unstake(to, uint256(lockupId), oldAmount, oldEnd, oldPoints);\n            newAmount += oldAmount;\n        }\n\n        // Collect funds from rewards (optional)\n        newAmount += _collectRewards(to, stakeRewards);\n\n        // Caculate Points and lockup\n        require(newAmount > 0, \"Staking: Not enough\");\n        require(newAmount <= type(uint128).max, \"Staking: Too much\");\n        (uint256 newPoints, uint256 newEnd) = previewPoints(newAmount, duration);\n        require(newPoints + totalSupply() <= type(uint192).max, \"Staking: Max points exceeded\");\n        lockup.end = uint128(newEnd);\n        lockup.amount = uint128(newAmount); // max checked in require above\n        lockup.points = newPoints;\n\n        // Update or create lockup\n        if (lockupId != NEW_STAKE) {\n            require(newEnd >= oldEnd, \"Staking: New lockup must not be shorter\");\n            require(newPoints > oldPoints, \"Staking: Must have increased amount or duration\");\n            lockups[to][uint256(lockupId)] = lockup;\n        } else {\n            lockups[to].push(lockup);\n            uint256 numLockups = lockups[to].length;\n            require(numLockups < uint256(type(int256).max), \"Staking: Too many lockups\");\n            lockupId = int256(numLockups - 1);\n            // Delegate voting power to the receiver, if unregistered and first stake\n            if (numLockups == 1 && delegates(to) == address(0)) {\n                _delegate(to, to);\n            }\n        }\n        _mint(to, newPoints - oldPoints);\n        emit Stake(to, uint256(lockupId), newAmount, newEnd, newPoints);\n    }\n\n    /// @notice Collect staked asset for a lockup and any earned rewards.\n    /// @param lockupId the id of the lockup to unstake\n    function unstake(uint256 lockupId) external {\n        Lockup memory lockup = lockups[msg.sender][lockupId];\n        uint256 amount = lockup.amount;\n        uint256 end = lockup.end;\n        uint256 points = lockup.points;\n        require(end != 0, \"Staking: Already unstaked this lockup\");\n        _collectRewards(msg.sender, false);\n\n        uint256 withdrawAmount = previewWithdraw(amount, end);\n        uint256 penalty = amount - withdrawAmount;\n\n        delete lockups[msg.sender][lockupId]; // Keeps empty in array, so indexes are stable\n        _burn(msg.sender, points);\n        if (penalty > 0) {\n            asset.transfer(address(rewardsSource), penalty);\n            emit Penalty(msg.sender, penalty);\n        }\n        asset.transfer(msg.sender, withdrawAmount);\n        emit Unstake(msg.sender, lockupId, withdrawAmount, end, points);\n    }\n\n    // 3. Reward functions\n\n    /// @notice Collect all earned asset rewards.\n    function collectRewards() external {\n        _collectRewards(msg.sender, false);\n    }\n\n    /// @dev Internal function to handle rewards accounting.\n    ///\n    /// 1. Collect new rewards for everyone\n    /// 2. Calculate this user's rewards and accounting\n    /// 3. Distribute this user's rewards\n    ///\n    /// This function *must* be called before any user balance changes.\n    ///\n    /// This will always update the user's rewardDebtPerShare to match\n    /// accRewardPerShare, which is essential to the accounting.\n    ///\n    /// @param user to collect rewards for\n    /// @param shouldRetainRewards if true user's rewards kept in this contract rather than sent\n    /// @return retainedRewards amount of rewards not sent to user\n    function _collectRewards(address user, bool shouldRetainRewards) internal returns (uint256) {\n        uint256 supply = totalSupply();\n        if (supply > 0) {\n            uint256 preBalance = asset.balanceOf(address(this));\n            try rewardsSource.collectRewards() {}\n            catch {\n                // Governance staking should continue, even if rewards fail\n            }\n            uint256 collected = asset.balanceOf(address(this)) - preBalance;\n            accRewardPerShare += (collected * 1e12) / supply;\n        }\n        uint256 netRewardsPerShare = accRewardPerShare - rewardDebtPerShare[user];\n        uint256 netRewards = (balanceOf(user) * netRewardsPerShare) / 1e12;\n        rewardDebtPerShare[user] = accRewardPerShare;\n        if (netRewards == 0) {\n            return 0;\n        }\n        emit Reward(user, netRewards);\n        if (shouldRetainRewards) {\n            return netRewards;\n        } else {\n            asset.transfer(user, netRewards);\n        }\n    }\n\n    /// @notice Preview the number of points that would be returned for the\n    /// given amount and duration.\n    ///\n    /// @param amount asset to be staked\n    /// @param duration number of seconds to stake for\n    /// @return points staking points that would be returned\n    /// @return end staking period end date\n    function previewPoints(uint256 amount, uint256 duration) public view returns (uint256, uint256) {\n        require(duration <= maxStakeDuration, \"Staking: Too long\");\n        uint256 start = block.timestamp > epoch ? block.timestamp : epoch;\n        uint256 end = start + duration;\n        uint256 endYearpoc = ((end - epoch) * 1e18) / 365 days;\n        uint256 multiplier = PRBMathUD60x18.pow(YEAR_BASE, endYearpoc);\n        return ((amount * multiplier) / 1e18, end);\n    }\n\n    /// @notice Preview the amount of asset a user would receive if they collected\n    /// rewards at this time.\n    ///\n    /// @param user to preview rewards for\n    /// @return asset rewards amount\n    function previewRewards(address user) external view returns (uint256) {\n        uint256 supply = totalSupply();\n        if (supply == 0) {\n            return 0; // No one has any points to even get rewards\n        }\n        uint256 _accRewardPerShare = accRewardPerShare;\n        _accRewardPerShare += (rewardsSource.previewRewards() * 1e12) / supply;\n        uint256 netRewardsPerShare = _accRewardPerShare - rewardDebtPerShare[user];\n        return (balanceOf(user) * netRewardsPerShare) / 1e12;\n    }\n\n    /// @notice Preview the amount that a user would receive if they withdraw now.\n    /// This amount is after any early withdraw fees are removed for early withdraws.\n    /// @param amount staked asset amount to be withdrawn\n    /// @param end stake end date to be withdrawn from.\n    /// @return withdrawAmount amount of assets that the user will receive from withdraw\n    function previewWithdraw(uint256 amount, uint256 end) public view returns (uint256) {\n        if (block.timestamp >= end) {\n            return amount;\n        }\n        uint256 fullDuration = end - block.timestamp;\n        (uint256 fullPoints,) = previewPoints(1e18, fullDuration);\n        (uint256 currentPoints,) = previewPoints(1e36, 0); // 1e36 saves a later multiplication\n        return amount * ((currentPoints / fullPoints)) / 1e18;\n    }\n\n    /// @notice Returns the total number of lockups the user has\n    ///         created so far (including expired & unstaked ones)\n    /// @param user Address\n    /// @return asset Number of lockups the user has had\n    function lockupsCount(address user) external view returns (uint256) {\n        return lockups[user].length;\n    }\n}\n"
+    },
+    "lib/prb-math/contracts/PRBMath.sol": {
+      "content": "// SPDX-License-Identifier: Unlicense\npragma solidity >=0.8.4;\n\n/// @notice Emitted when the result overflows uint256.\nerror PRBMath__MulDivFixedPointOverflow(uint256 prod1);\n\n/// @notice Emitted when the result overflows uint256.\nerror PRBMath__MulDivOverflow(uint256 prod1, uint256 denominator);\n\n/// @notice Emitted when one of the inputs is type(int256).min.\nerror PRBMath__MulDivSignedInputTooSmall();\n\n/// @notice Emitted when the intermediary absolute result overflows int256.\nerror PRBMath__MulDivSignedOverflow(uint256 rAbs);\n\n/// @notice Emitted when the input is MIN_SD59x18.\nerror PRBMathSD59x18__AbsInputTooSmall();\n\n/// @notice Emitted when ceiling a number overflows SD59x18.\nerror PRBMathSD59x18__CeilOverflow(int256 x);\n\n/// @notice Emitted when one of the inputs is MIN_SD59x18.\nerror PRBMathSD59x18__DivInputTooSmall();\n\n/// @notice Emitted when one of the intermediary unsigned results overflows SD59x18.\nerror PRBMathSD59x18__DivOverflow(uint256 rAbs);\n\n/// @notice Emitted when the input is greater than 133.084258667509499441.\nerror PRBMathSD59x18__ExpInputTooBig(int256 x);\n\n/// @notice Emitted when the input is greater than 192.\nerror PRBMathSD59x18__Exp2InputTooBig(int256 x);\n\n/// @notice Emitted when flooring a number underflows SD59x18.\nerror PRBMathSD59x18__FloorUnderflow(int256 x);\n\n/// @notice Emitted when converting a basic integer to the fixed-point format overflows SD59x18.\nerror PRBMathSD59x18__FromIntOverflow(int256 x);\n\n/// @notice Emitted when converting a basic integer to the fixed-point format underflows SD59x18.\nerror PRBMathSD59x18__FromIntUnderflow(int256 x);\n\n/// @notice Emitted when the product of the inputs is negative.\nerror PRBMathSD59x18__GmNegativeProduct(int256 x, int256 y);\n\n/// @notice Emitted when multiplying the inputs overflows SD59x18.\nerror PRBMathSD59x18__GmOverflow(int256 x, int256 y);\n\n/// @notice Emitted when the input is less than or equal to zero.\nerror PRBMathSD59x18__LogInputTooSmall(int256 x);\n\n/// @notice Emitted when one of the inputs is MIN_SD59x18.\nerror PRBMathSD59x18__MulInputTooSmall();\n\n/// @notice Emitted when the intermediary absolute result overflows SD59x18.\nerror PRBMathSD59x18__MulOverflow(uint256 rAbs);\n\n/// @notice Emitted when the intermediary absolute result overflows SD59x18.\nerror PRBMathSD59x18__PowuOverflow(uint256 rAbs);\n\n/// @notice Emitted when the input is negative.\nerror PRBMathSD59x18__SqrtNegativeInput(int256 x);\n\n/// @notice Emitted when the calculating the square root overflows SD59x18.\nerror PRBMathSD59x18__SqrtOverflow(int256 x);\n\n/// @notice Emitted when addition overflows UD60x18.\nerror PRBMathUD60x18__AddOverflow(uint256 x, uint256 y);\n\n/// @notice Emitted when ceiling a number overflows UD60x18.\nerror PRBMathUD60x18__CeilOverflow(uint256 x);\n\n/// @notice Emitted when the input is greater than 133.084258667509499441.\nerror PRBMathUD60x18__ExpInputTooBig(uint256 x);\n\n/// @notice Emitted when the input is greater than 192.\nerror PRBMathUD60x18__Exp2InputTooBig(uint256 x);\n\n/// @notice Emitted when converting a basic integer to the fixed-point format format overflows UD60x18.\nerror PRBMathUD60x18__FromUintOverflow(uint256 x);\n\n/// @notice Emitted when multiplying the inputs overflows UD60x18.\nerror PRBMathUD60x18__GmOverflow(uint256 x, uint256 y);\n\n/// @notice Emitted when the input is less than 1.\nerror PRBMathUD60x18__LogInputTooSmall(uint256 x);\n\n/// @notice Emitted when the calculating the square root overflows UD60x18.\nerror PRBMathUD60x18__SqrtOverflow(uint256 x);\n\n/// @notice Emitted when subtraction underflows UD60x18.\nerror PRBMathUD60x18__SubUnderflow(uint256 x, uint256 y);\n\n/// @dev Common mathematical functions used in both PRBMathSD59x18 and PRBMathUD60x18. Note that this shared library\n/// does not always assume the signed 59.18-decimal fixed-point or the unsigned 60.18-decimal fixed-point\n/// representation. When it does not, it is explicitly mentioned in the NatSpec documentation.\nlibrary PRBMath {\n    /// STRUCTS ///\n\n    struct SD59x18 {\n        int256 value;\n    }\n\n    struct UD60x18 {\n        uint256 value;\n    }\n\n    /// STORAGE ///\n\n    /// @dev How many trailing decimals can be represented.\n    uint256 internal constant SCALE = 1e18;\n\n    /// @dev Largest power of two divisor of SCALE.\n    uint256 internal constant SCALE_LPOTD = 262144;\n\n    /// @dev SCALE inverted mod 2^256.\n    uint256 internal constant SCALE_INVERSE =\n        78156646155174841979727994598816262306175212592076161876661_508869554232690281;\n\n    /// FUNCTIONS ///\n\n    /// @notice Calculates the binary exponent of x using the binary fraction method.\n    /// @dev Has to use 192.64-bit fixed-point numbers.\n    /// See https://ethereum.stackexchange.com/a/96594/24693.\n    /// @param x The exponent as an unsigned 192.64-bit fixed-point number.\n    /// @return result The result as an unsigned 60.18-decimal fixed-point number.\n    function exp2(uint256 x) internal pure returns (uint256 result) {\n        unchecked {\n            // Start from 0.5 in the 192.64-bit fixed-point format.\n            result = 0x800000000000000000000000000000000000000000000000;\n\n            // Multiply the result by root(2, 2^-i) when the bit at position i is 1. None of the intermediary results overflows\n            // because the initial result is 2^191 and all magic factors are less than 2^65.\n            if (x & 0x8000000000000000 > 0) {\n                result = (result * 0x16A09E667F3BCC909) >> 64;\n            }\n            if (x & 0x4000000000000000 > 0) {\n                result = (result * 0x1306FE0A31B7152DF) >> 64;\n            }\n            if (x & 0x2000000000000000 > 0) {\n                result = (result * 0x1172B83C7D517ADCE) >> 64;\n            }\n            if (x & 0x1000000000000000 > 0) {\n                result = (result * 0x10B5586CF9890F62A) >> 64;\n            }\n            if (x & 0x800000000000000 > 0) {\n                result = (result * 0x1059B0D31585743AE) >> 64;\n            }\n            if (x & 0x400000000000000 > 0) {\n                result = (result * 0x102C9A3E778060EE7) >> 64;\n            }\n            if (x & 0x200000000000000 > 0) {\n                result = (result * 0x10163DA9FB33356D8) >> 64;\n            }\n            if (x & 0x100000000000000 > 0) {\n                result = (result * 0x100B1AFA5ABCBED61) >> 64;\n            }\n            if (x & 0x80000000000000 > 0) {\n                result = (result * 0x10058C86DA1C09EA2) >> 64;\n            }\n            if (x & 0x40000000000000 > 0) {\n                result = (result * 0x1002C605E2E8CEC50) >> 64;\n            }\n            if (x & 0x20000000000000 > 0) {\n                result = (result * 0x100162F3904051FA1) >> 64;\n            }\n            if (x & 0x10000000000000 > 0) {\n                result = (result * 0x1000B175EFFDC76BA) >> 64;\n            }\n            if (x & 0x8000000000000 > 0) {\n                result = (result * 0x100058BA01FB9F96D) >> 64;\n            }\n            if (x & 0x4000000000000 > 0) {\n                result = (result * 0x10002C5CC37DA9492) >> 64;\n            }\n            if (x & 0x2000000000000 > 0) {\n                result = (result * 0x1000162E525EE0547) >> 64;\n            }\n            if (x & 0x1000000000000 > 0) {\n                result = (result * 0x10000B17255775C04) >> 64;\n            }\n            if (x & 0x800000000000 > 0) {\n                result = (result * 0x1000058B91B5BC9AE) >> 64;\n            }\n            if (x & 0x400000000000 > 0) {\n                result = (result * 0x100002C5C89D5EC6D) >> 64;\n            }\n            if (x & 0x200000000000 > 0) {\n                result = (result * 0x10000162E43F4F831) >> 64;\n            }\n            if (x & 0x100000000000 > 0) {\n                result = (result * 0x100000B1721BCFC9A) >> 64;\n            }\n            if (x & 0x80000000000 > 0) {\n                result = (result * 0x10000058B90CF1E6E) >> 64;\n            }\n            if (x & 0x40000000000 > 0) {\n                result = (result * 0x1000002C5C863B73F) >> 64;\n            }\n            if (x & 0x20000000000 > 0) {\n                result = (result * 0x100000162E430E5A2) >> 64;\n            }\n            if (x & 0x10000000000 > 0) {\n                result = (result * 0x1000000B172183551) >> 64;\n            }\n            if (x & 0x8000000000 > 0) {\n                result = (result * 0x100000058B90C0B49) >> 64;\n            }\n            if (x & 0x4000000000 > 0) {\n                result = (result * 0x10000002C5C8601CC) >> 64;\n            }\n            if (x & 0x2000000000 > 0) {\n                result = (result * 0x1000000162E42FFF0) >> 64;\n            }\n            if (x & 0x1000000000 > 0) {\n                result = (result * 0x10000000B17217FBB) >> 64;\n            }\n            if (x & 0x800000000 > 0) {\n                result = (result * 0x1000000058B90BFCE) >> 64;\n            }\n            if (x & 0x400000000 > 0) {\n                result = (result * 0x100000002C5C85FE3) >> 64;\n            }\n            if (x & 0x200000000 > 0) {\n                result = (result * 0x10000000162E42FF1) >> 64;\n            }\n            if (x & 0x100000000 > 0) {\n                result = (result * 0x100000000B17217F8) >> 64;\n            }\n            if (x & 0x80000000 > 0) {\n                result = (result * 0x10000000058B90BFC) >> 64;\n            }\n            if (x & 0x40000000 > 0) {\n                result = (result * 0x1000000002C5C85FE) >> 64;\n            }\n            if (x & 0x20000000 > 0) {\n                result = (result * 0x100000000162E42FF) >> 64;\n            }\n            if (x & 0x10000000 > 0) {\n                result = (result * 0x1000000000B17217F) >> 64;\n            }\n            if (x & 0x8000000 > 0) {\n                result = (result * 0x100000000058B90C0) >> 64;\n            }\n            if (x & 0x4000000 > 0) {\n                result = (result * 0x10000000002C5C860) >> 64;\n            }\n            if (x & 0x2000000 > 0) {\n                result = (result * 0x1000000000162E430) >> 64;\n            }\n            if (x & 0x1000000 > 0) {\n                result = (result * 0x10000000000B17218) >> 64;\n            }\n            if (x & 0x800000 > 0) {\n                result = (result * 0x1000000000058B90C) >> 64;\n            }\n            if (x & 0x400000 > 0) {\n                result = (result * 0x100000000002C5C86) >> 64;\n            }\n            if (x & 0x200000 > 0) {\n                result = (result * 0x10000000000162E43) >> 64;\n            }\n            if (x & 0x100000 > 0) {\n                result = (result * 0x100000000000B1721) >> 64;\n            }\n            if (x & 0x80000 > 0) {\n                result = (result * 0x10000000000058B91) >> 64;\n            }\n            if (x & 0x40000 > 0) {\n                result = (result * 0x1000000000002C5C8) >> 64;\n            }\n            if (x & 0x20000 > 0) {\n                result = (result * 0x100000000000162E4) >> 64;\n            }\n            if (x & 0x10000 > 0) {\n                result = (result * 0x1000000000000B172) >> 64;\n            }\n            if (x & 0x8000 > 0) {\n                result = (result * 0x100000000000058B9) >> 64;\n            }\n            if (x & 0x4000 > 0) {\n                result = (result * 0x10000000000002C5D) >> 64;\n            }\n            if (x & 0x2000 > 0) {\n                result = (result * 0x1000000000000162E) >> 64;\n            }\n            if (x & 0x1000 > 0) {\n                result = (result * 0x10000000000000B17) >> 64;\n            }\n            if (x & 0x800 > 0) {\n                result = (result * 0x1000000000000058C) >> 64;\n            }\n            if (x & 0x400 > 0) {\n                result = (result * 0x100000000000002C6) >> 64;\n            }\n            if (x & 0x200 > 0) {\n                result = (result * 0x10000000000000163) >> 64;\n            }\n            if (x & 0x100 > 0) {\n                result = (result * 0x100000000000000B1) >> 64;\n            }\n            if (x & 0x80 > 0) {\n                result = (result * 0x10000000000000059) >> 64;\n            }\n            if (x & 0x40 > 0) {\n                result = (result * 0x1000000000000002C) >> 64;\n            }\n            if (x & 0x20 > 0) {\n                result = (result * 0x10000000000000016) >> 64;\n            }\n            if (x & 0x10 > 0) {\n                result = (result * 0x1000000000000000B) >> 64;\n            }\n            if (x & 0x8 > 0) {\n                result = (result * 0x10000000000000006) >> 64;\n            }\n            if (x & 0x4 > 0) {\n                result = (result * 0x10000000000000003) >> 64;\n            }\n            if (x & 0x2 > 0) {\n                result = (result * 0x10000000000000001) >> 64;\n            }\n            if (x & 0x1 > 0) {\n                result = (result * 0x10000000000000001) >> 64;\n            }\n\n            // We're doing two things at the same time:\n            //\n            //   1. Multiply the result by 2^n + 1, where \"2^n\" is the integer part and the one is added to account for\n            //      the fact that we initially set the result to 0.5. This is accomplished by subtracting from 191\n            //      rather than 192.\n            //   2. Convert the result to the unsigned 60.18-decimal fixed-point format.\n            //\n            // This works because 2^(191-ip) = 2^ip / 2^191, where \"ip\" is the integer part \"2^n\".\n            result *= SCALE;\n            result >>= (191 - (x >> 64));\n        }\n    }\n\n    /// @notice Finds the zero-based index of the first one in the binary representation of x.\n    /// @dev See the note on msb in the \"Find First Set\" Wikipedia article https://en.wikipedia.org/wiki/Find_first_set\n    /// @param x The uint256 number for which to find the index of the most significant bit.\n    /// @return msb The index of the most significant bit as an uint256.\n    function mostSignificantBit(uint256 x) internal pure returns (uint256 msb) {\n        if (x >= 2**128) {\n            x >>= 128;\n            msb += 128;\n        }\n        if (x >= 2**64) {\n            x >>= 64;\n            msb += 64;\n        }\n        if (x >= 2**32) {\n            x >>= 32;\n            msb += 32;\n        }\n        if (x >= 2**16) {\n            x >>= 16;\n            msb += 16;\n        }\n        if (x >= 2**8) {\n            x >>= 8;\n            msb += 8;\n        }\n        if (x >= 2**4) {\n            x >>= 4;\n            msb += 4;\n        }\n        if (x >= 2**2) {\n            x >>= 2;\n            msb += 2;\n        }\n        if (x >= 2**1) {\n            // No need to shift x any more.\n            msb += 1;\n        }\n    }\n\n    /// @notice Calculates floor(x*y÷denominator) with full precision.\n    ///\n    /// @dev Credit to Remco Bloemen under MIT license https://xn--2-umb.com/21/muldiv.\n    ///\n    /// Requirements:\n    /// - The denominator cannot be zero.\n    /// - The result must fit within uint256.\n    ///\n    /// Caveats:\n    /// - This function does not work with fixed-point numbers.\n    ///\n    /// @param x The multiplicand as an uint256.\n    /// @param y The multiplier as an uint256.\n    /// @param denominator The divisor as an uint256.\n    /// @return result The result as an uint256.\n    function mulDiv(\n        uint256 x,\n        uint256 y,\n        uint256 denominator\n    ) internal pure returns (uint256 result) {\n        // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use\n        // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256\n        // variables such that product = prod1 * 2^256 + prod0.\n        uint256 prod0; // Least significant 256 bits of the product\n        uint256 prod1; // Most significant 256 bits of the product\n        assembly {\n            let mm := mulmod(x, y, not(0))\n            prod0 := mul(x, y)\n            prod1 := sub(sub(mm, prod0), lt(mm, prod0))\n        }\n\n        // Handle non-overflow cases, 256 by 256 division.\n        if (prod1 == 0) {\n            unchecked {\n                result = prod0 / denominator;\n            }\n            return result;\n        }\n\n        // Make sure the result is less than 2^256. Also prevents denominator == 0.\n        if (prod1 >= denominator) {\n            revert PRBMath__MulDivOverflow(prod1, denominator);\n        }\n\n        ///////////////////////////////////////////////\n        // 512 by 256 division.\n        ///////////////////////////////////////////////\n\n        // Make division exact by subtracting the remainder from [prod1 prod0].\n        uint256 remainder;\n        assembly {\n            // Compute remainder using mulmod.\n            remainder := mulmod(x, y, denominator)\n\n            // Subtract 256 bit number from 512 bit number.\n            prod1 := sub(prod1, gt(remainder, prod0))\n            prod0 := sub(prod0, remainder)\n        }\n\n        // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.\n        // See https://cs.stackexchange.com/q/138556/92363.\n        unchecked {\n            // Does not overflow because the denominator cannot be zero at this stage in the function.\n            uint256 lpotdod = denominator & (~denominator + 1);\n            assembly {\n                // Divide denominator by lpotdod.\n                denominator := div(denominator, lpotdod)\n\n                // Divide [prod1 prod0] by lpotdod.\n                prod0 := div(prod0, lpotdod)\n\n                // Flip lpotdod such that it is 2^256 / lpotdod. If lpotdod is zero, then it becomes one.\n                lpotdod := add(div(sub(0, lpotdod), lpotdod), 1)\n            }\n\n            // Shift in bits from prod1 into prod0.\n            prod0 |= prod1 * lpotdod;\n\n            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such\n            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for\n            // four bits. That is, denominator * inv = 1 mod 2^4.\n            uint256 inverse = (3 * denominator) ^ 2;\n\n            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works\n            // in modular arithmetic, doubling the correct bits in each step.\n            inverse *= 2 - denominator * inverse; // inverse mod 2^8\n            inverse *= 2 - denominator * inverse; // inverse mod 2^16\n            inverse *= 2 - denominator * inverse; // inverse mod 2^32\n            inverse *= 2 - denominator * inverse; // inverse mod 2^64\n            inverse *= 2 - denominator * inverse; // inverse mod 2^128\n            inverse *= 2 - denominator * inverse; // inverse mod 2^256\n\n            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.\n            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is\n            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1\n            // is no longer required.\n            result = prod0 * inverse;\n            return result;\n        }\n    }\n\n    /// @notice Calculates floor(x*y÷1e18) with full precision.\n    ///\n    /// @dev Variant of \"mulDiv\" with constant folding, i.e. in which the denominator is always 1e18. Before returning the\n    /// final result, we add 1 if (x * y) % SCALE >= HALF_SCALE. Without this, 6.6e-19 would be truncated to 0 instead of\n    /// being rounded to 1e-18.  See \"Listing 6\" and text above it at https://accu.org/index.php/journals/1717.\n    ///\n    /// Requirements:\n    /// - The result must fit within uint256.\n    ///\n    /// Caveats:\n    /// - The body is purposely left uncommented; see the NatSpec comments in \"PRBMath.mulDiv\" to understand how this works.\n    /// - It is assumed that the result can never be type(uint256).max when x and y solve the following two equations:\n    ///     1. x * y = type(uint256).max * SCALE\n    ///     2. (x * y) % SCALE >= SCALE / 2\n    ///\n    /// @param x The multiplicand as an unsigned 60.18-decimal fixed-point number.\n    /// @param y The multiplier as an unsigned 60.18-decimal fixed-point number.\n    /// @return result The result as an unsigned 60.18-decimal fixed-point number.\n    function mulDivFixedPoint(uint256 x, uint256 y) internal pure returns (uint256 result) {\n        uint256 prod0;\n        uint256 prod1;\n        assembly {\n            let mm := mulmod(x, y, not(0))\n            prod0 := mul(x, y)\n            prod1 := sub(sub(mm, prod0), lt(mm, prod0))\n        }\n\n        if (prod1 >= SCALE) {\n            revert PRBMath__MulDivFixedPointOverflow(prod1);\n        }\n\n        uint256 remainder;\n        uint256 roundUpUnit;\n        assembly {\n            remainder := mulmod(x, y, SCALE)\n            roundUpUnit := gt(remainder, 499999999999999999)\n        }\n\n        if (prod1 == 0) {\n            unchecked {\n                result = (prod0 / SCALE) + roundUpUnit;\n                return result;\n            }\n        }\n\n        assembly {\n            result := add(\n                mul(\n                    or(\n                        div(sub(prod0, remainder), SCALE_LPOTD),\n                        mul(sub(prod1, gt(remainder, prod0)), add(div(sub(0, SCALE_LPOTD), SCALE_LPOTD), 1))\n                    ),\n                    SCALE_INVERSE\n                ),\n                roundUpUnit\n            )\n        }\n    }\n\n    /// @notice Calculates floor(x*y÷denominator) with full precision.\n    ///\n    /// @dev An extension of \"mulDiv\" for signed numbers. Works by computing the signs and the absolute values separately.\n    ///\n    /// Requirements:\n    /// - None of the inputs can be type(int256).min.\n    /// - The result must fit within int256.\n    ///\n    /// @param x The multiplicand as an int256.\n    /// @param y The multiplier as an int256.\n    /// @param denominator The divisor as an int256.\n    /// @return result The result as an int256.\n    function mulDivSigned(\n        int256 x,\n        int256 y,\n        int256 denominator\n    ) internal pure returns (int256 result) {\n        if (x == type(int256).min || y == type(int256).min || denominator == type(int256).min) {\n            revert PRBMath__MulDivSignedInputTooSmall();\n        }\n\n        // Get hold of the absolute values of x, y and the denominator.\n        uint256 ax;\n        uint256 ay;\n        uint256 ad;\n        unchecked {\n            ax = x < 0 ? uint256(-x) : uint256(x);\n            ay = y < 0 ? uint256(-y) : uint256(y);\n            ad = denominator < 0 ? uint256(-denominator) : uint256(denominator);\n        }\n\n        // Compute the absolute value of (x*y)÷denominator. The result must fit within int256.\n        uint256 rAbs = mulDiv(ax, ay, ad);\n        if (rAbs > uint256(type(int256).max)) {\n            revert PRBMath__MulDivSignedOverflow(rAbs);\n        }\n\n        // Get the signs of x, y and the denominator.\n        uint256 sx;\n        uint256 sy;\n        uint256 sd;\n        assembly {\n            sx := sgt(x, sub(0, 1))\n            sy := sgt(y, sub(0, 1))\n            sd := sgt(denominator, sub(0, 1))\n        }\n\n        // XOR over sx, sy and sd. This is checking whether there are one or three negative signs in the inputs.\n        // If yes, the result should be negative.\n        result = sx ^ sy ^ sd == 0 ? -int256(rAbs) : int256(rAbs);\n    }\n\n    /// @notice Calculates the square root of x, rounding down.\n    /// @dev Uses the Babylonian method https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method.\n    ///\n    /// Caveats:\n    /// - This function does not work with fixed-point numbers.\n    ///\n    /// @param x The uint256 number for which to calculate the square root.\n    /// @return result The result as an uint256.\n    function sqrt(uint256 x) internal pure returns (uint256 result) {\n        if (x == 0) {\n            return 0;\n        }\n\n        // Set the initial guess to the least power of two that is greater than or equal to sqrt(x).\n        uint256 xAux = uint256(x);\n        result = 1;\n        if (xAux >= 0x100000000000000000000000000000000) {\n            xAux >>= 128;\n            result <<= 64;\n        }\n        if (xAux >= 0x10000000000000000) {\n            xAux >>= 64;\n            result <<= 32;\n        }\n        if (xAux >= 0x100000000) {\n            xAux >>= 32;\n            result <<= 16;\n        }\n        if (xAux >= 0x10000) {\n            xAux >>= 16;\n            result <<= 8;\n        }\n        if (xAux >= 0x100) {\n            xAux >>= 8;\n            result <<= 4;\n        }\n        if (xAux >= 0x10) {\n            xAux >>= 4;\n            result <<= 2;\n        }\n        if (xAux >= 0x8) {\n            result <<= 1;\n        }\n\n        // The operations can never overflow because the result is max 2^127 when it enters this block.\n        unchecked {\n            result = (result + x / result) >> 1;\n            result = (result + x / result) >> 1;\n            result = (result + x / result) >> 1;\n            result = (result + x / result) >> 1;\n            result = (result + x / result) >> 1;\n            result = (result + x / result) >> 1;\n            result = (result + x / result) >> 1; // Seven iterations should be enough\n            uint256 roundedDownResult = x / result;\n            return result >= roundedDownResult ? roundedDownResult : result;\n        }\n    }\n}\n"
+    },
+    "lib/prb-math/contracts/PRBMathUD60x18.sol": {
+      "content": "// SPDX-License-Identifier: Unlicense\npragma solidity >=0.8.4;\n\nimport \"./PRBMath.sol\";\n\n/// @title PRBMathUD60x18\n/// @author Paul Razvan Berg\n/// @notice Smart contract library for advanced fixed-point math that works with uint256 numbers considered to have 18\n/// trailing decimals. We call this number representation unsigned 60.18-decimal fixed-point, since there can be up to 60\n/// digits in the integer part and up to 18 decimals in the fractional part. The numbers are bound by the minimum and the\n/// maximum values permitted by the Solidity type uint256.\nlibrary PRBMathUD60x18 {\n    /// @dev Half the SCALE number.\n    uint256 internal constant HALF_SCALE = 5e17;\n\n    /// @dev log2(e) as an unsigned 60.18-decimal fixed-point number.\n    uint256 internal constant LOG2_E = 1_442695040888963407;\n\n    /// @dev The maximum value an unsigned 60.18-decimal fixed-point number can have.\n    uint256 internal constant MAX_UD60x18 =\n        115792089237316195423570985008687907853269984665640564039457_584007913129639935;\n\n    /// @dev The maximum whole value an unsigned 60.18-decimal fixed-point number can have.\n    uint256 internal constant MAX_WHOLE_UD60x18 =\n        115792089237316195423570985008687907853269984665640564039457_000000000000000000;\n\n    /// @dev How many trailing decimals can be represented.\n    uint256 internal constant SCALE = 1e18;\n\n    /// @notice Calculates the arithmetic average of x and y, rounding down.\n    /// @param x The first operand as an unsigned 60.18-decimal fixed-point number.\n    /// @param y The second operand as an unsigned 60.18-decimal fixed-point number.\n    /// @return result The arithmetic average as an unsigned 60.18-decimal fixed-point number.\n    function avg(uint256 x, uint256 y) internal pure returns (uint256 result) {\n        // The operations can never overflow.\n        unchecked {\n            // The last operand checks if both x and y are odd and if that is the case, we add 1 to the result. We need\n            // to do this because if both numbers are odd, the 0.5 remainder gets truncated twice.\n            result = (x >> 1) + (y >> 1) + (x & y & 1);\n        }\n    }\n\n    /// @notice Yields the least unsigned 60.18 decimal fixed-point number greater than or equal to x.\n    ///\n    /// @dev Optimized for fractional value inputs, because for every whole value there are (1e18 - 1) fractional counterparts.\n    /// See https://en.wikipedia.org/wiki/Floor_and_ceiling_functions.\n    ///\n    /// Requirements:\n    /// - x must be less than or equal to MAX_WHOLE_UD60x18.\n    ///\n    /// @param x The unsigned 60.18-decimal fixed-point number to ceil.\n    /// @param result The least integer greater than or equal to x, as an unsigned 60.18-decimal fixed-point number.\n    function ceil(uint256 x) internal pure returns (uint256 result) {\n        if (x > MAX_WHOLE_UD60x18) {\n            revert PRBMathUD60x18__CeilOverflow(x);\n        }\n        assembly {\n            // Equivalent to \"x % SCALE\" but faster.\n            let remainder := mod(x, SCALE)\n\n            // Equivalent to \"SCALE - remainder\" but faster.\n            let delta := sub(SCALE, remainder)\n\n            // Equivalent to \"x + delta * (remainder > 0 ? 1 : 0)\" but faster.\n            result := add(x, mul(delta, gt(remainder, 0)))\n        }\n    }\n\n    /// @notice Divides two unsigned 60.18-decimal fixed-point numbers, returning a new unsigned 60.18-decimal fixed-point number.\n    ///\n    /// @dev Uses mulDiv to enable overflow-safe multiplication and division.\n    ///\n    /// Requirements:\n    /// - The denominator cannot be zero.\n    ///\n    /// @param x The numerator as an unsigned 60.18-decimal fixed-point number.\n    /// @param y The denominator as an unsigned 60.18-decimal fixed-point number.\n    /// @param result The quotient as an unsigned 60.18-decimal fixed-point number.\n    function div(uint256 x, uint256 y) internal pure returns (uint256 result) {\n        result = PRBMath.mulDiv(x, SCALE, y);\n    }\n\n    /// @notice Returns Euler's number as an unsigned 60.18-decimal fixed-point number.\n    /// @dev See https://en.wikipedia.org/wiki/E_(mathematical_constant).\n    function e() internal pure returns (uint256 result) {\n        result = 2_718281828459045235;\n    }\n\n    /// @notice Calculates the natural exponent of x.\n    ///\n    /// @dev Based on the insight that e^x = 2^(x * log2(e)).\n    ///\n    /// Requirements:\n    /// - All from \"log2\".\n    /// - x must be less than 133.084258667509499441.\n    ///\n    /// @param x The exponent as an unsigned 60.18-decimal fixed-point number.\n    /// @return result The result as an unsigned 60.18-decimal fixed-point number.\n    function exp(uint256 x) internal pure returns (uint256 result) {\n        // Without this check, the value passed to \"exp2\" would be greater than 192.\n        if (x >= 133_084258667509499441) {\n            revert PRBMathUD60x18__ExpInputTooBig(x);\n        }\n\n        // Do the fixed-point multiplication inline to save gas.\n        unchecked {\n            uint256 doubleScaleProduct = x * LOG2_E;\n            result = exp2((doubleScaleProduct + HALF_SCALE) / SCALE);\n        }\n    }\n\n    /// @notice Calculates the binary exponent of x using the binary fraction method.\n    ///\n    /// @dev See https://ethereum.stackexchange.com/q/79903/24693.\n    ///\n    /// Requirements:\n    /// - x must be 192 or less.\n    /// - The result must fit within MAX_UD60x18.\n    ///\n    /// @param x The exponent as an unsigned 60.18-decimal fixed-point number.\n    /// @return result The result as an unsigned 60.18-decimal fixed-point number.\n    function exp2(uint256 x) internal pure returns (uint256 result) {\n        // 2^192 doesn't fit within the 192.64-bit format used internally in this function.\n        if (x >= 192e18) {\n            revert PRBMathUD60x18__Exp2InputTooBig(x);\n        }\n\n        unchecked {\n            // Convert x to the 192.64-bit fixed-point format.\n            uint256 x192x64 = (x << 64) / SCALE;\n\n            // Pass x to the PRBMath.exp2 function, which uses the 192.64-bit fixed-point number representation.\n            result = PRBMath.exp2(x192x64);\n        }\n    }\n\n    /// @notice Yields the greatest unsigned 60.18 decimal fixed-point number less than or equal to x.\n    /// @dev Optimized for fractional value inputs, because for every whole value there are (1e18 - 1) fractional counterparts.\n    /// See https://en.wikipedia.org/wiki/Floor_and_ceiling_functions.\n    /// @param x The unsigned 60.18-decimal fixed-point number to floor.\n    /// @param result The greatest integer less than or equal to x, as an unsigned 60.18-decimal fixed-point number.\n    function floor(uint256 x) internal pure returns (uint256 result) {\n        assembly {\n            // Equivalent to \"x % SCALE\" but faster.\n            let remainder := mod(x, SCALE)\n\n            // Equivalent to \"x - remainder * (remainder > 0 ? 1 : 0)\" but faster.\n            result := sub(x, mul(remainder, gt(remainder, 0)))\n        }\n    }\n\n    /// @notice Yields the excess beyond the floor of x.\n    /// @dev Based on the odd function definition https://en.wikipedia.org/wiki/Fractional_part.\n    /// @param x The unsigned 60.18-decimal fixed-point number to get the fractional part of.\n    /// @param result The fractional part of x as an unsigned 60.18-decimal fixed-point number.\n    function frac(uint256 x) internal pure returns (uint256 result) {\n        assembly {\n            result := mod(x, SCALE)\n        }\n    }\n\n    /// @notice Converts a number from basic integer form to unsigned 60.18-decimal fixed-point representation.\n    ///\n    /// @dev Requirements:\n    /// - x must be less than or equal to MAX_UD60x18 divided by SCALE.\n    ///\n    /// @param x The basic integer to convert.\n    /// @param result The same number in unsigned 60.18-decimal fixed-point representation.\n    function fromUint(uint256 x) internal pure returns (uint256 result) {\n        unchecked {\n            if (x > MAX_UD60x18 / SCALE) {\n                revert PRBMathUD60x18__FromUintOverflow(x);\n            }\n            result = x * SCALE;\n        }\n    }\n\n    /// @notice Calculates geometric mean of x and y, i.e. sqrt(x * y), rounding down.\n    ///\n    /// @dev Requirements:\n    /// - x * y must fit within MAX_UD60x18, lest it overflows.\n    ///\n    /// @param x The first operand as an unsigned 60.18-decimal fixed-point number.\n    /// @param y The second operand as an unsigned 60.18-decimal fixed-point number.\n    /// @return result The result as an unsigned 60.18-decimal fixed-point number.\n    function gm(uint256 x, uint256 y) internal pure returns (uint256 result) {\n        if (x == 0) {\n            return 0;\n        }\n\n        unchecked {\n            // Checking for overflow this way is faster than letting Solidity do it.\n            uint256 xy = x * y;\n            if (xy / x != y) {\n                revert PRBMathUD60x18__GmOverflow(x, y);\n            }\n\n            // We don't need to multiply by the SCALE here because the x*y product had already picked up a factor of SCALE\n            // during multiplication. See the comments within the \"sqrt\" function.\n            result = PRBMath.sqrt(xy);\n        }\n    }\n\n    /// @notice Calculates 1 / x, rounding toward zero.\n    ///\n    /// @dev Requirements:\n    /// - x cannot be zero.\n    ///\n    /// @param x The unsigned 60.18-decimal fixed-point number for which to calculate the inverse.\n    /// @return result The inverse as an unsigned 60.18-decimal fixed-point number.\n    function inv(uint256 x) internal pure returns (uint256 result) {\n        unchecked {\n            // 1e36 is SCALE * SCALE.\n            result = 1e36 / x;\n        }\n    }\n\n    /// @notice Calculates the natural logarithm of x.\n    ///\n    /// @dev Based on the insight that ln(x) = log2(x) / log2(e).\n    ///\n    /// Requirements:\n    /// - All from \"log2\".\n    ///\n    /// Caveats:\n    /// - All from \"log2\".\n    /// - This doesn't return exactly 1 for 2.718281828459045235, for that we would need more fine-grained precision.\n    ///\n    /// @param x The unsigned 60.18-decimal fixed-point number for which to calculate the natural logarithm.\n    /// @return result The natural logarithm as an unsigned 60.18-decimal fixed-point number.\n    function ln(uint256 x) internal pure returns (uint256 result) {\n        // Do the fixed-point multiplication inline to save gas. This is overflow-safe because the maximum value that log2(x)\n        // can return is 196205294292027477728.\n        unchecked {\n            result = (log2(x) * SCALE) / LOG2_E;\n        }\n    }\n\n    /// @notice Calculates the common logarithm of x.\n    ///\n    /// @dev First checks if x is an exact power of ten and it stops if yes. If it's not, calculates the common\n    /// logarithm based on the insight that log10(x) = log2(x) / log2(10).\n    ///\n    /// Requirements:\n    /// - All from \"log2\".\n    ///\n    /// Caveats:\n    /// - All from \"log2\".\n    ///\n    /// @param x The unsigned 60.18-decimal fixed-point number for which to calculate the common logarithm.\n    /// @return result The common logarithm as an unsigned 60.18-decimal fixed-point number.\n    function log10(uint256 x) internal pure returns (uint256 result) {\n        if (x < SCALE) {\n            revert PRBMathUD60x18__LogInputTooSmall(x);\n        }\n\n        // Note that the \"mul\" in this block is the assembly multiplication operation, not the \"mul\" function defined\n        // in this contract.\n        // prettier-ignore\n        assembly {\n            switch x\n            case 1 { result := mul(SCALE, sub(0, 18)) }\n            case 10 { result := mul(SCALE, sub(1, 18)) }\n            case 100 { result := mul(SCALE, sub(2, 18)) }\n            case 1000 { result := mul(SCALE, sub(3, 18)) }\n            case 10000 { result := mul(SCALE, sub(4, 18)) }\n            case 100000 { result := mul(SCALE, sub(5, 18)) }\n            case 1000000 { result := mul(SCALE, sub(6, 18)) }\n            case 10000000 { result := mul(SCALE, sub(7, 18)) }\n            case 100000000 { result := mul(SCALE, sub(8, 18)) }\n            case 1000000000 { result := mul(SCALE, sub(9, 18)) }\n            case 10000000000 { result := mul(SCALE, sub(10, 18)) }\n            case 100000000000 { result := mul(SCALE, sub(11, 18)) }\n            case 1000000000000 { result := mul(SCALE, sub(12, 18)) }\n            case 10000000000000 { result := mul(SCALE, sub(13, 18)) }\n            case 100000000000000 { result := mul(SCALE, sub(14, 18)) }\n            case 1000000000000000 { result := mul(SCALE, sub(15, 18)) }\n            case 10000000000000000 { result := mul(SCALE, sub(16, 18)) }\n            case 100000000000000000 { result := mul(SCALE, sub(17, 18)) }\n            case 1000000000000000000 { result := 0 }\n            case 10000000000000000000 { result := SCALE }\n            case 100000000000000000000 { result := mul(SCALE, 2) }\n            case 1000000000000000000000 { result := mul(SCALE, 3) }\n            case 10000000000000000000000 { result := mul(SCALE, 4) }\n            case 100000000000000000000000 { result := mul(SCALE, 5) }\n            case 1000000000000000000000000 { result := mul(SCALE, 6) }\n            case 10000000000000000000000000 { result := mul(SCALE, 7) }\n            case 100000000000000000000000000 { result := mul(SCALE, 8) }\n            case 1000000000000000000000000000 { result := mul(SCALE, 9) }\n            case 10000000000000000000000000000 { result := mul(SCALE, 10) }\n            case 100000000000000000000000000000 { result := mul(SCALE, 11) }\n            case 1000000000000000000000000000000 { result := mul(SCALE, 12) }\n            case 10000000000000000000000000000000 { result := mul(SCALE, 13) }\n            case 100000000000000000000000000000000 { result := mul(SCALE, 14) }\n            case 1000000000000000000000000000000000 { result := mul(SCALE, 15) }\n            case 10000000000000000000000000000000000 { result := mul(SCALE, 16) }\n            case 100000000000000000000000000000000000 { result := mul(SCALE, 17) }\n            case 1000000000000000000000000000000000000 { result := mul(SCALE, 18) }\n            case 10000000000000000000000000000000000000 { result := mul(SCALE, 19) }\n            case 100000000000000000000000000000000000000 { result := mul(SCALE, 20) }\n            case 1000000000000000000000000000000000000000 { result := mul(SCALE, 21) }\n            case 10000000000000000000000000000000000000000 { result := mul(SCALE, 22) }\n            case 100000000000000000000000000000000000000000 { result := mul(SCALE, 23) }\n            case 1000000000000000000000000000000000000000000 { result := mul(SCALE, 24) }\n            case 10000000000000000000000000000000000000000000 { result := mul(SCALE, 25) }\n            case 100000000000000000000000000000000000000000000 { result := mul(SCALE, 26) }\n            case 1000000000000000000000000000000000000000000000 { result := mul(SCALE, 27) }\n            case 10000000000000000000000000000000000000000000000 { result := mul(SCALE, 28) }\n            case 100000000000000000000000000000000000000000000000 { result := mul(SCALE, 29) }\n            case 1000000000000000000000000000000000000000000000000 { result := mul(SCALE, 30) }\n            case 10000000000000000000000000000000000000000000000000 { result := mul(SCALE, 31) }\n            case 100000000000000000000000000000000000000000000000000 { result := mul(SCALE, 32) }\n            case 1000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 33) }\n            case 10000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 34) }\n            case 100000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 35) }\n            case 1000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 36) }\n            case 10000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 37) }\n            case 100000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 38) }\n            case 1000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 39) }\n            case 10000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 40) }\n            case 100000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 41) }\n            case 1000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 42) }\n            case 10000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 43) }\n            case 100000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 44) }\n            case 1000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 45) }\n            case 10000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 46) }\n            case 100000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 47) }\n            case 1000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 48) }\n            case 10000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 49) }\n            case 100000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 50) }\n            case 1000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 51) }\n            case 10000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 52) }\n            case 100000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 53) }\n            case 1000000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 54) }\n            case 10000000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 55) }\n            case 100000000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 56) }\n            case 1000000000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 57) }\n            case 10000000000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 58) }\n            case 100000000000000000000000000000000000000000000000000000000000000000000000000000 { result := mul(SCALE, 59) }\n            default {\n                result := MAX_UD60x18\n            }\n        }\n\n        if (result == MAX_UD60x18) {\n            // Do the fixed-point division inline to save gas. The denominator is log2(10).\n            unchecked {\n                result = (log2(x) * SCALE) / 3_321928094887362347;\n            }\n        }\n    }\n\n    /// @notice Calculates the binary logarithm of x.\n    ///\n    /// @dev Based on the iterative approximation algorithm.\n    /// https://en.wikipedia.org/wiki/Binary_logarithm#Iterative_approximation\n    ///\n    /// Requirements:\n    /// - x must be greater than or equal to SCALE, otherwise the result would be negative.\n    ///\n    /// Caveats:\n    /// - The results are nor perfectly accurate to the last decimal, due to the lossy precision of the iterative approximation.\n    ///\n    /// @param x The unsigned 60.18-decimal fixed-point number for which to calculate the binary logarithm.\n    /// @return result The binary logarithm as an unsigned 60.18-decimal fixed-point number.\n    function log2(uint256 x) internal pure returns (uint256 result) {\n        if (x < SCALE) {\n            revert PRBMathUD60x18__LogInputTooSmall(x);\n        }\n        unchecked {\n            // Calculate the integer part of the logarithm and add it to the result and finally calculate y = x * 2^(-n).\n            uint256 n = PRBMath.mostSignificantBit(x / SCALE);\n\n            // The integer part of the logarithm as an unsigned 60.18-decimal fixed-point number. The operation can't overflow\n            // because n is maximum 255 and SCALE is 1e18.\n            result = n * SCALE;\n\n            // This is y = x * 2^(-n).\n            uint256 y = x >> n;\n\n            // If y = 1, the fractional part is zero.\n            if (y == SCALE) {\n                return result;\n            }\n\n            // Calculate the fractional part via the iterative approximation.\n            // The \"delta >>= 1\" part is equivalent to \"delta /= 2\", but shifting bits is faster.\n            for (uint256 delta = HALF_SCALE; delta > 0; delta >>= 1) {\n                y = (y * y) / SCALE;\n\n                // Is y^2 > 2 and so in the range [2,4)?\n                if (y >= 2 * SCALE) {\n                    // Add the 2^(-m) factor to the logarithm.\n                    result += delta;\n\n                    // Corresponds to z/2 on Wikipedia.\n                    y >>= 1;\n                }\n            }\n        }\n    }\n\n    /// @notice Multiplies two unsigned 60.18-decimal fixed-point numbers together, returning a new unsigned 60.18-decimal\n    /// fixed-point number.\n    /// @dev See the documentation for the \"PRBMath.mulDivFixedPoint\" function.\n    /// @param x The multiplicand as an unsigned 60.18-decimal fixed-point number.\n    /// @param y The multiplier as an unsigned 60.18-decimal fixed-point number.\n    /// @return result The product as an unsigned 60.18-decimal fixed-point number.\n    function mul(uint256 x, uint256 y) internal pure returns (uint256 result) {\n        result = PRBMath.mulDivFixedPoint(x, y);\n    }\n\n    /// @notice Returns PI as an unsigned 60.18-decimal fixed-point number.\n    function pi() internal pure returns (uint256 result) {\n        result = 3_141592653589793238;\n    }\n\n    /// @notice Raises x to the power of y.\n    ///\n    /// @dev Based on the insight that x^y = 2^(log2(x) * y).\n    ///\n    /// Requirements:\n    /// - All from \"exp2\", \"log2\" and \"mul\".\n    ///\n    /// Caveats:\n    /// - All from \"exp2\", \"log2\" and \"mul\".\n    /// - Assumes 0^0 is 1.\n    ///\n    /// @param x Number to raise to given power y, as an unsigned 60.18-decimal fixed-point number.\n    /// @param y Exponent to raise x to, as an unsigned 60.18-decimal fixed-point number.\n    /// @return result x raised to power y, as an unsigned 60.18-decimal fixed-point number.\n    function pow(uint256 x, uint256 y) internal pure returns (uint256 result) {\n        if (x == 0) {\n            result = y == 0 ? SCALE : uint256(0);\n        } else {\n            result = exp2(mul(log2(x), y));\n        }\n    }\n\n    /// @notice Raises x (unsigned 60.18-decimal fixed-point number) to the power of y (basic unsigned integer) using the\n    /// famous algorithm \"exponentiation by squaring\".\n    ///\n    /// @dev See https://en.wikipedia.org/wiki/Exponentiation_by_squaring\n    ///\n    /// Requirements:\n    /// - The result must fit within MAX_UD60x18.\n    ///\n    /// Caveats:\n    /// - All from \"mul\".\n    /// - Assumes 0^0 is 1.\n    ///\n    /// @param x The base as an unsigned 60.18-decimal fixed-point number.\n    /// @param y The exponent as an uint256.\n    /// @return result The result as an unsigned 60.18-decimal fixed-point number.\n    function powu(uint256 x, uint256 y) internal pure returns (uint256 result) {\n        // Calculate the first iteration of the loop in advance.\n        result = y & 1 > 0 ? x : SCALE;\n\n        // Equivalent to \"for(y /= 2; y > 0; y /= 2)\" but faster.\n        for (y >>= 1; y > 0; y >>= 1) {\n            x = PRBMath.mulDivFixedPoint(x, x);\n\n            // Equivalent to \"y % 2 == 1\" but faster.\n            if (y & 1 > 0) {\n                result = PRBMath.mulDivFixedPoint(result, x);\n            }\n        }\n    }\n\n    /// @notice Returns 1 as an unsigned 60.18-decimal fixed-point number.\n    function scale() internal pure returns (uint256 result) {\n        result = SCALE;\n    }\n\n    /// @notice Calculates the square root of x, rounding down.\n    /// @dev Uses the Babylonian method https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method.\n    ///\n    /// Requirements:\n    /// - x must be less than MAX_UD60x18 / SCALE.\n    ///\n    /// @param x The unsigned 60.18-decimal fixed-point number for which to calculate the square root.\n    /// @return result The result as an unsigned 60.18-decimal fixed-point .\n    function sqrt(uint256 x) internal pure returns (uint256 result) {\n        unchecked {\n            if (x > MAX_UD60x18 / SCALE) {\n                revert PRBMathUD60x18__SqrtOverflow(x);\n            }\n            // Multiply x by the SCALE to account for the factor of SCALE that is picked up when multiplying two unsigned\n            // 60.18-decimal fixed-point numbers together (in this case, those two numbers are both the square root).\n            result = PRBMath.sqrt(x * SCALE);\n        }\n    }\n\n    /// @notice Converts a unsigned 60.18-decimal fixed-point number to basic integer form, rounding down in the process.\n    /// @param x The unsigned 60.18-decimal fixed-point number to convert.\n    /// @return result The same number in basic integer form.\n    function toUint(uint256 x) internal pure returns (uint256 result) {\n        unchecked {\n            result = x / SCALE;\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/Context.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n\n    function _msgData() internal view virtual returns (bytes calldata) {\n        return msg.data;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/Strings.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Strings.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev String operations.\n */\nlibrary Strings {\n    bytes16 private constant _HEX_SYMBOLS = \"0123456789abcdef\";\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` decimal representation.\n     */\n    function toString(uint256 value) internal pure returns (string memory) {\n        // Inspired by OraclizeAPI's implementation - MIT licence\n        // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol\n\n        if (value == 0) {\n            return \"0\";\n        }\n        uint256 temp = value;\n        uint256 digits;\n        while (temp != 0) {\n            digits++;\n            temp /= 10;\n        }\n        bytes memory buffer = new bytes(digits);\n        while (value != 0) {\n            digits -= 1;\n            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));\n            value /= 10;\n        }\n        return string(buffer);\n    }\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.\n     */\n    function toHexString(uint256 value) internal pure returns (string memory) {\n        if (value == 0) {\n            return \"0x00\";\n        }\n        uint256 temp = value;\n        uint256 length = 0;\n        while (temp != 0) {\n            length++;\n            temp >>= 8;\n        }\n        return toHexString(value, length);\n    }\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.\n     */\n    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {\n        bytes memory buffer = new bytes(2 * length + 2);\n        buffer[0] = \"0\";\n        buffer[1] = \"x\";\n        for (uint256 i = 2 * length + 1; i > 1; --i) {\n            buffer[i] = _HEX_SYMBOLS[value & 0xf];\n            value >>= 4;\n        }\n        require(value == 0, \"Strings: hex length insufficient\");\n        return string(buffer);\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/Counters.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Counters.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @title Counters\n * @author Matt Condon (@shrugs)\n * @dev Provides counters that can only be incremented, decremented or reset. This can be used e.g. to track the number\n * of elements in a mapping, issuing ERC721 ids, or counting request ids.\n *\n * Include with `using Counters for Counters.Counter;`\n */\nlibrary Counters {\n    struct Counter {\n        // This variable should never be directly accessed by users of the library: interactions must be restricted to\n        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add\n        // this feature: see https://github.com/ethereum/solidity/issues/4637\n        uint256 _value; // default: 0\n    }\n\n    function current(Counter storage counter) internal view returns (uint256) {\n        return counter._value;\n    }\n\n    function increment(Counter storage counter) internal {\n        unchecked {\n            counter._value += 1;\n        }\n    }\n\n    function decrement(Counter storage counter) internal {\n        uint256 value = counter._value;\n        require(value > 0, \"Counter: decrement overflow\");\n        unchecked {\n            counter._value = value - 1;\n        }\n    }\n\n    function reset(Counter storage counter) internal {\n        counter._value = 0;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (utils/math/Math.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Standard math utilities missing in the Solidity language.\n */\nlibrary Math {\n    /**\n     * @dev Returns the largest of two numbers.\n     */\n    function max(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a >= b ? a : b;\n    }\n\n    /**\n     * @dev Returns the smallest of two numbers.\n     */\n    function min(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a < b ? a : b;\n    }\n\n    /**\n     * @dev Returns the average of two numbers. The result is rounded towards\n     * zero.\n     */\n    function average(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b) / 2 can overflow.\n        return (a & b) + (a ^ b) / 2;\n    }\n\n    /**\n     * @dev Returns the ceiling of the division of two numbers.\n     *\n     * This differs from standard division with `/` in that it rounds up instead\n     * of rounding down.\n     */\n    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b - 1) / b can overflow on addition, so we distribute.\n        return a / b + (a % b == 0 ? 0 : 1);\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/ERC20.sol)\n\npragma solidity ^0.8.0;\n\nimport \"./IERC20.sol\";\nimport \"./extensions/IERC20Metadata.sol\";\nimport \"../../utils/Context.sol\";\n\n/**\n * @dev Implementation of the {IERC20} interface.\n *\n * This implementation is agnostic to the way tokens are created. This means\n * that a supply mechanism has to be added in a derived contract using {_mint}.\n * For a generic mechanism see {ERC20PresetMinterPauser}.\n *\n * TIP: For a detailed writeup see our guide\n * https://forum.zeppelin.solutions/t/how-to-implement-erc20-supply-mechanisms/226[How\n * to implement supply mechanisms].\n *\n * We have followed general OpenZeppelin Contracts guidelines: functions revert\n * instead returning `false` on failure. This behavior is nonetheless\n * conventional and does not conflict with the expectations of ERC20\n * applications.\n *\n * Additionally, an {Approval} event is emitted on calls to {transferFrom}.\n * This allows applications to reconstruct the allowance for all accounts just\n * by listening to said events. Other implementations of the EIP may not emit\n * these events, as it isn't required by the specification.\n *\n * Finally, the non-standard {decreaseAllowance} and {increaseAllowance}\n * functions have been added to mitigate the well-known issues around setting\n * allowances. See {IERC20-approve}.\n */\ncontract ERC20 is Context, IERC20, IERC20Metadata {\n    mapping(address => uint256) private _balances;\n\n    mapping(address => mapping(address => uint256)) private _allowances;\n\n    uint256 private _totalSupply;\n\n    string private _name;\n    string private _symbol;\n\n    /**\n     * @dev Sets the values for {name} and {symbol}.\n     *\n     * The default value of {decimals} is 18. To select a different value for\n     * {decimals} you should overload it.\n     *\n     * All two of these values are immutable: they can only be set once during\n     * construction.\n     */\n    constructor(string memory name_, string memory symbol_) {\n        _name = name_;\n        _symbol = symbol_;\n    }\n\n    /**\n     * @dev Returns the name of the token.\n     */\n    function name() public view virtual override returns (string memory) {\n        return _name;\n    }\n\n    /**\n     * @dev Returns the symbol of the token, usually a shorter version of the\n     * name.\n     */\n    function symbol() public view virtual override returns (string memory) {\n        return _symbol;\n    }\n\n    /**\n     * @dev Returns the number of decimals used to get its user representation.\n     * For example, if `decimals` equals `2`, a balance of `505` tokens should\n     * be displayed to a user as `5.05` (`505 / 10 ** 2`).\n     *\n     * Tokens usually opt for a value of 18, imitating the relationship between\n     * Ether and Wei. This is the value {ERC20} uses, unless this function is\n     * overridden;\n     *\n     * NOTE: This information is only used for _display_ purposes: it in\n     * no way affects any of the arithmetic of the contract, including\n     * {IERC20-balanceOf} and {IERC20-transfer}.\n     */\n    function decimals() public view virtual override returns (uint8) {\n        return 18;\n    }\n\n    /**\n     * @dev See {IERC20-totalSupply}.\n     */\n    function totalSupply() public view virtual override returns (uint256) {\n        return _totalSupply;\n    }\n\n    /**\n     * @dev See {IERC20-balanceOf}.\n     */\n    function balanceOf(address account) public view virtual override returns (uint256) {\n        return _balances[account];\n    }\n\n    /**\n     * @dev See {IERC20-transfer}.\n     *\n     * Requirements:\n     *\n     * - `to` cannot be the zero address.\n     * - the caller must have a balance of at least `amount`.\n     */\n    function transfer(address to, uint256 amount) public virtual override returns (bool) {\n        address owner = _msgSender();\n        _transfer(owner, to, amount);\n        return true;\n    }\n\n    /**\n     * @dev See {IERC20-allowance}.\n     */\n    function allowance(address owner, address spender) public view virtual override returns (uint256) {\n        return _allowances[owner][spender];\n    }\n\n    /**\n     * @dev See {IERC20-approve}.\n     *\n     * NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on\n     * `transferFrom`. This is semantically equivalent to an infinite approval.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     */\n    function approve(address spender, uint256 amount) public virtual override returns (bool) {\n        address owner = _msgSender();\n        _approve(owner, spender, amount);\n        return true;\n    }\n\n    /**\n     * @dev See {IERC20-transferFrom}.\n     *\n     * Emits an {Approval} event indicating the updated allowance. This is not\n     * required by the EIP. See the note at the beginning of {ERC20}.\n     *\n     * NOTE: Does not update the allowance if the current allowance\n     * is the maximum `uint256`.\n     *\n     * Requirements:\n     *\n     * - `from` and `to` cannot be the zero address.\n     * - `from` must have a balance of at least `amount`.\n     * - the caller must have allowance for ``from``'s tokens of at least\n     * `amount`.\n     */\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) public virtual override returns (bool) {\n        address spender = _msgSender();\n        _spendAllowance(from, spender, amount);\n        _transfer(from, to, amount);\n        return true;\n    }\n\n    /**\n     * @dev Atomically increases the allowance granted to `spender` by the caller.\n     *\n     * This is an alternative to {approve} that can be used as a mitigation for\n     * problems described in {IERC20-approve}.\n     *\n     * Emits an {Approval} event indicating the updated allowance.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     */\n    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {\n        address owner = _msgSender();\n        _approve(owner, spender, allowance(owner, spender) + addedValue);\n        return true;\n    }\n\n    /**\n     * @dev Atomically decreases the allowance granted to `spender` by the caller.\n     *\n     * This is an alternative to {approve} that can be used as a mitigation for\n     * problems described in {IERC20-approve}.\n     *\n     * Emits an {Approval} event indicating the updated allowance.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `spender` must have allowance for the caller of at least\n     * `subtractedValue`.\n     */\n    function decreaseAllowance(address spender, uint256 subtractedValue) public virtual returns (bool) {\n        address owner = _msgSender();\n        uint256 currentAllowance = allowance(owner, spender);\n        require(currentAllowance >= subtractedValue, \"ERC20: decreased allowance below zero\");\n        unchecked {\n            _approve(owner, spender, currentAllowance - subtractedValue);\n        }\n\n        return true;\n    }\n\n    /**\n     * @dev Moves `amount` of tokens from `sender` to `recipient`.\n     *\n     * This internal function is equivalent to {transfer}, and can be used to\n     * e.g. implement automatic token fees, slashing mechanisms, etc.\n     *\n     * Emits a {Transfer} event.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `from` must have a balance of at least `amount`.\n     */\n    function _transfer(\n        address from,\n        address to,\n        uint256 amount\n    ) internal virtual {\n        require(from != address(0), \"ERC20: transfer from the zero address\");\n        require(to != address(0), \"ERC20: transfer to the zero address\");\n\n        _beforeTokenTransfer(from, to, amount);\n\n        uint256 fromBalance = _balances[from];\n        require(fromBalance >= amount, \"ERC20: transfer amount exceeds balance\");\n        unchecked {\n            _balances[from] = fromBalance - amount;\n        }\n        _balances[to] += amount;\n\n        emit Transfer(from, to, amount);\n\n        _afterTokenTransfer(from, to, amount);\n    }\n\n    /** @dev Creates `amount` tokens and assigns them to `account`, increasing\n     * the total supply.\n     *\n     * Emits a {Transfer} event with `from` set to the zero address.\n     *\n     * Requirements:\n     *\n     * - `account` cannot be the zero address.\n     */\n    function _mint(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: mint to the zero address\");\n\n        _beforeTokenTransfer(address(0), account, amount);\n\n        _totalSupply += amount;\n        _balances[account] += amount;\n        emit Transfer(address(0), account, amount);\n\n        _afterTokenTransfer(address(0), account, amount);\n    }\n\n    /**\n     * @dev Destroys `amount` tokens from `account`, reducing the\n     * total supply.\n     *\n     * Emits a {Transfer} event with `to` set to the zero address.\n     *\n     * Requirements:\n     *\n     * - `account` cannot be the zero address.\n     * - `account` must have at least `amount` tokens.\n     */\n    function _burn(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: burn from the zero address\");\n\n        _beforeTokenTransfer(account, address(0), amount);\n\n        uint256 accountBalance = _balances[account];\n        require(accountBalance >= amount, \"ERC20: burn amount exceeds balance\");\n        unchecked {\n            _balances[account] = accountBalance - amount;\n        }\n        _totalSupply -= amount;\n\n        emit Transfer(account, address(0), amount);\n\n        _afterTokenTransfer(account, address(0), amount);\n    }\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the `owner` s tokens.\n     *\n     * This internal function is equivalent to `approve`, and can be used to\n     * e.g. set automatic allowances for certain subsystems, etc.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `owner` cannot be the zero address.\n     * - `spender` cannot be the zero address.\n     */\n    function _approve(\n        address owner,\n        address spender,\n        uint256 amount\n    ) internal virtual {\n        require(owner != address(0), \"ERC20: approve from the zero address\");\n        require(spender != address(0), \"ERC20: approve to the zero address\");\n\n        _allowances[owner][spender] = amount;\n        emit Approval(owner, spender, amount);\n    }\n\n    /**\n     * @dev Updates `owner` s allowance for `spender` based on spent `amount`.\n     *\n     * Does not update the allowance amount in case of infinite allowance.\n     * Revert if not enough allowance is available.\n     *\n     * Might emit an {Approval} event.\n     */\n    function _spendAllowance(\n        address owner,\n        address spender,\n        uint256 amount\n    ) internal virtual {\n        uint256 currentAllowance = allowance(owner, spender);\n        if (currentAllowance != type(uint256).max) {\n            require(currentAllowance >= amount, \"ERC20: insufficient allowance\");\n            unchecked {\n                _approve(owner, spender, currentAllowance - amount);\n            }\n        }\n    }\n\n    /**\n     * @dev Hook that is called before any transfer of tokens. This includes\n     * minting and burning.\n     *\n     * Calling conditions:\n     *\n     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens\n     * will be transferred to `to`.\n     * - when `from` is zero, `amount` tokens will be minted for `to`.\n     * - when `to` is zero, `amount` of ``from``'s tokens will be burned.\n     * - `from` and `to` are never both zero.\n     *\n     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].\n     */\n    function _beforeTokenTransfer(\n        address from,\n        address to,\n        uint256 amount\n    ) internal virtual {}\n\n    /**\n     * @dev Hook that is called after any transfer of tokens. This includes\n     * minting and burning.\n     *\n     * Calling conditions:\n     *\n     * - when `from` and `to` are both non-zero, `amount` of ``from``'s tokens\n     * has been transferred to `to`.\n     * - when `from` is zero, `amount` tokens have been minted for `to`.\n     * - when `to` is zero, `amount` of ``from``'s tokens have been burned.\n     * - `from` and `to` are never both zero.\n     *\n     * To learn more about hooks, head to xref:ROOT:extending-contracts.adoc#using-hooks[Using Hooks].\n     */\n    function _afterTokenTransfer(\n        address from,\n        address to,\n        uint256 amount\n    ) internal virtual {}\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `to`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `from` to `to` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) external returns (bool);\n\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/math/SafeCast.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Wrappers over Solidity's uintXX/intXX casting operators with added overflow\n * checks.\n *\n * Downcasting from uint256/int256 in Solidity does not revert on overflow. This can\n * easily result in undesired exploitation or bugs, since developers usually\n * assume that overflows raise errors. `SafeCast` restores this intuition by\n * reverting the transaction when such an operation overflows.\n *\n * Using this library instead of the unchecked operations eliminates an entire\n * class of bugs, so it's recommended to use it always.\n *\n * Can be combined with {SafeMath} and {SignedSafeMath} to extend it to smaller types, by performing\n * all math on `uint256` and `int256` and then downcasting.\n */\nlibrary SafeCast {\n    /**\n     * @dev Returns the downcasted uint224 from uint256, reverting on\n     * overflow (when the input is greater than largest uint224).\n     *\n     * Counterpart to Solidity's `uint224` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 224 bits\n     */\n    function toUint224(uint256 value) internal pure returns (uint224) {\n        require(value <= type(uint224).max, \"SafeCast: value doesn't fit in 224 bits\");\n        return uint224(value);\n    }\n\n    /**\n     * @dev Returns the downcasted uint128 from uint256, reverting on\n     * overflow (when the input is greater than largest uint128).\n     *\n     * Counterpart to Solidity's `uint128` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 128 bits\n     */\n    function toUint128(uint256 value) internal pure returns (uint128) {\n        require(value <= type(uint128).max, \"SafeCast: value doesn't fit in 128 bits\");\n        return uint128(value);\n    }\n\n    /**\n     * @dev Returns the downcasted uint96 from uint256, reverting on\n     * overflow (when the input is greater than largest uint96).\n     *\n     * Counterpart to Solidity's `uint96` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 96 bits\n     */\n    function toUint96(uint256 value) internal pure returns (uint96) {\n        require(value <= type(uint96).max, \"SafeCast: value doesn't fit in 96 bits\");\n        return uint96(value);\n    }\n\n    /**\n     * @dev Returns the downcasted uint64 from uint256, reverting on\n     * overflow (when the input is greater than largest uint64).\n     *\n     * Counterpart to Solidity's `uint64` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 64 bits\n     */\n    function toUint64(uint256 value) internal pure returns (uint64) {\n        require(value <= type(uint64).max, \"SafeCast: value doesn't fit in 64 bits\");\n        return uint64(value);\n    }\n\n    /**\n     * @dev Returns the downcasted uint32 from uint256, reverting on\n     * overflow (when the input is greater than largest uint32).\n     *\n     * Counterpart to Solidity's `uint32` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 32 bits\n     */\n    function toUint32(uint256 value) internal pure returns (uint32) {\n        require(value <= type(uint32).max, \"SafeCast: value doesn't fit in 32 bits\");\n        return uint32(value);\n    }\n\n    /**\n     * @dev Returns the downcasted uint16 from uint256, reverting on\n     * overflow (when the input is greater than largest uint16).\n     *\n     * Counterpart to Solidity's `uint16` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 16 bits\n     */\n    function toUint16(uint256 value) internal pure returns (uint16) {\n        require(value <= type(uint16).max, \"SafeCast: value doesn't fit in 16 bits\");\n        return uint16(value);\n    }\n\n    /**\n     * @dev Returns the downcasted uint8 from uint256, reverting on\n     * overflow (when the input is greater than largest uint8).\n     *\n     * Counterpart to Solidity's `uint8` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 8 bits.\n     */\n    function toUint8(uint256 value) internal pure returns (uint8) {\n        require(value <= type(uint8).max, \"SafeCast: value doesn't fit in 8 bits\");\n        return uint8(value);\n    }\n\n    /**\n     * @dev Converts a signed int256 into an unsigned uint256.\n     *\n     * Requirements:\n     *\n     * - input must be greater than or equal to 0.\n     */\n    function toUint256(int256 value) internal pure returns (uint256) {\n        require(value >= 0, \"SafeCast: value must be positive\");\n        return uint256(value);\n    }\n\n    /**\n     * @dev Returns the downcasted int128 from int256, reverting on\n     * overflow (when the input is less than smallest int128 or\n     * greater than largest int128).\n     *\n     * Counterpart to Solidity's `int128` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 128 bits\n     *\n     * _Available since v3.1._\n     */\n    function toInt128(int256 value) internal pure returns (int128) {\n        require(value >= type(int128).min && value <= type(int128).max, \"SafeCast: value doesn't fit in 128 bits\");\n        return int128(value);\n    }\n\n    /**\n     * @dev Returns the downcasted int64 from int256, reverting on\n     * overflow (when the input is less than smallest int64 or\n     * greater than largest int64).\n     *\n     * Counterpart to Solidity's `int64` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 64 bits\n     *\n     * _Available since v3.1._\n     */\n    function toInt64(int256 value) internal pure returns (int64) {\n        require(value >= type(int64).min && value <= type(int64).max, \"SafeCast: value doesn't fit in 64 bits\");\n        return int64(value);\n    }\n\n    /**\n     * @dev Returns the downcasted int32 from int256, reverting on\n     * overflow (when the input is less than smallest int32 or\n     * greater than largest int32).\n     *\n     * Counterpart to Solidity's `int32` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 32 bits\n     *\n     * _Available since v3.1._\n     */\n    function toInt32(int256 value) internal pure returns (int32) {\n        require(value >= type(int32).min && value <= type(int32).max, \"SafeCast: value doesn't fit in 32 bits\");\n        return int32(value);\n    }\n\n    /**\n     * @dev Returns the downcasted int16 from int256, reverting on\n     * overflow (when the input is less than smallest int16 or\n     * greater than largest int16).\n     *\n     * Counterpart to Solidity's `int16` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 16 bits\n     *\n     * _Available since v3.1._\n     */\n    function toInt16(int256 value) internal pure returns (int16) {\n        require(value >= type(int16).min && value <= type(int16).max, \"SafeCast: value doesn't fit in 16 bits\");\n        return int16(value);\n    }\n\n    /**\n     * @dev Returns the downcasted int8 from int256, reverting on\n     * overflow (when the input is less than smallest int8 or\n     * greater than largest int8).\n     *\n     * Counterpart to Solidity's `int8` operator.\n     *\n     * Requirements:\n     *\n     * - input must fit into 8 bits.\n     *\n     * _Available since v3.1._\n     */\n    function toInt8(int256 value) internal pure returns (int8) {\n        require(value >= type(int8).min && value <= type(int8).max, \"SafeCast: value doesn't fit in 8 bits\");\n        return int8(value);\n    }\n\n    /**\n     * @dev Converts an unsigned uint256 into a signed int256.\n     *\n     * Requirements:\n     *\n     * - input must be less than or equal to maxInt256.\n     */\n    function toInt256(uint256 value) internal pure returns (int256) {\n        // Note: Unsafe cast below is okay because `type(int256).max` is guaranteed to be positive\n        require(value <= uint256(type(int256).max), \"SafeCast: value doesn't fit in an int256\");\n        return int256(value);\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/governance/utils/IVotes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (governance/utils/IVotes.sol)\npragma solidity ^0.8.0;\n\n/**\n * @dev Common interface for {ERC20Votes}, {ERC721Votes}, and other {Votes}-enabled contracts.\n *\n * _Available since v4.5._\n */\ninterface IVotes {\n    /**\n     * @dev Emitted when an account changes their delegate.\n     */\n    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);\n\n    /**\n     * @dev Emitted when a token transfer or delegate change results in changes to a delegate's number of votes.\n     */\n    event DelegateVotesChanged(address indexed delegate, uint256 previousBalance, uint256 newBalance);\n\n    /**\n     * @dev Returns the current amount of votes that `account` has.\n     */\n    function getVotes(address account) external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of votes that `account` had at the end of a past block (`blockNumber`).\n     */\n    function getPastVotes(address account, uint256 blockNumber) external view returns (uint256);\n\n    /**\n     * @dev Returns the total supply of votes available at the end of a past block (`blockNumber`).\n     *\n     * NOTE: This value is the sum of all available votes, which is not necessarily the sum of all delegated votes.\n     * Votes that have not been delegated are still part of total supply, even though they would not participate in a\n     * vote.\n     */\n    function getPastTotalSupply(uint256 blockNumber) external view returns (uint256);\n\n    /**\n     * @dev Returns the delegate that `account` has chosen.\n     */\n    function delegates(address account) external view returns (address);\n\n    /**\n     * @dev Delegates votes from the sender to `delegatee`.\n     */\n    function delegate(address delegatee) external;\n\n    /**\n     * @dev Delegates votes from signer to `delegatee`.\n     */\n    function delegateBySig(\n        address delegatee,\n        uint256 nonce,\n        uint256 expiry,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (utils/cryptography/ECDSA.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../Strings.sol\";\n\n/**\n * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.\n *\n * These functions can be used to verify that a message was signed by the holder\n * of the private keys of a given address.\n */\nlibrary ECDSA {\n    enum RecoverError {\n        NoError,\n        InvalidSignature,\n        InvalidSignatureLength,\n        InvalidSignatureS,\n        InvalidSignatureV\n    }\n\n    function _throwError(RecoverError error) private pure {\n        if (error == RecoverError.NoError) {\n            return; // no error: do nothing\n        } else if (error == RecoverError.InvalidSignature) {\n            revert(\"ECDSA: invalid signature\");\n        } else if (error == RecoverError.InvalidSignatureLength) {\n            revert(\"ECDSA: invalid signature length\");\n        } else if (error == RecoverError.InvalidSignatureS) {\n            revert(\"ECDSA: invalid signature 's' value\");\n        } else if (error == RecoverError.InvalidSignatureV) {\n            revert(\"ECDSA: invalid signature 'v' value\");\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature` or error string. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     *\n     * Documentation for signature generation:\n     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]\n     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(bytes32 hash, bytes memory signature) internal pure returns (address, RecoverError) {\n        // Check the signature length\n        // - case 65: r,s,v signature (standard)\n        // - case 64: r,vs signature (cf https://eips.ethereum.org/EIPS/eip-2098) _Available since v4.1._\n        if (signature.length == 65) {\n            bytes32 r;\n            bytes32 s;\n            uint8 v;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                s := mload(add(signature, 0x40))\n                v := byte(0, mload(add(signature, 0x60)))\n            }\n            return tryRecover(hash, v, r, s);\n        } else if (signature.length == 64) {\n            bytes32 r;\n            bytes32 vs;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                vs := mload(add(signature, 0x40))\n            }\n            return tryRecover(hash, r, vs);\n        } else {\n            return (address(0), RecoverError.InvalidSignatureLength);\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature`. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     */\n    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, signature);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.\n     *\n     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address, RecoverError) {\n        bytes32 s = vs & bytes32(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);\n        uint8 v = uint8((uint256(vs) >> 255) + 27);\n        return tryRecover(hash, v, r, s);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.\n     *\n     * _Available since v4.2._\n     */\n    function recover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, r, vs);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address, RecoverError) {\n        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature\n        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most\n        // signatures from current libraries generate a unique signature with an s-value in the lower half order.\n        //\n        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value\n        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or\n        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept\n        // these malleable signatures as well.\n        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {\n            return (address(0), RecoverError.InvalidSignatureS);\n        }\n        if (v != 27 && v != 28) {\n            return (address(0), RecoverError.InvalidSignatureV);\n        }\n\n        // If the signature is valid (and not malleable), return the signer address\n        address signer = ecrecover(hash, v, r, s);\n        if (signer == address(0)) {\n            return (address(0), RecoverError.InvalidSignature);\n        }\n\n        return (signer, RecoverError.NoError);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function recover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from a `hash`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {\n        // 32 is the length in bytes of hash,\n        // enforced by the type signature above\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", hash));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from `s`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes memory s) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n\", Strings.toString(s.length), s));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Typed Data, created from a\n     * `domainSeparator` and a `structHash`. This produces hash corresponding\n     * to the one signed with the\n     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]\n     * JSON-RPC method as part of EIP-712.\n     *\n     * See {recover}.\n     */\n    function toTypedDataHash(bytes32 domainSeparator, bytes32 structHash) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19\\x01\", domainSeparator, structHash));\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/cryptography/draft-EIP712.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/cryptography/draft-EIP712.sol)\n\npragma solidity ^0.8.0;\n\nimport \"./ECDSA.sol\";\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.\n *\n * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,\n * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding\n * they need in their contracts using a combination of `abi.encode` and `keccak256`.\n *\n * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding\n * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA\n * ({_hashTypedDataV4}).\n *\n * The implementation of the domain separator was designed to be as efficient as possible while still properly updating\n * the chain id to protect against replay attacks on an eventual fork of the chain.\n *\n * NOTE: This contract implements the version of the encoding known as \"v4\", as implemented by the JSON RPC method\n * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].\n *\n * _Available since v3.4._\n */\nabstract contract EIP712 {\n    /* solhint-disable var-name-mixedcase */\n    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to\n    // invalidate the cached domain separator if the chain id changes.\n    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;\n    uint256 private immutable _CACHED_CHAIN_ID;\n    address private immutable _CACHED_THIS;\n\n    bytes32 private immutable _HASHED_NAME;\n    bytes32 private immutable _HASHED_VERSION;\n    bytes32 private immutable _TYPE_HASH;\n\n    /* solhint-enable var-name-mixedcase */\n\n    /**\n     * @dev Initializes the domain separator and parameter caches.\n     *\n     * The meaning of `name` and `version` is specified in\n     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:\n     *\n     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.\n     * - `version`: the current major version of the signing domain.\n     *\n     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart\n     * contract upgrade].\n     */\n    constructor(string memory name, string memory version) {\n        bytes32 hashedName = keccak256(bytes(name));\n        bytes32 hashedVersion = keccak256(bytes(version));\n        bytes32 typeHash = keccak256(\n            \"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"\n        );\n        _HASHED_NAME = hashedName;\n        _HASHED_VERSION = hashedVersion;\n        _CACHED_CHAIN_ID = block.chainid;\n        _CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator(typeHash, hashedName, hashedVersion);\n        _CACHED_THIS = address(this);\n        _TYPE_HASH = typeHash;\n    }\n\n    /**\n     * @dev Returns the domain separator for the current chain.\n     */\n    function _domainSeparatorV4() internal view returns (bytes32) {\n        if (address(this) == _CACHED_THIS && block.chainid == _CACHED_CHAIN_ID) {\n            return _CACHED_DOMAIN_SEPARATOR;\n        } else {\n            return _buildDomainSeparator(_TYPE_HASH, _HASHED_NAME, _HASHED_VERSION);\n        }\n    }\n\n    function _buildDomainSeparator(\n        bytes32 typeHash,\n        bytes32 nameHash,\n        bytes32 versionHash\n    ) private view returns (bytes32) {\n        return keccak256(abi.encode(typeHash, nameHash, versionHash, block.chainid, address(this)));\n    }\n\n    /**\n     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this\n     * function returns the hash of the fully encoded EIP712 message for this domain.\n     *\n     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:\n     *\n     * ```solidity\n     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(\n     *     keccak256(\"Mail(address to,string contents)\"),\n     *     mailTo,\n     *     keccak256(bytes(mailContents))\n     * )));\n     * address signer = ECDSA.recover(digest, signature);\n     * ```\n     */\n    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {\n        return ECDSA.toTypedDataHash(_domainSeparatorV4(), structHash);\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/ERC20Votes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/extensions/ERC20Votes.sol)\n\npragma solidity ^0.8.0;\n\nimport \"./draft-ERC20Permit.sol\";\nimport \"../../../utils/math/Math.sol\";\nimport \"../../../governance/utils/IVotes.sol\";\nimport \"../../../utils/math/SafeCast.sol\";\nimport \"../../../utils/cryptography/ECDSA.sol\";\n\n/**\n * @dev Extension of ERC20 to support Compound-like voting and delegation. This version is more generic than Compound's,\n * and supports token supply up to 2^224^ - 1, while COMP is limited to 2^96^ - 1.\n *\n * NOTE: If exact COMP compatibility is required, use the {ERC20VotesComp} variant of this module.\n *\n * This extension keeps a history (checkpoints) of each account's vote power. Vote power can be delegated either\n * by calling the {delegate} function directly, or by providing a signature to be used with {delegateBySig}. Voting\n * power can be queried through the public accessors {getVotes} and {getPastVotes}.\n *\n * By default, token balance does not account for voting power. This makes transfers cheaper. The downside is that it\n * requires users to delegate to themselves in order to activate checkpoints and have their voting power tracked.\n *\n * _Available since v4.2._\n */\nabstract contract ERC20Votes is IVotes, ERC20Permit {\n    struct Checkpoint {\n        uint32 fromBlock;\n        uint224 votes;\n    }\n\n    bytes32 private constant _DELEGATION_TYPEHASH =\n        keccak256(\"Delegation(address delegatee,uint256 nonce,uint256 expiry)\");\n\n    mapping(address => address) private _delegates;\n    mapping(address => Checkpoint[]) private _checkpoints;\n    Checkpoint[] private _totalSupplyCheckpoints;\n\n    /**\n     * @dev Get the `pos`-th checkpoint for `account`.\n     */\n    function checkpoints(address account, uint32 pos) public view virtual returns (Checkpoint memory) {\n        return _checkpoints[account][pos];\n    }\n\n    /**\n     * @dev Get number of checkpoints for `account`.\n     */\n    function numCheckpoints(address account) public view virtual returns (uint32) {\n        return SafeCast.toUint32(_checkpoints[account].length);\n    }\n\n    /**\n     * @dev Get the address `account` is currently delegating to.\n     */\n    function delegates(address account) public view virtual override returns (address) {\n        return _delegates[account];\n    }\n\n    /**\n     * @dev Gets the current votes balance for `account`\n     */\n    function getVotes(address account) public view virtual override returns (uint256) {\n        uint256 pos = _checkpoints[account].length;\n        return pos == 0 ? 0 : _checkpoints[account][pos - 1].votes;\n    }\n\n    /**\n     * @dev Retrieve the number of votes for `account` at the end of `blockNumber`.\n     *\n     * Requirements:\n     *\n     * - `blockNumber` must have been already mined\n     */\n    function getPastVotes(address account, uint256 blockNumber) public view virtual override returns (uint256) {\n        require(blockNumber < block.number, \"ERC20Votes: block not yet mined\");\n        return _checkpointsLookup(_checkpoints[account], blockNumber);\n    }\n\n    /**\n     * @dev Retrieve the `totalSupply` at the end of `blockNumber`. Note, this value is the sum of all balances.\n     * It is but NOT the sum of all the delegated votes!\n     *\n     * Requirements:\n     *\n     * - `blockNumber` must have been already mined\n     */\n    function getPastTotalSupply(uint256 blockNumber) public view virtual override returns (uint256) {\n        require(blockNumber < block.number, \"ERC20Votes: block not yet mined\");\n        return _checkpointsLookup(_totalSupplyCheckpoints, blockNumber);\n    }\n\n    /**\n     * @dev Lookup a value in a list of (sorted) checkpoints.\n     */\n    function _checkpointsLookup(Checkpoint[] storage ckpts, uint256 blockNumber) private view returns (uint256) {\n        // We run a binary search to look for the earliest checkpoint taken after `blockNumber`.\n        //\n        // During the loop, the index of the wanted checkpoint remains in the range [low-1, high).\n        // With each iteration, either `low` or `high` is moved towards the middle of the range to maintain the invariant.\n        // - If the middle checkpoint is after `blockNumber`, we look in [low, mid)\n        // - If the middle checkpoint is before or equal to `blockNumber`, we look in [mid+1, high)\n        // Once we reach a single value (when low == high), we've found the right checkpoint at the index high-1, if not\n        // out of bounds (in which case we're looking too far in the past and the result is 0).\n        // Note that if the latest checkpoint available is exactly for `blockNumber`, we end up with an index that is\n        // past the end of the array, so we technically don't find a checkpoint after `blockNumber`, but it works out\n        // the same.\n        uint256 high = ckpts.length;\n        uint256 low = 0;\n        while (low < high) {\n            uint256 mid = Math.average(low, high);\n            if (ckpts[mid].fromBlock > blockNumber) {\n                high = mid;\n            } else {\n                low = mid + 1;\n            }\n        }\n\n        return high == 0 ? 0 : ckpts[high - 1].votes;\n    }\n\n    /**\n     * @dev Delegate votes from the sender to `delegatee`.\n     */\n    function delegate(address delegatee) public virtual override {\n        _delegate(_msgSender(), delegatee);\n    }\n\n    /**\n     * @dev Delegates votes from signer to `delegatee`\n     */\n    function delegateBySig(\n        address delegatee,\n        uint256 nonce,\n        uint256 expiry,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual override {\n        require(block.timestamp <= expiry, \"ERC20Votes: signature expired\");\n        address signer = ECDSA.recover(\n            _hashTypedDataV4(keccak256(abi.encode(_DELEGATION_TYPEHASH, delegatee, nonce, expiry))),\n            v,\n            r,\n            s\n        );\n        require(nonce == _useNonce(signer), \"ERC20Votes: invalid nonce\");\n        _delegate(signer, delegatee);\n    }\n\n    /**\n     * @dev Maximum token supply. Defaults to `type(uint224).max` (2^224^ - 1).\n     */\n    function _maxSupply() internal view virtual returns (uint224) {\n        return type(uint224).max;\n    }\n\n    /**\n     * @dev Snapshots the totalSupply after it has been increased.\n     */\n    function _mint(address account, uint256 amount) internal virtual override {\n        super._mint(account, amount);\n        require(totalSupply() <= _maxSupply(), \"ERC20Votes: total supply risks overflowing votes\");\n\n        _writeCheckpoint(_totalSupplyCheckpoints, _add, amount);\n    }\n\n    /**\n     * @dev Snapshots the totalSupply after it has been decreased.\n     */\n    function _burn(address account, uint256 amount) internal virtual override {\n        super._burn(account, amount);\n\n        _writeCheckpoint(_totalSupplyCheckpoints, _subtract, amount);\n    }\n\n    /**\n     * @dev Move voting power when tokens are transferred.\n     *\n     * Emits a {DelegateVotesChanged} event.\n     */\n    function _afterTokenTransfer(\n        address from,\n        address to,\n        uint256 amount\n    ) internal virtual override {\n        super._afterTokenTransfer(from, to, amount);\n\n        _moveVotingPower(delegates(from), delegates(to), amount);\n    }\n\n    /**\n     * @dev Change delegation for `delegator` to `delegatee`.\n     *\n     * Emits events {DelegateChanged} and {DelegateVotesChanged}.\n     */\n    function _delegate(address delegator, address delegatee) internal virtual {\n        address currentDelegate = delegates(delegator);\n        uint256 delegatorBalance = balanceOf(delegator);\n        _delegates[delegator] = delegatee;\n\n        emit DelegateChanged(delegator, currentDelegate, delegatee);\n\n        _moveVotingPower(currentDelegate, delegatee, delegatorBalance);\n    }\n\n    function _moveVotingPower(\n        address src,\n        address dst,\n        uint256 amount\n    ) private {\n        if (src != dst && amount > 0) {\n            if (src != address(0)) {\n                (uint256 oldWeight, uint256 newWeight) = _writeCheckpoint(_checkpoints[src], _subtract, amount);\n                emit DelegateVotesChanged(src, oldWeight, newWeight);\n            }\n\n            if (dst != address(0)) {\n                (uint256 oldWeight, uint256 newWeight) = _writeCheckpoint(_checkpoints[dst], _add, amount);\n                emit DelegateVotesChanged(dst, oldWeight, newWeight);\n            }\n        }\n    }\n\n    function _writeCheckpoint(\n        Checkpoint[] storage ckpts,\n        function(uint256, uint256) view returns (uint256) op,\n        uint256 delta\n    ) private returns (uint256 oldWeight, uint256 newWeight) {\n        uint256 pos = ckpts.length;\n        oldWeight = pos == 0 ? 0 : ckpts[pos - 1].votes;\n        newWeight = op(oldWeight, delta);\n\n        if (pos > 0 && ckpts[pos - 1].fromBlock == block.number) {\n            ckpts[pos - 1].votes = SafeCast.toUint224(newWeight);\n        } else {\n            ckpts.push(Checkpoint({fromBlock: SafeCast.toUint32(block.number), votes: SafeCast.toUint224(newWeight)}));\n        }\n    }\n\n    function _add(uint256 a, uint256 b) private pure returns (uint256) {\n        return a + b;\n    }\n\n    function _subtract(uint256 a, uint256 b) private pure returns (uint256) {\n        return a - b;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/IERC20Metadata.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../IERC20.sol\";\n\n/**\n * @dev Interface for the optional metadata functions from the ERC20 standard.\n *\n * _Available since v4.1._\n */\ninterface IERC20Metadata is IERC20 {\n    /**\n     * @dev Returns the name of the token.\n     */\n    function name() external view returns (string memory);\n\n    /**\n     * @dev Returns the symbol of the token.\n     */\n    function symbol() external view returns (string memory);\n\n    /**\n     * @dev Returns the decimals places of the token.\n     */\n    function decimals() external view returns (uint8);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/draft-ERC20Permit.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/draft-ERC20Permit.sol)\n\npragma solidity ^0.8.0;\n\nimport \"./draft-IERC20Permit.sol\";\nimport \"../ERC20.sol\";\nimport \"../../../utils/cryptography/draft-EIP712.sol\";\nimport \"../../../utils/cryptography/ECDSA.sol\";\nimport \"../../../utils/Counters.sol\";\n\n/**\n * @dev Implementation of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on `{IERC20-approve}`, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n *\n * _Available since v3.4._\n */\nabstract contract ERC20Permit is ERC20, IERC20Permit, EIP712 {\n    using Counters for Counters.Counter;\n\n    mapping(address => Counters.Counter) private _nonces;\n\n    // solhint-disable-next-line var-name-mixedcase\n    bytes32 private constant _PERMIT_TYPEHASH =\n        keccak256(\"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\");\n    /**\n     * @dev In previous versions `_PERMIT_TYPEHASH` was declared as `immutable`.\n     * However, to ensure consistency with the upgradeable transpiler, we will continue\n     * to reserve a slot.\n     * @custom:oz-renamed-from _PERMIT_TYPEHASH\n     */\n    // solhint-disable-next-line var-name-mixedcase\n    bytes32 private _PERMIT_TYPEHASH_DEPRECATED_SLOT;\n\n    /**\n     * @dev Initializes the {EIP712} domain separator using the `name` parameter, and setting `version` to `\"1\"`.\n     *\n     * It's a good idea to use the same `name` that is defined as the ERC20 token name.\n     */\n    constructor(string memory name) EIP712(name, \"1\") {}\n\n    /**\n     * @dev See {IERC20Permit-permit}.\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual override {\n        require(block.timestamp <= deadline, \"ERC20Permit: expired deadline\");\n\n        bytes32 structHash = keccak256(abi.encode(_PERMIT_TYPEHASH, owner, spender, value, _useNonce(owner), deadline));\n\n        bytes32 hash = _hashTypedDataV4(structHash);\n\n        address signer = ECDSA.recover(hash, v, r, s);\n        require(signer == owner, \"ERC20Permit: invalid signature\");\n\n        _approve(owner, spender, value);\n    }\n\n    /**\n     * @dev See {IERC20Permit-nonces}.\n     */\n    function nonces(address owner) public view virtual override returns (uint256) {\n        return _nonces[owner].current();\n    }\n\n    /**\n     * @dev See {IERC20Permit-DOMAIN_SEPARATOR}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view override returns (bytes32) {\n        return _domainSeparatorV4();\n    }\n\n    /**\n     * @dev \"Consume a nonce\": return the current value and increment.\n     *\n     * _Available since v4.1._\n     */\n    function _useNonce(address owner) internal virtual returns (uint256 current) {\n        Counters.Counter storage nonce = _nonces[owner];\n        current = nonce.current();\n        nonce.increment();\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/draft-IERC20Permit.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/draft-IERC20Permit.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n */\ninterface IERC20Permit {\n    /**\n     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,\n     * given ``owner``'s signed approval.\n     *\n     * IMPORTANT: The same issues {IERC20-approve} has related to transaction\n     * ordering also apply here.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `deadline` must be a timestamp in the future.\n     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`\n     * over the EIP712-formatted function arguments.\n     * - the signature must use ``owner``'s current nonce (see {nonces}).\n     *\n     * For more information on the signature format, see the\n     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP\n     * section].\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n\n    /**\n     * @dev Returns the current nonce for `owner`. This value must be\n     * included whenever a signature is generated for {permit}.\n     *\n     * Every successful call to {permit} increases ``owner``'s nonce by one. This\n     * prevents a signature from being used multiple times.\n     */\n    function nonces(address owner) external view returns (uint256);\n\n    /**\n     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.10+commit.fc410830"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "asset_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "epoch_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "minStakeDuration_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "rewardsSource_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "x",
+              "type": "uint256"
+            }
+          ],
+          "name": "PRBMathUD60x18__Exp2InputTooBig",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "x",
+              "type": "uint256"
+            }
+          ],
+          "name": "PRBMathUD60x18__LogInputTooSmall",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "prod1",
+              "type": "uint256"
+            }
+          ],
+          "name": "PRBMath__MulDivFixedPointOverflow",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "spender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            }
+          ],
+          "name": "Approval",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "delegator",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "fromDelegate",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "toDelegate",
+              "type": "address"
+            }
+          ],
+          "name": "DelegateChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "delegate",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "previousBalance",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newBalance",
+              "type": "uint256"
+            }
+          ],
+          "name": "DelegateVotesChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Penalty",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Reward",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "lockupId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "end",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "points",
+              "type": "uint256"
+            }
+          ],
+          "name": "Stake",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "from",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            }
+          ],
+          "name": "Transfer",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "lockupId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "end",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "points",
+              "type": "uint256"
+            }
+          ],
+          "name": "Unstake",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "DOMAIN_SEPARATOR",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "accRewardPerShare",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "spender",
+              "type": "address"
+            }
+          ],
+          "name": "allowance",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "spender",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "approve",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "asset",
+          "outputs": [
+            {
+              "internalType": "contract ERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "balanceOf",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint32",
+              "name": "pos",
+              "type": "uint32"
+            }
+          ],
+          "name": "checkpoints",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint32",
+                  "name": "fromBlock",
+                  "type": "uint32"
+                },
+                {
+                  "internalType": "uint224",
+                  "name": "votes",
+                  "type": "uint224"
+                }
+              ],
+              "internalType": "struct ERC20Votes.Checkpoint",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "collectRewards",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "decimals",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "spender",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "subtractedValue",
+              "type": "uint256"
+            }
+          ],
+          "name": "decreaseAllowance",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "delegatee",
+              "type": "address"
+            }
+          ],
+          "name": "delegate",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "delegatee",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "nonce",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expiry",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint8",
+              "name": "v",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "r",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "s",
+              "type": "bytes32"
+            }
+          ],
+          "name": "delegateBySig",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "delegates",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "epoch",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "blockNumber",
+              "type": "uint256"
+            }
+          ],
+          "name": "getPastTotalSupply",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "blockNumber",
+              "type": "uint256"
+            }
+          ],
+          "name": "getPastVotes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "getVotes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "spender",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "addedValue",
+              "type": "uint256"
+            }
+          ],
+          "name": "increaseAllowance",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "lockups",
+          "outputs": [
+            {
+              "internalType": "uint128",
+              "name": "amount",
+              "type": "uint128"
+            },
+            {
+              "internalType": "uint128",
+              "name": "end",
+              "type": "uint128"
+            },
+            {
+              "internalType": "uint256",
+              "name": "points",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            }
+          ],
+          "name": "lockupsCount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxStakeDuration",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "minStakeDuration",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "name",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "nonces",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "numCheckpoints",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "spender",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint8",
+              "name": "v",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "r",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "s",
+              "type": "bytes32"
+            }
+          ],
+          "name": "permit",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "duration",
+              "type": "uint256"
+            }
+          ],
+          "name": "previewPoints",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            }
+          ],
+          "name": "previewRewards",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "end",
+              "type": "uint256"
+            }
+          ],
+          "name": "previewWithdraw",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "rewardDebtPerShare",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "rewardsSource",
+          "outputs": [
+            {
+              "internalType": "contract RewardsSource",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "duration",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "stakeRewards",
+              "type": "bool"
+            },
+            {
+              "internalType": "int256",
+              "name": "lockupId",
+              "type": "int256"
+            }
+          ],
+          "name": "stake",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "symbol",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "totalSupply",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "transfer",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "transferFrom",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "lockupId",
+              "type": "uint256"
+            }
+          ],
+          "name": "unstake",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Daniel Von Fange",
+        "kind": "dev",
+        "methods": {
+          "DOMAIN_SEPARATOR()": {
+            "details": "See {IERC20Permit-DOMAIN_SEPARATOR}."
+          },
+          "allowance(address,address)": {
+            "details": "See {IERC20-allowance}."
+          },
+          "approve(address,uint256)": {
+            "details": "See {IERC20-approve}. NOTE: If `amount` is the maximum `uint256`, the allowance is not updated on `transferFrom`. This is semantically equivalent to an infinite approval. Requirements: - `spender` cannot be the zero address."
+          },
+          "balanceOf(address)": {
+            "details": "See {IERC20-balanceOf}."
+          },
+          "checkpoints(address,uint32)": {
+            "details": "Get the `pos`-th checkpoint for `account`."
+          },
+          "decimals()": {
+            "details": "Returns the number of decimals used to get its user representation. For example, if `decimals` equals `2`, a balance of `505` tokens should be displayed to a user as `5.05` (`505 / 10 ** 2`). Tokens usually opt for a value of 18, imitating the relationship between Ether and Wei. This is the value {ERC20} uses, unless this function is overridden; NOTE: This information is only used for _display_ purposes: it in no way affects any of the arithmetic of the contract, including {IERC20-balanceOf} and {IERC20-transfer}."
+          },
+          "decreaseAllowance(address,uint256)": {
+            "details": "Atomically decreases the allowance granted to `spender` by the caller. This is an alternative to {approve} that can be used as a mitigation for problems described in {IERC20-approve}. Emits an {Approval} event indicating the updated allowance. Requirements: - `spender` cannot be the zero address. - `spender` must have allowance for the caller of at least `subtractedValue`."
+          },
+          "delegate(address)": {
+            "details": "Delegate votes from the sender to `delegatee`."
+          },
+          "delegateBySig(address,uint256,uint256,uint8,bytes32,bytes32)": {
+            "details": "Delegates votes from signer to `delegatee`"
+          },
+          "delegates(address)": {
+            "details": "Get the address `account` is currently delegating to."
+          },
+          "getPastTotalSupply(uint256)": {
+            "details": "Retrieve the `totalSupply` at the end of `blockNumber`. Note, this value is the sum of all balances. It is but NOT the sum of all the delegated votes! Requirements: - `blockNumber` must have been already mined"
+          },
+          "getPastVotes(address,uint256)": {
+            "details": "Retrieve the number of votes for `account` at the end of `blockNumber`. Requirements: - `blockNumber` must have been already mined"
+          },
+          "getVotes(address)": {
+            "details": "Gets the current votes balance for `account`"
+          },
+          "increaseAllowance(address,uint256)": {
+            "details": "Atomically increases the allowance granted to `spender` by the caller. This is an alternative to {approve} that can be used as a mitigation for problems described in {IERC20-approve}. Emits an {Approval} event indicating the updated allowance. Requirements: - `spender` cannot be the zero address."
+          },
+          "lockupsCount(address)": {
+            "params": {
+              "user": "Address"
+            },
+            "returns": {
+              "_0": "asset Number of lockups the user has had"
+            }
+          },
+          "name()": {
+            "details": "Returns the name of the token."
+          },
+          "nonces(address)": {
+            "details": "See {IERC20Permit-nonces}."
+          },
+          "numCheckpoints(address)": {
+            "details": "Get number of checkpoints for `account`."
+          },
+          "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)": {
+            "details": "See {IERC20Permit-permit}."
+          },
+          "previewPoints(uint256,uint256)": {
+            "params": {
+              "amount": "asset to be staked",
+              "duration": "number of seconds to stake for"
+            },
+            "returns": {
+              "_0": "points staking points that would be returned",
+              "_1": "end staking period end date"
+            }
+          },
+          "previewRewards(address)": {
+            "params": {
+              "user": "to preview rewards for"
+            },
+            "returns": {
+              "_0": "asset rewards amount"
+            }
+          },
+          "previewWithdraw(uint256,uint256)": {
+            "params": {
+              "amount": "staked asset amount to be withdrawn",
+              "end": "stake end date to be withdrawn from."
+            },
+            "returns": {
+              "_0": "withdrawAmount amount of assets that the user will receive from withdraw"
+            }
+          },
+          "stake(uint256,uint256,address,bool,int256)": {
+            "params": {
+              "amountIn": "asset to lockup in the stake",
+              "duration": "in seconds for the stake",
+              "lockupId": "previous stake to extend / add funds to. -1 to create a new stake.",
+              "stakeRewards": "should pending user rewards be added to the stake",
+              "to": "address to receive ownership of the stake"
+            }
+          },
+          "symbol()": {
+            "details": "Returns the symbol of the token, usually a shorter version of the name."
+          },
+          "totalSupply()": {
+            "details": "See {IERC20-totalSupply}."
+          },
+          "unstake(uint256)": {
+            "params": {
+              "lockupId": "the id of the lockup to unstake"
+            }
+          }
+        },
+        "title": "ExponentialStaking",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "PRBMathUD60x18__Exp2InputTooBig(uint256)": [
+            {
+              "notice": "Emitted when the input is greater than 192."
+            }
+          ],
+          "PRBMathUD60x18__LogInputTooSmall(uint256)": [
+            {
+              "notice": "Emitted when the input is less than 1."
+            }
+          ],
+          "PRBMath__MulDivFixedPointOverflow(uint256)": [
+            {
+              "notice": "Emitted when the result overflows uint256."
+            }
+          ]
+        },
+        "kind": "user",
+        "methods": {
+          "collectRewards()": {
+            "notice": "Collect all earned asset rewards."
+          },
+          "lockupsCount(address)": {
+            "notice": "Returns the total number of lockups the user has         created so far (including expired & unstaked ones)"
+          },
+          "previewPoints(uint256,uint256)": {
+            "notice": "Preview the number of points that would be returned for the given amount and duration."
+          },
+          "previewRewards(address)": {
+            "notice": "Preview the amount of asset a user would receive if they collected rewards at this time."
+          },
+          "previewWithdraw(uint256,uint256)": {
+            "notice": "Preview the amount that a user would receive if they withdraw now. This amount is after any early withdraw fees are removed for early withdraws."
+          },
+          "stake(uint256,uint256,address,bool,int256)": {
+            "notice": "Stake asset to an address that may not be the same as the sender of the funds. This can be used to give staked funds to someone else. If staking before the start of staking (epoch), then the lockup start and end dates are shifted forward so that the lockup starts at the epoch. Any rewards previously earned will be paid out or rolled into the stake."
+          },
+          "unstake(uint256)": {
+            "notice": "Collect staked asset for a lockup and any earned rewards."
+          }
+        },
+        "notice": "Provides staking, vote power history, vote delegation, and rewards distribution. The balance received for staking (and thus the voting power and rewards distribution) goes up exponentially by the end of the staked period.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/ExponentialStaking.sol": "ExponentialStaking"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":OpenZeppelin/openzeppelin-contracts-upgradeable@4.6.0/=lib/openzeppelin-contracts-upgradeable/",
+        ":OpenZeppelin/openzeppelin-contracts-upgradeable@a16f26a063cd018c4c986832c3df332a131f53b9/=lib/openzeppelin-contracts-upgradeable/",
+        ":OpenZeppelin/openzeppelin-contracts@02fcc75bb7f35376c22def91b0fb9bc7a50b9458/=lib/openzeppelin-contracts/",
+        ":OpenZeppelin/openzeppelin-contracts@4.6.0/=lib/openzeppelin-contracts/",
+        ":contracts/=contracts/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":paulrberg/prb-math@2.5.0/=lib/prb-math/",
+        ":prb-math/=lib/prb-math/contracts/",
+        ":script/=script/",
+        ":tests/=tests/"
+      ]
+    },
+    "sources": {
+      "contracts/ExponentialStaking.sol": {
+        "keccak256": "0x8aca3108971f3f097cc138d11fb0625c995602ebacf23f0ef86595e6afa02107",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://37b3a59abdcba2b3ef6a273a5a8cc90631d1618f8072b9d88fad48630bb5eaef",
+          "dweb:/ipfs/QmUasbkbZoVHB9MLEjnfBKSxj21iMZsiJGwuQtaAAmVxn1"
+        ]
+      },
+      "contracts/Governable.sol": {
+        "keccak256": "0xafca586723bc18c383dbf41d5596c12d6e866c57aadfb1b832d0ef7007085d2c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://dee95289adb49fdd314b38b3668da5e4778a59b3d9c0db8cbb2b686696035b83",
+          "dweb:/ipfs/Qmajukf1eRZSek8kDZZvejF7nCakvHyRsFkD7ARMgssqDC"
+        ]
+      },
+      "contracts/RewardsSource.sol": {
+        "keccak256": "0x6e30645c817616c4c6aaa096d689a0c81bc60b47b7cde7a65011cb9d4034441b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://210e51617424276e7eee202c9109aea9ba510b71cc6fac11082e145dfce77af2",
+          "dweb:/ipfs/QmbcmP518aGzKA7gZ3UnrBwqLVqqDYqb7Hu11A4e8wQi6X"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/governance/utils/IVotes.sol": {
+        "keccak256": "0xf5324a55ee9c0b4a840ea57c055ac9d046f88986ceef567e1cf68113e46a79c0",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f41fe2bddc33c17ccccfc25379b1869354e9ee62d8b28d2acc95229eeba37a86",
+          "dweb:/ipfs/Qmb6SF2XL2uSvH6k5JSjtx4Xoqz41ACkhdAhtbW1Yh3RiY"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol": {
+        "keccak256": "0x17b6b6189de509d602776fab3d0924c576ec365e53e712d16bdc57b1538edadb",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7d8b3d9f1484e8ae7443a0a5e46f2faef362813f4fd6e0660d4b64725a16a990",
+          "dweb:/ipfs/QmQVeGDmxWy5A4PfKKpNrrEjFTgwygS7xCTtySSMC7R4M8"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol": {
+        "keccak256": "0xbbc8ac883ac3c0078ce5ad3e288fbb3ffcc8a30c3a98c0fda0114d64fc44fca2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://87a7a5d2f6f63f84598af02b8c50ca2df2631cb8ba2453e8d95fcb17e4be9824",
+          "dweb:/ipfs/QmR76hqtAcRqoFj33tmNjcWTLrgNsAaakYwnKZ8zoJtKei"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/ERC20Votes.sol": {
+        "keccak256": "0x7fd2492be0468be4662081ee25cde38a31e4a0ceca0fed10160462389013910f",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://10c660ba772feee0fcb29319b15b328b429cd020079786e8d00992159f4b7b4e",
+          "dweb:/ipfs/QmTjnb1FLbjHkgSZ7qcRZnNSwmZnobBpkJ9UWSc1SkVqhU"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol": {
+        "keccak256": "0x8de418a5503946cabe331f35fe242d3201a73f67f77aaeb7110acb1f30423aca",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5a376d3dda2cb70536c0a45c208b29b34ac560c4cb4f513a42079f96ba47d2dd",
+          "dweb:/ipfs/QmZQg6gn1sUpM8wHzwNvSnihumUCAhxD119MpXeKp8B9s8"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/draft-ERC20Permit.sol": {
+        "keccak256": "0x1db8ae6da1d84d97a21e2e8a72cf9ddefe84d6db1d058c43040592581629409c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0b05ff3de36d3638e439874203da23fcfc5eae87bc4b0022ce6989682f848b2d",
+          "dweb:/ipfs/QmbMZjuvLPDBQXZGaqkdnUiahK1zqYgFVRyGvCYeboSyjH"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC20/extensions/draft-IERC20Permit.sol": {
+        "keccak256": "0xf41ca991f30855bf80ffd11e9347856a517b977f0a6c2d52e6421a99b7840329",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b2717fd2bdac99daa960a6de500754ea1b932093c946388c381da48658234b95",
+          "dweb:/ipfs/QmP6QVMn6UeA3ByahyJbYQr5M6coHKBKsf3ySZSfbyA8R7"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/Context.sol": {
+        "keccak256": "0xe2e337e6dde9ef6b680e07338c493ebea1b5fd09b43424112868e9cc1706bca7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6df0ddf21ce9f58271bdfaa85cde98b200ef242a05a3f85c2bc10a8294800a92",
+          "dweb:/ipfs/QmRK2Y5Yc6BK7tGKkgsgn3aJEQGi5aakeSPZvS65PV8Xp3"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/Counters.sol": {
+        "keccak256": "0xf0018c2440fbe238dd3a8732fa8e17a0f9dce84d31451dc8a32f6d62b349c9f1",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://59e1c62884d55b70f3ae5432b44bb3166ad71ae3acd19c57ab6ddc3c87c325ee",
+          "dweb:/ipfs/QmezuXg5GK5oeA4F91EZhozBFekhq5TD966bHPH18cCqhu"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/Strings.sol": {
+        "keccak256": "0x32c202bd28995dd20c4347b7c6467a6d3241c74c8ad3edcbb610cd9205916c45",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8179c356adb19e70d6b31a1eedc8c5c7f0c00e669e2540f4099e3844c6074d30",
+          "dweb:/ipfs/QmWFbivarEobbqhS1go64ootVuHfVohBseerYy9FTEd1W2"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol": {
+        "keccak256": "0x3c07f43e60e099b3b157243b3152722e73b80eeb7985c2cd73712828d7f7da29",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://466ffb5a6e3bd65fffd996f9287ffd240ea21588a338c6efe143d94eaed014a7",
+          "dweb:/ipfs/Qmans3vvPJZcvxe9KLAPc9Xwe4TFVTJdzaQGpi62Vrhoe2"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/cryptography/draft-EIP712.sol": {
+        "keccak256": "0x6688fad58b9ec0286d40fa957152e575d5d8bd4c3aa80985efdb11b44f776ae7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8bc00ab7f133cdaafd212a5cc6a16c8d37319721105d130c8e5af0c4e8f170ba",
+          "dweb:/ipfs/QmVmf6LVMfFiEkvKYLzSv3bGHzymEW93AcUuFrNUdY3NtT"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+        "keccak256": "0xc995bddbca1ae19788db9f8b61e63385edd3fddf89693b612d5abd1a275974d2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ab84f13e6e6e0823854a0cddd49e96df052092d5919f95587607f0ed28a64cb6",
+          "dweb:/ipfs/QmbNtqAq23ZDjCzHukQaa7B3y6rcobscm6FZF5PMQXcnVr"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/math/SafeCast.sol": {
+        "keccak256": "0x5c6caab697d302ad7eb59c234a4d2dbc965c1bae87709bd2850060b7695b28c7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://fb62abcee612c175f1b9bc70e5dfe5bd23473c99987ade6e80e291f68dc60ff1",
+          "dweb:/ipfs/QmZCMajhG7FtRYNDwBchXN89mXR6HLPVzr9732qfUdNf9E"
+        ]
+      },
+      "lib/prb-math/contracts/PRBMath.sol": {
+        "keccak256": "0xed164c95012964f5e125b5d2b2d00471a4bdee4def618cd1fcf341d196011b61",
+        "license": "Unlicense",
+        "urls": [
+          "bzz-raw://3ba3ad78675323279adfc09038eaa14f4cde3f3173e5d2d60b9c30bf7099aa7b",
+          "dweb:/ipfs/QmV56KGJZQG681hwd7JQDv3KjAa9JSGF88ShGx8YBCuvcR"
+        ]
+      },
+      "lib/prb-math/contracts/PRBMathUD60x18.sol": {
+        "keccak256": "0x2180489de7680a79844dd5ef145f800e4f68e515e0e89409242f0187dbbd657b",
+        "license": "Unlicense",
+        "urls": [
+          "bzz-raw://d79ea95d887792ad6922f8bdcefc21bc2949b7438784f16276917160c3bdf5e1",
+          "dweb:/ipfs/QmQ24reyfKuvBzJaPpqnENYNHySu4r28Yx5kJXiNGyTrhv"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.10+commit.fc410830",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": [
+        ":OpenZeppelin/openzeppelin-contracts-upgradeable@4.6.0/=lib/openzeppelin-contracts-upgradeable/",
+        ":OpenZeppelin/openzeppelin-contracts-upgradeable@a16f26a063cd018c4c986832c3df332a131f53b9/=lib/openzeppelin-contracts-upgradeable/",
+        ":OpenZeppelin/openzeppelin-contracts@02fcc75bb7f35376c22def91b0fb9bc7a50b9458/=lib/openzeppelin-contracts/",
+        ":OpenZeppelin/openzeppelin-contracts@4.6.0/=lib/openzeppelin-contracts/",
+        ":contracts/=contracts/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":paulrberg/prb-math@2.5.0/=lib/prb-math/",
+        ":prb-math/=lib/prb-math/contracts/",
+        ":script/=script/",
+        ":tests/=tests/"
+      ]
+    },
+    "name": "ExponentialStaking",
+    "fullyQualifiedName": "contracts/ExponentialStaking.sol:ExponentialStaking"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "2043880",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T14:27:17Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0x97711c7a5D64A064a95d10e37f786d2bD8b1F3c8"
+}

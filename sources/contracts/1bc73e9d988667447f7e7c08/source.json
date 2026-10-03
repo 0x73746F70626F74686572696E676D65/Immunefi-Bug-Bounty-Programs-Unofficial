@@ -1,0 +1,1293 @@
+{
+  "sources": {
+    "src/ProtocolUpgradeHandler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity 0.8.24;\n\nimport {IZKsyncEra} from \"./interfaces/IZKsyncEra.sol\";\nimport {IChainTypeManager} from \"./interfaces/IChainTypeManager.sol\";\nimport {IBridgeHub} from \"./interfaces/IBridgeHub.sol\";\nimport {IPausable} from \"./interfaces/IPausable.sol\";\nimport {IChainAssetHandler} from \"./interfaces/IChainAssetHandler.sol\";\nimport {IProtocolUpgradeHandler} from \"./interfaces/IProtocolUpgradeHandler.sol\";\nimport {Initializable} from \"@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol\";\n\n/// @title Protocol Upgrade Handler\n/// @author Matter Labs\n/// @custom:security-contact security@matterlabs.dev\n/// @dev The contract that holds ownership of all ZKsync contracts (L1 and L2). It is responsible\n/// for handling ZKsync protocol upgrades proposed by L2 Token Assembly and executing it.\n///\n/// The upgrade process follows these key stages:\n/// 1. Proposal: Token holders on L2 propose the protocol upgrades and send the L2 -> L1 message\n///    that this contract reads and starts the upgrade process.\n/// 2. Legal veto: During this period, the guardians can veto the upgrade **offchain**. The default legal period review\n///    takes 3 days but can be extended by guardians onchain for 7 days in total.\n/// 3. Approval: Requires approval from either the guardians or the Security Council. The Security Council can\n///    immediately move the proposal to the next stage, while guardians approval will move the proposal to the\n///    next stage only after 30 days delay after the legal veto passes. If no approval is received within the specified period, the proposal\n///    is expired.\n/// 4. Pending: A mandatory delay period before the actual execution of the upgrade, allowing for final\n///    preparations and reviews.\n/// 5. Execution: The proposed changes are executed by the authorized address in the proposal,\n///    completing the upgrade process.\n///\n/// The contract implements the state machine that represents the logic of moving upgrade from each\n/// stage by time changes and Guardians/Security Council actions.\ncontract ProtocolUpgradeHandler is IProtocolUpgradeHandler, Initializable {\n    /// @dev Duration of the standard legal veto period.\n    /// Note: this value should not exceed EXTENDED_LEGAL_VETO_PERIOD.\n    function STANDARD_LEGAL_VETO_PERIOD() internal pure virtual returns (uint256) {\n        return 3 days;\n    }\n\n    /// @dev Duration of the extended legal veto period.\n    uint256 internal constant EXTENDED_LEGAL_VETO_PERIOD = 7 days;\n\n    /// @dev The mandatory delay period before an upgrade can be executed.\n    /// This period is intended to provide a buffer after an upgrade's final approval and before its execution,\n    /// allowing for final reviews and preparations for devs and users.\n    function UPGRADE_DELAY_PERIOD() internal pure virtual returns (uint256) {\n        return 1 days;\n    }\n\n    /// @dev Time limit for an upgrade proposal to be approved by guardians or expire, and the waiting period for execution post-guardians approval.\n    /// If the Security Council approves, the upgrade can proceed immediately; otherwise,\n    /// the proposal will expire after this period if not approved, or wait this period after guardians approval.\n    uint256 internal constant UPGRADE_WAIT_OR_EXPIRE_PERIOD = 30 days;\n\n    /// @dev Duration of a soft freeze which temporarily pause protocol contract functionality.\n    /// This freeze window is needed for the Security Council to decide whether they want to\n    /// do hard freeze and protocol upgrade.\n    uint256 internal constant SOFT_FREEZE_PERIOD = 12 hours;\n\n    /// @dev Duration of a hard freeze which temporarily pause protocol contract functionality.\n    /// This freeze window is needed for the Security Council to perform emergency protocol upgrade.\n    uint256 internal constant HARD_FREEZE_PERIOD = 7 days;\n\n    /// @dev Address of the L2 Protocol Governor contract.\n    /// This address is used to interface with governance actions initiated on Layer 2,\n    /// specifically for proposing and approving protocol upgrades.\n    address public immutable L2_PROTOCOL_GOVERNOR;\n\n    /// @dev ZKsync smart contract that used to operate with L2 via asynchronous L2 <-> L1 communication.\n    IZKsyncEra public immutable ZKSYNC_ERA;\n\n    /// @dev ZKsync smart contract that is responsible for creating new ZK Chains and changing parameters in existent.\n    IChainTypeManager public immutable CHAIN_TYPE_MANAGER;\n\n    /// @dev Bridgehub smart contract that is used to operate with L2 via asynchronous L2 <-> L1 communication.\n    IBridgeHub public immutable BRIDGE_HUB;\n\n    /// @dev The nullifier contract that is used for bridging.\n    IPausable public immutable L1_NULLIFIER;\n\n    /// @dev The asset router contract that is used for bridging.\n    IPausable public immutable L1_ASSET_ROUTER;\n\n    /// @dev Vault holding L1 native ETH and ERC20 tokens bridged into the ZK chains.\n    IPausable public immutable L1_NATIVE_TOKEN_VAULT;\n\n    /// @dev Chain asset handler contract for migration pausing/unpausing.\n    IChainAssetHandler public immutable CHAIN_ASSET_HANDLER;\n\n    /// @notice The address of the Security Council.\n    address public securityCouncil;\n\n    /// @notice The address of the guardians.\n    address public guardians;\n\n    /// @notice The address of the smart contract that can execute protocol emergency upgrade.\n    address public emergencyUpgradeBoard;\n\n    /// @notice A mapping to store status of an upgrade process for each upgrade ID.\n    mapping(bytes32 upgradeId => UpgradeStatus) public upgradeStatus;\n\n    /// @notice Tracks the last freeze type within an upgrade cycle.\n    FreezeStatus public lastFreezeStatusInUpgradeCycle;\n\n    /// @notice Stores the timestamp until which the protocol remains frozen.\n    uint256 public protocolFrozenUntil;\n\n    /// @notice Initializes the contract with the Security Council address, guardians address and address of L2 voting governor.\n    /// @param _l2ProtocolGovernor The address of the L2 voting governor contract for protocol upgrades.\n    /// @param _ZKsyncEra The address of the zkSync Era chain, on top of which the `_l2ProtocolGovernor` is deployed.\n    /// @param _chainTypeManager The address of the state transition manager.\n    /// @param _bridgeHub The address of the bridgehub.\n    /// @param _l1Nullifier The address of the nullifier\n    /// @param _l1AssetRouter The address of the L1 asset router.\n    /// @param _l1NativeTokenVault The address of the L1 native token vault.\n    /// @param _chainAssetHandler The address of the L1 chain asset handler.\n    constructor(\n        address _l2ProtocolGovernor,\n        IZKsyncEra _ZKsyncEra,\n        IChainTypeManager _chainTypeManager,\n        IBridgeHub _bridgeHub,\n        IPausable _l1Nullifier,\n        IPausable _l1AssetRouter,\n        IPausable _l1NativeTokenVault,\n        IChainAssetHandler _chainAssetHandler\n    ) {\n        _disableInitializers();\n\n        // Soft configuration check for contracts that inherit this contract.\n        assert(STANDARD_LEGAL_VETO_PERIOD() <= EXTENDED_LEGAL_VETO_PERIOD);\n\n        L2_PROTOCOL_GOVERNOR = _l2ProtocolGovernor;\n        ZKSYNC_ERA = _ZKsyncEra;\n        CHAIN_TYPE_MANAGER = _chainTypeManager;\n        BRIDGE_HUB = _bridgeHub;\n        L1_NULLIFIER = _l1Nullifier;\n        L1_ASSET_ROUTER = _l1AssetRouter;\n        L1_NATIVE_TOKEN_VAULT = _l1NativeTokenVault;\n        CHAIN_ASSET_HANDLER = _chainAssetHandler;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            MODIFIERS\n    //////////////////////////////////////////////////////////////*/\n\n    /// @notice Checks that the message sender is contract itself.\n    modifier onlySelf() {\n        require(msg.sender == address(this), \"Only upgrade handler contract itself is allowed to call this function\");\n        _;\n    }\n\n    /// @notice Checks that the message sender is an active Security Council.\n    modifier onlySecurityCouncil() {\n        require(msg.sender == securityCouncil, \"Only Security Council is allowed to call this function\");\n        _;\n    }\n\n    /// @notice Checks that the message sender is an active guardians.\n    modifier onlyGuardians() {\n        require(msg.sender == guardians, \"Only guardians is allowed to call this function\");\n        _;\n    }\n\n    /// @notice Checks that the message sender is an active Security Council or the protocol is frozen but freeze period expired.\n    modifier onlySecurityCouncilOrProtocolFreezeExpired() {\n        require(\n            msg.sender == securityCouncil || (protocolFrozenUntil != 0 && block.timestamp > protocolFrozenUntil),\n            \"Only Security Council is allowed to call this function or the protocol should be frozen\"\n        );\n        _;\n    }\n\n    /// @notice Checks that the message sender is an Emergency Upgrade Board.\n    modifier onlyEmergencyUpgradeBoard() {\n        require(msg.sender == emergencyUpgradeBoard, \"Only Emergency Upgrade Board is allowed to call this function\");\n        _;\n    }\n\n    /// @notice Calculates the current upgrade state for the specified upgrade ID.\n    /// @param _id The unique identifier of the upgrade proposal to be approved.\n    function upgradeState(bytes32 _id) public view returns (UpgradeState) {\n        UpgradeStatus memory upg = upgradeStatus[_id];\n        // Upgrade already executed\n        if (upg.executed) {\n            return UpgradeState.Done;\n        }\n\n        // Upgrade doesn't exist\n        if (upg.creationTimestamp == 0) {\n            return UpgradeState.None;\n        }\n\n        // Legal veto period\n        uint256 legalVetoTime =\n            upg.guardiansExtendedLegalVeto ? EXTENDED_LEGAL_VETO_PERIOD : STANDARD_LEGAL_VETO_PERIOD();\n        if (block.timestamp < upg.creationTimestamp + legalVetoTime) {\n            return UpgradeState.LegalVetoPeriod;\n        }\n\n        // Security council approval case\n        if (upg.securityCouncilApprovalTimestamp != 0) {\n            uint256 readyWithSecurityCouncilTimestamp = upg.securityCouncilApprovalTimestamp + UPGRADE_DELAY_PERIOD();\n            return block.timestamp >= readyWithSecurityCouncilTimestamp\n                ? UpgradeState.Ready\n                : UpgradeState.ExecutionPending;\n        }\n\n        uint256 waitOrExpiryTimestamp = upg.creationTimestamp + legalVetoTime + UPGRADE_WAIT_OR_EXPIRE_PERIOD;\n        if (block.timestamp >= waitOrExpiryTimestamp) {\n            if (!upg.guardiansApproval) {\n                return UpgradeState.Expired;\n            }\n\n            uint256 readyWithGuardiansTimestamp = waitOrExpiryTimestamp + UPGRADE_DELAY_PERIOD();\n            return block.timestamp >= readyWithGuardiansTimestamp ? UpgradeState.Ready : UpgradeState.ExecutionPending;\n        }\n\n        return UpgradeState.Waiting;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            UPGRADE PROCESS\n    //////////////////////////////////////////////////////////////*/\n\n    /// @notice Initiates the upgrade process by verifying an L2 voting decision.\n    /// @dev This function decodes and validates an upgrade proposal message from L2, setting the initial state for the upgrade process.\n    /// @param _l2BatchNumber The batch number of the L2 transaction containing the upgrade proposal.\n    /// @param _l2MessageIndex The index of the message within the L2 batch.\n    /// @param _l2TxNumberInBatch The transaction number of the upgrade proposal in the L2 batch.\n    /// @param _proof Merkle proof verifying the inclusion of the upgrade message in the L2 batch.\n    /// @param _proposal The upgrade proposal details including proposed actions and the executor address.\n    function startUpgrade(\n        uint256 _l2BatchNumber,\n        uint256 _l2MessageIndex,\n        uint16 _l2TxNumberInBatch,\n        bytes32[] calldata _proof,\n        UpgradeProposal calldata _proposal\n    ) external {\n        bytes memory upgradeMessage = abi.encode(_proposal);\n        IZKsyncEra.L2Message memory l2ToL1Message = IZKsyncEra.L2Message({\n            txNumberInBatch: _l2TxNumberInBatch,\n            sender: L2_PROTOCOL_GOVERNOR,\n            data: upgradeMessage\n        });\n        bool success = ZKSYNC_ERA.proveL2MessageInclusion(_l2BatchNumber, _l2MessageIndex, l2ToL1Message, _proof);\n        require(success, \"Failed to check upgrade proposal initiation\");\n        require(_proposal.executor != emergencyUpgradeBoard, \"Emergency Upgrade Board can't execute usual upgrade\");\n\n        bytes32 id = keccak256(upgradeMessage);\n        UpgradeState upgState = upgradeState(id);\n        require(upgState == UpgradeState.None, \"Upgrade with this id already exists\");\n\n        upgradeStatus[id].creationTimestamp = uint48(block.timestamp);\n        emit UpgradeStarted(id, _proposal);\n    }\n\n    /// @notice Extends the legal veto period by the guardians.\n    /// @param _id The unique identifier of the upgrade proposal to be approved.\n    function extendLegalVeto(bytes32 _id) external onlyGuardians {\n        require(!upgradeStatus[_id].guardiansExtendedLegalVeto, \"Legal veto period is already extended\");\n        UpgradeState upgState = upgradeState(_id);\n        require(upgState == UpgradeState.LegalVetoPeriod, \"Upgrade with this id is not in the legal veto period\");\n        upgradeStatus[_id].guardiansExtendedLegalVeto = true;\n\n        emit UpgradeLegalVetoExtended(_id);\n    }\n\n    /// @notice Approves an upgrade proposal by the Security Council.\n    /// @dev Transitions the state of an upgrade proposal to 'VetoPeriod' after approval by the Security Council.\n    /// @param _id The unique identifier of the upgrade proposal to be approved.\n    function approveUpgradeSecurityCouncil(bytes32 _id) external onlySecurityCouncil {\n        UpgradeState upgState = upgradeState(_id);\n        require(\n            upgState == UpgradeState.Waiting,\n            \"Upgrade with this id is not waiting for the approval from Security Council\"\n        );\n        upgradeStatus[_id].securityCouncilApprovalTimestamp = uint48(block.timestamp);\n\n        emit UpgradeApprovedBySecurityCouncil(_id);\n    }\n\n    /// @notice Approves an upgrade proposal by the guardians.\n    /// @dev Marks the upgrade proposal identified by `_id` as approved by guardians.\n    /// @param _id The unique identifier of the upgrade proposal to approve.\n    function approveUpgradeGuardians(bytes32 _id) external onlyGuardians {\n        require(!upgradeStatus[_id].guardiansApproval, \"Upgrade is already approved by guardians\");\n\n        UpgradeState upgState = upgradeState(_id);\n        require(upgState == UpgradeState.Waiting, \"Upgrade with this id is not waiting for the approval from Guardians\");\n        upgradeStatus[_id].guardiansApproval = true;\n\n        emit UpgradeApprovedByGuardians(_id);\n    }\n\n    /// @notice Executes an upgrade proposal that has reached the 'Ready' state.\n    /// @param _proposal The upgrade proposal to be executed, containing the target calls and optionally an executor.\n    function execute(UpgradeProposal calldata _proposal) external payable {\n        bytes32 id = keccak256(abi.encode(_proposal));\n        UpgradeState upgState = upgradeState(id);\n        // 1. Checks\n        require(upgState == UpgradeState.Ready, \"Upgrade is not yet ready\");\n        require(\n            _proposal.executor == address(0) || _proposal.executor == msg.sender,\n            \"msg.sender is not authorized to perform the upgrade\"\n        );\n        // 2. Effects\n        upgradeStatus[id].executed = true;\n        // 3. Interactions\n        _execute(_proposal.calls);\n        emit UpgradeExecuted(id);\n    }\n\n    /// @notice Executes an emergency upgrade proposal initiated by the emergency upgrade board.\n    /// @param _proposal The upgrade proposal details including proposed actions and the executor address.\n    function executeEmergencyUpgrade(UpgradeProposal calldata _proposal) external payable onlyEmergencyUpgradeBoard {\n        bytes32 id = keccak256(abi.encode(_proposal));\n        UpgradeState upgState = upgradeState(id);\n        // 1. Checks\n        require(upgState == UpgradeState.None, \"Upgrade already exists\");\n        require(_proposal.executor == msg.sender, \"msg.sender is not authorized to perform the upgrade\");\n        // 2. Effects\n        upgradeStatus[id].executed = true;\n        // Clear the freeze\n        lastFreezeStatusInUpgradeCycle = FreezeStatus.None;\n        protocolFrozenUntil = 0;\n        _unfreeze();\n        // 3. Interactions\n        _execute(_proposal.calls);\n        emit Unfreeze();\n        emit EmergencyUpgradeExecuted(id);\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            HELPERS\n    //////////////////////////////////////////////////////////////*/\n\n    /// @dev Execute an upgrade's calls.\n    /// @param _calls The array of calls to be executed.\n    function _execute(Call[] calldata _calls) internal {\n        for (uint256 i = 0; i < _calls.length; ++i) {\n            if (_calls[i].data.length > 0) {\n                require(\n                    _calls[i].target.code.length > 0, \"Target must be a smart contract if the calldata is not empty\"\n                );\n            }\n            (bool success, bytes memory returnData) = _calls[i].target.call{value: _calls[i].value}(_calls[i].data);\n            if (!success) {\n                // Propagate an error if the call fails.\n                assembly {\n                    revert(add(returnData, 0x20), mload(returnData))\n                }\n            }\n        }\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            FREEZABILITY\n    //////////////////////////////////////////////////////////////*/\n\n    /// @notice Initiates a soft protocol freeze.\n    function softFreeze() external onlySecurityCouncil {\n        require(lastFreezeStatusInUpgradeCycle == FreezeStatus.None, \"Protocol already frozen\");\n        lastFreezeStatusInUpgradeCycle = FreezeStatus.Soft;\n        protocolFrozenUntil = block.timestamp + SOFT_FREEZE_PERIOD;\n        _freeze();\n        emit SoftFreeze(protocolFrozenUntil);\n    }\n\n    /// @notice Initiates a hard protocol freeze.\n    function hardFreeze() external onlySecurityCouncil {\n        FreezeStatus freezeStatus = lastFreezeStatusInUpgradeCycle;\n        require(\n            freezeStatus == FreezeStatus.None || freezeStatus == FreezeStatus.Soft\n                || freezeStatus == FreezeStatus.AfterSoftFreeze,\n            \"Protocol can't be hard frozen\"\n        );\n        lastFreezeStatusInUpgradeCycle = FreezeStatus.Hard;\n        protocolFrozenUntil = block.timestamp + HARD_FREEZE_PERIOD;\n        _freeze();\n        emit HardFreeze(protocolFrozenUntil);\n    }\n\n    /// @dev Reinforces the freezing state of the protocol if it is already within the frozen period. This function\n    /// can be called by anyone to ensure the protocol remains in a frozen state, particularly useful if there is a need\n    /// to confirm or re-apply the freeze due to partial or incomplete application during the initial freeze.\n    function reinforceFreeze() external {\n        require(block.timestamp <= protocolFrozenUntil, \"Protocol should be already frozen\");\n        _freeze();\n        emit ReinforceFreeze();\n    }\n\n    /// @dev Reinforces the freezing state of the specific chain if the protocol is already within the frozen period.\n    /// The function is an analog of `reinforceFreeze` but only for one specific chain, needed in the\n    /// rare case where the execution could get stuck at a particular ID for some unforeseen reason.\n    function reinforceFreezeOneChain(uint256 _chainId) external {\n        require(block.timestamp <= protocolFrozenUntil, \"Protocol should be already frozen\");\n        CHAIN_TYPE_MANAGER.freezeChain(_chainId);\n        emit ReinforceFreezeOneChain(_chainId);\n    }\n\n    /// @dev Freeze all ZKsync contracts, including bridges, state transition managers and all ZK Chains.\n    function _freeze() internal {\n        uint256[] memory zkChainIds = BRIDGE_HUB.getAllZKChainChainIDs();\n        uint256 len = zkChainIds.length;\n        for (uint256 i = 0; i < len; ++i) {\n            try CHAIN_TYPE_MANAGER.freezeChain(zkChainIds[i]) {} catch {}\n        }\n\n        try BRIDGE_HUB.pause() {} catch {}\n        try L1_NULLIFIER.pause() {} catch {}\n        try L1_ASSET_ROUTER.pause() {} catch {}\n        try L1_NATIVE_TOKEN_VAULT.pause() {} catch {}\n        try CHAIN_ASSET_HANDLER.pauseMigration() {} catch {}\n    }\n\n    /// @dev Unfreezes the protocol and resumes normal operations.\n    function unfreeze() external onlySecurityCouncilOrProtocolFreezeExpired {\n        if (lastFreezeStatusInUpgradeCycle == FreezeStatus.Soft) {\n            lastFreezeStatusInUpgradeCycle = FreezeStatus.AfterSoftFreeze;\n        } else if (lastFreezeStatusInUpgradeCycle == FreezeStatus.Hard) {\n            lastFreezeStatusInUpgradeCycle = FreezeStatus.AfterHardFreeze;\n        } else {\n            revert(\"Unexpected last freeze status\");\n        }\n        protocolFrozenUntil = 0;\n        _unfreeze();\n        emit Unfreeze();\n    }\n\n    /// @dev Reinforces the unfreeze for protocol if it is not in the freeze mode. This function can be called\n    /// by anyone to ensure the protocol remains in an unfrozen state, particularly useful if there is a need\n    /// to confirm or re-apply the unfreeze due to partial or incomplete application during the initial unfreeze.\n    function reinforceUnfreeze() external {\n        require(protocolFrozenUntil == 0, \"Protocol should be already unfrozen\");\n        _unfreeze();\n        emit ReinforceUnfreeze();\n    }\n\n    /// @dev Reinforces the unfreeze for one specific chain if the protocol is not in the freeze mode.\n    /// The function is an analog of `reinforceUnfreeze` but only for one specific chain, needed in the\n    /// rare case where the execution could get stuck at a particular ID for some unforeseen reason.\n    function reinforceUnfreezeOneChain(uint256 _chainId) external {\n        require(protocolFrozenUntil == 0, \"Protocol should be already unfrozen\");\n        CHAIN_TYPE_MANAGER.unfreezeChain(_chainId);\n        emit ReinforceUnfreezeOneChain(_chainId);\n    }\n\n    /// @dev Unfreeze all ZKsync contracts, including bridges, state transition managers and all ZK Chains.\n    function _unfreeze() internal {\n        uint256[] memory zkChainIds = BRIDGE_HUB.getAllZKChainChainIDs();\n        uint256 len = zkChainIds.length;\n        for (uint256 i = 0; i < len; ++i) {\n            try CHAIN_TYPE_MANAGER.unfreezeChain(zkChainIds[i]) {} catch {}\n        }\n\n        try BRIDGE_HUB.unpause() {} catch {}\n        try L1_NULLIFIER.unpause() {} catch {}\n        try L1_ASSET_ROUTER.unpause() {} catch {}\n        try L1_NATIVE_TOKEN_VAULT.unpause() {} catch {}\n        try CHAIN_ASSET_HANDLER.unpauseMigration() {} catch {}\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            SELF UPGRADES\n    //////////////////////////////////////////////////////////////*/\n\n    /// @dev Updates the address of the Security Council.\n    /// @param _newSecurityCouncil The address of the new Security Council.\n    function updateSecurityCouncil(address _newSecurityCouncil) external onlySelf {\n        emit ChangeSecurityCouncil(securityCouncil, _newSecurityCouncil);\n        securityCouncil = _newSecurityCouncil;\n    }\n\n    /// @dev Updates the address of the guardians.\n    /// @param _newGuardians The address of the guardians.\n    function updateGuardians(address _newGuardians) external onlySelf {\n        emit ChangeGuardians(guardians, _newGuardians);\n        guardians = _newGuardians;\n    }\n\n    /// @dev Updates the address of the emergency upgrade board.\n    /// @param _newEmergencyUpgradeBoard The address of the guardians.\n    function updateEmergencyUpgradeBoard(address _newEmergencyUpgradeBoard) external onlySelf {\n        emit ChangeEmergencyUpgradeBoard(emergencyUpgradeBoard, _newEmergencyUpgradeBoard);\n        emergencyUpgradeBoard = _newEmergencyUpgradeBoard;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            FALLBACK\n    //////////////////////////////////////////////////////////////*/\n\n    /// @dev Contract might receive/hold ETH as part of the maintenance process.\n    receive() external payable {}\n\n    /*//////////////////////////////////////////////////////////////\n                        PROXY INITIALIZER\n    //////////////////////////////////////////////////////////////*/\n    function initialize(\n        address _securityCouncil,\n        address _guardians,\n        address _emergencyUpgradeBoard\n    ) external initializer() {\n        securityCouncil = _securityCouncil;\n        emit ChangeSecurityCouncil(address(0), _securityCouncil);\n\n        guardians = _guardians;\n        emit ChangeGuardians(address(0), _guardians);\n\n        emergencyUpgradeBoard = _emergencyUpgradeBoard;\n        emit ChangeEmergencyUpgradeBoard(address(0), _emergencyUpgradeBoard);\n    }\n}\n"
+    },
+    "src/interfaces/IZKsyncEra.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity 0.8.24;\n\n/// @author Matter Labs\n/// @custom:security-contact security@matterlabs.dev\ninterface IZKsyncEra {\n    /// @dev An arbitrary length message passed from L2\n    /// @notice Under the hood it is `L2Log` sent from the special system L2 contract\n    /// @param txNumberInBatch The L2 transaction number in the batch, in which the message was sent\n    /// @param sender The address of the L2 account from which the message was passed\n    /// @param data An arbitrary length message\n    struct L2Message {\n        uint16 txNumberInBatch;\n        address sender;\n        bytes data;\n    }\n\n    /// @notice Prove that a specific arbitrary-length message was sent in a specific L2 batch number\n    /// @param _batchNumber The executed L2 batch number in which the message appeared\n    /// @param _index The position in the L2 logs Merkle tree of the l2Log that was sent with the message\n    /// @param _message Information about the sent message: sender address, the message itself, tx index in the L2 batch where the message was sent\n    /// @param _proof Merkle proof for inclusion of L2 log that was sent with the message\n    /// @return Whether the proof is valid\n    function proveL2MessageInclusion(\n        uint256 _batchNumber,\n        uint256 _index,\n        L2Message memory _message,\n        bytes32[] calldata _proof\n    ) external view returns (bool);\n\n    /// @notice Request execution of L2 transaction from L1.\n    /// @param _contractL2 The L2 receiver address\n    /// @param _l2Value `msg.value` of L2 transaction\n    /// @param _calldata The input of the L2 transaction\n    /// @param _l2GasLimit Maximum amount of L2 gas that transaction can consume during execution on L2\n    /// @param _l2GasPerPubdataByteLimit The maximum amount L2 gas that the operator may charge the user for single byte of pubdata.\n    /// @param _factoryDeps An array of L2 bytecodes that will be marked as known on L2\n    /// @param _refundRecipient The address on L2 that will receive the refund for the transaction.\n    /// @dev If the L2 deposit finalization transaction fails, the `_refundRecipient` will receive the `_l2Value`.\n    /// Please note, the contract may change the refund recipient's address to eliminate sending funds to addresses out of control.\n    /// - If `_refundRecipient` is a contract on L1, the refund will be sent to the aliased `_refundRecipient`.\n    /// - If `_refundRecipient` is set to `address(0)` and the sender has NO deployed bytecode on L1, the refund will be sent to the `msg.sender` address.\n    /// - If `_refundRecipient` is set to `address(0)` and the sender has deployed bytecode on L1, the refund will be sent to the aliased `msg.sender` address.\n    /// @dev The address aliasing of L1 contracts as refund recipient on L2 is necessary to guarantee that the funds are controllable,\n    /// since address aliasing to the from address for the L2 tx will be applied if the L1 `msg.sender` is a contract.\n    /// Without address aliasing for L1 contracts as refund recipients they would not be able to make proper L2 tx requests\n    /// through the Mailbox to use or withdraw the funds from L2, and the funds would be lost.\n    function requestL2Transaction(\n        address _contractL2,\n        uint256 _l2Value,\n        bytes calldata _calldata,\n        uint256 _l2GasLimit,\n        uint256 _l2GasPerPubdataByteLimit,\n        bytes[] calldata _factoryDeps,\n        address _refundRecipient\n    ) external payable;\n\n    /// @notice Estimates the cost in Ether of requesting execution of an L2 transaction from L1\n    /// @param _gasPrice expected L1 gas price at which the user requests the transaction execution\n    /// @param _l2GasLimit Maximum amount of L2 gas that transaction can consume during execution on L2\n    /// @param _l2GasPerPubdataByteLimit The maximum amount of L2 gas that the operator may charge the user for a single byte of pubdata.\n    /// @return The estimated ETH spent on L2 gas for the transaction\n    function l2TransactionBaseCost(\n        uint256 _gasPrice,\n        uint256 _l2GasLimit,\n        uint256 _l2GasPerPubdataByteLimit\n    ) external view returns (uint256);\n}\n"
+    },
+    "src/interfaces/IChainTypeManager.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity 0.8.24;\n\n/// @author Matter Labs\n/// @custom:security-contact security@matterlabs.dev\ninterface IChainTypeManager {\n    function freezeChain(uint256 _chainId) external;\n\n    function unfreezeChain(uint256 _chainId) external;\n\n    function validatorTimelock() external view returns (address);\n}\n"
+    },
+    "src/interfaces/IBridgeHub.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity 0.8.24;\n\nimport {IPausable} from \"./IPausable.sol\";\n\n/// @author Matter Labs\n/// @custom:security-contact security@matterlabs.dev\ninterface IBridgeHub is IPausable {\n    function getAllZKChainChainIDs() external view returns (uint256[] memory);\n}\n"
+    },
+    "src/interfaces/IPausable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity 0.8.24;\n\n/// @author Matter Labs\n/// @custom:security-contact security@matterlabs.dev\ninterface IPausable {\n    function pause() external;\n\n    function unpause() external;\n}\n"
+    },
+    "src/interfaces/IChainAssetHandler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity 0.8.24;\n\n/// @author Matter Labs\n/// @custom:security-contact security@matterlabs.dev\ninterface IChainAssetHandler {\n    /// @notice Pauses migration functions.\n    function pauseMigration() external;\n\n    /// @notice Unpauses migration functions.\n    function unpauseMigration() external;\n}\n"
+    },
+    "src/interfaces/IProtocolUpgradeHandler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity 0.8.24;\n\n/// @author Matter Labs\n/// @custom:security-contact security@matterlabs.dev\ninterface IProtocolUpgradeHandler {\n    /// @dev This enumeration includes the following states:\n    /// @param None Default state, indicating the upgrade has not been set.\n    /// @param LegalVetoPeriod The upgrade passed L2 voting process but it is waiting for the legal veto period.\n    /// @param Waiting The upgrade passed Legal Veto period but it is waiting for the approval from guardians or Security Council.\n    /// @param ExecutionPending The upgrade proposal is waiting for the delay period before being ready for execution.\n    /// @param Ready The upgrade proposal is ready to be executed.\n    /// @param Expired The upgrade proposal was expired.\n    /// @param Done The upgrade has been successfully executed.\n    enum UpgradeState {\n        None,\n        LegalVetoPeriod,\n        Waiting,\n        ExecutionPending,\n        Ready,\n        Expired,\n        Done\n    }\n\n    /// @dev Represents the status of an upgrade process, including the creation timestamp and actions made by guardians and Security Council.\n    /// @param creationTimestamp The timestamp (in seconds) when the upgrade state was created.\n    /// @param securityCouncilApprovalTimestamp The timestamp (in seconds) when Security Council approved the upgrade.\n    /// @param guardiansApproval Indicates whether the upgrade has been approved by the guardians.\n    /// @param guardiansExtendedLegalVeto Indicates whether guardians extended the legal veto period.\n    /// @param executed Indicates whether the proposal is executed or not.\n    struct UpgradeStatus {\n        uint48 creationTimestamp;\n        uint48 securityCouncilApprovalTimestamp;\n        bool guardiansApproval;\n        bool guardiansExtendedLegalVeto;\n        bool executed;\n    }\n\n    /// @dev Represents a call to be made during an upgrade.\n    /// @param target The address to which the call will be made.\n    /// @param value The amount of Ether (in wei) to be sent along with the call.\n    /// @param data The calldata to be executed on the `target` address.\n    struct Call {\n        address target;\n        uint256 value;\n        bytes data;\n    }\n\n    /// @dev Defines the structure of an upgrade that is executed by Protocol Upgrade Handler.\n    /// @param executor The L1 address that is authorized to perform the upgrade execution (if address(0) then anyone).\n    /// @param calls An array of `Call` structs, each representing a call to be made during the upgrade execution.\n    /// @param salt A bytes32 value used for creating unique upgrade proposal hashes.\n    struct UpgradeProposal {\n        Call[] calls;\n        address executor;\n        bytes32 salt;\n    }\n\n    /// @dev This enumeration includes the following states:\n    /// @param None Default state, indicating the freeze has not been happening in this upgrade cycle.\n    /// @param Soft The protocol is/was frozen for the short time.\n    /// @param Hard The protocol is/was frozen for the long time.\n    /// @param AfterSoftFreeze The protocol was soft frozen, it can be hard frozen in this upgrade cycle.\n    /// @param AfterHardFreeze The protocol was hard frozen, but now it can't be frozen until the upgrade.\n    enum FreezeStatus {\n        None,\n        Soft,\n        Hard,\n        AfterSoftFreeze,\n        AfterHardFreeze\n    }\n\n    function startUpgrade(\n        uint256 _l2BatchNumber,\n        uint256 _l2MessageIndex,\n        uint16 _l2TxNumberInBatch,\n        bytes32[] calldata _proof,\n        UpgradeProposal calldata _proposal\n    ) external;\n\n    function extendLegalVeto(bytes32 _id) external;\n\n    function approveUpgradeSecurityCouncil(bytes32 _id) external;\n\n    function approveUpgradeGuardians(bytes32 _id) external;\n\n    function execute(UpgradeProposal calldata _proposal) external payable;\n\n    function executeEmergencyUpgrade(UpgradeProposal calldata _proposal) external payable;\n\n    function softFreeze() external;\n\n    function hardFreeze() external;\n\n    function reinforceFreeze() external;\n\n    function unfreeze() external;\n\n    function reinforceFreezeOneChain(uint256 _chainId) external;\n\n    function reinforceUnfreeze() external;\n\n    function reinforceUnfreezeOneChain(uint256 _chainId) external;\n\n    function upgradeState(bytes32 _id) external view returns (UpgradeState);\n\n    function updateSecurityCouncil(address _newSecurityCouncil) external;\n\n    function updateGuardians(address _newGuardians) external;\n\n    function updateEmergencyUpgradeBoard(address _newEmergencyUpgradeBoard) external;\n\n    /// @notice Emitted when the security council address is changed.\n    event ChangeSecurityCouncil(address indexed _securityCouncilBefore, address indexed _securityCouncilAfter);\n\n    /// @notice Emitted when the guardians address is changed.\n    event ChangeGuardians(address indexed _guardiansBefore, address indexed _guardiansAfter);\n\n    /// @notice Emitted when the emergency upgrade board address is changed.\n    event ChangeEmergencyUpgradeBoard(\n        address indexed _emergencyUpgradeBoardBefore, address indexed _emergencyUpgradeBoardAfter\n    );\n\n    /// @notice Emitted when upgrade process on L1 is started.\n    event UpgradeStarted(bytes32 indexed _id, UpgradeProposal _proposal);\n\n    /// @notice Emitted when the legal veto period is extended.\n    event UpgradeLegalVetoExtended(bytes32 indexed _id);\n\n    /// @notice Emitted when Security Council approved the upgrade.\n    event UpgradeApprovedBySecurityCouncil(bytes32 indexed _id);\n\n    /// @notice Emitted when Guardians approved the upgrade.\n    event UpgradeApprovedByGuardians(bytes32 indexed _id);\n\n    /// @notice Emitted when the upgrade is executed.\n    event UpgradeExecuted(bytes32 indexed _id);\n\n    /// @notice Emitted when the emergency upgrade is executed.\n    event EmergencyUpgradeExecuted(bytes32 indexed _id);\n\n    /// @notice Emitted when the protocol became soft frozen.\n    event SoftFreeze(uint256 _protocolFrozenUntil);\n\n    /// @notice Emitted when the protocol became hard frozen.\n    event HardFreeze(uint256 _protocolFrozenUntil);\n\n    /// @notice Emitted when someone makes an attempt to freeze the protocol when it is frozen already.\n    event ReinforceFreeze();\n\n    /// @notice Emitted when the protocol became active after the soft/hard freeze.\n    event Unfreeze();\n\n    /// @notice Emitted when someone makes an attempt to freeze the specific chain when the protocol is frozen already.\n    event ReinforceFreezeOneChain(uint256 _chainId);\n\n    /// @notice Emitted when someone makes an attempt to unfreeze the protocol when it is unfrozen already.\n    event ReinforceUnfreeze();\n\n    /// @notice Emitted when someone makes an attempt to unfreeze the specific chain when the protocol is unfrozen already.\n    event ReinforceUnfreezeOneChain(uint256 _chainId);\n}\n"
+    },
+    "lib/openzeppelin-contracts-upgradeable/contracts/proxy/utils/Initializable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (proxy/utils/Initializable.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev This is a base contract to aid in writing upgradeable contracts, or any kind of contract that will be deployed\n * behind a proxy. Since proxied contracts do not make use of a constructor, it's common to move constructor logic to an\n * external initializer function, usually called `initialize`. It then becomes necessary to protect this initializer\n * function so it can only be called once. The {initializer} modifier provided by this contract will have this effect.\n *\n * The initialization functions use a version number. Once a version number is used, it is consumed and cannot be\n * reused. This mechanism prevents re-execution of each \"step\" but allows the creation of new initialization steps in\n * case an upgrade adds a module that needs to be initialized.\n *\n * For example:\n *\n * [.hljs-theme-light.nopadding]\n * ```solidity\n * contract MyToken is ERC20Upgradeable {\n *     function initialize() initializer public {\n *         __ERC20_init(\"MyToken\", \"MTK\");\n *     }\n * }\n *\n * contract MyTokenV2 is MyToken, ERC20PermitUpgradeable {\n *     function initializeV2() reinitializer(2) public {\n *         __ERC20Permit_init(\"MyToken\");\n *     }\n * }\n * ```\n *\n * TIP: To avoid leaving the proxy in an uninitialized state, the initializer function should be called as early as\n * possible by providing the encoded function call as the `_data` argument to {ERC1967Proxy-constructor}.\n *\n * CAUTION: When used with inheritance, manual care must be taken to not invoke a parent initializer twice, or to ensure\n * that all initializers are idempotent. This is not verified automatically as constructors are by Solidity.\n *\n * [CAUTION]\n * ====\n * Avoid leaving a contract uninitialized.\n *\n * An uninitialized contract can be taken over by an attacker. This applies to both a proxy and its implementation\n * contract, which may impact the proxy. To prevent the implementation contract from being used, you should invoke\n * the {_disableInitializers} function in the constructor to automatically lock it when it is deployed:\n *\n * [.hljs-theme-light.nopadding]\n * ```\n * /// @custom:oz-upgrades-unsafe-allow constructor\n * constructor() {\n *     _disableInitializers();\n * }\n * ```\n * ====\n */\nabstract contract Initializable {\n    /**\n     * @dev Storage of the initializable contract.\n     *\n     * It's implemented on a custom ERC-7201 namespace to reduce the risk of storage collisions\n     * when using with upgradeable contracts.\n     *\n     * @custom:storage-location erc7201:openzeppelin.storage.Initializable\n     */\n    struct InitializableStorage {\n        /**\n         * @dev Indicates that the contract has been initialized.\n         */\n        uint64 _initialized;\n        /**\n         * @dev Indicates that the contract is in the process of being initialized.\n         */\n        bool _initializing;\n    }\n\n    // keccak256(abi.encode(uint256(keccak256(\"openzeppelin.storage.Initializable\")) - 1)) & ~bytes32(uint256(0xff))\n    bytes32 private constant INITIALIZABLE_STORAGE = 0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00;\n\n    /**\n     * @dev The contract is already initialized.\n     */\n    error InvalidInitialization();\n\n    /**\n     * @dev The contract is not initializing.\n     */\n    error NotInitializing();\n\n    /**\n     * @dev Triggered when the contract has been initialized or reinitialized.\n     */\n    event Initialized(uint64 version);\n\n    /**\n     * @dev A modifier that defines a protected initializer function that can be invoked at most once. In its scope,\n     * `onlyInitializing` functions can be used to initialize parent contracts.\n     *\n     * Similar to `reinitializer(1)`, except that in the context of a constructor an `initializer` may be invoked any\n     * number of times. This behavior in the constructor can be useful during testing and is not expected to be used in\n     * production.\n     *\n     * Emits an {Initialized} event.\n     */\n    modifier initializer() {\n        // solhint-disable-next-line var-name-mixedcase\n        InitializableStorage storage $ = _getInitializableStorage();\n\n        // Cache values to avoid duplicated sloads\n        bool isTopLevelCall = !$._initializing;\n        uint64 initialized = $._initialized;\n\n        // Allowed calls:\n        // - initialSetup: the contract is not in the initializing state and no previous version was\n        //                 initialized\n        // - construction: the contract is initialized at version 1 (no reininitialization) and the\n        //                 current contract is just being deployed\n        bool initialSetup = initialized == 0 && isTopLevelCall;\n        bool construction = initialized == 1 && address(this).code.length == 0;\n\n        if (!initialSetup && !construction) {\n            revert InvalidInitialization();\n        }\n        $._initialized = 1;\n        if (isTopLevelCall) {\n            $._initializing = true;\n        }\n        _;\n        if (isTopLevelCall) {\n            $._initializing = false;\n            emit Initialized(1);\n        }\n    }\n\n    /**\n     * @dev A modifier that defines a protected reinitializer function that can be invoked at most once, and only if the\n     * contract hasn't been initialized to a greater version before. In its scope, `onlyInitializing` functions can be\n     * used to initialize parent contracts.\n     *\n     * A reinitializer may be used after the original initialization step. This is essential to configure modules that\n     * are added through upgrades and that require initialization.\n     *\n     * When `version` is 1, this modifier is similar to `initializer`, except that functions marked with `reinitializer`\n     * cannot be nested. If one is invoked in the context of another, execution will revert.\n     *\n     * Note that versions can jump in increments greater than 1; this implies that if multiple reinitializers coexist in\n     * a contract, executing them in the right order is up to the developer or operator.\n     *\n     * WARNING: Setting the version to 2**64 - 1 will prevent any future reinitialization.\n     *\n     * Emits an {Initialized} event.\n     */\n    modifier reinitializer(uint64 version) {\n        // solhint-disable-next-line var-name-mixedcase\n        InitializableStorage storage $ = _getInitializableStorage();\n\n        if ($._initializing || $._initialized >= version) {\n            revert InvalidInitialization();\n        }\n        $._initialized = version;\n        $._initializing = true;\n        _;\n        $._initializing = false;\n        emit Initialized(version);\n    }\n\n    /**\n     * @dev Modifier to protect an initialization function so that it can only be invoked by functions with the\n     * {initializer} and {reinitializer} modifiers, directly or indirectly.\n     */\n    modifier onlyInitializing() {\n        _checkInitializing();\n        _;\n    }\n\n    /**\n     * @dev Reverts if the contract is not in an initializing state. See {onlyInitializing}.\n     */\n    function _checkInitializing() internal view virtual {\n        if (!_isInitializing()) {\n            revert NotInitializing();\n        }\n    }\n\n    /**\n     * @dev Locks the contract, preventing any future reinitialization. This cannot be part of an initializer call.\n     * Calling this in the constructor of a contract will prevent that contract from being initialized or reinitialized\n     * to any version. It is recommended to use this to lock implementation contracts that are designed to be called\n     * through proxies.\n     *\n     * Emits an {Initialized} event the first time it is successfully executed.\n     */\n    function _disableInitializers() internal virtual {\n        // solhint-disable-next-line var-name-mixedcase\n        InitializableStorage storage $ = _getInitializableStorage();\n\n        if ($._initializing) {\n            revert InvalidInitialization();\n        }\n        if ($._initialized != type(uint64).max) {\n            $._initialized = type(uint64).max;\n            emit Initialized(type(uint64).max);\n        }\n    }\n\n    /**\n     * @dev Returns the highest version that has been initialized. See {reinitializer}.\n     */\n    function _getInitializedVersion() internal view returns (uint64) {\n        return _getInitializableStorage()._initialized;\n    }\n\n    /**\n     * @dev Returns `true` if the contract is currently initializing. See {onlyInitializing}.\n     */\n    function _isInitializing() internal view returns (bool) {\n        return _getInitializableStorage()._initializing;\n    }\n\n    /**\n     * @dev Returns a pointer to the storage namespace.\n     */\n    // solhint-disable-next-line var-name-mixedcase\n    function _getInitializableStorage() private pure returns (InitializableStorage storage $) {\n        assembly {\n            $.slot := INITIALIZABLE_STORAGE\n        }\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.24+commit.e11b9ed9"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_l2ProtocolGovernor",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IZKsyncEra",
+              "name": "_ZKsyncEra",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IChainTypeManager",
+              "name": "_chainTypeManager",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IBridgeHub",
+              "name": "_bridgeHub",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IPausable",
+              "name": "_l1Nullifier",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IPausable",
+              "name": "_l1AssetRouter",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IPausable",
+              "name": "_l1NativeTokenVault",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IChainAssetHandler",
+              "name": "_chainAssetHandler",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidInitialization",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotInitializing",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_emergencyUpgradeBoardBefore",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_emergencyUpgradeBoardAfter",
+              "type": "address"
+            }
+          ],
+          "name": "ChangeEmergencyUpgradeBoard",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_guardiansBefore",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_guardiansAfter",
+              "type": "address"
+            }
+          ],
+          "name": "ChangeGuardians",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_securityCouncilBefore",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_securityCouncilAfter",
+              "type": "address"
+            }
+          ],
+          "name": "ChangeSecurityCouncil",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "EmergencyUpgradeExecuted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_protocolFrozenUntil",
+              "type": "uint256"
+            }
+          ],
+          "name": "HardFreeze",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "version",
+              "type": "uint64"
+            }
+          ],
+          "name": "Initialized",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "ReinforceFreeze",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ReinforceFreezeOneChain",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "ReinforceUnfreeze",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ReinforceUnfreezeOneChain",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_protocolFrozenUntil",
+              "type": "uint256"
+            }
+          ],
+          "name": "SoftFreeze",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Unfreeze",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "UpgradeApprovedByGuardians",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "UpgradeApprovedBySecurityCouncil",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "UpgradeExecuted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "UpgradeLegalVetoExtended",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            },
+            {
+              "components": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "target",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "data",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct IProtocolUpgradeHandler.Call[]",
+                  "name": "calls",
+                  "type": "tuple[]"
+                },
+                {
+                  "internalType": "address",
+                  "name": "executor",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "salt",
+                  "type": "bytes32"
+                }
+              ],
+              "indexed": false,
+              "internalType": "struct IProtocolUpgradeHandler.UpgradeProposal",
+              "name": "_proposal",
+              "type": "tuple"
+            }
+          ],
+          "name": "UpgradeStarted",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "BRIDGE_HUB",
+          "outputs": [
+            {
+              "internalType": "contract IBridgeHub",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "CHAIN_ASSET_HANDLER",
+          "outputs": [
+            {
+              "internalType": "contract IChainAssetHandler",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "CHAIN_TYPE_MANAGER",
+          "outputs": [
+            {
+              "internalType": "contract IChainTypeManager",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "L1_ASSET_ROUTER",
+          "outputs": [
+            {
+              "internalType": "contract IPausable",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "L1_NATIVE_TOKEN_VAULT",
+          "outputs": [
+            {
+              "internalType": "contract IPausable",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "L1_NULLIFIER",
+          "outputs": [
+            {
+              "internalType": "contract IPausable",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "L2_PROTOCOL_GOVERNOR",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ZKSYNC_ERA",
+          "outputs": [
+            {
+              "internalType": "contract IZKsyncEra",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "approveUpgradeGuardians",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "approveUpgradeSecurityCouncil",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "emergencyUpgradeBoard",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "target",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "data",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct IProtocolUpgradeHandler.Call[]",
+                  "name": "calls",
+                  "type": "tuple[]"
+                },
+                {
+                  "internalType": "address",
+                  "name": "executor",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "salt",
+                  "type": "bytes32"
+                }
+              ],
+              "internalType": "struct IProtocolUpgradeHandler.UpgradeProposal",
+              "name": "_proposal",
+              "type": "tuple"
+            }
+          ],
+          "name": "execute",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "target",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "data",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct IProtocolUpgradeHandler.Call[]",
+                  "name": "calls",
+                  "type": "tuple[]"
+                },
+                {
+                  "internalType": "address",
+                  "name": "executor",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "salt",
+                  "type": "bytes32"
+                }
+              ],
+              "internalType": "struct IProtocolUpgradeHandler.UpgradeProposal",
+              "name": "_proposal",
+              "type": "tuple"
+            }
+          ],
+          "name": "executeEmergencyUpgrade",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "extendLegalVeto",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "guardians",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "hardFreeze",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_securityCouncil",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_guardians",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_emergencyUpgradeBoard",
+              "type": "address"
+            }
+          ],
+          "name": "initialize",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lastFreezeStatusInUpgradeCycle",
+          "outputs": [
+            {
+              "internalType": "enum IProtocolUpgradeHandler.FreezeStatus",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "protocolFrozenUntil",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "reinforceFreeze",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "reinforceFreezeOneChain",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "reinforceUnfreeze",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "reinforceUnfreezeOneChain",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "securityCouncil",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "softFreeze",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_l2BatchNumber",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_l2MessageIndex",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint16",
+              "name": "_l2TxNumberInBatch",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes32[]",
+              "name": "_proof",
+              "type": "bytes32[]"
+            },
+            {
+              "components": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "target",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "data",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct IProtocolUpgradeHandler.Call[]",
+                  "name": "calls",
+                  "type": "tuple[]"
+                },
+                {
+                  "internalType": "address",
+                  "name": "executor",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "salt",
+                  "type": "bytes32"
+                }
+              ],
+              "internalType": "struct IProtocolUpgradeHandler.UpgradeProposal",
+              "name": "_proposal",
+              "type": "tuple"
+            }
+          ],
+          "name": "startUpgrade",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "unfreeze",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_newEmergencyUpgradeBoard",
+              "type": "address"
+            }
+          ],
+          "name": "updateEmergencyUpgradeBoard",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_newGuardians",
+              "type": "address"
+            }
+          ],
+          "name": "updateGuardians",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_newSecurityCouncil",
+              "type": "address"
+            }
+          ],
+          "name": "updateSecurityCouncil",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "upgradeState",
+          "outputs": [
+            {
+              "internalType": "enum IProtocolUpgradeHandler.UpgradeState",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "upgradeId",
+              "type": "bytes32"
+            }
+          ],
+          "name": "upgradeStatus",
+          "outputs": [
+            {
+              "internalType": "uint48",
+              "name": "creationTimestamp",
+              "type": "uint48"
+            },
+            {
+              "internalType": "uint48",
+              "name": "securityCouncilApprovalTimestamp",
+              "type": "uint48"
+            },
+            {
+              "internalType": "bool",
+              "name": "guardiansApproval",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "guardiansExtendedLegalVeto",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "executed",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "author": "Matter Labs",
+        "custom:security-contact": "security@matterlabs.dev",
+        "details": "The contract that holds ownership of all ZKsync contracts (L1 and L2). It is responsible for handling ZKsync protocol upgrades proposed by L2 Token Assembly and executing it. The upgrade process follows these key stages: 1. Proposal: Token holders on L2 propose the protocol upgrades and send the L2 -> L1 message    that this contract reads and starts the upgrade process. 2. Legal veto: During this period, the guardians can veto the upgrade **offchain**. The default legal period review    takes 3 days but can be extended by guardians onchain for 7 days in total. 3. Approval: Requires approval from either the guardians or the Security Council. The Security Council can    immediately move the proposal to the next stage, while guardians approval will move the proposal to the    next stage only after 30 days delay after the legal veto passes. If no approval is received within the specified period, the proposal    is expired. 4. Pending: A mandatory delay period before the actual execution of the upgrade, allowing for final    preparations and reviews. 5. Execution: The proposed changes are executed by the authorized address in the proposal,    completing the upgrade process. The contract implements the state machine that represents the logic of moving upgrade from each stage by time changes and Guardians/Security Council actions.",
+        "errors": {
+          "InvalidInitialization()": [
+            {
+              "details": "The contract is already initialized."
+            }
+          ],
+          "NotInitializing()": [
+            {
+              "details": "The contract is not initializing."
+            }
+          ]
+        },
+        "events": {
+          "Initialized(uint64)": {
+            "details": "Triggered when the contract has been initialized or reinitialized."
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "approveUpgradeGuardians(bytes32)": {
+            "details": "Marks the upgrade proposal identified by `_id` as approved by guardians.",
+            "params": {
+              "_id": "The unique identifier of the upgrade proposal to approve."
+            }
+          },
+          "approveUpgradeSecurityCouncil(bytes32)": {
+            "details": "Transitions the state of an upgrade proposal to 'VetoPeriod' after approval by the Security Council.",
+            "params": {
+              "_id": "The unique identifier of the upgrade proposal to be approved."
+            }
+          },
+          "constructor": {
+            "params": {
+              "_ZKsyncEra": "The address of the zkSync Era chain, on top of which the `_l2ProtocolGovernor` is deployed.",
+              "_bridgeHub": "The address of the bridgehub.",
+              "_chainAssetHandler": "The address of the L1 chain asset handler.",
+              "_chainTypeManager": "The address of the state transition manager.",
+              "_l1AssetRouter": "The address of the L1 asset router.",
+              "_l1NativeTokenVault": "The address of the L1 native token vault.",
+              "_l1Nullifier": "The address of the nullifier",
+              "_l2ProtocolGovernor": "The address of the L2 voting governor contract for protocol upgrades."
+            }
+          },
+          "execute(((address,uint256,bytes)[],address,bytes32))": {
+            "params": {
+              "_proposal": "The upgrade proposal to be executed, containing the target calls and optionally an executor."
+            }
+          },
+          "executeEmergencyUpgrade(((address,uint256,bytes)[],address,bytes32))": {
+            "params": {
+              "_proposal": "The upgrade proposal details including proposed actions and the executor address."
+            }
+          },
+          "extendLegalVeto(bytes32)": {
+            "params": {
+              "_id": "The unique identifier of the upgrade proposal to be approved."
+            }
+          },
+          "reinforceFreeze()": {
+            "details": "Reinforces the freezing state of the protocol if it is already within the frozen period. This function can be called by anyone to ensure the protocol remains in a frozen state, particularly useful if there is a need to confirm or re-apply the freeze due to partial or incomplete application during the initial freeze."
+          },
+          "reinforceFreezeOneChain(uint256)": {
+            "details": "Reinforces the freezing state of the specific chain if the protocol is already within the frozen period. The function is an analog of `reinforceFreeze` but only for one specific chain, needed in the rare case where the execution could get stuck at a particular ID for some unforeseen reason."
+          },
+          "reinforceUnfreeze()": {
+            "details": "Reinforces the unfreeze for protocol if it is not in the freeze mode. This function can be called by anyone to ensure the protocol remains in an unfrozen state, particularly useful if there is a need to confirm or re-apply the unfreeze due to partial or incomplete application during the initial unfreeze."
+          },
+          "reinforceUnfreezeOneChain(uint256)": {
+            "details": "Reinforces the unfreeze for one specific chain if the protocol is not in the freeze mode. The function is an analog of `reinforceUnfreeze` but only for one specific chain, needed in the rare case where the execution could get stuck at a particular ID for some unforeseen reason."
+          },
+          "startUpgrade(uint256,uint256,uint16,bytes32[],((address,uint256,bytes)[],address,bytes32))": {
+            "details": "This function decodes and validates an upgrade proposal message from L2, setting the initial state for the upgrade process.",
+            "params": {
+              "_l2BatchNumber": "The batch number of the L2 transaction containing the upgrade proposal.",
+              "_l2MessageIndex": "The index of the message within the L2 batch.",
+              "_l2TxNumberInBatch": "The transaction number of the upgrade proposal in the L2 batch.",
+              "_proof": "Merkle proof verifying the inclusion of the upgrade message in the L2 batch.",
+              "_proposal": "The upgrade proposal details including proposed actions and the executor address."
+            }
+          },
+          "unfreeze()": {
+            "details": "Unfreezes the protocol and resumes normal operations."
+          },
+          "updateEmergencyUpgradeBoard(address)": {
+            "details": "Updates the address of the emergency upgrade board.",
+            "params": {
+              "_newEmergencyUpgradeBoard": "The address of the guardians."
+            }
+          },
+          "updateGuardians(address)": {
+            "details": "Updates the address of the guardians.",
+            "params": {
+              "_newGuardians": "The address of the guardians."
+            }
+          },
+          "updateSecurityCouncil(address)": {
+            "details": "Updates the address of the Security Council.",
+            "params": {
+              "_newSecurityCouncil": "The address of the new Security Council."
+            }
+          },
+          "upgradeState(bytes32)": {
+            "params": {
+              "_id": "The unique identifier of the upgrade proposal to be approved."
+            }
+          }
+        },
+        "stateVariables": {
+          "BRIDGE_HUB": {
+            "details": "Bridgehub smart contract that is used to operate with L2 via asynchronous L2 <-> L1 communication."
+          },
+          "CHAIN_ASSET_HANDLER": {
+            "details": "Chain asset handler contract for migration pausing/unpausing."
+          },
+          "CHAIN_TYPE_MANAGER": {
+            "details": "ZKsync smart contract that is responsible for creating new ZK Chains and changing parameters in existent."
+          },
+          "EXTENDED_LEGAL_VETO_PERIOD": {
+            "details": "Duration of the extended legal veto period."
+          },
+          "HARD_FREEZE_PERIOD": {
+            "details": "Duration of a hard freeze which temporarily pause protocol contract functionality. This freeze window is needed for the Security Council to perform emergency protocol upgrade."
+          },
+          "L1_ASSET_ROUTER": {
+            "details": "The asset router contract that is used for bridging."
+          },
+          "L1_NATIVE_TOKEN_VAULT": {
+            "details": "Vault holding L1 native ETH and ERC20 tokens bridged into the ZK chains."
+          },
+          "L1_NULLIFIER": {
+            "details": "The nullifier contract that is used for bridging."
+          },
+          "L2_PROTOCOL_GOVERNOR": {
+            "details": "Address of the L2 Protocol Governor contract. This address is used to interface with governance actions initiated on Layer 2, specifically for proposing and approving protocol upgrades."
+          },
+          "SOFT_FREEZE_PERIOD": {
+            "details": "Duration of a soft freeze which temporarily pause protocol contract functionality. This freeze window is needed for the Security Council to decide whether they want to do hard freeze and protocol upgrade."
+          },
+          "UPGRADE_WAIT_OR_EXPIRE_PERIOD": {
+            "details": "Time limit for an upgrade proposal to be approved by guardians or expire, and the waiting period for execution post-guardians approval. If the Security Council approves, the upgrade can proceed immediately; otherwise, the proposal will expire after this period if not approved, or wait this period after guardians approval."
+          },
+          "ZKSYNC_ERA": {
+            "details": "ZKsync smart contract that used to operate with L2 via asynchronous L2 <-> L1 communication."
+          }
+        },
+        "title": "Protocol Upgrade Handler",
+        "version": 1
+      },
+      "userdoc": {
+        "events": {
+          "ChangeEmergencyUpgradeBoard(address,address)": {
+            "notice": "Emitted when the emergency upgrade board address is changed."
+          },
+          "ChangeGuardians(address,address)": {
+            "notice": "Emitted when the guardians address is changed."
+          },
+          "ChangeSecurityCouncil(address,address)": {
+            "notice": "Emitted when the security council address is changed."
+          },
+          "EmergencyUpgradeExecuted(bytes32)": {
+            "notice": "Emitted when the emergency upgrade is executed."
+          },
+          "HardFreeze(uint256)": {
+            "notice": "Emitted when the protocol became hard frozen."
+          },
+          "ReinforceFreeze()": {
+            "notice": "Emitted when someone makes an attempt to freeze the protocol when it is frozen already."
+          },
+          "ReinforceFreezeOneChain(uint256)": {
+            "notice": "Emitted when someone makes an attempt to freeze the specific chain when the protocol is frozen already."
+          },
+          "ReinforceUnfreeze()": {
+            "notice": "Emitted when someone makes an attempt to unfreeze the protocol when it is unfrozen already."
+          },
+          "ReinforceUnfreezeOneChain(uint256)": {
+            "notice": "Emitted when someone makes an attempt to unfreeze the specific chain when the protocol is unfrozen already."
+          },
+          "SoftFreeze(uint256)": {
+            "notice": "Emitted when the protocol became soft frozen."
+          },
+          "Unfreeze()": {
+            "notice": "Emitted when the protocol became active after the soft/hard freeze."
+          },
+          "UpgradeApprovedByGuardians(bytes32)": {
+            "notice": "Emitted when Guardians approved the upgrade."
+          },
+          "UpgradeApprovedBySecurityCouncil(bytes32)": {
+            "notice": "Emitted when Security Council approved the upgrade."
+          },
+          "UpgradeExecuted(bytes32)": {
+            "notice": "Emitted when the upgrade is executed."
+          },
+          "UpgradeLegalVetoExtended(bytes32)": {
+            "notice": "Emitted when the legal veto period is extended."
+          },
+          "UpgradeStarted(bytes32,((address,uint256,bytes)[],address,bytes32))": {
+            "notice": "Emitted when upgrade process on L1 is started."
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "approveUpgradeGuardians(bytes32)": {
+            "notice": "Approves an upgrade proposal by the guardians."
+          },
+          "approveUpgradeSecurityCouncil(bytes32)": {
+            "notice": "Approves an upgrade proposal by the Security Council."
+          },
+          "constructor": {
+            "notice": "Initializes the contract with the Security Council address, guardians address and address of L2 voting governor."
+          },
+          "emergencyUpgradeBoard()": {
+            "notice": "The address of the smart contract that can execute protocol emergency upgrade."
+          },
+          "execute(((address,uint256,bytes)[],address,bytes32))": {
+            "notice": "Executes an upgrade proposal that has reached the 'Ready' state."
+          },
+          "executeEmergencyUpgrade(((address,uint256,bytes)[],address,bytes32))": {
+            "notice": "Executes an emergency upgrade proposal initiated by the emergency upgrade board."
+          },
+          "extendLegalVeto(bytes32)": {
+            "notice": "Extends the legal veto period by the guardians."
+          },
+          "guardians()": {
+            "notice": "The address of the guardians."
+          },
+          "hardFreeze()": {
+            "notice": "Initiates a hard protocol freeze."
+          },
+          "lastFreezeStatusInUpgradeCycle()": {
+            "notice": "Tracks the last freeze type within an upgrade cycle."
+          },
+          "protocolFrozenUntil()": {
+            "notice": "Stores the timestamp until which the protocol remains frozen."
+          },
+          "securityCouncil()": {
+            "notice": "The address of the Security Council."
+          },
+          "softFreeze()": {
+            "notice": "Initiates a soft protocol freeze."
+          },
+          "startUpgrade(uint256,uint256,uint16,bytes32[],((address,uint256,bytes)[],address,bytes32))": {
+            "notice": "Initiates the upgrade process by verifying an L2 voting decision."
+          },
+          "upgradeState(bytes32)": {
+            "notice": "Calculates the current upgrade state for the specified upgrade ID."
+          },
+          "upgradeStatus(bytes32)": {
+            "notice": "A mapping to store status of an upgrade process for each upgrade ID."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/ProtocolUpgradeHandler.sol": "ProtocolUpgradeHandler"
+      },
+      "evmVersion": "cancun",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+        ":@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+        ":ds-test/=lib/openzeppelin-contracts-upgradeable/lib/forge-std/lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts-upgradeable/lib/erc4626-tests/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/"
+      ]
+    },
+    "sources": {
+      "lib/openzeppelin-contracts-upgradeable/contracts/proxy/utils/Initializable.sol": {
+        "keccak256": "0x631188737069917d2f909d29ce62c4d48611d326686ba6683e26b72a23bfac0b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7a61054ae84cd6c4d04c0c4450ba1d6de41e27e0a2c4f1bcdf58f796b401c609",
+          "dweb:/ipfs/QmUvtdp7X1mRVyC3CsHrtPbgoqWaXHp3S1ZR24tpAQYJWM"
+        ]
+      },
+      "src/ProtocolUpgradeHandler.sol": {
+        "keccak256": "0x8f45f449dcb1b2345bd127c925a8aa579b829d139cbfcc6a9bb49a5a4518e151",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://494d5d87ab890dd9f658d6badf17d1a4f44730a69245efe26e59fb5ebd17eb8d",
+          "dweb:/ipfs/Qmbg2x7GxGspTdMLnUGx4zshxvdHcLFohaBQFHhYquSzAz"
+        ]
+      },
+      "src/interfaces/IBridgeHub.sol": {
+        "keccak256": "0xc176a042ccbb35ffe8416e0f468cfd654bad31be6ad98377bec88d4f53adb540",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f5f79774b98c05a3626388c65a2744cd1b1c59e03a01f2a39c1afc10f774d957",
+          "dweb:/ipfs/QmQcvbPvHhf6LMdqwWr5Cx1kbGwWN1TENCXgAHhLkPvBqQ"
+        ]
+      },
+      "src/interfaces/IChainAssetHandler.sol": {
+        "keccak256": "0x01dd5ddf8e9afb739ef302b2474f7f435491267cb5d28b842615c02e65607d2f",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e3b35d35120851c961b7b56e362fda285bb27c053ce6910948507f02910925ab",
+          "dweb:/ipfs/QmSKnvk2GbA6uom6RREHRG3XS7SbFVKXWZcqRMKwsLcAfW"
+        ]
+      },
+      "src/interfaces/IChainTypeManager.sol": {
+        "keccak256": "0x2f12b17f74e3a7360c409ad0c91b89c4eed41c0e37b2ed708f5c9f3930ff4df9",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://1ba5a8562bd75bcc60122c008458bd19342e89ab3a694fe9a25d4a154d1538ab",
+          "dweb:/ipfs/QmXdY4PKFiQhenpizcWcjckYfx9yjBRNXL72VfMTKTity5"
+        ]
+      },
+      "src/interfaces/IPausable.sol": {
+        "keccak256": "0x9cd94daf920101695f5eb3c795c16f8e2b33c879e7de07abe4a4854b63c66bca",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7f88a4929253b4606d6f03889f303724c0498f0b00f464b8fc7ae3691cb96eff",
+          "dweb:/ipfs/Qmecdu6goTAfUi4uYGyX5DbiLMSX1UBo2kqM6oQRbphdHg"
+        ]
+      },
+      "src/interfaces/IProtocolUpgradeHandler.sol": {
+        "keccak256": "0x7ecc19cbc2e4389f1a2c6dad0e0c974598eb351d71b4b63f8519ebc8805615c7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5dd92e276be12085b0050642b16d45d14c6e9d457e7671ae370b86fd9b35a09c",
+          "dweb:/ipfs/QmP4emmsUfy2CChG9RHxrKFjo97oth2CC6ZA9RDarxc3VQ"
+        ]
+      },
+      "src/interfaces/IZKsyncEra.sol": {
+        "keccak256": "0xc74ca20bf39898f4e1603835b244f7ec9877f5b9a8acad57c08609c1107c6d89",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://15da8a6eaee209a2ef1fb45753626fc138dd5eaded2bd32347d968b247c88b4d",
+          "dweb:/ipfs/QmW7So2eJvPBoZQj4JLu2Jkw6nJgbwVEomfAutd49jRavy"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.24+commit.e11b9ed9",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "cancun",
+      "remappings": [
+        "@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/",
+        "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+        "ds-test/=lib/openzeppelin-contracts-upgradeable/lib/forge-std/lib/ds-test/src/",
+        "erc4626-tests/=lib/openzeppelin-contracts-upgradeable/lib/erc4626-tests/",
+        "forge-std/=lib/forge-std/src/",
+        "openzeppelin-contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/"
+      ]
+    },
+    "name": "ProtocolUpgradeHandler",
+    "fullyQualifiedName": "src/ProtocolUpgradeHandler.sol:ProtocolUpgradeHandler"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "18432660",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-02-13T09:33:37Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0x36625Bd3dDB469377C6e9893712158cA3c0cC14B"
+}

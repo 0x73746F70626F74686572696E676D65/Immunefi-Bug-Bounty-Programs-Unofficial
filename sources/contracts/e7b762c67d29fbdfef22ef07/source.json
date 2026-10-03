@@ -1,0 +1,868 @@
+{
+  "sources": {
+    "src/contracts/adapters/PaxosAssetAdapter.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity ^0.8.23;\n\nimport {Initializable} from \"@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol\";\n\nimport {IAssetAdapter, IERC20} from \"../Interfaces.sol\";\nimport {OwnableOperable} from \"../OwnableOperable.sol\";\n\n/**\n * @title Paxos asset adapter\n * @notice Adapter for redeeming Paxos-issued stablecoins through off-chain Paxos Actions with on-chain settlement.\n * @author Origin Protocol Inc\n */\ncontract PaxosAssetAdapter is Initializable, IAssetAdapter, OwnableOperable {\n    /// @notice ARM contract authorized to request and claim redemptions.\n    address public immutable arm;\n    /// @notice Paxos-issued stablecoin supplied by the ARM.\n    IERC20 public immutable baseAsset;\n    /// @notice Liquidity stablecoin received after Paxos settlement.\n    IERC20 public immutable liquidityAsset;\n\n    /// @notice On-chain Paxos deposit address used by Actions to settle queued redemptions.\n    address public paxosRecipient;\n    /// @notice Base asset amount queued in the adapter but not yet sent to Paxos.\n    uint256 public pendingShares;\n    /// @notice Base asset amount sent to Paxos and awaiting on-chain USDC settlement.\n    uint256 public settlingShares;\n\n    error InvalidPaxosRecipient(); // 0xfd956f0b\n    error PaxosRecipientNotConfigured(); // 0x11f03d8a\n    error RedeemAmountTooHigh(); // 0xc4526429\n    error InsufficientSettledAssets(uint256 required, uint256 available); // 0x34b0f470\n    error OnlyARM(); // 0x1628bf2a\n    error ZeroShares(); // 0x9811e0c7\n    error DecimalsMismatch(); // 0x5a8dbaed\n\n    event PaxosRecipientUpdated(address indexed paxosRecipient);\n    /// @notice Emitted when base assets are queued for redemption, where `100e6` is 100 tokens for 6-decimal assets.\n    event PaxosRedeemRequested(uint256 shares, uint256 assetsExpected);\n    event PaxosRedeemSubmitted(bytes32 indexed paxosRedemptionId, uint256 shares, address indexed paxosRecipient);\n    /// @notice Emitted when settled liquidity assets are transferred to the ARM, where `100e6` is 100 USDC.\n    event PaxosRedeemClaimed(uint256 shares, uint256 assetsExpected, uint256 assetsReceived);\n    event ExcessLiquidityRecovered(address indexed to, uint256 amount);\n\n    modifier onlyARM() {\n        if (msg.sender != arm) revert OnlyARM();\n        _;\n    }\n\n    modifier nonZeroShares(uint256 shares) {\n        if (shares == 0) revert ZeroShares();\n        _;\n    }\n\n    /// @param _arm ARM contract authorized to use the adapter.\n    /// @param _baseAsset Paxos-issued stablecoin to redeem.\n    /// @param _liquidityAsset Liquidity stablecoin received after Paxos settlement.\n    constructor(address _arm, address _baseAsset, address _liquidityAsset) {\n        arm = _arm;\n        baseAsset = IERC20(_baseAsset);\n        liquidityAsset = IERC20(_liquidityAsset);\n\n        if (baseAsset.decimals() != liquidityAsset.decimals()) revert DecimalsMismatch();\n\n        _setOwner(address(0));\n        _disableInitializers();\n    }\n\n    /// @notice Initialize the adapter operator and Paxos recipient.\n    /// @param _operator Account that can submit queued redemptions to Paxos.\n    /// @param _paxosRecipient Paxos on-chain deposit address. Must be non-zero, otherwise reverts.\n    function initialize(address _operator, address _paxosRecipient) external initializer {\n        _initOwnableOperable(_operator);\n        _setPaxosRecipient(_paxosRecipient);\n    }\n\n    /// @notice Set the Paxos on-chain deposit address used for future submissions.\n    /// @param _paxosRecipient Paxos deposit address for the adapter's base asset.\n    function setPaxosRecipient(address _paxosRecipient) external onlyOwner {\n        _setPaxosRecipient(_paxosRecipient);\n    }\n\n    /// @notice Submit queued base assets to Paxos for API-orchestrated redemption.\n    /// @dev Paxos Actions should use `paxosRedemptionId` to correlate this transfer with off-chain orchestration.\n    /// @param shares Base asset amount to send. For example, `100e6` is 100 USDG/PYUSD.\n    /// @param paxosRedemptionId Off-chain Paxos orchestration or idempotency identifier.\n    function submitPaxosRedeem(uint256 shares, bytes32 paxosRedemptionId)\n        external\n        onlyOperatorOrOwner\n        nonZeroShares(shares)\n    {\n        uint256 pendingSharesMem = pendingShares;\n        if (shares > pendingSharesMem) revert RedeemAmountTooHigh();\n\n        address paxosRecipientMem = paxosRecipient;\n        if (paxosRecipientMem == address(0)) revert PaxosRecipientNotConfigured();\n\n        pendingShares = pendingSharesMem - shares;\n        settlingShares += shares;\n        baseAsset.transfer(paxosRecipientMem, shares);\n\n        emit PaxosRedeemSubmitted(paxosRedemptionId, shares, paxosRecipientMem);\n    }\n\n    /// @notice Returns the liquidity asset produced by Paxos settlement.\n    function asset() external view returns (address) {\n        return address(liquidityAsset);\n    }\n\n    /// @notice Converts base stablecoin shares into expected liquidity assets at 1:1.\n    /// @param shares Base asset amount.\n    /// @return assets Expected liquidity asset amount.\n    function convertToAssets(uint256 shares) external pure returns (uint256 assets) {\n        return shares;\n    }\n\n    /// @notice Converts liquidity assets into expected base stablecoin shares at 1:1.\n    /// @param assets Liquidity asset amount.\n    /// @return shares Expected base asset amount.\n    function convertToShares(uint256 assets) external pure returns (uint256 shares) {\n        return assets;\n    }\n\n    /// @notice Pulls base assets from the ARM and queues them for Paxos redemption.\n    /// @param shares Base asset amount to queue.\n    /// @return sharesRequested Base asset amount queued.\n    /// @return assetsExpected Expected USDC from Paxos settlement.\n    function requestRedeem(uint256 shares)\n        external\n        onlyARM\n        nonZeroShares(shares)\n        returns (uint256 sharesRequested, uint256 assetsExpected)\n    {\n        pendingShares += shares;\n        baseAsset.transferFrom(arm, address(this), shares);\n\n        sharesRequested = shares;\n        assetsExpected = shares;\n\n        emit PaxosRedeemRequested(sharesRequested, assetsExpected);\n    }\n\n    /// @notice Claims settled USDC after Paxos Actions complete on-chain settlement to this adapter.\n    /// @param shares Base asset amount represented by the settled redemption.\n    /// @return sharesClaimed Base asset amount claimed.\n    /// @return assetsExpected Expected USDC from Paxos settlement.\n    /// @return assetsReceived USDC transferred to the ARM.\n    function redeem(uint256 shares)\n        external\n        onlyARM\n        nonZeroShares(shares)\n        returns (uint256 sharesClaimed, uint256 assetsExpected, uint256 assetsReceived)\n    {\n        uint256 settlingSharesMem = settlingShares;\n        if (shares > settlingSharesMem) revert RedeemAmountTooHigh();\n\n        uint256 available = liquidityAsset.balanceOf(address(this));\n        if (available < shares) revert InsufficientSettledAssets(shares, available);\n\n        settlingShares = settlingSharesMem - shares;\n        liquidityAsset.transfer(arm, shares);\n\n        sharesClaimed = shares;\n        assetsExpected = shares;\n        assetsReceived = shares;\n\n        emit PaxosRedeemClaimed(sharesClaimed, assetsExpected, assetsReceived);\n    }\n\n    /// @notice Recovers liquidity asset held beyond what `settlingShares` still owes, e.g. donated tokens\n    ///         or a Paxos settlement that arrived after its `settlingShares` was already closed out.\n    /// @dev The recovered liquidity asset is always sent to the ARM.\n    function recoverExcessLiquidity() external onlyOwner {\n        uint256 balance = liquidityAsset.balanceOf(address(this));\n        uint256 settlingSharesMem = settlingShares;\n        uint256 excess = balance > settlingSharesMem ? balance - settlingSharesMem : 0;\n\n        liquidityAsset.transfer(arm, excess);\n\n        emit ExcessLiquidityRecovered(arm, excess);\n    }\n\n    function _setPaxosRecipient(address _paxosRecipient) internal {\n        if (_paxosRecipient == address(0)) revert InvalidPaxosRecipient();\n        paxosRecipient = _paxosRecipient;\n\n        emit PaxosRecipientUpdated(_paxosRecipient);\n    }\n}\n"
+    },
+    "dependencies/@openzeppelin-contracts-upgradeable-5.0.2-5.0.2/contracts/proxy/utils/Initializable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (proxy/utils/Initializable.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev This is a base contract to aid in writing upgradeable contracts, or any kind of contract that will be deployed\n * behind a proxy. Since proxied contracts do not make use of a constructor, it's common to move constructor logic to an\n * external initializer function, usually called `initialize`. It then becomes necessary to protect this initializer\n * function so it can only be called once. The {initializer} modifier provided by this contract will have this effect.\n *\n * The initialization functions use a version number. Once a version number is used, it is consumed and cannot be\n * reused. This mechanism prevents re-execution of each \"step\" but allows the creation of new initialization steps in\n * case an upgrade adds a module that needs to be initialized.\n *\n * For example:\n *\n * [.hljs-theme-light.nopadding]\n * ```solidity\n * contract MyToken is ERC20Upgradeable {\n *     function initialize() initializer public {\n *         __ERC20_init(\"MyToken\", \"MTK\");\n *     }\n * }\n *\n * contract MyTokenV2 is MyToken, ERC20PermitUpgradeable {\n *     function initializeV2() reinitializer(2) public {\n *         __ERC20Permit_init(\"MyToken\");\n *     }\n * }\n * ```\n *\n * TIP: To avoid leaving the proxy in an uninitialized state, the initializer function should be called as early as\n * possible by providing the encoded function call as the `_data` argument to {ERC1967Proxy-constructor}.\n *\n * CAUTION: When used with inheritance, manual care must be taken to not invoke a parent initializer twice, or to ensure\n * that all initializers are idempotent. This is not verified automatically as constructors are by Solidity.\n *\n * [CAUTION]\n * ====\n * Avoid leaving a contract uninitialized.\n *\n * An uninitialized contract can be taken over by an attacker. This applies to both a proxy and its implementation\n * contract, which may impact the proxy. To prevent the implementation contract from being used, you should invoke\n * the {_disableInitializers} function in the constructor to automatically lock it when it is deployed:\n *\n * [.hljs-theme-light.nopadding]\n * ```\n * /// @custom:oz-upgrades-unsafe-allow constructor\n * constructor() {\n *     _disableInitializers();\n * }\n * ```\n * ====\n */\nabstract contract Initializable {\n    /**\n     * @dev Storage of the initializable contract.\n     *\n     * It's implemented on a custom ERC-7201 namespace to reduce the risk of storage collisions\n     * when using with upgradeable contracts.\n     *\n     * @custom:storage-location erc7201:openzeppelin.storage.Initializable\n     */\n    struct InitializableStorage {\n        /**\n         * @dev Indicates that the contract has been initialized.\n         */\n        uint64 _initialized;\n        /**\n         * @dev Indicates that the contract is in the process of being initialized.\n         */\n        bool _initializing;\n    }\n\n    // keccak256(abi.encode(uint256(keccak256(\"openzeppelin.storage.Initializable\")) - 1)) & ~bytes32(uint256(0xff))\n    bytes32 private constant INITIALIZABLE_STORAGE = 0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00;\n\n    /**\n     * @dev The contract is already initialized.\n     */\n    error InvalidInitialization();\n\n    /**\n     * @dev The contract is not initializing.\n     */\n    error NotInitializing();\n\n    /**\n     * @dev Triggered when the contract has been initialized or reinitialized.\n     */\n    event Initialized(uint64 version);\n\n    /**\n     * @dev A modifier that defines a protected initializer function that can be invoked at most once. In its scope,\n     * `onlyInitializing` functions can be used to initialize parent contracts.\n     *\n     * Similar to `reinitializer(1)`, except that in the context of a constructor an `initializer` may be invoked any\n     * number of times. This behavior in the constructor can be useful during testing and is not expected to be used in\n     * production.\n     *\n     * Emits an {Initialized} event.\n     */\n    modifier initializer() {\n        // solhint-disable-next-line var-name-mixedcase\n        InitializableStorage storage $ = _getInitializableStorage();\n\n        // Cache values to avoid duplicated sloads\n        bool isTopLevelCall = !$._initializing;\n        uint64 initialized = $._initialized;\n\n        // Allowed calls:\n        // - initialSetup: the contract is not in the initializing state and no previous version was\n        //                 initialized\n        // - construction: the contract is initialized at version 1 (no reininitialization) and the\n        //                 current contract is just being deployed\n        bool initialSetup = initialized == 0 && isTopLevelCall;\n        bool construction = initialized == 1 && address(this).code.length == 0;\n\n        if (!initialSetup && !construction) {\n            revert InvalidInitialization();\n        }\n        $._initialized = 1;\n        if (isTopLevelCall) {\n            $._initializing = true;\n        }\n        _;\n        if (isTopLevelCall) {\n            $._initializing = false;\n            emit Initialized(1);\n        }\n    }\n\n    /**\n     * @dev A modifier that defines a protected reinitializer function that can be invoked at most once, and only if the\n     * contract hasn't been initialized to a greater version before. In its scope, `onlyInitializing` functions can be\n     * used to initialize parent contracts.\n     *\n     * A reinitializer may be used after the original initialization step. This is essential to configure modules that\n     * are added through upgrades and that require initialization.\n     *\n     * When `version` is 1, this modifier is similar to `initializer`, except that functions marked with `reinitializer`\n     * cannot be nested. If one is invoked in the context of another, execution will revert.\n     *\n     * Note that versions can jump in increments greater than 1; this implies that if multiple reinitializers coexist in\n     * a contract, executing them in the right order is up to the developer or operator.\n     *\n     * WARNING: Setting the version to 2**64 - 1 will prevent any future reinitialization.\n     *\n     * Emits an {Initialized} event.\n     */\n    modifier reinitializer(uint64 version) {\n        // solhint-disable-next-line var-name-mixedcase\n        InitializableStorage storage $ = _getInitializableStorage();\n\n        if ($._initializing || $._initialized >= version) {\n            revert InvalidInitialization();\n        }\n        $._initialized = version;\n        $._initializing = true;\n        _;\n        $._initializing = false;\n        emit Initialized(version);\n    }\n\n    /**\n     * @dev Modifier to protect an initialization function so that it can only be invoked by functions with the\n     * {initializer} and {reinitializer} modifiers, directly or indirectly.\n     */\n    modifier onlyInitializing() {\n        _checkInitializing();\n        _;\n    }\n\n    /**\n     * @dev Reverts if the contract is not in an initializing state. See {onlyInitializing}.\n     */\n    function _checkInitializing() internal view virtual {\n        if (!_isInitializing()) {\n            revert NotInitializing();\n        }\n    }\n\n    /**\n     * @dev Locks the contract, preventing any future reinitialization. This cannot be part of an initializer call.\n     * Calling this in the constructor of a contract will prevent that contract from being initialized or reinitialized\n     * to any version. It is recommended to use this to lock implementation contracts that are designed to be called\n     * through proxies.\n     *\n     * Emits an {Initialized} event the first time it is successfully executed.\n     */\n    function _disableInitializers() internal virtual {\n        // solhint-disable-next-line var-name-mixedcase\n        InitializableStorage storage $ = _getInitializableStorage();\n\n        if ($._initializing) {\n            revert InvalidInitialization();\n        }\n        if ($._initialized != type(uint64).max) {\n            $._initialized = type(uint64).max;\n            emit Initialized(type(uint64).max);\n        }\n    }\n\n    /**\n     * @dev Returns the highest version that has been initialized. See {reinitializer}.\n     */\n    function _getInitializedVersion() internal view returns (uint64) {\n        return _getInitializableStorage()._initialized;\n    }\n\n    /**\n     * @dev Returns `true` if the contract is currently initializing. See {onlyInitializing}.\n     */\n    function _isInitializing() internal view returns (bool) {\n        return _getInitializableStorage()._initializing;\n    }\n\n    /**\n     * @dev Returns a pointer to the storage namespace.\n     */\n    // solhint-disable-next-line var-name-mixedcase\n    function _getInitializableStorage() private pure returns (InitializableStorage storage $) {\n        assembly {\n            $.slot := INITIALIZABLE_STORAGE\n        }\n    }\n}\n"
+    },
+    "src/contracts/Interfaces.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\nimport {IERC4626} from \"@openzeppelin/contracts/interfaces/IERC4626.sol\";\n\ninterface IERC20 {\n    function totalSupply() external view returns (uint256);\n    function balanceOf(address account) external view returns (uint256);\n    function transfer(address to, uint256 value) external returns (bool);\n    function allowance(address owner, address spender) external view returns (uint256);\n    function approve(address spender, uint256 value) external returns (bool);\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n    function decimals() external view returns (uint8);\n\n    event Transfer(address indexed from, address indexed to, uint256 value);\n}\n\ninterface ILiquidityProviderARM is IERC20 {\n    function previewDeposit(uint256 assets) external returns (uint256 shares);\n    function deposit(uint256 assets) external returns (uint256 shares);\n    function deposit(uint256 assets, address liquidityProvider) external returns (uint256 shares);\n\n    function previewRedeem(uint256 shares) external returns (uint256 assets);\n    function requestRedeem(uint256 shares) external returns (uint256 requestId, uint256 assets);\n    function claimRedeem(uint256 requestId) external returns (uint256 assets);\n\n    function totalAssets() external returns (uint256 assets);\n    function convertToShares(uint256 assets) external returns (uint256 shares);\n    function convertToAssets(uint256 shares) external returns (uint256 assets);\n    function lastTotalAssets() external returns (uint256 assets);\n}\n\ninterface ICapManager {\n    function postDepositHook(address liquidityProvider, uint256 assets) external;\n}\n\n/// @notice Adapter interface for assets that require protocol-specific redemption flows.\n/// @dev ARM calls adapters when a base asset cannot be redeemed synchronously into the ARM liquidity asset.\ninterface IAssetAdapter {\n    /// @notice Returns the liquidity asset received by the ARM after adapter redemptions.\n    function asset() external view returns (address);\n\n    /// @notice Converts adapter share tokens into the expected amount of liquidity assets.\n    /// @param shares Amount of protocol share tokens.\n    /// @return assets Expected amount of liquidity assets.\n    function convertToAssets(uint256 shares) external view returns (uint256 assets);\n\n    /// @notice Converts liquidity assets into the expected amount of adapter share tokens.\n    /// @param assets Amount of liquidity assets.\n    /// @return shares Expected amount of protocol share tokens.\n    function convertToShares(uint256 assets) external view returns (uint256 shares);\n\n    /// @notice Requests an asynchronous redemption from protocol share tokens into liquidity assets.\n    /// @dev Implementations pull `shares` from the ARM and record protocol request metadata for later claiming.\n    /// @param shares Amount of protocol share tokens to redeem.\n    /// @return sharesRequested Amount of share tokens accepted into the redemption request.\n    /// @return assetsExpected Expected liquidity assets from the redemption request.\n    function requestRedeem(uint256 shares) external returns (uint256 sharesRequested, uint256 assetsExpected);\n\n    /// @notice Claims previously requested redemptions and sends received liquidity assets to the ARM.\n    /// @dev Claims must be made in the adapter's pending-request order and may revert if the requested shares are not\n    ///      fully claimable.\n    /// @param shares Amount of protocol share tokens represented by pending requests to claim.\n    /// @return sharesClaimed Amount of share tokens represented by claimed requests.\n    /// @return assetsExpected Expected liquidity assets recorded when the requests were opened.\n    /// @return assetsReceived Actual liquidity assets received and transferred to the ARM.\n    function redeem(uint256 shares)\n        external\n        returns (uint256 sharesClaimed, uint256 assetsExpected, uint256 assetsReceived);\n}\n\ninterface LegacyAMM {\n    function transferToken(address tokenOut, address to, uint256 amount) external;\n}\n\ninterface IOriginVault {\n    function mint(address _asset, uint256 _amount, uint256 _minimumOusdAmount) external;\n\n    function redeem(uint256 _amount, uint256 _minimumUnitAmount) external;\n\n    function requestWithdrawal(uint256 amount) external returns (uint256 requestId, uint256 queued);\n\n    function claimWithdrawal(uint256 requestId) external returns (uint256 amount);\n\n    function claimWithdrawals(uint256[] memory requestIds)\n        external\n        returns (uint256[] memory amounts, uint256 totalAmount);\n\n    function addWithdrawalQueueLiquidity() external;\n\n    function setMaxSupplyDiff(uint256 _maxSupplyDiff) external;\n\n    function governor() external view returns (address);\n\n    function dripper() external view returns (address);\n\n    function withdrawalQueueMetadata()\n        external\n        view\n        returns (uint128 queued, uint128 claimable, uint128 claimed, uint128 nextWithdrawalIndex);\n\n    function withdrawalRequests(uint256 requestId)\n        external\n        view\n        returns (address withdrawer, bool claimed, uint40 timestamp, uint128 amount, uint128 queued);\n\n    function withdrawalClaimDelay() external view returns (uint256);\n}\n\ninterface IGovernance {\n    enum ProposalState {\n        Pending,\n        Active,\n        Canceled,\n        Defeated,\n        Succeeded,\n        Queued,\n        Expired,\n        Executed\n    }\n\n    function state(uint256 proposalId) external view returns (ProposalState);\n\n    function proposalSnapshot(uint256 proposalId) external view returns (uint256);\n\n    function proposalDeadline(uint256 proposalId) external view returns (uint256);\n\n    function proposalEta(uint256 proposalId) external view returns (uint256);\n\n    function votingDelay() external view returns (uint256);\n\n    function castVote(uint256 proposalId, uint8 support) external returns (uint256 balance);\n\n    function queue(uint256 proposalId) external;\n\n    function execute(uint256 proposalId) external;\n}\n\ninterface IWETH is IERC20 {\n    event Deposit(address indexed dst, uint256 wad);\n    event Withdrawal(address indexed src, uint256 wad);\n\n    function deposit() external payable;\n    function withdraw(uint256 wad) external;\n}\n\ninterface ISTETH is IERC20 {\n    event Submitted(address indexed sender, uint256 amount, address referral);\n\n    // function() external payable;\n    function submit(address _referral) external payable returns (uint256);\n}\n\ninterface IWstETH is IERC20 {\n    function getStETHByWstETH(uint256 wstETHAmount) external view returns (uint256);\n    function getWstETHByStETH(uint256 stETHAmount) external view returns (uint256);\n    function unwrap(uint256 wstETHAmount) external returns (uint256);\n}\n\ninterface IStETHWithdrawal {\n    event WithdrawalRequested(\n        uint256 indexed requestId,\n        address indexed requestor,\n        address indexed owner,\n        uint256 amountOfStETH,\n        uint256 amountOfShares\n    );\n    event WithdrawalsFinalized(\n        uint256 indexed from, uint256 indexed to, uint256 amountOfETHLocked, uint256 sharesToBurn, uint256 timestamp\n    );\n    event WithdrawalClaimed(\n        uint256 indexed requestId, address indexed owner, address indexed receiver, uint256 amountOfETH\n    );\n\n    struct WithdrawalRequestStatus {\n        /// @notice stETH token amount that was locked on withdrawal queue for this request\n        uint256 amountOfStETH;\n        /// @notice amount of stETH shares locked on withdrawal queue for this request\n        uint256 amountOfShares;\n        /// @notice address that can claim or transfer this request\n        address owner;\n        /// @notice timestamp of when the request was created, in seconds\n        uint256 timestamp;\n        /// @notice true, if request is finalized\n        bool isFinalized;\n        /// @notice true, if request is claimed. Request is claimable if (isFinalized && !isClaimed)\n        bool isClaimed;\n    }\n\n    function transferFrom(address _from, address _to, uint256 _requestId) external;\n    function ownerOf(uint256 _requestId) external returns (address);\n    function requestWithdrawals(uint256[] calldata _amounts, address _owner)\n        external\n        returns (uint256[] memory requestIds);\n    function getLastCheckpointIndex() external view returns (uint256);\n    function findCheckpointHints(uint256[] calldata _requestIds, uint256 _firstIndex, uint256 _lastIndex)\n        external\n        view\n        returns (uint256[] memory hintIds);\n    function claimWithdrawals(uint256[] calldata _requestIds, uint256[] calldata _hints) external;\n    function getWithdrawalStatus(uint256[] calldata _requestIds)\n        external\n        view\n        returns (WithdrawalRequestStatus[] memory statuses);\n    function getWithdrawalRequests(address _owner) external view returns (uint256[] memory requestsIds);\n    function getLastRequestId() external view returns (uint256);\n}\n\ninterface IOracle {\n    function price(address asset) external view returns (uint256 price);\n}\n\ninterface IHarvestable {\n    function collectRewards() external returns (address[] memory tokens, uint256[] memory rewards);\n}\n\ninterface IMagpieRouter {\n    function swapWithMagpieSignature(bytes calldata) external payable returns (uint256 amountOut);\n}\n\nlibrary DistributionTypes {\n    struct IncentivesProgramCreationInput {\n        string name;\n        address rewardToken;\n        uint104 emissionPerSecond;\n        uint40 distributionEnd;\n    }\n}\n\nlibrary IDistributionManager {\n    struct AccruedRewards {\n        uint256 amount;\n        bytes32 programId;\n        address rewardToken;\n    }\n}\n\ninterface SiloIncentivesControllerGaugeLike {\n    function claimRewards(address _to) external returns (IDistributionManager.AccruedRewards[] memory accruedRewards);\n    function createIncentivesProgram(DistributionTypes.IncentivesProgramCreationInput memory _incentivesProgramInput)\n        external;\n    function getAllProgramsNames() external view returns (string[] memory programsNames);\n    function getRewardsBalance(address _user, string memory _programName)\n        external\n        view\n        returns (uint256 unclaimedRewards);\n    function incentivesPrograms(bytes32)\n        external\n        view\n        returns (\n            uint256 index,\n            address rewardToken,\n            uint104 emissionPerSecond,\n            uint40 lastUpdateTimestamp,\n            uint40 distributionEnd\n        );\n    function owner() external view returns (address);\n}\n\ninterface IEETHWithdrawal {\n    function requestWithdraw(address receipient, uint256 amount) external returns (uint256 requestId);\n}\n\ninterface IEETHWithdrawalNFT {\n    function finalizeRequests(uint256 requestId) external;\n    function claimWithdraw(uint256 requestId) external;\n    function batchClaimWithdraw(uint256[] calldata requestIds) external;\n}\n\ninterface IEETHRedemptionManager {\n    function redeemEEth(uint256 amount, address receiver) external;\n    function redeemWeEth(uint256 amount, address receiver) external;\n    function canRedeem(uint256 amount) external view returns (bool);\n}\n\ninterface IWeETH {\n    function getEETHByWeETH(uint256 weETHAmount) external view returns (uint256);\n    function getWeETHByeETH(uint256 eETHAmount) external view returns (uint256);\n    function unwrap(uint256 weETHAmount) external returns (uint256);\n}\n\ninterface IDistributor {\n    function claim(\n        address[] calldata users,\n        address[] calldata tokens,\n        uint256[] calldata amounts,\n        bytes32[][] calldata proofs\n    ) external;\n}\n\n// Ethena Interfaces\n\nstruct UserCooldown {\n    uint104 cooldownEnd;\n    uint152 underlyingAmount;\n}\n\ninterface IStakedUSDe is IERC4626 {\n    // Errors //\n    /// @notice Error emitted when the shares amount to redeem is greater than the shares balance of the owner\n    error ExcessiveRedeemAmount(); // 0x63345388\n    /// @notice Error emitted when the shares amount to withdraw is greater than the shares balance of the owner\n    error ExcessiveWithdrawAmount(); // 0xdf53dde2\n\n    function cooldownAssets(uint256 assets) external returns (uint256 shares);\n\n    function cooldownShares(uint256 shares) external returns (uint256 assets);\n\n    function unstake(address receiver) external;\n\n    function cooldowns(address receiver) external view returns (UserCooldown memory);\n\n    function getUnvestedAmount() external view returns (uint256);\n\n    function lastDistributionTimestamp() external view returns (uint256);\n\n    function transferInRewards(uint256 amount) external;\n}\n"
+    },
+    "src/contracts/OwnableOperable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\nimport {Ownable} from \"./Ownable.sol\";\n\n/**\n * @title Base contract that provides ownership and operational control\n * @author Origin Protocol Inc\n */\ncontract OwnableOperable is Ownable {\n    error OnlyOperatorOrOwner(); // 0x3fbed347\n\n    /// @notice The account that can request and claim withdrawals.\n    address public operator;\n\n    uint256[49] private _gap;\n\n    event OperatorChanged(address newAdmin);\n\n    function _initOwnableOperable(address _operator) internal {\n        _setOperator(_operator);\n    }\n\n    /// @notice Set the account that can request and claim withdrawals.\n    /// @param newOperator The address of the new operator.\n    function setOperator(address newOperator) external onlyOwner {\n        _setOperator(newOperator);\n    }\n\n    function _setOperator(address newOperator) internal {\n        operator = newOperator;\n\n        emit OperatorChanged(newOperator);\n    }\n\n    modifier onlyOperatorOrOwner() {\n        if (msg.sender != operator && msg.sender != _owner()) revert OnlyOperatorOrOwner();\n        _;\n    }\n}\n"
+    },
+    "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/interfaces/IERC4626.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/IERC4626.sol)\n\npragma solidity ^0.8.20;\n\nimport {IERC20} from \"../token/ERC20/IERC20.sol\";\nimport {IERC20Metadata} from \"../token/ERC20/extensions/IERC20Metadata.sol\";\n\n/**\n * @dev Interface of the ERC4626 \"Tokenized Vault Standard\", as defined in\n * https://eips.ethereum.org/EIPS/eip-4626[ERC-4626].\n */\ninterface IERC4626 is IERC20, IERC20Metadata {\n    event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);\n\n    event Withdraw(\n        address indexed sender,\n        address indexed receiver,\n        address indexed owner,\n        uint256 assets,\n        uint256 shares\n    );\n\n    /**\n     * @dev Returns the address of the underlying token used for the Vault for accounting, depositing, and withdrawing.\n     *\n     * - MUST be an ERC-20 token contract.\n     * - MUST NOT revert.\n     */\n    function asset() external view returns (address assetTokenAddress);\n\n    /**\n     * @dev Returns the total amount of the underlying asset that is “managed” by Vault.\n     *\n     * - SHOULD include any compounding that occurs from yield.\n     * - MUST be inclusive of any fees that are charged against assets in the Vault.\n     * - MUST NOT revert.\n     */\n    function totalAssets() external view returns (uint256 totalManagedAssets);\n\n    /**\n     * @dev Returns the amount of shares that the Vault would exchange for the amount of assets provided, in an ideal\n     * scenario where all the conditions are met.\n     *\n     * - MUST NOT be inclusive of any fees that are charged against assets in the Vault.\n     * - MUST NOT show any variations depending on the caller.\n     * - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.\n     * - MUST NOT revert.\n     *\n     * NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the\n     * “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and\n     * from.\n     */\n    function convertToShares(uint256 assets) external view returns (uint256 shares);\n\n    /**\n     * @dev Returns the amount of assets that the Vault would exchange for the amount of shares provided, in an ideal\n     * scenario where all the conditions are met.\n     *\n     * - MUST NOT be inclusive of any fees that are charged against assets in the Vault.\n     * - MUST NOT show any variations depending on the caller.\n     * - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.\n     * - MUST NOT revert.\n     *\n     * NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the\n     * “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and\n     * from.\n     */\n    function convertToAssets(uint256 shares) external view returns (uint256 assets);\n\n    /**\n     * @dev Returns the maximum amount of the underlying asset that can be deposited into the Vault for the receiver,\n     * through a deposit call.\n     *\n     * - MUST return a limited value if receiver is subject to some deposit limit.\n     * - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of assets that may be deposited.\n     * - MUST NOT revert.\n     */\n    function maxDeposit(address receiver) external view returns (uint256 maxAssets);\n\n    /**\n     * @dev Allows an on-chain or off-chain user to simulate the effects of their deposit at the current block, given\n     * current on-chain conditions.\n     *\n     * - MUST return as close to and no more than the exact amount of Vault shares that would be minted in a deposit\n     *   call in the same transaction. I.e. deposit should return the same or more shares as previewDeposit if called\n     *   in the same transaction.\n     * - MUST NOT account for deposit limits like those returned from maxDeposit and should always act as though the\n     *   deposit would be accepted, regardless if the user has enough tokens approved, etc.\n     * - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.\n     * - MUST NOT revert.\n     *\n     * NOTE: any unfavorable discrepancy between convertToShares and previewDeposit SHOULD be considered slippage in\n     * share price or some other type of condition, meaning the depositor will lose assets by depositing.\n     */\n    function previewDeposit(uint256 assets) external view returns (uint256 shares);\n\n    /**\n     * @dev Mints shares Vault shares to receiver by depositing exactly amount of underlying tokens.\n     *\n     * - MUST emit the Deposit event.\n     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the\n     *   deposit execution, and are accounted for during deposit.\n     * - MUST revert if all of assets cannot be deposited (due to deposit limit being reached, slippage, the user not\n     *   approving enough underlying tokens to the Vault contract, etc).\n     *\n     * NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.\n     */\n    function deposit(uint256 assets, address receiver) external returns (uint256 shares);\n\n    /**\n     * @dev Returns the maximum amount of the Vault shares that can be minted for the receiver, through a mint call.\n     * - MUST return a limited value if receiver is subject to some mint limit.\n     * - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of shares that may be minted.\n     * - MUST NOT revert.\n     */\n    function maxMint(address receiver) external view returns (uint256 maxShares);\n\n    /**\n     * @dev Allows an on-chain or off-chain user to simulate the effects of their mint at the current block, given\n     * current on-chain conditions.\n     *\n     * - MUST return as close to and no fewer than the exact amount of assets that would be deposited in a mint call\n     *   in the same transaction. I.e. mint should return the same or fewer assets as previewMint if called in the\n     *   same transaction.\n     * - MUST NOT account for mint limits like those returned from maxMint and should always act as though the mint\n     *   would be accepted, regardless if the user has enough tokens approved, etc.\n     * - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.\n     * - MUST NOT revert.\n     *\n     * NOTE: any unfavorable discrepancy between convertToAssets and previewMint SHOULD be considered slippage in\n     * share price or some other type of condition, meaning the depositor will lose assets by minting.\n     */\n    function previewMint(uint256 shares) external view returns (uint256 assets);\n\n    /**\n     * @dev Mints exactly shares Vault shares to receiver by depositing amount of underlying tokens.\n     *\n     * - MUST emit the Deposit event.\n     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the mint\n     *   execution, and are accounted for during mint.\n     * - MUST revert if all of shares cannot be minted (due to deposit limit being reached, slippage, the user not\n     *   approving enough underlying tokens to the Vault contract, etc).\n     *\n     * NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.\n     */\n    function mint(uint256 shares, address receiver) external returns (uint256 assets);\n\n    /**\n     * @dev Returns the maximum amount of the underlying asset that can be withdrawn from the owner balance in the\n     * Vault, through a withdraw call.\n     *\n     * - MUST return a limited value if owner is subject to some withdrawal limit or timelock.\n     * - MUST NOT revert.\n     */\n    function maxWithdraw(address owner) external view returns (uint256 maxAssets);\n\n    /**\n     * @dev Allows an on-chain or off-chain user to simulate the effects of their withdrawal at the current block,\n     * given current on-chain conditions.\n     *\n     * - MUST return as close to and no fewer than the exact amount of Vault shares that would be burned in a withdraw\n     *   call in the same transaction. I.e. withdraw should return the same or fewer shares as previewWithdraw if\n     *   called\n     *   in the same transaction.\n     * - MUST NOT account for withdrawal limits like those returned from maxWithdraw and should always act as though\n     *   the withdrawal would be accepted, regardless if the user has enough shares, etc.\n     * - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.\n     * - MUST NOT revert.\n     *\n     * NOTE: any unfavorable discrepancy between convertToShares and previewWithdraw SHOULD be considered slippage in\n     * share price or some other type of condition, meaning the depositor will lose assets by depositing.\n     */\n    function previewWithdraw(uint256 assets) external view returns (uint256 shares);\n\n    /**\n     * @dev Burns shares from owner and sends exactly assets of underlying tokens to receiver.\n     *\n     * - MUST emit the Withdraw event.\n     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the\n     *   withdraw execution, and are accounted for during withdraw.\n     * - MUST revert if all of assets cannot be withdrawn (due to withdrawal limit being reached, slippage, the owner\n     *   not having enough shares, etc).\n     *\n     * Note that some implementations will require pre-requesting to the Vault before a withdrawal may be performed.\n     * Those methods should be performed separately.\n     */\n    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);\n\n    /**\n     * @dev Returns the maximum amount of Vault shares that can be redeemed from the owner balance in the Vault,\n     * through a redeem call.\n     *\n     * - MUST return a limited value if owner is subject to some withdrawal limit or timelock.\n     * - MUST return balanceOf(owner) if owner is not subject to any withdrawal limit or timelock.\n     * - MUST NOT revert.\n     */\n    function maxRedeem(address owner) external view returns (uint256 maxShares);\n\n    /**\n     * @dev Allows an on-chain or off-chain user to simulate the effects of their redeemption at the current block,\n     * given current on-chain conditions.\n     *\n     * - MUST return as close to and no more than the exact amount of assets that would be withdrawn in a redeem call\n     *   in the same transaction. I.e. redeem should return the same or more assets as previewRedeem if called in the\n     *   same transaction.\n     * - MUST NOT account for redemption limits like those returned from maxRedeem and should always act as though the\n     *   redemption would be accepted, regardless if the user has enough shares, etc.\n     * - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.\n     * - MUST NOT revert.\n     *\n     * NOTE: any unfavorable discrepancy between convertToAssets and previewRedeem SHOULD be considered slippage in\n     * share price or some other type of condition, meaning the depositor will lose assets by redeeming.\n     */\n    function previewRedeem(uint256 shares) external view returns (uint256 assets);\n\n    /**\n     * @dev Burns exactly shares from owner and sends assets of underlying tokens to receiver.\n     *\n     * - MUST emit the Withdraw event.\n     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the\n     *   redeem execution, and are accounted for during redeem.\n     * - MUST revert if all of shares cannot be redeemed (due to withdrawal limit being reached, slippage, the owner\n     *   not having enough shares, etc).\n     *\n     * NOTE: some implementations will require pre-requesting to the Vault before a withdrawal may be performed.\n     * Those methods should be performed separately.\n     */\n    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);\n}\n"
+    },
+    "src/contracts/Ownable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\n/**\n * @title Base contract that provides ownership control\n * @author Origin Protocol Inc\n */\ncontract Ownable {\n    error OnlyOwner(); // 0x5fc483c5\n\n    /// @notice The slot used to store the owner of the contract.\n    /// This is also used as the proxy admin.\n    /// keccak256(“eip1967.proxy.admin”) - 1 per EIP 1967\n    bytes32 internal constant OWNER_SLOT = 0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103;\n\n    event AdminChanged(address previousAdmin, address newAdmin);\n\n    constructor() {\n        assert(OWNER_SLOT == bytes32(uint256(keccak256(\"eip1967.proxy.admin\")) - 1));\n        _setOwner(msg.sender);\n    }\n\n    /// @notice The contract owner and proxy admin.\n    function owner() public view returns (address) {\n        return _owner();\n    }\n\n    /// @notice Set the owner and proxy admin of the contract.\n    /// @param newOwner The address of the new owner.\n    function setOwner(address newOwner) external onlyOwner {\n        _setOwner(newOwner);\n    }\n\n    function _owner() internal view returns (address ownerOut) {\n        bytes32 position = OWNER_SLOT;\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            ownerOut := sload(position)\n        }\n    }\n\n    function _setOwner(address newOwner) internal {\n        emit AdminChanged(_owner(), newOwner);\n        bytes32 position = OWNER_SLOT;\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            sstore(position, newOwner)\n        }\n    }\n\n    function _onlyOwner() internal view {\n        if (msg.sender != _owner()) revert OnlyOwner();\n    }\n\n    modifier onlyOwner() {\n        _onlyOwner();\n        _;\n    }\n}\n"
+    },
+    "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/token/ERC20/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /**\n     * @dev Returns the value of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the value of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves a `value` amount of tokens from the caller's account to `to`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address to, uint256 value) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the\n     * caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 value) external returns (bool);\n\n    /**\n     * @dev Moves a `value` amount of tokens from `from` to `to` using the\n     * allowance mechanism. `value` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n}\n"
+    },
+    "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/token/ERC20/extensions/IERC20Metadata.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Metadata.sol)\n\npragma solidity ^0.8.20;\n\nimport {IERC20} from \"../IERC20.sol\";\n\n/**\n * @dev Interface for the optional metadata functions from the ERC20 standard.\n */\ninterface IERC20Metadata is IERC20 {\n    /**\n     * @dev Returns the name of the token.\n     */\n    function name() external view returns (string memory);\n\n    /**\n     * @dev Returns the symbol of the token.\n     */\n    function symbol() external view returns (string memory);\n\n    /**\n     * @dev Returns the decimals places of the token.\n     */\n    function decimals() external view returns (uint8);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.23+commit.f704f362"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_arm",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_baseAsset",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_liquidityAsset",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "DecimalsMismatch",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "required",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "available",
+              "type": "uint256"
+            }
+          ],
+          "name": "InsufficientSettledAssets",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidInitialization",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidPaxosRecipient",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotInitializing",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "OnlyARM",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "OnlyOperatorOrOwner",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "OnlyOwner",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "PaxosRecipientNotConfigured",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "RedeemAmountTooHigh",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroShares",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "previousAdmin",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "AdminChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "ExcessLiquidityRecovered",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "version",
+              "type": "uint64"
+            }
+          ],
+          "name": "Initialized",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "OperatorChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "paxosRecipient",
+              "type": "address"
+            }
+          ],
+          "name": "PaxosRecipientUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "assetsExpected",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "assetsReceived",
+              "type": "uint256"
+            }
+          ],
+          "name": "PaxosRedeemClaimed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "assetsExpected",
+              "type": "uint256"
+            }
+          ],
+          "name": "PaxosRedeemRequested",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "paxosRedemptionId",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "paxosRecipient",
+              "type": "address"
+            }
+          ],
+          "name": "PaxosRedeemSubmitted",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "arm",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "asset",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "baseAsset",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "name": "convertToAssets",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "assets",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "assets",
+              "type": "uint256"
+            }
+          ],
+          "name": "convertToShares",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_operator",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_paxosRecipient",
+              "type": "address"
+            }
+          ],
+          "name": "initialize",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "liquidityAsset",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "operator",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "paxosRecipient",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pendingShares",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "recoverExcessLiquidity",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "name": "redeem",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "sharesClaimed",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "assetsExpected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "assetsReceived",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "name": "requestRedeem",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "sharesRequested",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "assetsExpected",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOperator",
+              "type": "address"
+            }
+          ],
+          "name": "setOperator",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "setOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_paxosRecipient",
+              "type": "address"
+            }
+          ],
+          "name": "setPaxosRecipient",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "settlingShares",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "paxosRedemptionId",
+              "type": "bytes32"
+            }
+          ],
+          "name": "submitPaxosRedeem",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Origin Protocol Inc",
+        "errors": {
+          "InvalidInitialization()": [
+            {
+              "details": "The contract is already initialized."
+            }
+          ],
+          "NotInitializing()": [
+            {
+              "details": "The contract is not initializing."
+            }
+          ]
+        },
+        "events": {
+          "Initialized(uint64)": {
+            "details": "Triggered when the contract has been initialized or reinitialized."
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "constructor": {
+            "params": {
+              "_arm": "ARM contract authorized to use the adapter.",
+              "_baseAsset": "Paxos-issued stablecoin to redeem.",
+              "_liquidityAsset": "Liquidity stablecoin received after Paxos settlement."
+            }
+          },
+          "convertToAssets(uint256)": {
+            "params": {
+              "shares": "Base asset amount."
+            },
+            "returns": {
+              "assets": "Expected liquidity asset amount."
+            }
+          },
+          "convertToShares(uint256)": {
+            "params": {
+              "assets": "Liquidity asset amount."
+            },
+            "returns": {
+              "shares": "Expected base asset amount."
+            }
+          },
+          "initialize(address,address)": {
+            "params": {
+              "_operator": "Account that can submit queued redemptions to Paxos.",
+              "_paxosRecipient": "Paxos on-chain deposit address. Must be non-zero, otherwise reverts."
+            }
+          },
+          "recoverExcessLiquidity()": {
+            "details": "The recovered liquidity asset is always sent to the ARM."
+          },
+          "redeem(uint256)": {
+            "params": {
+              "shares": "Base asset amount represented by the settled redemption."
+            },
+            "returns": {
+              "assetsExpected": "Expected USDC from Paxos settlement.",
+              "assetsReceived": "USDC transferred to the ARM.",
+              "sharesClaimed": "Base asset amount claimed."
+            }
+          },
+          "requestRedeem(uint256)": {
+            "params": {
+              "shares": "Base asset amount to queue."
+            },
+            "returns": {
+              "assetsExpected": "Expected USDC from Paxos settlement.",
+              "sharesRequested": "Base asset amount queued."
+            }
+          },
+          "setOperator(address)": {
+            "params": {
+              "newOperator": "The address of the new operator."
+            }
+          },
+          "setOwner(address)": {
+            "params": {
+              "newOwner": "The address of the new owner."
+            }
+          },
+          "setPaxosRecipient(address)": {
+            "params": {
+              "_paxosRecipient": "Paxos deposit address for the adapter's base asset."
+            }
+          },
+          "submitPaxosRedeem(uint256,bytes32)": {
+            "details": "Paxos Actions should use `paxosRedemptionId` to correlate this transfer with off-chain orchestration.",
+            "params": {
+              "paxosRedemptionId": "Off-chain Paxos orchestration or idempotency identifier.",
+              "shares": "Base asset amount to send. For example, `100e6` is 100 USDG/PYUSD."
+            }
+          }
+        },
+        "title": "Paxos asset adapter",
+        "version": 1
+      },
+      "userdoc": {
+        "events": {
+          "PaxosRedeemClaimed(uint256,uint256,uint256)": {
+            "notice": "Emitted when settled liquidity assets are transferred to the ARM, where `100e6` is 100 USDC."
+          },
+          "PaxosRedeemRequested(uint256,uint256)": {
+            "notice": "Emitted when base assets are queued for redemption, where `100e6` is 100 tokens for 6-decimal assets."
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "arm()": {
+            "notice": "ARM contract authorized to request and claim redemptions."
+          },
+          "asset()": {
+            "notice": "Returns the liquidity asset produced by Paxos settlement."
+          },
+          "baseAsset()": {
+            "notice": "Paxos-issued stablecoin supplied by the ARM."
+          },
+          "convertToAssets(uint256)": {
+            "notice": "Converts base stablecoin shares into expected liquidity assets at 1:1."
+          },
+          "convertToShares(uint256)": {
+            "notice": "Converts liquidity assets into expected base stablecoin shares at 1:1."
+          },
+          "initialize(address,address)": {
+            "notice": "Initialize the adapter operator and Paxos recipient."
+          },
+          "liquidityAsset()": {
+            "notice": "Liquidity stablecoin received after Paxos settlement."
+          },
+          "operator()": {
+            "notice": "The account that can request and claim withdrawals."
+          },
+          "owner()": {
+            "notice": "The contract owner and proxy admin."
+          },
+          "paxosRecipient()": {
+            "notice": "On-chain Paxos deposit address used by Actions to settle queued redemptions."
+          },
+          "pendingShares()": {
+            "notice": "Base asset amount queued in the adapter but not yet sent to Paxos."
+          },
+          "recoverExcessLiquidity()": {
+            "notice": "Recovers liquidity asset held beyond what `settlingShares` still owes, e.g. donated tokens         or a Paxos settlement that arrived after its `settlingShares` was already closed out."
+          },
+          "redeem(uint256)": {
+            "notice": "Claims settled USDC after Paxos Actions complete on-chain settlement to this adapter."
+          },
+          "requestRedeem(uint256)": {
+            "notice": "Pulls base assets from the ARM and queues them for Paxos redemption."
+          },
+          "setOperator(address)": {
+            "notice": "Set the account that can request and claim withdrawals."
+          },
+          "setOwner(address)": {
+            "notice": "Set the owner and proxy admin of the contract."
+          },
+          "setPaxosRecipient(address)": {
+            "notice": "Set the Paxos on-chain deposit address used for future submissions."
+          },
+          "settlingShares()": {
+            "notice": "Base asset amount sent to Paxos and awaiting on-chain USDC settlement."
+          },
+          "submitPaxosRedeem(uint256,bytes32)": {
+            "notice": "Submit queued base assets to Paxos for API-orchestrated redemption."
+          }
+        },
+        "notice": "Adapter for redeeming Paxos-issued stablecoins through off-chain Paxos Actions with on-chain settlement.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/contracts/adapters/PaxosAssetAdapter.sol": "PaxosAssetAdapter"
+      },
+      "evmVersion": "shanghai",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts-upgradeable/=dependencies/@openzeppelin-contracts-upgradeable-5.0.2-5.0.2/contracts/",
+        ":@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/",
+        ":@pendle-sy/=dependencies/@pendle-sy-1.0.0-1.0.0/contracts/",
+        ":@solmate/=dependencies/solmate-6.7.0/src/",
+        ":contracts/=src/contracts/",
+        ":forge-std/=dependencies/forge-std-1.9.7/src/",
+        ":script/=script/",
+        ":test/=test/",
+        ":utils/=src/contracts/utils/",
+        "dependencies/@pendle-sy-1.0.0-1.0.0/:@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-4.9.3-4.9.3/contracts/"
+      ]
+    },
+    "sources": {
+      "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/interfaces/IERC4626.sol": {
+        "keccak256": "0x207f64371bc0fcc5be86713aa5da109a870cc3a6da50e93b64ee881e369b593d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://548667cfa76683767c2c610b577f6c2f0675d0ce28f53c3f37b969c84a56b205",
+          "dweb:/ipfs/QmUzA1CKC6bDdULuS44wGd7PWBNLiHb6bh7oHwJBDZSLAx"
+        ]
+      },
+      "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/token/ERC20/IERC20.sol": {
+        "keccak256": "0xc6a8ff0ea489379b61faa647490411b80102578440ab9d84e9a957cc12164e70",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0ea104e577e63faea3b69c415637e99e755dcbf64c5833d7140c35a714d6d90c",
+          "dweb:/ipfs/Qmau6x4Ns9XdyynRCNNp3RhLqijJjFm7z5fyZazfYFGYdq"
+        ]
+      },
+      "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/token/ERC20/extensions/IERC20Metadata.sol": {
+        "keccak256": "0xaa761817f6cd7892fcf158b3c776b34551cde36f48ff9703d53898bc45a94ea2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0ad7c8d4d08938c8dfc43d75a148863fb324b80cf53e0a36f7e5a4ac29008850",
+          "dweb:/ipfs/QmcrhfPgVNf5mkdhQvy1pMv51TFokD3Y4Wa5WZhFqVh8UV"
+        ]
+      },
+      "dependencies/@openzeppelin-contracts-upgradeable-5.0.2-5.0.2/contracts/proxy/utils/Initializable.sol": {
+        "keccak256": "0x631188737069917d2f909d29ce62c4d48611d326686ba6683e26b72a23bfac0b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7a61054ae84cd6c4d04c0c4450ba1d6de41e27e0a2c4f1bcdf58f796b401c609",
+          "dweb:/ipfs/QmUvtdp7X1mRVyC3CsHrtPbgoqWaXHp3S1ZR24tpAQYJWM"
+        ]
+      },
+      "src/contracts/Interfaces.sol": {
+        "keccak256": "0x825f778ad4a240db241f5e191bda96b16a6505c5dd6a6baf37f64f6c1a282dd5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://839b291ad4771ef84f700aba4c431405298c4b67ccf6934dc145a90d7846932e",
+          "dweb:/ipfs/QmegUexVC7JiexGU6aE6woxCuCuYfH83No3crBPKh5H1je"
+        ]
+      },
+      "src/contracts/Ownable.sol": {
+        "keccak256": "0x2342fbedd4995cf68278a13adcc4cf0bea8b8e8e31fd74c2898791fae67ef99a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b1908a0f0e4479e269cb8a3c8e2641ebf75f7e9c3b9bd85a937a9e255c959345",
+          "dweb:/ipfs/QmdZX5XkzCd777KSzVb2eKa8z8dGWKbCdAUWma2zZeiZys"
+        ]
+      },
+      "src/contracts/OwnableOperable.sol": {
+        "keccak256": "0x40ee53d1d31baf4c1c9e68c8e270555844481981cef77f3780b17c7c332de274",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://42d6936a3d0a35bd7add8bc29148fb0ffc4aaef60457bd9e1da25d0e156126b9",
+          "dweb:/ipfs/QmPMha4FPXbv38hGjcuuvtPaLejmfQEBjzE5T4S6ym3CxD"
+        ]
+      },
+      "src/contracts/adapters/PaxosAssetAdapter.sol": {
+        "keccak256": "0xc9c1a9c941f9329535c82ca29adccb9be83534818694860ba975ec7f64f395a0",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://74f534ea2aff2e822e9008e42f3eed5f0ca96bd33e7dfe22746deee500477a83",
+          "dweb:/ipfs/QmRYFCk7K6J2xju9hBUuEirPULyvJ13DdJzv3pHCG3pSH7"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.23+commit.f704f362",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "shanghai",
+      "remappings": [
+        "dependencies/@pendle-sy-1.0.0-1.0.0/:@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-4.9.3-4.9.3/contracts/",
+        "contracts/=src/contracts/",
+        "script/=script/",
+        "test/=test/",
+        "utils/=src/contracts/utils/",
+        "@solmate/=dependencies/solmate-6.7.0/src/",
+        "forge-std/=dependencies/forge-std-1.9.7/src/",
+        "@pendle-sy/=dependencies/@pendle-sy-1.0.0-1.0.0/contracts/",
+        "@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/",
+        "@openzeppelin/contracts-upgradeable/=dependencies/@openzeppelin-contracts-upgradeable-5.0.2-5.0.2/contracts/"
+      ]
+    },
+    "name": "PaxosAssetAdapter",
+    "fullyQualifiedName": "src/contracts/adapters/PaxosAssetAdapter.sol:PaxosAssetAdapter"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "43005669",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-07-29T07:06:03Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0x0bD1bE3B983DE582291dc16DFB123C74dcd65ae8"
+}

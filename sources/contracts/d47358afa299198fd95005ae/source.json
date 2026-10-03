@@ -1,0 +1,681 @@
+{
+  "sources": {
+    "src/contracts/adapters/EthenaAssetAdapter.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity ^0.8.23;\n\nimport {EthenaUnstaker} from \"../EthenaUnstaker.sol\";\nimport {IAssetAdapter, IERC20, IStakedUSDe, UserCooldown} from \"../Interfaces.sol\";\nimport {Ownable} from \"../Ownable.sol\";\n\n/**\n * @title Ethena sUSDe asset adapter\n * @notice Adapter for redeeming sUSDe through Ethena cooldown unstakers into USDe.\n * @dev Redemption requests rotate across unstaker helper contracts because sUSDe cooldowns are per account.\n * @author Origin Protocol Inc\n */\ncontract EthenaAssetAdapter is IAssetAdapter, Ownable {\n    /// @notice Minimum delay between new cooldown requests.\n    uint256 public constant DELAY_REQUEST = 30 minutes;\n    /// @notice Maximum number of rotating unstaker helper contracts.\n    uint8 public constant MAX_UNSTAKERS = 42;\n\n    /// @notice ARM contract authorized to request and claim redemptions.\n    address public immutable arm;\n    /// @notice USDe liquidity asset returned to the ARM.\n    IERC20 public immutable usde;\n    /// @notice sUSDe token redeemed through Ethena cooldowns.\n    IStakedUSDe public immutable susde;\n\n    /// @notice Rotating helper contracts that hold and cool down sUSDe.\n    address[MAX_UNSTAKERS] public unstakers;\n    /// @notice Index of the next unstaker helper to use for a new request.\n    uint8 public nextUnstakerIndex;\n    /// @notice Timestamp of the most recent cooldown request.\n    uint32 public lastRequestTimestamp;\n\n    /// @notice sUSDe share amount pending for each unstaker helper.\n    mapping(address unstaker => uint256 shares) public requestShares;\n    /// @notice Expected USDe amount pending for each unstaker helper.\n    mapping(address unstaker => uint256 assets) public requestAssets;\n    /// @notice Total number of unstaker cooldown requests queued by the adapter.\n    uint256 public totalRequests;\n    uint256 internal nextPendingIndex;\n\n    modifier onlyARM() {\n        require(msg.sender == arm, \"Adapter: only ARM\");\n        _;\n    }\n\n    modifier nonZeroShares(uint256 shares) {\n        require(shares > 0, \"Adapter: zero shares\");\n        _;\n    }\n\n    /// @param _arm ARM contract authorized to use the adapter.\n    /// @param _usde USDe token received after cooldown claims.\n    /// @param _susde sUSDe token to redeem.\n    constructor(address _arm, address _usde, address _susde) {\n        arm = _arm;\n        usde = IERC20(_usde);\n        susde = IStakedUSDe(_susde);\n\n        _setOwner(address(0));\n    }\n\n    /// @notice Returns USDe as the liquidity asset produced by Ethena claims.\n    function asset() external view returns (address) {\n        return address(usde);\n    }\n\n    /// @notice Converts sUSDe shares into expected USDe assets.\n    /// @param shares Amount of sUSDe shares.\n    /// @return assets Expected USDe assets.\n    function convertToAssets(uint256 shares) external view returns (uint256 assets) {\n        return susde.convertToAssets(shares);\n    }\n\n    /// @notice Converts USDe assets into expected sUSDe shares.\n    /// @param assets Amount of USDe assets.\n    /// @return shares Expected sUSDe shares.\n    function convertToShares(uint256 assets) external view returns (uint256 shares) {\n        return susde.convertToShares(assets);\n    }\n\n    /// @notice Transfers sUSDe to the next available unstaker and starts an Ethena cooldown.\n    /// @dev Requires the per-request delay to have passed and the selected unstaker to have no pending cooldown.\n    /// @param shares Amount of sUSDe shares to request for redemption.\n    /// @return sharesRequested Amount of sUSDe shares accepted into the cooldown request.\n    /// @return assetsExpected Expected USDe assets after cooldown.\n    function requestRedeem(uint256 shares)\n        external\n        onlyARM\n        nonZeroShares(shares)\n        returns (uint256 sharesRequested, uint256 assetsExpected)\n    {\n        require(block.timestamp >= lastRequestTimestamp + DELAY_REQUEST, \"Adapter: delay not passed\");\n        lastRequestTimestamp = uint32(block.timestamp);\n\n        address unstaker = unstakers[nextUnstakerIndex];\n        require(unstaker != address(0), \"Adapter: invalid unstaker\");\n\n        UserCooldown memory cooldown = susde.cooldowns(unstaker);\n        require(cooldown.underlyingAmount == 0, \"Adapter: unstaker in cooldown\");\n        require(requestShares[unstaker] == 0, \"Adapter: unstaker pending\");\n\n        totalRequests++;\n        nextUnstakerIndex = uint8((nextUnstakerIndex + 1) % MAX_UNSTAKERS);\n\n        susde.transferFrom(arm, unstaker, shares);\n        assetsExpected = EthenaUnstaker(unstaker).requestUnstake(shares);\n        requestShares[unstaker] = shares;\n        requestAssets[unstaker] = assetsExpected;\n        sharesRequested = shares;\n    }\n\n    /// @notice Claims completed Ethena cooldowns and transfers received USDe to the ARM.\n    /// @dev Claims pending unstakers in FIFO order and requires `shares` to match complete request sizes.\n    /// @param shares Exact amount of sUSDe shares represented by pending unstakers to claim.\n    /// @return sharesClaimed Amount of sUSDe shares represented by claimed unstakers.\n    /// @return assetsExpected Expected USDe amount recorded when cooldowns were opened.\n    /// @return assetsReceived Actual USDe amount received and transferred to the ARM.\n    function redeem(uint256 shares)\n        external\n        onlyARM\n        nonZeroShares(shares)\n        returns (uint256 sharesClaimed, uint256 assetsExpected, uint256 assetsReceived)\n    {\n        uint256 length = totalRequests;\n        uint256 cursor = nextPendingIndex;\n        uint256 claimCount;\n\n        while (cursor + claimCount < length && sharesClaimed < shares) {\n            address unstaker = unstakers[unstakerIndexAt(cursor + claimCount)];\n            uint256 requestShareAmount = requestShares[unstaker];\n            require(requestShareAmount > 0, \"Adapter: invalid request\");\n            require(sharesClaimed + requestShareAmount <= shares, \"Adapter: invalid redeem amount\");\n\n            sharesClaimed += requestShareAmount;\n            assetsExpected += requestAssets[unstaker];\n            claimCount++;\n        }\n\n        require(sharesClaimed == shares, \"Adapter: redeem exceeds claimable\");\n\n        uint256 balanceBefore = usde.balanceOf(address(this));\n        for (uint256 i = 0; i < claimCount; ++i) {\n            address unstaker = unstakers[unstakerIndexAt(cursor + i)];\n            delete requestShares[unstaker];\n            delete requestAssets[unstaker];\n            EthenaUnstaker(unstaker).claimUnstake();\n        }\n        nextPendingIndex = cursor + claimCount;\n\n        assetsReceived = usde.balanceOf(address(this)) - balanceBefore;\n        usde.transfer(arm, assetsReceived);\n    }\n\n    /// @notice Deploys missing unstaker helper contracts.\n    /// @dev Only the owner can seed helper contracts after ownership is assigned during deployment.\n    function deployUnstakers() external onlyOwner {\n        for (uint256 i = 0; i < MAX_UNSTAKERS; ++i) {\n            if (unstakers[i] == address(0)) unstakers[i] = address(new EthenaUnstaker(address(this), susde));\n        }\n    }\n\n    /// @notice Replaces the unstaker helper set.\n    /// @dev Existing helpers can only be replaced when they have no pending shares and no active cooldown.\n    /// @param _unstakers New fixed-size unstaker helper list.\n    function setUnstakers(address[MAX_UNSTAKERS] calldata _unstakers) external onlyOwner {\n        for (uint256 i = 0; i < MAX_UNSTAKERS; ++i) {\n            address oldUnstaker = unstakers[i];\n            if (oldUnstaker != _unstakers[i]) {\n                require(requestShares[oldUnstaker] == 0, \"Adapter: unstaker pending\");\n                require(susde.cooldowns(oldUnstaker).underlyingAmount == 0, \"Adapter: unstaker in cooldown\");\n            }\n        }\n\n        unstakers = _unstakers;\n    }\n\n    /// @notice Returns the unstaker helper index used by a queued request.\n    /// @param requestIndex Index in the request queue.\n    function unstakerIndexAt(uint256 requestIndex) public pure returns (uint8) {\n        return uint8(requestIndex % MAX_UNSTAKERS);\n    }\n}\n"
+    },
+    "src/contracts/EthenaUnstaker.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity ^0.8.23;\n\nimport {IStakedUSDe} from \"./Interfaces.sol\";\n\n/**\n * @title A helper contract that allows the ARM to have multiple sUSDe cooldowns in parallel.\n * @author Origin Protocol Inc\n */\ncontract EthenaUnstaker {\n    /// The parent Ethena ARM contract\n    address public immutable arm;\n    /// @notice The address of Ethena's staked synthetic dollar token (sUSDe)\n    IStakedUSDe public immutable susde;\n\n    constructor(address _arm, IStakedUSDe _susde) {\n        arm = _arm;\n        susde = _susde;\n    }\n\n    /// @notice Request a cooldown of USDe from Ethena's Staked USDe (sUSDe) contract.\n    /// @param sUSDeAmount The amount of staked USDe (sUSDe) to withdraw.\n    /// @return usde The amount of underlying USDe that will be withdrawable after the cooldown period.\n    function requestUnstake(uint256 sUSDeAmount) external returns (uint256 usde) {\n        require(msg.sender == arm, \"Only ARM can request unstake\");\n        usde = susde.cooldownShares(sUSDeAmount);\n    }\n\n    /// @notice Claim the underlying USDe after the cooldown period has ended and send to the ARM.\n    /// Reverts with `InvalidCooldown` from the Staked USDe contract if the cooldown period has not yet passed.\n    function claimUnstake() external {\n        require(msg.sender == arm, \"Only ARM can request unstake\");\n        susde.unstake(arm);\n    }\n}\n"
+    },
+    "src/contracts/Interfaces.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\nimport {IERC4626} from \"@openzeppelin/contracts/interfaces/IERC4626.sol\";\n\ninterface IERC20 {\n    function totalSupply() external view returns (uint256);\n    function balanceOf(address account) external view returns (uint256);\n    function transfer(address to, uint256 value) external returns (bool);\n    function allowance(address owner, address spender) external view returns (uint256);\n    function approve(address spender, uint256 value) external returns (bool);\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n    function decimals() external view returns (uint8);\n\n    event Transfer(address indexed from, address indexed to, uint256 value);\n}\n\ninterface ILiquidityProviderARM is IERC20 {\n    function previewDeposit(uint256 assets) external returns (uint256 shares);\n    function deposit(uint256 assets) external returns (uint256 shares);\n    function deposit(uint256 assets, address liquidityProvider) external returns (uint256 shares);\n\n    function previewRedeem(uint256 shares) external returns (uint256 assets);\n    function requestRedeem(uint256 shares) external returns (uint256 requestId, uint256 assets);\n    function claimRedeem(uint256 requestId) external returns (uint256 assets);\n\n    function totalAssets() external returns (uint256 assets);\n    function convertToShares(uint256 assets) external returns (uint256 shares);\n    function convertToAssets(uint256 shares) external returns (uint256 assets);\n    function lastTotalAssets() external returns (uint256 assets);\n}\n\ninterface ICapManager {\n    function postDepositHook(address liquidityProvider, uint256 assets) external;\n}\n\n/// @notice Adapter interface for assets that require protocol-specific redemption flows.\n/// @dev ARM calls adapters when a base asset cannot be redeemed synchronously into the ARM liquidity asset.\ninterface IAssetAdapter {\n    /// @notice Returns the liquidity asset received by the ARM after adapter redemptions.\n    function asset() external view returns (address);\n\n    /// @notice Converts adapter share tokens into the expected amount of liquidity assets.\n    /// @param shares Amount of protocol share tokens.\n    /// @return assets Expected amount of liquidity assets.\n    function convertToAssets(uint256 shares) external view returns (uint256 assets);\n\n    /// @notice Converts liquidity assets into the expected amount of adapter share tokens.\n    /// @param assets Amount of liquidity assets.\n    /// @return shares Expected amount of protocol share tokens.\n    function convertToShares(uint256 assets) external view returns (uint256 shares);\n\n    /// @notice Requests an asynchronous redemption from protocol share tokens into liquidity assets.\n    /// @dev Implementations pull `shares` from the ARM and record protocol request metadata for later claiming.\n    /// @param shares Amount of protocol share tokens to redeem.\n    /// @return sharesRequested Amount of share tokens accepted into the redemption request.\n    /// @return assetsExpected Expected liquidity assets from the redemption request.\n    function requestRedeem(uint256 shares) external returns (uint256 sharesRequested, uint256 assetsExpected);\n\n    /// @notice Claims previously requested redemptions and sends received liquidity assets to the ARM.\n    /// @dev Claims must be made in the adapter's pending-request order and may revert if the requested shares are not\n    ///      fully claimable.\n    /// @param shares Amount of protocol share tokens represented by pending requests to claim.\n    /// @return sharesClaimed Amount of share tokens represented by claimed requests.\n    /// @return assetsExpected Expected liquidity assets recorded when the requests were opened.\n    /// @return assetsReceived Actual liquidity assets received and transferred to the ARM.\n    function redeem(uint256 shares)\n        external\n        returns (uint256 sharesClaimed, uint256 assetsExpected, uint256 assetsReceived);\n}\n\ninterface LegacyAMM {\n    function transferToken(address tokenOut, address to, uint256 amount) external;\n}\n\ninterface IOriginVault {\n    function mint(address _asset, uint256 _amount, uint256 _minimumOusdAmount) external;\n\n    function redeem(uint256 _amount, uint256 _minimumUnitAmount) external;\n\n    function requestWithdrawal(uint256 amount) external returns (uint256 requestId, uint256 queued);\n\n    function claimWithdrawal(uint256 requestId) external returns (uint256 amount);\n\n    function claimWithdrawals(uint256[] memory requestIds)\n        external\n        returns (uint256[] memory amounts, uint256 totalAmount);\n\n    function addWithdrawalQueueLiquidity() external;\n\n    function setMaxSupplyDiff(uint256 _maxSupplyDiff) external;\n\n    function governor() external view returns (address);\n\n    function dripper() external view returns (address);\n\n    function withdrawalQueueMetadata()\n        external\n        view\n        returns (uint128 queued, uint128 claimable, uint128 claimed, uint128 nextWithdrawalIndex);\n\n    function withdrawalRequests(uint256 requestId)\n        external\n        view\n        returns (address withdrawer, bool claimed, uint40 timestamp, uint128 amount, uint128 queued);\n\n    function withdrawalClaimDelay() external view returns (uint256);\n}\n\ninterface IGovernance {\n    enum ProposalState {\n        Pending,\n        Active,\n        Canceled,\n        Defeated,\n        Succeeded,\n        Queued,\n        Expired,\n        Executed\n    }\n\n    function state(uint256 proposalId) external view returns (ProposalState);\n\n    function proposalSnapshot(uint256 proposalId) external view returns (uint256);\n\n    function proposalDeadline(uint256 proposalId) external view returns (uint256);\n\n    function proposalEta(uint256 proposalId) external view returns (uint256);\n\n    function votingDelay() external view returns (uint256);\n\n    function castVote(uint256 proposalId, uint8 support) external returns (uint256 balance);\n\n    function queue(uint256 proposalId) external;\n\n    function execute(uint256 proposalId) external;\n}\n\ninterface IWETH is IERC20 {\n    event Deposit(address indexed dst, uint256 wad);\n    event Withdrawal(address indexed src, uint256 wad);\n\n    function deposit() external payable;\n    function withdraw(uint256 wad) external;\n}\n\ninterface ISTETH is IERC20 {\n    event Submitted(address indexed sender, uint256 amount, address referral);\n\n    // function() external payable;\n    function submit(address _referral) external payable returns (uint256);\n}\n\ninterface IWstETH is IERC20 {\n    function getStETHByWstETH(uint256 wstETHAmount) external view returns (uint256);\n    function getWstETHByStETH(uint256 stETHAmount) external view returns (uint256);\n    function unwrap(uint256 wstETHAmount) external returns (uint256);\n}\n\ninterface IStETHWithdrawal {\n    event WithdrawalRequested(\n        uint256 indexed requestId,\n        address indexed requestor,\n        address indexed owner,\n        uint256 amountOfStETH,\n        uint256 amountOfShares\n    );\n    event WithdrawalsFinalized(\n        uint256 indexed from, uint256 indexed to, uint256 amountOfETHLocked, uint256 sharesToBurn, uint256 timestamp\n    );\n    event WithdrawalClaimed(\n        uint256 indexed requestId, address indexed owner, address indexed receiver, uint256 amountOfETH\n    );\n\n    struct WithdrawalRequestStatus {\n        /// @notice stETH token amount that was locked on withdrawal queue for this request\n        uint256 amountOfStETH;\n        /// @notice amount of stETH shares locked on withdrawal queue for this request\n        uint256 amountOfShares;\n        /// @notice address that can claim or transfer this request\n        address owner;\n        /// @notice timestamp of when the request was created, in seconds\n        uint256 timestamp;\n        /// @notice true, if request is finalized\n        bool isFinalized;\n        /// @notice true, if request is claimed. Request is claimable if (isFinalized && !isClaimed)\n        bool isClaimed;\n    }\n\n    function transferFrom(address _from, address _to, uint256 _requestId) external;\n    function ownerOf(uint256 _requestId) external returns (address);\n    function requestWithdrawals(uint256[] calldata _amounts, address _owner)\n        external\n        returns (uint256[] memory requestIds);\n    function getLastCheckpointIndex() external view returns (uint256);\n    function findCheckpointHints(uint256[] calldata _requestIds, uint256 _firstIndex, uint256 _lastIndex)\n        external\n        view\n        returns (uint256[] memory hintIds);\n    function claimWithdrawals(uint256[] calldata _requestIds, uint256[] calldata _hints) external;\n    function getWithdrawalStatus(uint256[] calldata _requestIds)\n        external\n        view\n        returns (WithdrawalRequestStatus[] memory statuses);\n    function getWithdrawalRequests(address _owner) external view returns (uint256[] memory requestsIds);\n    function getLastRequestId() external view returns (uint256);\n}\n\ninterface IOracle {\n    function price(address asset) external view returns (uint256 price);\n}\n\ninterface IHarvestable {\n    function collectRewards() external returns (address[] memory tokens, uint256[] memory rewards);\n}\n\ninterface IMagpieRouter {\n    function swapWithMagpieSignature(bytes calldata) external payable returns (uint256 amountOut);\n}\n\nlibrary DistributionTypes {\n    struct IncentivesProgramCreationInput {\n        string name;\n        address rewardToken;\n        uint104 emissionPerSecond;\n        uint40 distributionEnd;\n    }\n}\n\nlibrary IDistributionManager {\n    struct AccruedRewards {\n        uint256 amount;\n        bytes32 programId;\n        address rewardToken;\n    }\n}\n\ninterface SiloIncentivesControllerGaugeLike {\n    function claimRewards(address _to) external returns (IDistributionManager.AccruedRewards[] memory accruedRewards);\n    function createIncentivesProgram(DistributionTypes.IncentivesProgramCreationInput memory _incentivesProgramInput)\n        external;\n    function getAllProgramsNames() external view returns (string[] memory programsNames);\n    function getRewardsBalance(address _user, string memory _programName)\n        external\n        view\n        returns (uint256 unclaimedRewards);\n    function incentivesPrograms(bytes32)\n        external\n        view\n        returns (\n            uint256 index,\n            address rewardToken,\n            uint104 emissionPerSecond,\n            uint40 lastUpdateTimestamp,\n            uint40 distributionEnd\n        );\n    function owner() external view returns (address);\n}\n\ninterface IEETHWithdrawal {\n    function requestWithdraw(address receipient, uint256 amount) external returns (uint256 requestId);\n}\n\ninterface IEETHWithdrawalNFT {\n    function finalizeRequests(uint256 requestId) external;\n    function claimWithdraw(uint256 requestId) external;\n    function batchClaimWithdraw(uint256[] calldata requestIds) external;\n}\n\ninterface IEETHRedemptionManager {\n    function redeemEEth(uint256 amount, address receiver) external;\n    function redeemWeEth(uint256 amount, address receiver) external;\n    function canRedeem(uint256 amount) external view returns (bool);\n}\n\ninterface IWeETH {\n    function getEETHByWeETH(uint256 weETHAmount) external view returns (uint256);\n    function getWeETHByeETH(uint256 eETHAmount) external view returns (uint256);\n    function unwrap(uint256 weETHAmount) external returns (uint256);\n}\n\ninterface IDistributor {\n    function claim(\n        address[] calldata users,\n        address[] calldata tokens,\n        uint256[] calldata amounts,\n        bytes32[][] calldata proofs\n    ) external;\n}\n\n// Ethena Interfaces\n\nstruct UserCooldown {\n    uint104 cooldownEnd;\n    uint152 underlyingAmount;\n}\n\ninterface IStakedUSDe is IERC4626 {\n    // Errors //\n    /// @notice Error emitted when the shares amount to redeem is greater than the shares balance of the owner\n    error ExcessiveRedeemAmount(); // 0x63345388\n    /// @notice Error emitted when the shares amount to withdraw is greater than the shares balance of the owner\n    error ExcessiveWithdrawAmount(); // 0xdf53dde2\n\n    function cooldownAssets(uint256 assets) external returns (uint256 shares);\n\n    function cooldownShares(uint256 shares) external returns (uint256 assets);\n\n    function unstake(address receiver) external;\n\n    function cooldowns(address receiver) external view returns (UserCooldown memory);\n\n    function getUnvestedAmount() external view returns (uint256);\n\n    function lastDistributionTimestamp() external view returns (uint256);\n\n    function transferInRewards(uint256 amount) external;\n}\n"
+    },
+    "src/contracts/Ownable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\n/**\n * @title Base contract that provides ownership control\n * @author Origin Protocol Inc\n */\ncontract Ownable {\n    error OnlyOwner(); // 0x5fc483c5\n\n    /// @notice The slot used to store the owner of the contract.\n    /// This is also used as the proxy admin.\n    /// keccak256(“eip1967.proxy.admin”) - 1 per EIP 1967\n    bytes32 internal constant OWNER_SLOT = 0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103;\n\n    event AdminChanged(address previousAdmin, address newAdmin);\n\n    constructor() {\n        assert(OWNER_SLOT == bytes32(uint256(keccak256(\"eip1967.proxy.admin\")) - 1));\n        _setOwner(msg.sender);\n    }\n\n    /// @notice The contract owner and proxy admin.\n    function owner() public view returns (address) {\n        return _owner();\n    }\n\n    /// @notice Set the owner and proxy admin of the contract.\n    /// @param newOwner The address of the new owner.\n    function setOwner(address newOwner) external onlyOwner {\n        _setOwner(newOwner);\n    }\n\n    function _owner() internal view returns (address ownerOut) {\n        bytes32 position = OWNER_SLOT;\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            ownerOut := sload(position)\n        }\n    }\n\n    function _setOwner(address newOwner) internal {\n        emit AdminChanged(_owner(), newOwner);\n        bytes32 position = OWNER_SLOT;\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            sstore(position, newOwner)\n        }\n    }\n\n    function _onlyOwner() internal view {\n        if (msg.sender != _owner()) revert OnlyOwner();\n    }\n\n    modifier onlyOwner() {\n        _onlyOwner();\n        _;\n    }\n}\n"
+    },
+    "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/interfaces/IERC4626.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/IERC4626.sol)\n\npragma solidity ^0.8.20;\n\nimport {IERC20} from \"../token/ERC20/IERC20.sol\";\nimport {IERC20Metadata} from \"../token/ERC20/extensions/IERC20Metadata.sol\";\n\n/**\n * @dev Interface of the ERC4626 \"Tokenized Vault Standard\", as defined in\n * https://eips.ethereum.org/EIPS/eip-4626[ERC-4626].\n */\ninterface IERC4626 is IERC20, IERC20Metadata {\n    event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);\n\n    event Withdraw(\n        address indexed sender,\n        address indexed receiver,\n        address indexed owner,\n        uint256 assets,\n        uint256 shares\n    );\n\n    /**\n     * @dev Returns the address of the underlying token used for the Vault for accounting, depositing, and withdrawing.\n     *\n     * - MUST be an ERC-20 token contract.\n     * - MUST NOT revert.\n     */\n    function asset() external view returns (address assetTokenAddress);\n\n    /**\n     * @dev Returns the total amount of the underlying asset that is “managed” by Vault.\n     *\n     * - SHOULD include any compounding that occurs from yield.\n     * - MUST be inclusive of any fees that are charged against assets in the Vault.\n     * - MUST NOT revert.\n     */\n    function totalAssets() external view returns (uint256 totalManagedAssets);\n\n    /**\n     * @dev Returns the amount of shares that the Vault would exchange for the amount of assets provided, in an ideal\n     * scenario where all the conditions are met.\n     *\n     * - MUST NOT be inclusive of any fees that are charged against assets in the Vault.\n     * - MUST NOT show any variations depending on the caller.\n     * - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.\n     * - MUST NOT revert.\n     *\n     * NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the\n     * “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and\n     * from.\n     */\n    function convertToShares(uint256 assets) external view returns (uint256 shares);\n\n    /**\n     * @dev Returns the amount of assets that the Vault would exchange for the amount of shares provided, in an ideal\n     * scenario where all the conditions are met.\n     *\n     * - MUST NOT be inclusive of any fees that are charged against assets in the Vault.\n     * - MUST NOT show any variations depending on the caller.\n     * - MUST NOT reflect slippage or other on-chain conditions, when performing the actual exchange.\n     * - MUST NOT revert.\n     *\n     * NOTE: This calculation MAY NOT reflect the “per-user” price-per-share, and instead should reflect the\n     * “average-user’s” price-per-share, meaning what the average user should expect to see when exchanging to and\n     * from.\n     */\n    function convertToAssets(uint256 shares) external view returns (uint256 assets);\n\n    /**\n     * @dev Returns the maximum amount of the underlying asset that can be deposited into the Vault for the receiver,\n     * through a deposit call.\n     *\n     * - MUST return a limited value if receiver is subject to some deposit limit.\n     * - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of assets that may be deposited.\n     * - MUST NOT revert.\n     */\n    function maxDeposit(address receiver) external view returns (uint256 maxAssets);\n\n    /**\n     * @dev Allows an on-chain or off-chain user to simulate the effects of their deposit at the current block, given\n     * current on-chain conditions.\n     *\n     * - MUST return as close to and no more than the exact amount of Vault shares that would be minted in a deposit\n     *   call in the same transaction. I.e. deposit should return the same or more shares as previewDeposit if called\n     *   in the same transaction.\n     * - MUST NOT account for deposit limits like those returned from maxDeposit and should always act as though the\n     *   deposit would be accepted, regardless if the user has enough tokens approved, etc.\n     * - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.\n     * - MUST NOT revert.\n     *\n     * NOTE: any unfavorable discrepancy between convertToShares and previewDeposit SHOULD be considered slippage in\n     * share price or some other type of condition, meaning the depositor will lose assets by depositing.\n     */\n    function previewDeposit(uint256 assets) external view returns (uint256 shares);\n\n    /**\n     * @dev Mints shares Vault shares to receiver by depositing exactly amount of underlying tokens.\n     *\n     * - MUST emit the Deposit event.\n     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the\n     *   deposit execution, and are accounted for during deposit.\n     * - MUST revert if all of assets cannot be deposited (due to deposit limit being reached, slippage, the user not\n     *   approving enough underlying tokens to the Vault contract, etc).\n     *\n     * NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.\n     */\n    function deposit(uint256 assets, address receiver) external returns (uint256 shares);\n\n    /**\n     * @dev Returns the maximum amount of the Vault shares that can be minted for the receiver, through a mint call.\n     * - MUST return a limited value if receiver is subject to some mint limit.\n     * - MUST return 2 ** 256 - 1 if there is no limit on the maximum amount of shares that may be minted.\n     * - MUST NOT revert.\n     */\n    function maxMint(address receiver) external view returns (uint256 maxShares);\n\n    /**\n     * @dev Allows an on-chain or off-chain user to simulate the effects of their mint at the current block, given\n     * current on-chain conditions.\n     *\n     * - MUST return as close to and no fewer than the exact amount of assets that would be deposited in a mint call\n     *   in the same transaction. I.e. mint should return the same or fewer assets as previewMint if called in the\n     *   same transaction.\n     * - MUST NOT account for mint limits like those returned from maxMint and should always act as though the mint\n     *   would be accepted, regardless if the user has enough tokens approved, etc.\n     * - MUST be inclusive of deposit fees. Integrators should be aware of the existence of deposit fees.\n     * - MUST NOT revert.\n     *\n     * NOTE: any unfavorable discrepancy between convertToAssets and previewMint SHOULD be considered slippage in\n     * share price or some other type of condition, meaning the depositor will lose assets by minting.\n     */\n    function previewMint(uint256 shares) external view returns (uint256 assets);\n\n    /**\n     * @dev Mints exactly shares Vault shares to receiver by depositing amount of underlying tokens.\n     *\n     * - MUST emit the Deposit event.\n     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the mint\n     *   execution, and are accounted for during mint.\n     * - MUST revert if all of shares cannot be minted (due to deposit limit being reached, slippage, the user not\n     *   approving enough underlying tokens to the Vault contract, etc).\n     *\n     * NOTE: most implementations will require pre-approval of the Vault with the Vault’s underlying asset token.\n     */\n    function mint(uint256 shares, address receiver) external returns (uint256 assets);\n\n    /**\n     * @dev Returns the maximum amount of the underlying asset that can be withdrawn from the owner balance in the\n     * Vault, through a withdraw call.\n     *\n     * - MUST return a limited value if owner is subject to some withdrawal limit or timelock.\n     * - MUST NOT revert.\n     */\n    function maxWithdraw(address owner) external view returns (uint256 maxAssets);\n\n    /**\n     * @dev Allows an on-chain or off-chain user to simulate the effects of their withdrawal at the current block,\n     * given current on-chain conditions.\n     *\n     * - MUST return as close to and no fewer than the exact amount of Vault shares that would be burned in a withdraw\n     *   call in the same transaction. I.e. withdraw should return the same or fewer shares as previewWithdraw if\n     *   called\n     *   in the same transaction.\n     * - MUST NOT account for withdrawal limits like those returned from maxWithdraw and should always act as though\n     *   the withdrawal would be accepted, regardless if the user has enough shares, etc.\n     * - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.\n     * - MUST NOT revert.\n     *\n     * NOTE: any unfavorable discrepancy between convertToShares and previewWithdraw SHOULD be considered slippage in\n     * share price or some other type of condition, meaning the depositor will lose assets by depositing.\n     */\n    function previewWithdraw(uint256 assets) external view returns (uint256 shares);\n\n    /**\n     * @dev Burns shares from owner and sends exactly assets of underlying tokens to receiver.\n     *\n     * - MUST emit the Withdraw event.\n     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the\n     *   withdraw execution, and are accounted for during withdraw.\n     * - MUST revert if all of assets cannot be withdrawn (due to withdrawal limit being reached, slippage, the owner\n     *   not having enough shares, etc).\n     *\n     * Note that some implementations will require pre-requesting to the Vault before a withdrawal may be performed.\n     * Those methods should be performed separately.\n     */\n    function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares);\n\n    /**\n     * @dev Returns the maximum amount of Vault shares that can be redeemed from the owner balance in the Vault,\n     * through a redeem call.\n     *\n     * - MUST return a limited value if owner is subject to some withdrawal limit or timelock.\n     * - MUST return balanceOf(owner) if owner is not subject to any withdrawal limit or timelock.\n     * - MUST NOT revert.\n     */\n    function maxRedeem(address owner) external view returns (uint256 maxShares);\n\n    /**\n     * @dev Allows an on-chain or off-chain user to simulate the effects of their redeemption at the current block,\n     * given current on-chain conditions.\n     *\n     * - MUST return as close to and no more than the exact amount of assets that would be withdrawn in a redeem call\n     *   in the same transaction. I.e. redeem should return the same or more assets as previewRedeem if called in the\n     *   same transaction.\n     * - MUST NOT account for redemption limits like those returned from maxRedeem and should always act as though the\n     *   redemption would be accepted, regardless if the user has enough shares, etc.\n     * - MUST be inclusive of withdrawal fees. Integrators should be aware of the existence of withdrawal fees.\n     * - MUST NOT revert.\n     *\n     * NOTE: any unfavorable discrepancy between convertToAssets and previewRedeem SHOULD be considered slippage in\n     * share price or some other type of condition, meaning the depositor will lose assets by redeeming.\n     */\n    function previewRedeem(uint256 shares) external view returns (uint256 assets);\n\n    /**\n     * @dev Burns exactly shares from owner and sends assets of underlying tokens to receiver.\n     *\n     * - MUST emit the Withdraw event.\n     * - MAY support an additional flow in which the underlying tokens are owned by the Vault contract before the\n     *   redeem execution, and are accounted for during redeem.\n     * - MUST revert if all of shares cannot be redeemed (due to withdrawal limit being reached, slippage, the owner\n     *   not having enough shares, etc).\n     *\n     * NOTE: some implementations will require pre-requesting to the Vault before a withdrawal may be performed.\n     * Those methods should be performed separately.\n     */\n    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);\n}\n"
+    },
+    "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/token/ERC20/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /**\n     * @dev Returns the value of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the value of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves a `value` amount of tokens from the caller's account to `to`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address to, uint256 value) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets a `value` amount of tokens as the allowance of `spender` over the\n     * caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 value) external returns (bool);\n\n    /**\n     * @dev Moves a `value` amount of tokens from `from` to `to` using the\n     * allowance mechanism. `value` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n}\n"
+    },
+    "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/token/ERC20/extensions/IERC20Metadata.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC20/extensions/IERC20Metadata.sol)\n\npragma solidity ^0.8.20;\n\nimport {IERC20} from \"../IERC20.sol\";\n\n/**\n * @dev Interface for the optional metadata functions from the ERC20 standard.\n */\ninterface IERC20Metadata is IERC20 {\n    /**\n     * @dev Returns the name of the token.\n     */\n    function name() external view returns (string memory);\n\n    /**\n     * @dev Returns the symbol of the token.\n     */\n    function symbol() external view returns (string memory);\n\n    /**\n     * @dev Returns the decimals places of the token.\n     */\n    function decimals() external view returns (uint8);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.23+commit.f704f362"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_arm",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_usde",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_susde",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "OnlyOwner",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "previousAdmin",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "AdminChanged",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "DELAY_REQUEST",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_UNSTAKERS",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "arm",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "asset",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "name": "convertToAssets",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "assets",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "assets",
+              "type": "uint256"
+            }
+          ],
+          "name": "convertToShares",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "deployUnstakers",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lastRequestTimestamp",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "nextUnstakerIndex",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "name": "redeem",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "sharesClaimed",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "assetsExpected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "assetsReceived",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "unstaker",
+              "type": "address"
+            }
+          ],
+          "name": "requestAssets",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "assets",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "name": "requestRedeem",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "sharesRequested",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "assetsExpected",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "unstaker",
+              "type": "address"
+            }
+          ],
+          "name": "requestShares",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "setOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[42]",
+              "name": "_unstakers",
+              "type": "address[42]"
+            }
+          ],
+          "name": "setUnstakers",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "susde",
+          "outputs": [
+            {
+              "internalType": "contract IStakedUSDe",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "totalRequests",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "requestIndex",
+              "type": "uint256"
+            }
+          ],
+          "name": "unstakerIndexAt",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "unstakers",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "usde",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Origin Protocol Inc",
+        "details": "Redemption requests rotate across unstaker helper contracts because sUSDe cooldowns are per account.",
+        "kind": "dev",
+        "methods": {
+          "constructor": {
+            "params": {
+              "_arm": "ARM contract authorized to use the adapter.",
+              "_susde": "sUSDe token to redeem.",
+              "_usde": "USDe token received after cooldown claims."
+            }
+          },
+          "convertToAssets(uint256)": {
+            "params": {
+              "shares": "Amount of sUSDe shares."
+            },
+            "returns": {
+              "assets": "Expected USDe assets."
+            }
+          },
+          "convertToShares(uint256)": {
+            "params": {
+              "assets": "Amount of USDe assets."
+            },
+            "returns": {
+              "shares": "Expected sUSDe shares."
+            }
+          },
+          "deployUnstakers()": {
+            "details": "Only the owner can seed helper contracts after ownership is assigned during deployment."
+          },
+          "redeem(uint256)": {
+            "details": "Claims pending unstakers in FIFO order and requires `shares` to match complete request sizes.",
+            "params": {
+              "shares": "Exact amount of sUSDe shares represented by pending unstakers to claim."
+            },
+            "returns": {
+              "assetsExpected": "Expected USDe amount recorded when cooldowns were opened.",
+              "assetsReceived": "Actual USDe amount received and transferred to the ARM.",
+              "sharesClaimed": "Amount of sUSDe shares represented by claimed unstakers."
+            }
+          },
+          "requestRedeem(uint256)": {
+            "details": "Requires the per-request delay to have passed and the selected unstaker to have no pending cooldown.",
+            "params": {
+              "shares": "Amount of sUSDe shares to request for redemption."
+            },
+            "returns": {
+              "assetsExpected": "Expected USDe assets after cooldown.",
+              "sharesRequested": "Amount of sUSDe shares accepted into the cooldown request."
+            }
+          },
+          "setOwner(address)": {
+            "params": {
+              "newOwner": "The address of the new owner."
+            }
+          },
+          "setUnstakers(address[42])": {
+            "details": "Existing helpers can only be replaced when they have no pending shares and no active cooldown.",
+            "params": {
+              "_unstakers": "New fixed-size unstaker helper list."
+            }
+          },
+          "unstakerIndexAt(uint256)": {
+            "params": {
+              "requestIndex": "Index in the request queue."
+            }
+          }
+        },
+        "title": "Ethena sUSDe asset adapter",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "DELAY_REQUEST()": {
+            "notice": "Minimum delay between new cooldown requests."
+          },
+          "MAX_UNSTAKERS()": {
+            "notice": "Maximum number of rotating unstaker helper contracts."
+          },
+          "arm()": {
+            "notice": "ARM contract authorized to request and claim redemptions."
+          },
+          "asset()": {
+            "notice": "Returns USDe as the liquidity asset produced by Ethena claims."
+          },
+          "convertToAssets(uint256)": {
+            "notice": "Converts sUSDe shares into expected USDe assets."
+          },
+          "convertToShares(uint256)": {
+            "notice": "Converts USDe assets into expected sUSDe shares."
+          },
+          "deployUnstakers()": {
+            "notice": "Deploys missing unstaker helper contracts."
+          },
+          "lastRequestTimestamp()": {
+            "notice": "Timestamp of the most recent cooldown request."
+          },
+          "nextUnstakerIndex()": {
+            "notice": "Index of the next unstaker helper to use for a new request."
+          },
+          "owner()": {
+            "notice": "The contract owner and proxy admin."
+          },
+          "redeem(uint256)": {
+            "notice": "Claims completed Ethena cooldowns and transfers received USDe to the ARM."
+          },
+          "requestAssets(address)": {
+            "notice": "Expected USDe amount pending for each unstaker helper."
+          },
+          "requestRedeem(uint256)": {
+            "notice": "Transfers sUSDe to the next available unstaker and starts an Ethena cooldown."
+          },
+          "requestShares(address)": {
+            "notice": "sUSDe share amount pending for each unstaker helper."
+          },
+          "setOwner(address)": {
+            "notice": "Set the owner and proxy admin of the contract."
+          },
+          "setUnstakers(address[42])": {
+            "notice": "Replaces the unstaker helper set."
+          },
+          "susde()": {
+            "notice": "sUSDe token redeemed through Ethena cooldowns."
+          },
+          "totalRequests()": {
+            "notice": "Total number of unstaker cooldown requests queued by the adapter."
+          },
+          "unstakerIndexAt(uint256)": {
+            "notice": "Returns the unstaker helper index used by a queued request."
+          },
+          "unstakers(uint256)": {
+            "notice": "Rotating helper contracts that hold and cool down sUSDe."
+          },
+          "usde()": {
+            "notice": "USDe liquidity asset returned to the ARM."
+          }
+        },
+        "notice": "Adapter for redeeming sUSDe through Ethena cooldown unstakers into USDe.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/contracts/adapters/EthenaAssetAdapter.sol": "EthenaAssetAdapter"
+      },
+      "evmVersion": "shanghai",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts-upgradeable/=dependencies/@openzeppelin-contracts-upgradeable-5.0.2-5.0.2/contracts/",
+        ":@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/",
+        ":@pendle-sy/=dependencies/@pendle-sy-1.0.0-1.0.0/contracts/",
+        ":@solmate/=dependencies/solmate-6.7.0/src/",
+        ":contracts/=src/contracts/",
+        ":forge-std/=dependencies/forge-std-1.9.7/src/",
+        ":script/=script/",
+        ":test/=test/",
+        ":utils/=src/contracts/utils/",
+        "dependencies/@pendle-sy-1.0.0-1.0.0/:@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-4.9.3-4.9.3/contracts/"
+      ]
+    },
+    "sources": {
+      "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/interfaces/IERC4626.sol": {
+        "keccak256": "0x207f64371bc0fcc5be86713aa5da109a870cc3a6da50e93b64ee881e369b593d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://548667cfa76683767c2c610b577f6c2f0675d0ce28f53c3f37b969c84a56b205",
+          "dweb:/ipfs/QmUzA1CKC6bDdULuS44wGd7PWBNLiHb6bh7oHwJBDZSLAx"
+        ]
+      },
+      "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/token/ERC20/IERC20.sol": {
+        "keccak256": "0xc6a8ff0ea489379b61faa647490411b80102578440ab9d84e9a957cc12164e70",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0ea104e577e63faea3b69c415637e99e755dcbf64c5833d7140c35a714d6d90c",
+          "dweb:/ipfs/Qmau6x4Ns9XdyynRCNNp3RhLqijJjFm7z5fyZazfYFGYdq"
+        ]
+      },
+      "dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/token/ERC20/extensions/IERC20Metadata.sol": {
+        "keccak256": "0xaa761817f6cd7892fcf158b3c776b34551cde36f48ff9703d53898bc45a94ea2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0ad7c8d4d08938c8dfc43d75a148863fb324b80cf53e0a36f7e5a4ac29008850",
+          "dweb:/ipfs/QmcrhfPgVNf5mkdhQvy1pMv51TFokD3Y4Wa5WZhFqVh8UV"
+        ]
+      },
+      "src/contracts/EthenaUnstaker.sol": {
+        "keccak256": "0xf06182e3b150b1e144a3bc4066de68a3d23bf26e8aa359ec5eeadd07f99a54db",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://73fc3f03968adcdde3e6bd94b1e5bca5c25addde8117ccd6bf0bcce7d357ad68",
+          "dweb:/ipfs/QmR55E123hdE3jnSjPecaVK3zhRqmNtHZrCCNdFrQNbVzx"
+        ]
+      },
+      "src/contracts/Interfaces.sol": {
+        "keccak256": "0x825f778ad4a240db241f5e191bda96b16a6505c5dd6a6baf37f64f6c1a282dd5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://839b291ad4771ef84f700aba4c431405298c4b67ccf6934dc145a90d7846932e",
+          "dweb:/ipfs/QmegUexVC7JiexGU6aE6woxCuCuYfH83No3crBPKh5H1je"
+        ]
+      },
+      "src/contracts/Ownable.sol": {
+        "keccak256": "0x2342fbedd4995cf68278a13adcc4cf0bea8b8e8e31fd74c2898791fae67ef99a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b1908a0f0e4479e269cb8a3c8e2641ebf75f7e9c3b9bd85a937a9e255c959345",
+          "dweb:/ipfs/QmdZX5XkzCd777KSzVb2eKa8z8dGWKbCdAUWma2zZeiZys"
+        ]
+      },
+      "src/contracts/adapters/EthenaAssetAdapter.sol": {
+        "keccak256": "0x06296dae1fb655ecc9a3e9cd8664fa5aec296df7087a22196f5b9bafd8117134",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://467e84041633693c58dae44f32dc4ad8d00384efba4e39ca1ca17f57367e8e50",
+          "dweb:/ipfs/QmScky5mNQNHahjevCSiGtJWv6ttweLWabWw9gzq42YFg9"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.23+commit.f704f362",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "shanghai",
+      "remappings": [
+        "dependencies/@pendle-sy-1.0.0-1.0.0/:@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-4.9.3-4.9.3/contracts/",
+        "contracts/=src/contracts/",
+        "script/=script/",
+        "test/=test/",
+        "utils/=src/contracts/utils/",
+        "@solmate/=dependencies/solmate-6.7.0/src/",
+        "forge-std/=dependencies/forge-std-1.9.7/src/",
+        "@pendle-sy/=dependencies/@pendle-sy-1.0.0-1.0.0/contracts/",
+        "@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/",
+        "@openzeppelin/contracts-upgradeable/=dependencies/@openzeppelin-contracts-upgradeable-5.0.2-5.0.2/contracts/"
+      ]
+    },
+    "name": "EthenaAssetAdapter",
+    "fullyQualifiedName": "src/contracts/adapters/EthenaAssetAdapter.sol:EthenaAssetAdapter"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "32254929",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-06-16T19:26:37Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0x1707b933037287eAf35A64ff1E89Cb00Db809aaB"
+}
