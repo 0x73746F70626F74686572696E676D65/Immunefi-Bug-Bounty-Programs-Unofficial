@@ -235,7 +235,8 @@ def persist_contract(entry, obj, kind, endpoint):
     save_json(dest/'source.json',obj)
     return {'status':'fetched','kind':kind,'fetched_at':stamp(),'source':relative(dest/'source.json'),'retrieval_url':endpoint,'source_file_count':len(obj.get('sources',{}))}
 
-def blockscout(entry, host, address):
+def blockscout(entry, host, address, seen=None):
+    seen=set(seen or ());seen.add(address.lower())
     bases=['https://'+host]
     if host=='blockscout.com':
         path=urllib.parse.urlsplit(entry['url']).path.split('/address/')[0];bases=['https://'+host+path]
@@ -248,6 +249,18 @@ def blockscout(entry, host, address):
                 obj['sources']={obj.get('file_path') or obj.get('name','Contract')+'.sol':{'content':obj['source_code']}}
                 for extra in obj.get('additional_sources') or []:obj['sources'][extra.get('file_path') or extra.get('name','source.sol')]={'content':extra['source_code']}
                 return persist_contract(entry,obj,'blockscout_verified_contract',endpoint)
+            for implementation in obj.get('implementations') or []:
+                target=implementation.get('address_hash') or implementation.get('address')
+                if not target or target.lower() in seen or len(seen)>5:continue
+                try:
+                    result=blockscout(entry,host,target,seen)
+                    source=json.loads((ROOT/result['source']).read_text())
+                    source.setdefault('unverified_proxy_chain',[]).append({'address':address,'implementation':target,'verification':obj})
+                    source['explorer_implementation_addresses']=[target]
+                    save_json(ROOT/result['source'],source)
+                    result.update({'kind':'blockscout_implementation_contract','proxy_address':address,'implementation_address':target,'proxy_source_available':False,'source_role':'proxy_implementation'})
+                    return result
+                except Exception as e:errors.append('Implementation '+target+': '+str(e))
             errors.append('API has no verified source')
         except Exception as e:errors.append(str(e))
     raise RuntimeError('; '.join(errors))
@@ -457,7 +470,18 @@ def bytecode_metadata_source(entry,chain,address):
     code=get_json(endpoint,post_json={'jsonrpc':'2.0','id':1,'method':'eth_getCode','params':[address,'latest']}).get('result')
     if not isinstance(code,str) or code=='0x':raise RuntimeError('The RPC exposes no deployed contract bytecode')
     cid=bytecode_cid(code)
-    if not cid:raise RuntimeError('The deployed bytecode has no Solidity IPFS metadata reference')
+    if not cid:
+        clone=re.search(r'363d3d373d3d3d363d73([a-fA-F0-9]{40})5af43d82803e903d91602b57fd5bf3',code)
+        if clone and entry.get('_proxy_recovery_depth',0)<5:
+            implementation='0x'+clone.group(1);parsed=urllib.parse.urlsplit(entry['url']);url='https://'+parsed.netloc+'/address/'+implementation+'#code'
+            child={**entry,'url':url,'id':digest(url),'_proxy_recovery_depth':entry.get('_proxy_recovery_depth',0)+1}
+            recovered=alternate_contract(child);obj=json.loads((ROOT/recovered['source']).read_text())
+            obj['minimal_proxy_scope']={'address':address,'implementation':implementation,'bytecode':code,'chain_id':chain}
+            obj['explorer_implementation_addresses']=[implementation]
+            result=persist_contract(entry,obj,'minimal_proxy_implementation_source',recovered['retrieval_url'])
+            result.update({'implementation_address':implementation,'source_role':'proxy_implementation','proxy_source_form':'EIP-1167 deployed bytecode'})
+            return result
+        raise RuntimeError('The deployed bytecode has no Solidity IPFS metadata reference')
     metadata=json.loads(ipfs_bytes(cid));sources={}
     for name,source in metadata.get('sources',{}).items():
         if isinstance(source.get('content'),str):sources[name]=source;continue
