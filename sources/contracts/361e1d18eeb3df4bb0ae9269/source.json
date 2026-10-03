@@ -1,0 +1,1689 @@
+{
+  "sources": {
+    "contracts/release/core/fund-deployer/FundDeployer.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\npragma experimental ABIEncoderV2;\n\nimport {IDispatcher} from \"../../../persistent/dispatcher/IDispatcher.sol\";\nimport {IMigrationHookHandler} from \"../../../persistent/dispatcher/IMigrationHookHandler.sol\";\nimport {IExtension} from \"../../extensions/IExtension.sol\";\nimport {GasRelayRecipientMixin} from \"../../infrastructure/gas-relayer/GasRelayRecipientMixin.sol\";\nimport {IProtocolFeeTracker} from \"../../infrastructure/protocol-fees/IProtocolFeeTracker.sol\";\nimport {ComptrollerProxy} from \"../fund/comptroller/ComptrollerProxy.sol\";\nimport {IComptroller} from \"../fund/comptroller/IComptroller.sol\";\nimport {IVault} from \"../fund/vault/IVault.sol\";\nimport {IFundDeployer} from \"./IFundDeployer.sol\";\n\n/// @title FundDeployer Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice The top-level contract of the release.\n/// It primarily coordinates fund deployment and fund migration, but\n/// it is also deferred to for contract access control and for allowed calls\n/// that can be made with a fund's VaultProxy as the msg.sender.\ncontract FundDeployer is IFundDeployer, IMigrationHookHandler, GasRelayRecipientMixin {\n    event BuySharesOnBehalfCallerDeregistered(address caller);\n\n    event BuySharesOnBehalfCallerRegistered(address caller);\n\n    event ComptrollerLibSet(address comptrollerLib);\n\n    event ComptrollerProxyDeployed(\n        address indexed creator,\n        address comptrollerProxy,\n        address indexed denominationAsset,\n        uint256 sharesActionTimelock\n    );\n\n    event GasLimitsForDestructCallSet(uint256 nextDeactivateFeeManagerGasLimit, uint256 nextPayProtocolFeeGasLimit);\n\n    event MigrationRequestCreated(address indexed creator, address indexed vaultProxy, address comptrollerProxy);\n\n    event NewFundCreated(address indexed creator, address vaultProxy, address comptrollerProxy);\n\n    event ProtocolFeeTrackerSet(address protocolFeeTracker);\n\n    event ReconfigurationRequestCancelled(address indexed vaultProxy, address indexed nextComptrollerProxy);\n\n    event ReconfigurationRequestCreated(\n        address indexed creator, address indexed vaultProxy, address comptrollerProxy, uint256 executableTimestamp\n    );\n\n    event ReconfigurationRequestExecuted(\n        address indexed vaultProxy, address indexed prevComptrollerProxy, address indexed nextComptrollerProxy\n    );\n\n    event ReconfigurationTimelockSet(uint256 nextTimelock);\n\n    event ReleaseIsLive();\n\n    event VaultCallDeregistered(address indexed contractAddress, bytes4 selector, bytes32 dataHash);\n\n    event VaultCallRegistered(address indexed contractAddress, bytes4 selector, bytes32 dataHash);\n\n    event VaultLibSet(address vaultLib);\n\n    // Constants\n    // keccak256(abi.encodePacked(\"mln.vaultCall.any\")\n    bytes32 private constant ANY_VAULT_CALL = 0x5bf1898dd28c4d29f33c4c1bb9b8a7e2f6322847d70be63e8f89de024d08a669;\n\n    address private immutable CREATOR;\n    address private immutable DISPATCHER;\n\n    // Pseudo-constants (can only be set once)\n    address private comptrollerLib;\n    address private protocolFeeTracker;\n    address private vaultLib;\n\n    // Storage\n    uint32 private gasLimitForDestructCallToDeactivateFeeManager; // Can reduce to uint16\n    uint32 private gasLimitForDestructCallToPayProtocolFee; // Can reduce to uint16\n    bool private isLive;\n    uint256 private reconfigurationTimelock;\n\n    mapping(address => bool) private acctToIsAllowedBuySharesOnBehalfCaller;\n    mapping(bytes32 => mapping(bytes32 => bool)) private vaultCallToPayloadToIsAllowed;\n    mapping(address => ReconfigurationRequest) private vaultProxyToReconfigurationRequest;\n\n    modifier onlyDispatcher() {\n        require(msg.sender == DISPATCHER, \"Only Dispatcher can call this function\");\n        _;\n    }\n\n    modifier onlyLiveRelease() {\n        require(releaseIsLive(), \"Release is not yet live\");\n        _;\n    }\n\n    modifier onlyMigrator(address _vaultProxy) {\n        __assertIsMigrator(_vaultProxy, __msgSender());\n        _;\n    }\n\n    modifier onlyMigratorNotRelayable(address _vaultProxy) {\n        __assertIsMigrator(_vaultProxy, msg.sender);\n        _;\n    }\n\n    modifier onlyOwner() {\n        require(msg.sender == getOwner(), \"Only the contract owner can call this function\");\n        _;\n    }\n\n    modifier pseudoConstant(address _storageValue) {\n        require(_storageValue == address(0), \"This value can only be set once\");\n        _;\n    }\n\n    function __assertIsMigrator(address _vaultProxy, address _who) private view {\n        require(IVault(_vaultProxy).canMigrate(_who), \"Only a permissioned migrator can call this function\");\n    }\n\n    constructor(address _dispatcher, address _gasRelayPaymasterFactory)\n        public\n        GasRelayRecipientMixin(_gasRelayPaymasterFactory)\n    {\n        // Validate constants\n        require(\n            ANY_VAULT_CALL == keccak256(abi.encodePacked(\"mln.vaultCall.any\")), \"constructor: Incorrect ANY_VAULT_CALL\"\n        );\n\n        CREATOR = msg.sender;\n        DISPATCHER = _dispatcher;\n\n        // Estimated base call cost: 17k\n        // Per fee that uses shares outstanding (default recipient): 33k\n        // 300k accommodates up to 8 such fees\n        gasLimitForDestructCallToDeactivateFeeManager = 300000;\n        // Estimated cost: 50k\n        gasLimitForDestructCallToPayProtocolFee = 200000;\n\n        reconfigurationTimelock = 2 days;\n    }\n\n    //////////////////////////////////////\n    // PSEUDO-CONSTANTS (only set once) //\n    //////////////////////////////////////\n\n    /// @notice Sets the ComptrollerLib\n    /// @param _comptrollerLib The ComptrollerLib contract address\n    function setComptrollerLib(address _comptrollerLib)\n        external\n        override\n        onlyOwner\n        pseudoConstant(getComptrollerLib())\n    {\n        comptrollerLib = _comptrollerLib;\n\n        emit ComptrollerLibSet(_comptrollerLib);\n    }\n\n    /// @notice Sets the ProtocolFeeTracker\n    /// @param _protocolFeeTracker The ProtocolFeeTracker contract address\n    function setProtocolFeeTracker(address _protocolFeeTracker)\n        external\n        override\n        onlyOwner\n        pseudoConstant(getProtocolFeeTracker())\n    {\n        protocolFeeTracker = _protocolFeeTracker;\n\n        emit ProtocolFeeTrackerSet(_protocolFeeTracker);\n    }\n\n    /// @notice Sets the VaultLib\n    /// @param _vaultLib The VaultLib contract address\n    function setVaultLib(address _vaultLib) external override onlyOwner pseudoConstant(getVaultLib()) {\n        vaultLib = _vaultLib;\n\n        emit VaultLibSet(_vaultLib);\n    }\n\n    /////////////\n    // GENERAL //\n    /////////////\n\n    /// @notice Gets the current owner of the contract\n    /// @return owner_ The contract owner address\n    /// @dev The owner is initially the contract's creator, for convenience in setting up configuration.\n    /// Ownership is handed-off when the creator calls setReleaseLive().\n    function getOwner() public view override returns (address owner_) {\n        if (!releaseIsLive()) {\n            return getCreator();\n        }\n\n        return IDispatcher(getDispatcher()).getOwner();\n    }\n\n    /// @notice Sets the amounts of gas to forward to each of the ComptrollerLib.destructActivated() external calls\n    /// @param _nextDeactivateFeeManagerGasLimit The amount of gas to forward to deactivate the FeeManager\n    /// @param _nextPayProtocolFeeGasLimit The amount of gas to forward to pay the protocol fee\n    function setGasLimitsForDestructCall(uint32 _nextDeactivateFeeManagerGasLimit, uint32 _nextPayProtocolFeeGasLimit)\n        external\n        override\n        onlyOwner\n    {\n        require(\n            _nextDeactivateFeeManagerGasLimit > 0 && _nextPayProtocolFeeGasLimit > 0,\n            \"setGasLimitsForDestructCall: Zero value not allowed\"\n        );\n\n        gasLimitForDestructCallToDeactivateFeeManager = _nextDeactivateFeeManagerGasLimit;\n        gasLimitForDestructCallToPayProtocolFee = _nextPayProtocolFeeGasLimit;\n\n        emit GasLimitsForDestructCallSet(_nextDeactivateFeeManagerGasLimit, _nextPayProtocolFeeGasLimit);\n    }\n\n    /// @notice Sets the release as live\n    /// @dev A live release allows funds to be created and migrated once this contract\n    /// is set as the Dispatcher.currentFundDeployer\n    function setReleaseLive() external override {\n        require(msg.sender == getCreator(), \"setReleaseLive: Only the creator can call this function\");\n        require(!releaseIsLive(), \"setReleaseLive: Already live\");\n\n        // All pseudo-constants should be set\n        require(getComptrollerLib() != address(0), \"setReleaseLive: comptrollerLib is not set\");\n        require(getProtocolFeeTracker() != address(0), \"setReleaseLive: protocolFeeTracker is not set\");\n        require(getVaultLib() != address(0), \"setReleaseLive: vaultLib is not set\");\n\n        isLive = true;\n\n        emit ReleaseIsLive();\n    }\n\n    /// @dev Helper to call ComptrollerProxy.destructActivated() with the correct params\n    function __destructActivatedComptrollerProxy(address _comptrollerProxy) private {\n        (uint256 deactivateFeeManagerGasLimit, uint256 payProtocolFeeGasLimit) = getGasLimitsForDestructCall();\n        IComptroller(_comptrollerProxy).destructActivated(deactivateFeeManagerGasLimit, payProtocolFeeGasLimit);\n    }\n\n    ///////////////////\n    // FUND CREATION //\n    ///////////////////\n\n    /// @notice Creates a fully-configured ComptrollerProxy instance for a VaultProxy and signals the migration process\n    /// @param _vaultProxy The VaultProxy to migrate\n    /// @param _denominationAsset The contract address of the denomination asset for the fund\n    /// @param _sharesActionTimelock The minimum number of seconds between any two \"shares actions\"\n    /// (buying or selling shares) by the same user\n    /// @param _feeManagerConfigData Bytes data for the fees to be enabled for the fund\n    /// @param _policyManagerConfigData Bytes data for the policies to be enabled for the fund\n    /// @param _bypassPrevReleaseFailure True if should override a failure in the previous release while signaling migration\n    /// @return comptrollerProxy_ The address of the ComptrollerProxy deployed during this action\n    function createMigrationRequest(\n        address _vaultProxy,\n        address _denominationAsset,\n        uint256 _sharesActionTimelock,\n        bytes calldata _feeManagerConfigData,\n        bytes calldata _policyManagerConfigData,\n        bool _bypassPrevReleaseFailure\n    ) external override onlyLiveRelease onlyMigratorNotRelayable(_vaultProxy) returns (address comptrollerProxy_) {\n        // Bad _vaultProxy value is validated by Dispatcher.signalMigration()\n\n        require(\n            !IDispatcher(getDispatcher()).hasMigrationRequest(_vaultProxy),\n            \"createMigrationRequest: A MigrationRequest already exists\"\n        );\n\n        comptrollerProxy_ = __deployComptrollerProxy(msg.sender, _denominationAsset, _sharesActionTimelock);\n\n        IComptroller(comptrollerProxy_).setVaultProxy(_vaultProxy);\n\n        __configureExtensions(comptrollerProxy_, _vaultProxy, _feeManagerConfigData, _policyManagerConfigData);\n\n        IDispatcher(getDispatcher()).signalMigration(\n            _vaultProxy, comptrollerProxy_, getVaultLib(), _bypassPrevReleaseFailure\n        );\n\n        emit MigrationRequestCreated(msg.sender, _vaultProxy, comptrollerProxy_);\n\n        return comptrollerProxy_;\n    }\n\n    /// @notice Creates a new fund\n    /// @param _fundOwner The address of the owner for the fund\n    /// @param _fundName The name of the fund's shares token\n    /// @param _fundSymbol The symbol of the fund's shares token\n    /// @param _denominationAsset The contract address of the denomination asset for the fund\n    /// @param _sharesActionTimelock The minimum number of seconds between any two \"shares actions\"\n    /// (buying or selling shares) by the same user\n    /// @param _feeManagerConfigData Bytes data for the fees to be enabled for the fund\n    /// @param _policyManagerConfigData Bytes data for the policies to be enabled for the fund\n    /// @return comptrollerProxy_ The address of the ComptrollerProxy deployed during this action\n    function createNewFund(\n        address _fundOwner,\n        string calldata _fundName,\n        string calldata _fundSymbol,\n        address _denominationAsset,\n        uint256 _sharesActionTimelock,\n        bytes calldata _feeManagerConfigData,\n        bytes calldata _policyManagerConfigData\n    ) external override onlyLiveRelease returns (address comptrollerProxy_, address vaultProxy_) {\n        // _fundOwner is validated by VaultLib.__setOwner()\n        address canonicalSender = __msgSender();\n\n        comptrollerProxy_ = __deployComptrollerProxy(canonicalSender, _denominationAsset, _sharesActionTimelock);\n\n        vaultProxy_ = __deployVaultProxy(_fundOwner, comptrollerProxy_, _fundName, _fundSymbol);\n\n        IComptroller comptrollerContract = IComptroller(comptrollerProxy_);\n        comptrollerContract.setVaultProxy(vaultProxy_);\n\n        __configureExtensions(comptrollerProxy_, vaultProxy_, _feeManagerConfigData, _policyManagerConfigData);\n\n        comptrollerContract.activate(false);\n\n        IProtocolFeeTracker(getProtocolFeeTracker()).initializeForVault(vaultProxy_);\n\n        emit NewFundCreated(canonicalSender, vaultProxy_, comptrollerProxy_);\n\n        return (comptrollerProxy_, vaultProxy_);\n    }\n\n    /// @notice Creates a fully-configured ComptrollerProxy instance for a VaultProxy and signals the reconfiguration process\n    /// @param _vaultProxy The VaultProxy to reconfigure\n    /// @param _denominationAsset The contract address of the denomination asset for the fund\n    /// @param _sharesActionTimelock The minimum number of seconds between any two \"shares actions\"\n    /// (buying or selling shares) by the same user\n    /// @param _feeManagerConfigData Bytes data for the fees to be enabled for the fund\n    /// @param _policyManagerConfigData Bytes data for the policies to be enabled for the fund\n    /// @return comptrollerProxy_ The address of the ComptrollerProxy deployed during this action\n    function createReconfigurationRequest(\n        address _vaultProxy,\n        address _denominationAsset,\n        uint256 _sharesActionTimelock,\n        bytes calldata _feeManagerConfigData,\n        bytes calldata _policyManagerConfigData\n    ) external override returns (address comptrollerProxy_) {\n        address canonicalSender = __msgSender();\n        __assertIsMigrator(_vaultProxy, canonicalSender);\n        require(\n            IDispatcher(getDispatcher()).getFundDeployerForVaultProxy(_vaultProxy) == address(this),\n            \"createReconfigurationRequest: VaultProxy not on this release\"\n        );\n        require(\n            !hasReconfigurationRequest(_vaultProxy),\n            \"createReconfigurationRequest: VaultProxy has a pending reconfiguration request\"\n        );\n\n        comptrollerProxy_ = __deployComptrollerProxy(canonicalSender, _denominationAsset, _sharesActionTimelock);\n\n        IComptroller(comptrollerProxy_).setVaultProxy(_vaultProxy);\n\n        __configureExtensions(comptrollerProxy_, _vaultProxy, _feeManagerConfigData, _policyManagerConfigData);\n\n        uint256 executableTimestamp = block.timestamp + getReconfigurationTimelock();\n        vaultProxyToReconfigurationRequest[_vaultProxy] =\n            ReconfigurationRequest({nextComptrollerProxy: comptrollerProxy_, executableTimestamp: executableTimestamp});\n\n        emit ReconfigurationRequestCreated(canonicalSender, _vaultProxy, comptrollerProxy_, executableTimestamp);\n\n        return comptrollerProxy_;\n    }\n\n    /// @dev Helper function to configure the Extensions for a given ComptrollerProxy\n    function __configureExtensions(\n        address _comptrollerProxy,\n        address _vaultProxy,\n        bytes memory _feeManagerConfigData,\n        bytes memory _policyManagerConfigData\n    ) private {\n        // Since fees can only be set in this step, if there are no fees, there is no need to set the validated VaultProxy\n        if (_feeManagerConfigData.length > 0) {\n            IExtension(IComptroller(_comptrollerProxy).getFeeManager()).setConfigForFund(\n                _comptrollerProxy, _vaultProxy, _feeManagerConfigData\n            );\n        }\n\n        // For all other extensions, we call to cache the validated VaultProxy, for simplicity.\n        // In the future, we can consider caching conditionally.\n        IExtension(IComptroller(_comptrollerProxy).getExternalPositionManager()).setConfigForFund(\n            _comptrollerProxy, _vaultProxy, \"\"\n        );\n        IExtension(IComptroller(_comptrollerProxy).getIntegrationManager()).setConfigForFund(\n            _comptrollerProxy, _vaultProxy, \"\"\n        );\n        IExtension(IComptroller(_comptrollerProxy).getPolicyManager()).setConfigForFund(\n            _comptrollerProxy, _vaultProxy, _policyManagerConfigData\n        );\n    }\n\n    /// @dev Helper function to deploy a configured ComptrollerProxy\n    function __deployComptrollerProxy(\n        address _canonicalSender,\n        address _denominationAsset,\n        uint256 _sharesActionTimelock\n    ) private returns (address comptrollerProxy_) {\n        // _denominationAsset is validated by ComptrollerLib.init()\n\n        bytes memory constructData =\n            abi.encodeWithSelector(IComptroller.init.selector, _denominationAsset, _sharesActionTimelock);\n        comptrollerProxy_ = address(new ComptrollerProxy(constructData, getComptrollerLib()));\n\n        emit ComptrollerProxyDeployed(_canonicalSender, comptrollerProxy_, _denominationAsset, _sharesActionTimelock);\n\n        return comptrollerProxy_;\n    }\n\n    /// @dev Helper to deploy a new VaultProxy instance during fund creation.\n    /// Avoids stack-too-deep error.\n    function __deployVaultProxy(\n        address _fundOwner,\n        address _comptrollerProxy,\n        string calldata _fundName,\n        string calldata _fundSymbol\n    ) private returns (address vaultProxy_) {\n        vaultProxy_ =\n            IDispatcher(getDispatcher()).deployVaultProxy(getVaultLib(), _fundOwner, _comptrollerProxy, _fundName);\n        if (bytes(_fundSymbol).length != 0) {\n            IVault(vaultProxy_).setSymbol(_fundSymbol);\n        }\n\n        return vaultProxy_;\n    }\n\n    ///////////////////////////////////////////////\n    // RECONFIGURATION (INTRA-RELEASE MIGRATION) //\n    ///////////////////////////////////////////////\n\n    /// @notice Cancels a pending reconfiguration request\n    /// @param _vaultProxy The VaultProxy contract for which to cancel the reconfiguration request\n    function cancelReconfiguration(address _vaultProxy) external override onlyMigrator(_vaultProxy) {\n        address nextComptrollerProxy = vaultProxyToReconfigurationRequest[_vaultProxy].nextComptrollerProxy;\n        require(\n            nextComptrollerProxy != address(0),\n            \"cancelReconfiguration: No reconfiguration request exists for _vaultProxy\"\n        );\n\n        // Destroy the nextComptrollerProxy\n        IComptroller(nextComptrollerProxy).destructUnactivated();\n\n        // Remove the reconfiguration request\n        delete vaultProxyToReconfigurationRequest[_vaultProxy];\n\n        emit ReconfigurationRequestCancelled(_vaultProxy, nextComptrollerProxy);\n    }\n\n    /// @notice Executes a pending reconfiguration request\n    /// @param _vaultProxy The VaultProxy contract for which to execute the reconfiguration request\n    /// @dev ProtocolFeeTracker.initializeForVault() does not need to be included in a reconfiguration,\n    /// as it refers to the vault and not the new ComptrollerProxy\n    function executeReconfiguration(address _vaultProxy) external override onlyMigrator(_vaultProxy) {\n        ReconfigurationRequest memory request = getReconfigurationRequestForVaultProxy(_vaultProxy);\n        require(\n            request.nextComptrollerProxy != address(0),\n            \"executeReconfiguration: No reconfiguration request exists for _vaultProxy\"\n        );\n        require(\n            block.timestamp >= request.executableTimestamp,\n            \"executeReconfiguration: The reconfiguration timelock has not elapsed\"\n        );\n        // Not technically necessary, but a nice assurance\n        require(\n            IDispatcher(getDispatcher()).getFundDeployerForVaultProxy(_vaultProxy) == address(this),\n            \"executeReconfiguration: _vaultProxy is no longer on this release\"\n        );\n\n        // Unwind and destroy the prevComptrollerProxy before setting the nextComptrollerProxy as the VaultProxy.accessor\n        address prevComptrollerProxy = IVault(_vaultProxy).getAccessor();\n        address paymaster = IComptroller(prevComptrollerProxy).getGasRelayPaymaster();\n        __destructActivatedComptrollerProxy(prevComptrollerProxy);\n\n        // Execute the reconfiguration\n        IVault(_vaultProxy).setAccessorForFundReconfiguration(request.nextComptrollerProxy);\n\n        // Activate the new ComptrollerProxy\n        IComptroller(request.nextComptrollerProxy).activate(true);\n        if (paymaster != address(0)) {\n            IComptroller(request.nextComptrollerProxy).setGasRelayPaymaster(paymaster);\n        }\n\n        // Remove the reconfiguration request\n        delete vaultProxyToReconfigurationRequest[_vaultProxy];\n\n        emit ReconfigurationRequestExecuted(_vaultProxy, prevComptrollerProxy, request.nextComptrollerProxy);\n    }\n\n    /// @notice Sets a new reconfiguration timelock\n    /// @param _nextTimelock The number of seconds for the new timelock\n    function setReconfigurationTimelock(uint256 _nextTimelock) external override onlyOwner {\n        reconfigurationTimelock = _nextTimelock;\n\n        emit ReconfigurationTimelockSet(_nextTimelock);\n    }\n\n    //////////////////\n    // MIGRATION IN //\n    //////////////////\n\n    /// @notice Cancels fund migration\n    /// @param _vaultProxy The VaultProxy for which to cancel migration\n    /// @param _bypassPrevReleaseFailure True if should override a failure in the previous release while canceling migration\n    function cancelMigration(address _vaultProxy, bool _bypassPrevReleaseFailure)\n        external\n        override\n        onlyMigratorNotRelayable(_vaultProxy)\n    {\n        IDispatcher(getDispatcher()).cancelMigration(_vaultProxy, _bypassPrevReleaseFailure);\n    }\n\n    /// @notice Executes fund migration\n    /// @param _vaultProxy The VaultProxy for which to execute the migration\n    /// @param _bypassPrevReleaseFailure True if should override a failure in the previous release while executing migration\n    function executeMigration(address _vaultProxy, bool _bypassPrevReleaseFailure)\n        external\n        override\n        onlyMigratorNotRelayable(_vaultProxy)\n    {\n        IDispatcher dispatcherContract = IDispatcher(getDispatcher());\n\n        (, address comptrollerProxy,,) = dispatcherContract.getMigrationRequestDetailsForVaultProxy(_vaultProxy);\n\n        dispatcherContract.executeMigration(_vaultProxy, _bypassPrevReleaseFailure);\n\n        IComptroller(comptrollerProxy).activate(true);\n\n        IProtocolFeeTracker(getProtocolFeeTracker()).initializeForVault(_vaultProxy);\n    }\n\n    /// @notice Executes logic when a migration is canceled on the Dispatcher\n    /// @param _nextComptrollerProxy The ComptrollerProxy created on this release\n    function invokeMigrationInCancelHook(address, address, address _nextComptrollerProxy, address)\n        external\n        override\n        onlyDispatcher\n    {\n        IComptroller(_nextComptrollerProxy).destructUnactivated();\n    }\n\n    ///////////////////\n    // MIGRATION OUT //\n    ///////////////////\n\n    /// @notice Allows \"hooking into\" specific moments in the migration pipeline\n    /// to execute arbitrary logic during a migration out of this release\n    /// @param _vaultProxy The VaultProxy being migrated\n    function invokeMigrationOutHook(MigrationOutHook _hook, address _vaultProxy, address, address, address)\n        external\n        override\n        onlyDispatcher\n    {\n        if (_hook != MigrationOutHook.PreMigrate) {\n            return;\n        }\n\n        // Must use PreMigrate hook to get the ComptrollerProxy from the VaultProxy\n        address comptrollerProxy = IVault(_vaultProxy).getAccessor();\n\n        // Wind down fund and destroy its config\n        __destructActivatedComptrollerProxy(comptrollerProxy);\n    }\n\n    //////////////\n    // REGISTRY //\n    //////////////\n\n    // BUY SHARES CALLERS\n\n    /// @notice Deregisters allowed callers of ComptrollerProxy.buySharesOnBehalf()\n    /// @param _callers The callers to deregister\n    function deregisterBuySharesOnBehalfCallers(address[] calldata _callers) external override onlyOwner {\n        for (uint256 i; i < _callers.length; i++) {\n            require(\n                isAllowedBuySharesOnBehalfCaller(_callers[i]),\n                \"deregisterBuySharesOnBehalfCallers: Caller not registered\"\n            );\n\n            acctToIsAllowedBuySharesOnBehalfCaller[_callers[i]] = false;\n\n            emit BuySharesOnBehalfCallerDeregistered(_callers[i]);\n        }\n    }\n\n    /// @notice Registers allowed callers of ComptrollerProxy.buySharesOnBehalf()\n    /// @param _callers The allowed callers\n    /// @dev Validate that each registered caller only forwards requests to buy shares that\n    /// originate from the same _buyer passed into buySharesOnBehalf(). This is critical\n    /// to the integrity of VaultProxy.freelyTransferableShares.\n    function registerBuySharesOnBehalfCallers(address[] calldata _callers) external override onlyOwner {\n        for (uint256 i; i < _callers.length; i++) {\n            require(\n                !isAllowedBuySharesOnBehalfCaller(_callers[i]),\n                \"registerBuySharesOnBehalfCallers: Caller already registered\"\n            );\n\n            acctToIsAllowedBuySharesOnBehalfCaller[_callers[i]] = true;\n\n            emit BuySharesOnBehalfCallerRegistered(_callers[i]);\n        }\n    }\n\n    // VAULT CALLS\n\n    /// @notice De-registers allowed arbitrary contract calls that can be sent from the VaultProxy\n    /// @param _contracts The contracts of the calls to de-register\n    /// @param _selectors The selectors of the calls to de-register\n    /// @param _dataHashes The keccak call data hashes of the calls to de-register\n    /// @dev ANY_VAULT_CALL is a wildcard that allows any payload\n    function deregisterVaultCalls(\n        address[] calldata _contracts,\n        bytes4[] calldata _selectors,\n        bytes32[] memory _dataHashes\n    ) external override onlyOwner {\n        require(_contracts.length > 0, \"deregisterVaultCalls: Empty _contracts\");\n        require(\n            _contracts.length == _selectors.length && _contracts.length == _dataHashes.length,\n            \"deregisterVaultCalls: Uneven input arrays\"\n        );\n\n        for (uint256 i; i < _contracts.length; i++) {\n            require(\n                isRegisteredVaultCall(_contracts[i], _selectors[i], _dataHashes[i]),\n                \"deregisterVaultCalls: Call not registered\"\n            );\n\n            vaultCallToPayloadToIsAllowed[keccak256(abi.encodePacked(_contracts[i], _selectors[i]))][_dataHashes[i]] =\n                false;\n\n            emit VaultCallDeregistered(_contracts[i], _selectors[i], _dataHashes[i]);\n        }\n    }\n\n    /// @notice Registers allowed arbitrary contract calls that can be sent from the VaultProxy\n    /// @param _contracts The contracts of the calls to register\n    /// @param _selectors The selectors of the calls to register\n    /// @param _dataHashes The keccak call data hashes of the calls to register\n    /// @dev ANY_VAULT_CALL is a wildcard that allows any payload\n    function registerVaultCalls(\n        address[] calldata _contracts,\n        bytes4[] calldata _selectors,\n        bytes32[] memory _dataHashes\n    ) external override onlyOwner {\n        require(_contracts.length > 0, \"registerVaultCalls: Empty _contracts\");\n        require(\n            _contracts.length == _selectors.length && _contracts.length == _dataHashes.length,\n            \"registerVaultCalls: Uneven input arrays\"\n        );\n\n        for (uint256 i; i < _contracts.length; i++) {\n            require(\n                !isRegisteredVaultCall(_contracts[i], _selectors[i], _dataHashes[i]),\n                \"registerVaultCalls: Call already registered\"\n            );\n\n            vaultCallToPayloadToIsAllowed[keccak256(abi.encodePacked(_contracts[i], _selectors[i]))][_dataHashes[i]] =\n                true;\n\n            emit VaultCallRegistered(_contracts[i], _selectors[i], _dataHashes[i]);\n        }\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    // EXTERNAL FUNCTIONS\n\n    /// @notice Checks if a contract call is allowed\n    /// @param _contract The contract of the call to check\n    /// @param _selector The selector of the call to check\n    /// @param _dataHash The keccak call data hash of the call to check\n    /// @return isAllowed_ True if the call is allowed\n    /// @dev A vault call is allowed if the _dataHash is specifically allowed,\n    /// or if any _dataHash is allowed\n    function isAllowedVaultCall(address _contract, bytes4 _selector, bytes32 _dataHash)\n        external\n        view\n        override\n        returns (bool isAllowed_)\n    {\n        bytes32 contractFunctionHash = keccak256(abi.encodePacked(_contract, _selector));\n\n        return vaultCallToPayloadToIsAllowed[contractFunctionHash][_dataHash]\n            || vaultCallToPayloadToIsAllowed[contractFunctionHash][ANY_VAULT_CALL];\n    }\n\n    // PUBLIC FUNCTIONS\n\n    /// @notice Gets the `comptrollerLib` variable value\n    /// @return comptrollerLib_ The `comptrollerLib` variable value\n    function getComptrollerLib() public view override returns (address comptrollerLib_) {\n        return comptrollerLib;\n    }\n\n    /// @notice Gets the `CREATOR` variable value\n    /// @return creator_ The `CREATOR` variable value\n    function getCreator() public view override returns (address creator_) {\n        return CREATOR;\n    }\n\n    /// @notice Gets the `DISPATCHER` variable value\n    /// @return dispatcher_ The `DISPATCHER` variable value\n    function getDispatcher() public view override returns (address dispatcher_) {\n        return DISPATCHER;\n    }\n\n    /// @notice Gets the amounts of gas to forward to each of the ComptrollerLib.destructActivated() external calls\n    /// @return deactivateFeeManagerGasLimit_ The amount of gas to forward to deactivate the FeeManager\n    /// @return payProtocolFeeGasLimit_ The amount of gas to forward to pay the protocol fee\n    function getGasLimitsForDestructCall()\n        public\n        view\n        override\n        returns (uint256 deactivateFeeManagerGasLimit_, uint256 payProtocolFeeGasLimit_)\n    {\n        return (gasLimitForDestructCallToDeactivateFeeManager, gasLimitForDestructCallToPayProtocolFee);\n    }\n\n    /// @notice Gets the `protocolFeeTracker` variable value\n    /// @return protocolFeeTracker_ The `protocolFeeTracker` variable value\n    function getProtocolFeeTracker() public view override returns (address protocolFeeTracker_) {\n        return protocolFeeTracker;\n    }\n\n    /// @notice Gets the pending ReconfigurationRequest for a given VaultProxy\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return reconfigurationRequest_ The pending ReconfigurationRequest\n    function getReconfigurationRequestForVaultProxy(address _vaultProxy)\n        public\n        view\n        override\n        returns (ReconfigurationRequest memory reconfigurationRequest_)\n    {\n        return vaultProxyToReconfigurationRequest[_vaultProxy];\n    }\n\n    /// @notice Gets the amount of time that must pass before executing a ReconfigurationRequest\n    /// @return reconfigurationTimelock_ The timelock value (in seconds)\n    function getReconfigurationTimelock() public view override returns (uint256 reconfigurationTimelock_) {\n        return reconfigurationTimelock;\n    }\n\n    /// @notice Gets the `vaultLib` variable value\n    /// @return vaultLib_ The `vaultLib` variable value\n    function getVaultLib() public view override returns (address vaultLib_) {\n        return vaultLib;\n    }\n\n    /// @notice Checks whether a ReconfigurationRequest exists for a given VaultProxy\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return hasReconfigurationRequest_ True if a ReconfigurationRequest exists\n    function hasReconfigurationRequest(address _vaultProxy)\n        public\n        view\n        override\n        returns (bool hasReconfigurationRequest_)\n    {\n        return vaultProxyToReconfigurationRequest[_vaultProxy].nextComptrollerProxy != address(0);\n    }\n\n    /// @notice Checks if an account is an allowed caller of ComptrollerProxy.buySharesOnBehalf()\n    /// @param _who The account to check\n    /// @return isAllowed_ True if the account is an allowed caller\n    function isAllowedBuySharesOnBehalfCaller(address _who) public view override returns (bool isAllowed_) {\n        return acctToIsAllowedBuySharesOnBehalfCaller[_who];\n    }\n\n    /// @notice Checks if a contract call is registered\n    /// @param _contract The contract of the call to check\n    /// @param _selector The selector of the call to check\n    /// @param _dataHash The keccak call data hash of the call to check\n    /// @return isRegistered_ True if the call is registered\n    function isRegisteredVaultCall(address _contract, bytes4 _selector, bytes32 _dataHash)\n        public\n        view\n        override\n        returns (bool isRegistered_)\n    {\n        return vaultCallToPayloadToIsAllowed[keccak256(abi.encodePacked(_contract, _selector))][_dataHash];\n    }\n\n    /// @notice Gets the `isLive` variable value\n    /// @return isLive_ The `isLive` variable value\n    function releaseIsLive() public view override returns (bool isLive_) {\n        return isLive;\n    }\n}\n"
+    },
+    "contracts/persistent/dispatcher/IDispatcher.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IDispatcher Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IDispatcher {\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function claimOwnership() external;\n\n    function deployVaultProxy(address _vaultLib, address _owner, address _vaultAccessor, string calldata _fundName)\n        external\n        returns (address vaultProxy_);\n\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function getCurrentFundDeployer() external view returns (address currentFundDeployer_);\n\n    function getFundDeployerForVaultProxy(address _vaultProxy) external view returns (address fundDeployer_);\n\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        );\n\n    function getMigrationTimelock() external view returns (uint256 migrationTimelock_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getOwner() external view returns (address owner_);\n\n    function getSharesTokenSymbol() external view returns (string memory sharesTokenSymbol_);\n\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (uint256 secondsRemaining_);\n\n    function hasExecutableMigrationRequest(address _vaultProxy) external view returns (bool hasExecutableRequest_);\n\n    function hasMigrationRequest(address _vaultProxy) external view returns (bool hasMigrationRequest_);\n\n    function removeNominatedOwner() external;\n\n    function setCurrentFundDeployer(address _nextFundDeployer) external;\n\n    function setMigrationTimelock(uint256 _nextTimelock) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSharesTokenSymbol(string calldata _nextSymbol) external;\n\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external;\n}\n"
+    },
+    "contracts/persistent/dispatcher/IMigrationHookHandler.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IMigrationHookHandler Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IMigrationHookHandler {\n    enum MigrationOutHook {\n        PreSignal,\n        PostSignal,\n        PreMigrate,\n        PostMigrate,\n        PostCancel\n    }\n\n    function invokeMigrationInCancelHook(\n        address _vaultProxy,\n        address _prevFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib\n    ) external;\n\n    function invokeMigrationOutHook(\n        MigrationOutHook _hook,\n        address _vaultProxy,\n        address _nextFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib\n    ) external;\n}\n"
+    },
+    "contracts/release/extensions/IExtension.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IExtension Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Interface for all extensions\ninterface IExtension {\n    function activateForFund(bool _isMigration) external;\n\n    function deactivateForFund() external;\n\n    function receiveCallFromComptroller(address _caller, uint256 _actionId, bytes calldata _callArgs) external;\n\n    function setConfigForFund(address _comptrollerProxy, address _vaultProxy, bytes calldata _configData) external;\n}\n"
+    },
+    "contracts/release/infrastructure/gas-relayer/GasRelayRecipientMixin.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\nimport {IBeaconProxyFactory} from \"../../../utils/0.6.12/beacon-proxy/IBeaconProxyFactory.sol\";\nimport {IGasRelayPaymaster} from \"./IGasRelayPaymaster.sol\";\n\npragma solidity 0.6.12;\n\n/// @title GasRelayRecipientMixin Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A mixin that enables receiving GSN-relayed calls\n/// @dev IMPORTANT: Do not use storage var in this contract,\n/// unless it is no longer inherited by the VaultLib\nabstract contract GasRelayRecipientMixin {\n    address internal immutable GAS_RELAY_PAYMASTER_FACTORY;\n\n    constructor(address _gasRelayPaymasterFactory) internal {\n        GAS_RELAY_PAYMASTER_FACTORY = _gasRelayPaymasterFactory;\n    }\n\n    /// @dev Helper to parse the canonical sender of a tx based on whether it has been relayed\n    function __msgSender() internal view returns (address payable canonicalSender_) {\n        if (msg.data.length >= 24 && msg.sender == getGasRelayTrustedForwarder()) {\n            assembly {\n                canonicalSender_ := shr(96, calldataload(sub(calldatasize(), 20)))\n            }\n\n            return canonicalSender_;\n        }\n\n        return msg.sender;\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the `GAS_RELAY_PAYMASTER_FACTORY` variable\n    /// @return gasRelayPaymasterFactory_ The `GAS_RELAY_PAYMASTER_FACTORY` variable value\n    function getGasRelayPaymasterFactory() public view returns (address gasRelayPaymasterFactory_) {\n        return GAS_RELAY_PAYMASTER_FACTORY;\n    }\n\n    /// @notice Gets the trusted forwarder for GSN relaying\n    /// @return trustedForwarder_ The trusted forwarder\n    function getGasRelayTrustedForwarder() public view returns (address trustedForwarder_) {\n        return\n            IGasRelayPaymaster(IBeaconProxyFactory(getGasRelayPaymasterFactory()).getCanonicalLib()).trustedForwarder();\n    }\n}\n"
+    },
+    "contracts/release/infrastructure/protocol-fees/IProtocolFeeTracker.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IProtocolFeeTracker Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IProtocolFeeTracker {\n    function getFeeBpsDefault() external view returns (uint256 feeBpsDefault_);\n\n    function getFeeBpsForVault(address _vaultProxy) external view returns (uint256 feeBps_);\n\n    function getFeeBpsOverrideForVault(address _vaultProxy) external view returns (uint256 feeBpsOverride_);\n\n    function getLastPaidForVault(address _vaultProxy) external view returns (uint256 lastPaid_);\n\n    function initializeForVault(address _vaultProxy) external;\n\n    function payFee() external returns (uint256 sharesDue_);\n\n    function setFeeBpsDefault(uint256 _nextFeeBpsDefault) external;\n\n    function setFeeBpsOverrideForVault(address _vaultProxy, uint256 _nextFeeBpsOverride) external;\n\n    function setLastPaidForVault(address _vaultProxy, uint256 _nextTimestamp) external;\n}\n"
+    },
+    "contracts/release/core/fund/comptroller/ComptrollerProxy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport {NonUpgradableProxy} from \"../../../../utils/0.6.12/NonUpgradableProxy.sol\";\n\n/// @title ComptrollerProxy Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A proxy contract for all ComptrollerProxy instances\ncontract ComptrollerProxy is NonUpgradableProxy {\n    constructor(bytes memory _constructData, address _comptrollerLib)\n        public\n        NonUpgradableProxy(_constructData, _comptrollerLib)\n    {}\n}\n"
+    },
+    "contracts/release/core/fund/comptroller/IComptroller.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport {IVault} from \"../vault/IVault.sol\";\n\n/// @title IComptroller Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IComptroller {\n    function activate(bool _isMigration) external;\n\n    function buyBackProtocolFeeShares(uint256 _sharesAmount) external;\n\n    function buyShares(uint256 _investmentAmount, uint256 _minSharesQuantity)\n        external\n        returns (uint256 sharesReceived_);\n\n    function buySharesOnBehalf(address _buyer, uint256 _investmentAmount, uint256 _minSharesQuantity)\n        external\n        returns (uint256 sharesReceived_);\n\n    function calcGav() external returns (uint256 gav_);\n\n    function calcGrossShareValue() external returns (uint256 grossShareValue_);\n\n    function callOnExtension(address _extension, uint256 _actionId, bytes calldata _callArgs) external;\n\n    function deployGasRelayPaymaster() external;\n\n    function depositToGasRelayPaymaster() external;\n\n    function destructActivated(uint256 _deactivateFeeManagerGasLimit, uint256 _payProtocolFeeGasLimit) external;\n\n    function destructUnactivated() external;\n\n    function doesAutoProtocolFeeSharesBuyback() external view returns (bool doesAutoBuyback_);\n\n    function getDenominationAsset() external view returns (address denominationAsset_);\n\n    function getDispatcher() external view returns (address dispatcher_);\n\n    function getExternalPositionManager() external view returns (address externalPositionManager_);\n\n    function getFeeManager() external view returns (address feeManager_);\n\n    function getFundDeployer() external view returns (address fundDeployer_);\n\n    function getGasRelayPaymaster() external view returns (address gasRelayPaymaster_);\n\n    function getIntegrationManager() external view returns (address integrationManager_);\n\n    function getLastSharesBoughtTimestampForAccount(address _who)\n        external\n        view\n        returns (uint256 lastSharesBoughtTimestamp_);\n\n    function getMlnToken() external view returns (address mlnToken_);\n\n    function getPolicyManager() external view returns (address policyManager_);\n\n    function getProtocolFeeReserve() external view returns (address protocolFeeReserve_);\n\n    function getSharesActionTimelock() external view returns (uint256 sharesActionTimelock_);\n\n    function getValueInterpreter() external view returns (address valueInterpreter_);\n\n    function getVaultProxy() external view returns (address vaultProxy_);\n\n    function getWethToken() external view returns (address wethToken_);\n\n    function init(address _denominationAsset, uint256 _sharesActionTimelock) external;\n\n    function permissionedVaultAction(IVault.VaultAction _action, bytes calldata _actionData) external;\n\n    function preTransferSharesHook(address _sender, address _recipient, uint256 _amount) external;\n\n    function preTransferSharesHookFreelyTransferable(address _sender) external view;\n\n    function redeemSharesForSpecificAssets(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _payoutAssets,\n        uint256[] calldata _payoutAssetPercentages\n    ) external returns (uint256[] memory payoutAmounts_);\n\n    function redeemSharesInKind(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _additionalAssets,\n        address[] calldata _assetsToSkip\n    ) external returns (address[] memory payoutAssets_, uint256[] memory payoutAmounts_);\n\n    function setAutoProtocolFeeSharesBuyback(bool _nextAutoProtocolFeeSharesBuyback) external;\n\n    function setGasRelayPaymaster(address _nextGasRelayPaymaster) external;\n\n    function setVaultProxy(address _vaultProxy) external;\n\n    function shutdownGasRelayPaymaster() external;\n\n    function vaultCallOnContract(address _contract, bytes4 _selector, bytes calldata _encodedArgs)\n        external\n        returns (bytes memory returnData_);\n}\n"
+    },
+    "contracts/release/core/fund/vault/IVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport {IExternalPositionVault} from \"../../../../persistent/vault/interfaces/IExternalPositionVault.sol\";\nimport {IFreelyTransferableSharesVault} from\n    \"../../../../persistent/vault/interfaces/IFreelyTransferableSharesVault.sol\";\nimport {IMigratableVault} from \"../../../../persistent/vault/interfaces/IMigratableVault.sol\";\nimport {IVaultCore} from \"../../../../persistent/vault/interfaces/IVaultCore.sol\";\n\n/// @title IVault Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IVault is IVaultCore, IMigratableVault, IFreelyTransferableSharesVault, IExternalPositionVault {\n    enum VaultAction {\n        None,\n        // Shares management\n        BurnShares,\n        MintShares,\n        TransferShares,\n        // Asset management\n        AddTrackedAsset,\n        ApproveAssetSpender,\n        RemoveTrackedAsset,\n        WithdrawAssetTo,\n        // External position management\n        AddExternalPosition,\n        CallOnExternalPosition,\n        RemoveExternalPosition\n    }\n\n    function addAssetManagers(address[] calldata _managers) external;\n\n    function addTrackedAsset(address _asset) external;\n\n    function burnShares(address _target, uint256 _amount) external;\n\n    function buyBackProtocolFeeShares(uint256 _sharesAmount, uint256 _mlnValue, uint256 _gav) external;\n\n    function callOnContract(address _contract, bytes calldata _callData) external returns (bytes memory returnData_);\n\n    function canManageAssets(address _who) external view returns (bool canManageAssets_);\n\n    function canRelayCalls(address _who) external view returns (bool canRelayCalls_);\n\n    function claimOwnership() external;\n\n    function getActiveExternalPositions() external view returns (address[] memory activeExternalPositions_);\n\n    function getExternalPositionManager() external view returns (address externalPositionManager_);\n\n    function getFundDeployer() external view returns (address fundDeployer_);\n\n    function getMlnBurner() external view returns (address mlnBurner_);\n\n    function getMlnToken() external view returns (address mlnToken_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getPositionsLimit() external view returns (uint256 positionsLimit_);\n\n    function getProtocolFeeReserve() external view returns (address protocolFeeReserve_);\n\n    function getProtocolFeeTracker() external view returns (address protocolFeeTracker_);\n\n    function getTrackedAssets() external view returns (address[] memory trackedAssets_);\n\n    function isActiveExternalPosition(address _externalPosition)\n        external\n        view\n        returns (bool isActiveExternalPosition_);\n\n    function isAssetManager(address _who) external view returns (bool isAssetManager_);\n\n    function isTrackedAsset(address _asset) external view returns (bool isTrackedAsset_);\n\n    function mintShares(address _target, uint256 _amount) external;\n\n    function payProtocolFee() external;\n\n    function receiveValidatedVaultAction(VaultAction _action, bytes calldata _actionData) external;\n\n    function removeAssetManagers(address[] calldata _managers) external;\n\n    function removeNominatedOwner() external;\n\n    function setAccessorForFundReconfiguration(address _nextAccessor) external;\n\n    function setFreelyTransferableShares() external;\n\n    function setMigrator(address _nextMigrator) external;\n\n    function setName(string calldata _nextName) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSymbol(string calldata _nextSymbol) external;\n\n    function transferShares(address _from, address _to, uint256 _amount) external;\n\n    function withdrawAssetTo(address _asset, address _target, uint256 _amount) external;\n}\n"
+    },
+    "contracts/release/core/fund-deployer/IFundDeployer.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\n/// @title IFundDeployer Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IFundDeployer {\n    struct ReconfigurationRequest {\n        address nextComptrollerProxy;\n        uint256 executableTimestamp;\n    }\n\n    function cancelMigration(address _vaultProxy, bool _bypassPrevReleaseFailure) external;\n\n    function cancelReconfiguration(address _vaultProxy) external;\n\n    function createMigrationRequest(\n        address _vaultProxy,\n        address _denominationAsset,\n        uint256 _sharesActionTimelock,\n        bytes calldata _feeManagerConfigData,\n        bytes calldata _policyManagerConfigData,\n        bool _bypassPrevReleaseFailure\n    ) external returns (address comptrollerProxy_);\n\n    function createNewFund(\n        address _fundOwner,\n        string calldata _fundName,\n        string calldata _fundSymbol,\n        address _denominationAsset,\n        uint256 _sharesActionTimelock,\n        bytes calldata _feeManagerConfigData,\n        bytes calldata _policyManagerConfigData\n    ) external returns (address comptrollerProxy_, address vaultProxy_);\n\n    function createReconfigurationRequest(\n        address _vaultProxy,\n        address _denominationAsset,\n        uint256 _sharesActionTimelock,\n        bytes calldata _feeManagerConfigData,\n        bytes calldata _policyManagerConfigData\n    ) external returns (address comptrollerProxy_);\n\n    function deregisterBuySharesOnBehalfCallers(address[] calldata _callers) external;\n\n    function deregisterVaultCalls(\n        address[] calldata _contracts,\n        bytes4[] calldata _selectors,\n        bytes32[] memory _dataHashes\n    ) external;\n\n    function executeMigration(address _vaultProxy, bool _bypassPrevReleaseFailure) external;\n\n    function executeReconfiguration(address _vaultProxy) external;\n\n    function getComptrollerLib() external view returns (address comptrollerLib_);\n\n    function getCreator() external view returns (address creator_);\n\n    function getDispatcher() external view returns (address dispatcher_);\n\n    function getGasLimitsForDestructCall()\n        external\n        view\n        returns (uint256 deactivateFeeManagerGasLimit_, uint256 payProtocolFeeGasLimit_);\n\n    function getOwner() external view returns (address owner_);\n\n    function getProtocolFeeTracker() external view returns (address protocolFeeTracker_);\n\n    function getReconfigurationRequestForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (ReconfigurationRequest memory reconfigurationRequest_);\n\n    function getReconfigurationTimelock() external view returns (uint256 reconfigurationTimelock_);\n\n    function getVaultLib() external view returns (address vaultLib_);\n\n    function hasReconfigurationRequest(address _vaultProxy) external view returns (bool hasReconfigurationRequest_);\n\n    function isAllowedBuySharesOnBehalfCaller(address _who) external view returns (bool isAllowed_);\n\n    function isAllowedVaultCall(address _contract, bytes4 _selector, bytes32 _dataHash)\n        external\n        view\n        returns (bool isAllowed_);\n\n    function isRegisteredVaultCall(address _contract, bytes4 _selector, bytes32 _dataHash)\n        external\n        view\n        returns (bool isRegistered_);\n\n    function registerBuySharesOnBehalfCallers(address[] calldata _callers) external;\n\n    function registerVaultCalls(\n        address[] calldata _contracts,\n        bytes4[] calldata _selectors,\n        bytes32[] memory _dataHashes\n    ) external;\n\n    function releaseIsLive() external view returns (bool isLive_);\n\n    function setComptrollerLib(address _comptrollerLib) external;\n\n    function setGasLimitsForDestructCall(uint32 _nextDeactivateFeeManagerGasLimit, uint32 _nextPayProtocolFeeGasLimit)\n        external;\n\n    function setProtocolFeeTracker(address _protocolFeeTracker) external;\n\n    function setReconfigurationTimelock(uint256 _nextTimelock) external;\n\n    function setReleaseLive() external;\n\n    function setVaultLib(address _vaultLib) external;\n}\n"
+    },
+    "contracts/utils/0.6.12/beacon-proxy/IBeaconProxyFactory.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\nimport {IBeacon} from \"./IBeacon.sol\";\n\npragma solidity 0.6.12;\n\n/// @title IBeaconProxyFactory interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IBeaconProxyFactory is IBeacon {\n    function deployProxy(bytes memory _constructData) external returns (address proxy_);\n\n    function getOwner() external view returns (address owner_);\n\n    function setCanonicalLib(address _canonicalLib) external;\n}\n"
+    },
+    "contracts/release/infrastructure/gas-relayer/IGasRelayPaymaster.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\nimport {IGsnPaymaster} from \"../../../external-interfaces/IGsnPaymaster.sol\";\n\n/// @title IGasRelayPaymaster Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IGasRelayPaymaster is IGsnPaymaster {\n    function addAdditionalRelayUsers(address[] calldata _usersToAdd) external;\n\n    function deposit() external;\n\n    function getLastDepositTimestamp() external view returns (uint256 lastDepositTimestamp_);\n\n    function getParentComptroller() external view returns (address parentComptroller_);\n\n    function getParentVault() external view returns (address parentVault_);\n\n    function getWethToken() external view returns (address wethToken_);\n\n    function init(address _vault) external;\n\n    function isAdditionalRelayUser(address _who) external view returns (bool isAdditionalRelayUser_);\n\n    function removeAdditionalRelayUsers(address[] calldata _usersToRemove) external;\n\n    function withdrawBalance() external;\n}\n"
+    },
+    "contracts/utils/0.6.12/NonUpgradableProxy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title NonUpgradableProxy Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A proxy contract for use with non-upgradable libs\n/// @dev The recommended constructor-fallback pattern of a proxy in EIP-1822, updated for solc 0.6.12,\n/// and using an immutable lib value to save on gas (since not upgradable).\n/// The EIP-1967 storage slot for the lib is still assigned,\n/// for ease of referring to UIs that understand the pattern, i.e., Etherscan.\nabstract contract NonUpgradableProxy {\n    address private immutable CONTRACT_LOGIC;\n\n    constructor(bytes memory _constructData, address _contractLogic) public {\n        CONTRACT_LOGIC = _contractLogic;\n\n        assembly {\n            // EIP-1967 slot: `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`\n            sstore(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc, _contractLogic)\n        }\n        (bool success, bytes memory returnData) = _contractLogic.delegatecall(_constructData);\n        require(success, string(returnData));\n    }\n\n    // solhint-disable-next-line no-complex-fallback\n    fallback() external payable {\n        address contractLogic = CONTRACT_LOGIC;\n\n        assembly {\n            calldatacopy(0x0, 0x0, calldatasize())\n            let success := delegatecall(sub(gas(), 10000), contractLogic, 0x0, calldatasize(), 0, 0)\n            let retSz := returndatasize()\n            returndatacopy(0, 0, retSz)\n            switch success\n            case 0 { revert(0, retSz) }\n            default { return(0, retSz) }\n        }\n    }\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IExternalPositionVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IExternalPositionVault interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// Provides an interface to get the externalPositionLib for a given type from the Vault\ninterface IExternalPositionVault {\n    function getExternalPositionLibForType(uint256) external view returns (address);\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IFreelyTransferableSharesVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IFreelyTransferableSharesVault Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Provides the interface for determining whether a vault's shares\n/// are guaranteed to be freely transferable.\n/// @dev DO NOT EDIT CONTRACT\ninterface IFreelyTransferableSharesVault {\n    function sharesAreFreelyTransferable() external view returns (bool sharesAreFreelyTransferable_);\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IMigratableVault Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @dev DO NOT EDIT CONTRACT\ninterface IMigratableVault {\n    function canMigrate(address _who) external view returns (bool canMigrate_);\n\n    function init(address _owner, address _accessor, string calldata _fundName) external;\n\n    function setAccessor(address _nextAccessor) external;\n\n    function setVaultLib(address _nextVaultLib) external;\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IVaultCore.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IVaultCore interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Interface for getters of core vault storage\n/// @dev DO NOT EDIT CONTRACT\ninterface IVaultCore {\n    function getAccessor() external view returns (address accessor_);\n\n    function getCreator() external view returns (address creator_);\n\n    function getMigrator() external view returns (address migrator_);\n\n    function getOwner() external view returns (address owner_);\n}\n"
+    },
+    "contracts/utils/0.6.12/beacon-proxy/IBeacon.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IBeacon interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IBeacon {\n    function getCanonicalLib() external view returns (address);\n}\n"
+    },
+    "contracts/external-interfaces/IGsnPaymaster.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\nimport \"./IGsnTypes.sol\";\n\n/// @title IGsnPaymaster interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IGsnPaymaster {\n    struct GasAndDataLimits {\n        uint256 acceptanceBudget;\n        uint256 preRelayedCallGasLimit;\n        uint256 postRelayedCallGasLimit;\n        uint256 calldataSizeLimit;\n    }\n\n    function getGasAndDataLimits() external view returns (GasAndDataLimits memory limits);\n\n    function getHubAddr() external view returns (address);\n\n    function getRelayHubDeposit() external view returns (uint256);\n\n    function preRelayedCall(\n        IGsnTypes.RelayRequest calldata relayRequest,\n        bytes calldata signature,\n        bytes calldata approvalData,\n        uint256 maxPossibleGas\n    ) external returns (bytes memory context, bool rejectOnRecipientRevert);\n\n    function postRelayedCall(\n        bytes calldata context,\n        bool success,\n        uint256 gasUseWithoutPost,\n        IGsnTypes.RelayData calldata relayData\n    ) external;\n\n    function trustedForwarder() external view returns (address);\n\n    function versionPaymaster() external view returns (string memory);\n}\n"
+    },
+    "contracts/external-interfaces/IGsnTypes.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\nimport \"./IGsnForwarder.sol\";\n\n/// @title IGsnTypes Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IGsnTypes {\n    struct RelayData {\n        uint256 gasPrice;\n        uint256 pctRelayFee;\n        uint256 baseRelayFee;\n        address relayWorker;\n        address paymaster;\n        address forwarder;\n        bytes paymasterData;\n        uint256 clientId;\n    }\n\n    struct RelayRequest {\n        IGsnForwarder.ForwardRequest request;\n        RelayData relayData;\n    }\n}\n"
+    },
+    "contracts/external-interfaces/IGsnForwarder.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IGsnForwarder interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IGsnForwarder {\n    struct ForwardRequest {\n        address from;\n        address to;\n        uint256 value;\n        uint256 gas;\n        uint256 nonce;\n        bytes data;\n        uint256 validUntil;\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.6.12+commit.27d51765"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_dispatcher",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_gasRelayPaymasterFactory",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "caller",
+              "type": "address"
+            }
+          ],
+          "name": "BuySharesOnBehalfCallerDeregistered",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "caller",
+              "type": "address"
+            }
+          ],
+          "name": "BuySharesOnBehalfCallerRegistered",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "comptrollerLib",
+              "type": "address"
+            }
+          ],
+          "name": "ComptrollerLibSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "creator",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "comptrollerProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "denominationAsset",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "sharesActionTimelock",
+              "type": "uint256"
+            }
+          ],
+          "name": "ComptrollerProxyDeployed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "nextDeactivateFeeManagerGasLimit",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "nextPayProtocolFeeGasLimit",
+              "type": "uint256"
+            }
+          ],
+          "name": "GasLimitsForDestructCallSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "creator",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "comptrollerProxy",
+              "type": "address"
+            }
+          ],
+          "name": "MigrationRequestCreated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "creator",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "comptrollerProxy",
+              "type": "address"
+            }
+          ],
+          "name": "NewFundCreated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "protocolFeeTracker",
+              "type": "address"
+            }
+          ],
+          "name": "ProtocolFeeTrackerSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nextComptrollerProxy",
+              "type": "address"
+            }
+          ],
+          "name": "ReconfigurationRequestCancelled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "creator",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "comptrollerProxy",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "executableTimestamp",
+              "type": "uint256"
+            }
+          ],
+          "name": "ReconfigurationRequestCreated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "prevComptrollerProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nextComptrollerProxy",
+              "type": "address"
+            }
+          ],
+          "name": "ReconfigurationRequestExecuted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "nextTimelock",
+              "type": "uint256"
+            }
+          ],
+          "name": "ReconfigurationTimelockSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "ReleaseIsLive",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "contractAddress",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes4",
+              "name": "selector",
+              "type": "bytes4"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "dataHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "VaultCallDeregistered",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "contractAddress",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes4",
+              "name": "selector",
+              "type": "bytes4"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "dataHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "VaultCallRegistered",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "vaultLib",
+              "type": "address"
+            }
+          ],
+          "name": "VaultLibSet",
+          "type": "event"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "_bypassPrevReleaseFailure",
+              "type": "bool"
+            }
+          ],
+          "name": "cancelMigration",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "cancelReconfiguration",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_denominationAsset",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_sharesActionTimelock",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_feeManagerConfigData",
+              "type": "bytes"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_policyManagerConfigData",
+              "type": "bytes"
+            },
+            {
+              "internalType": "bool",
+              "name": "_bypassPrevReleaseFailure",
+              "type": "bool"
+            }
+          ],
+          "name": "createMigrationRequest",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "comptrollerProxy_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_fundOwner",
+              "type": "address"
+            },
+            {
+              "internalType": "string",
+              "name": "_fundName",
+              "type": "string"
+            },
+            {
+              "internalType": "string",
+              "name": "_fundSymbol",
+              "type": "string"
+            },
+            {
+              "internalType": "address",
+              "name": "_denominationAsset",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_sharesActionTimelock",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_feeManagerConfigData",
+              "type": "bytes"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_policyManagerConfigData",
+              "type": "bytes"
+            }
+          ],
+          "name": "createNewFund",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "comptrollerProxy_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "vaultProxy_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_denominationAsset",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_sharesActionTimelock",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_feeManagerConfigData",
+              "type": "bytes"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_policyManagerConfigData",
+              "type": "bytes"
+            }
+          ],
+          "name": "createReconfigurationRequest",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "comptrollerProxy_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "_callers",
+              "type": "address[]"
+            }
+          ],
+          "name": "deregisterBuySharesOnBehalfCallers",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "_contracts",
+              "type": "address[]"
+            },
+            {
+              "internalType": "bytes4[]",
+              "name": "_selectors",
+              "type": "bytes4[]"
+            },
+            {
+              "internalType": "bytes32[]",
+              "name": "_dataHashes",
+              "type": "bytes32[]"
+            }
+          ],
+          "name": "deregisterVaultCalls",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "_bypassPrevReleaseFailure",
+              "type": "bool"
+            }
+          ],
+          "name": "executeMigration",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "executeReconfiguration",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getComptrollerLib",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "comptrollerLib_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getCreator",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "creator_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getDispatcher",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "dispatcher_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getGasLimitsForDestructCall",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "deactivateFeeManagerGasLimit_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "payProtocolFeeGasLimit_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getGasRelayPaymasterFactory",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "gasRelayPaymasterFactory_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getGasRelayTrustedForwarder",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "trustedForwarder_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getOwner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "owner_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getProtocolFeeTracker",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "protocolFeeTracker_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "getReconfigurationRequestForVaultProxy",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "nextComptrollerProxy",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "executableTimestamp",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct IFundDeployer.ReconfigurationRequest",
+              "name": "reconfigurationRequest_",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getReconfigurationTimelock",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "reconfigurationTimelock_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getVaultLib",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "vaultLib_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "hasReconfigurationRequest",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "hasReconfigurationRequest_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_nextComptrollerProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "invokeMigrationInCancelHook",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "enum IMigrationHookHandler.MigrationOutHook",
+              "name": "_hook",
+              "type": "uint8"
+            },
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "invokeMigrationOutHook",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_who",
+              "type": "address"
+            }
+          ],
+          "name": "isAllowedBuySharesOnBehalfCaller",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isAllowed_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_contract",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes4",
+              "name": "_selector",
+              "type": "bytes4"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "_dataHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "isAllowedVaultCall",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isAllowed_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_contract",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes4",
+              "name": "_selector",
+              "type": "bytes4"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "_dataHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "isRegisteredVaultCall",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isRegistered_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "_callers",
+              "type": "address[]"
+            }
+          ],
+          "name": "registerBuySharesOnBehalfCallers",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "_contracts",
+              "type": "address[]"
+            },
+            {
+              "internalType": "bytes4[]",
+              "name": "_selectors",
+              "type": "bytes4[]"
+            },
+            {
+              "internalType": "bytes32[]",
+              "name": "_dataHashes",
+              "type": "bytes32[]"
+            }
+          ],
+          "name": "registerVaultCalls",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "releaseIsLive",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isLive_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_comptrollerLib",
+              "type": "address"
+            }
+          ],
+          "name": "setComptrollerLib",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint32",
+              "name": "_nextDeactivateFeeManagerGasLimit",
+              "type": "uint32"
+            },
+            {
+              "internalType": "uint32",
+              "name": "_nextPayProtocolFeeGasLimit",
+              "type": "uint32"
+            }
+          ],
+          "name": "setGasLimitsForDestructCall",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_protocolFeeTracker",
+              "type": "address"
+            }
+          ],
+          "name": "setProtocolFeeTracker",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_nextTimelock",
+              "type": "uint256"
+            }
+          ],
+          "name": "setReconfigurationTimelock",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "setReleaseLive",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultLib",
+              "type": "address"
+            }
+          ],
+          "name": "setVaultLib",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Enzyme Council <security@enzyme.finance>",
+        "kind": "dev",
+        "methods": {
+          "cancelMigration(address,bool)": {
+            "params": {
+              "_bypassPrevReleaseFailure": "True if should override a failure in the previous release while canceling migration",
+              "_vaultProxy": "The VaultProxy for which to cancel migration"
+            }
+          },
+          "cancelReconfiguration(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy contract for which to cancel the reconfiguration request"
+            }
+          },
+          "createMigrationRequest(address,address,uint256,bytes,bytes,bool)": {
+            "params": {
+              "_bypassPrevReleaseFailure": "True if should override a failure in the previous release while signaling migration",
+              "_denominationAsset": "The contract address of the denomination asset for the fund",
+              "_feeManagerConfigData": "Bytes data for the fees to be enabled for the fund",
+              "_policyManagerConfigData": "Bytes data for the policies to be enabled for the fund",
+              "_sharesActionTimelock": "The minimum number of seconds between any two \"shares actions\" (buying or selling shares) by the same user",
+              "_vaultProxy": "The VaultProxy to migrate"
+            },
+            "returns": {
+              "comptrollerProxy_": "The address of the ComptrollerProxy deployed during this action"
+            }
+          },
+          "createNewFund(address,string,string,address,uint256,bytes,bytes)": {
+            "params": {
+              "_denominationAsset": "The contract address of the denomination asset for the fund",
+              "_feeManagerConfigData": "Bytes data for the fees to be enabled for the fund",
+              "_fundName": "The name of the fund's shares token",
+              "_fundOwner": "The address of the owner for the fund",
+              "_fundSymbol": "The symbol of the fund's shares token",
+              "_policyManagerConfigData": "Bytes data for the policies to be enabled for the fund",
+              "_sharesActionTimelock": "The minimum number of seconds between any two \"shares actions\" (buying or selling shares) by the same user"
+            },
+            "returns": {
+              "comptrollerProxy_": "The address of the ComptrollerProxy deployed during this action"
+            }
+          },
+          "createReconfigurationRequest(address,address,uint256,bytes,bytes)": {
+            "params": {
+              "_denominationAsset": "The contract address of the denomination asset for the fund",
+              "_feeManagerConfigData": "Bytes data for the fees to be enabled for the fund",
+              "_policyManagerConfigData": "Bytes data for the policies to be enabled for the fund",
+              "_sharesActionTimelock": "The minimum number of seconds between any two \"shares actions\" (buying or selling shares) by the same user",
+              "_vaultProxy": "The VaultProxy to reconfigure"
+            },
+            "returns": {
+              "comptrollerProxy_": "The address of the ComptrollerProxy deployed during this action"
+            }
+          },
+          "deregisterBuySharesOnBehalfCallers(address[])": {
+            "params": {
+              "_callers": "The callers to deregister"
+            }
+          },
+          "deregisterVaultCalls(address[],bytes4[],bytes32[])": {
+            "details": "ANY_VAULT_CALL is a wildcard that allows any payload",
+            "params": {
+              "_contracts": "The contracts of the calls to de-register",
+              "_dataHashes": "The keccak call data hashes of the calls to de-register",
+              "_selectors": "The selectors of the calls to de-register"
+            }
+          },
+          "executeMigration(address,bool)": {
+            "params": {
+              "_bypassPrevReleaseFailure": "True if should override a failure in the previous release while executing migration",
+              "_vaultProxy": "The VaultProxy for which to execute the migration"
+            }
+          },
+          "executeReconfiguration(address)": {
+            "details": "ProtocolFeeTracker.initializeForVault() does not need to be included in a reconfiguration, as it refers to the vault and not the new ComptrollerProxy",
+            "params": {
+              "_vaultProxy": "The VaultProxy contract for which to execute the reconfiguration request"
+            }
+          },
+          "getComptrollerLib()": {
+            "returns": {
+              "comptrollerLib_": "The `comptrollerLib` variable value"
+            }
+          },
+          "getCreator()": {
+            "returns": {
+              "creator_": "The `CREATOR` variable value"
+            }
+          },
+          "getDispatcher()": {
+            "returns": {
+              "dispatcher_": "The `DISPATCHER` variable value"
+            }
+          },
+          "getGasLimitsForDestructCall()": {
+            "returns": {
+              "deactivateFeeManagerGasLimit_": "The amount of gas to forward to deactivate the FeeManager",
+              "payProtocolFeeGasLimit_": "The amount of gas to forward to pay the protocol fee"
+            }
+          },
+          "getGasRelayPaymasterFactory()": {
+            "returns": {
+              "gasRelayPaymasterFactory_": "The `GAS_RELAY_PAYMASTER_FACTORY` variable value"
+            }
+          },
+          "getGasRelayTrustedForwarder()": {
+            "returns": {
+              "trustedForwarder_": "The trusted forwarder"
+            }
+          },
+          "getOwner()": {
+            "details": "The owner is initially the contract's creator, for convenience in setting up configuration. Ownership is handed-off when the creator calls setReleaseLive().",
+            "returns": {
+              "owner_": "The contract owner address"
+            }
+          },
+          "getProtocolFeeTracker()": {
+            "returns": {
+              "protocolFeeTracker_": "The `protocolFeeTracker` variable value"
+            }
+          },
+          "getReconfigurationRequestForVaultProxy(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy instance"
+            },
+            "returns": {
+              "reconfigurationRequest_": "The pending ReconfigurationRequest"
+            }
+          },
+          "getReconfigurationTimelock()": {
+            "returns": {
+              "reconfigurationTimelock_": "The timelock value (in seconds)"
+            }
+          },
+          "getVaultLib()": {
+            "returns": {
+              "vaultLib_": "The `vaultLib` variable value"
+            }
+          },
+          "hasReconfigurationRequest(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy instance"
+            },
+            "returns": {
+              "hasReconfigurationRequest_": "True if a ReconfigurationRequest exists"
+            }
+          },
+          "invokeMigrationInCancelHook(address,address,address,address)": {
+            "params": {
+              "_nextComptrollerProxy": "The ComptrollerProxy created on this release"
+            }
+          },
+          "invokeMigrationOutHook(uint8,address,address,address,address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy being migrated"
+            }
+          },
+          "isAllowedBuySharesOnBehalfCaller(address)": {
+            "params": {
+              "_who": "The account to check"
+            },
+            "returns": {
+              "isAllowed_": "True if the account is an allowed caller"
+            }
+          },
+          "isAllowedVaultCall(address,bytes4,bytes32)": {
+            "details": "A vault call is allowed if the _dataHash is specifically allowed, or if any _dataHash is allowed",
+            "params": {
+              "_contract": "The contract of the call to check",
+              "_dataHash": "The keccak call data hash of the call to check",
+              "_selector": "The selector of the call to check"
+            },
+            "returns": {
+              "isAllowed_": "True if the call is allowed"
+            }
+          },
+          "isRegisteredVaultCall(address,bytes4,bytes32)": {
+            "params": {
+              "_contract": "The contract of the call to check",
+              "_dataHash": "The keccak call data hash of the call to check",
+              "_selector": "The selector of the call to check"
+            },
+            "returns": {
+              "isRegistered_": "True if the call is registered"
+            }
+          },
+          "registerBuySharesOnBehalfCallers(address[])": {
+            "details": "Validate that each registered caller only forwards requests to buy shares that originate from the same _buyer passed into buySharesOnBehalf(). This is critical to the integrity of VaultProxy.freelyTransferableShares.",
+            "params": {
+              "_callers": "The allowed callers"
+            }
+          },
+          "registerVaultCalls(address[],bytes4[],bytes32[])": {
+            "details": "ANY_VAULT_CALL is a wildcard that allows any payload",
+            "params": {
+              "_contracts": "The contracts of the calls to register",
+              "_dataHashes": "The keccak call data hashes of the calls to register",
+              "_selectors": "The selectors of the calls to register"
+            }
+          },
+          "releaseIsLive()": {
+            "returns": {
+              "isLive_": "The `isLive` variable value"
+            }
+          },
+          "setComptrollerLib(address)": {
+            "params": {
+              "_comptrollerLib": "The ComptrollerLib contract address"
+            }
+          },
+          "setGasLimitsForDestructCall(uint32,uint32)": {
+            "params": {
+              "_nextDeactivateFeeManagerGasLimit": "The amount of gas to forward to deactivate the FeeManager",
+              "_nextPayProtocolFeeGasLimit": "The amount of gas to forward to pay the protocol fee"
+            }
+          },
+          "setProtocolFeeTracker(address)": {
+            "params": {
+              "_protocolFeeTracker": "The ProtocolFeeTracker contract address"
+            }
+          },
+          "setReconfigurationTimelock(uint256)": {
+            "params": {
+              "_nextTimelock": "The number of seconds for the new timelock"
+            }
+          },
+          "setReleaseLive()": {
+            "details": "A live release allows funds to be created and migrated once this contract is set as the Dispatcher.currentFundDeployer"
+          },
+          "setVaultLib(address)": {
+            "params": {
+              "_vaultLib": "The VaultLib contract address"
+            }
+          }
+        },
+        "title": "FundDeployer Contract",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "cancelMigration(address,bool)": {
+            "notice": "Cancels fund migration"
+          },
+          "cancelReconfiguration(address)": {
+            "notice": "Cancels a pending reconfiguration request"
+          },
+          "createMigrationRequest(address,address,uint256,bytes,bytes,bool)": {
+            "notice": "Creates a fully-configured ComptrollerProxy instance for a VaultProxy and signals the migration process"
+          },
+          "createNewFund(address,string,string,address,uint256,bytes,bytes)": {
+            "notice": "Creates a new fund"
+          },
+          "createReconfigurationRequest(address,address,uint256,bytes,bytes)": {
+            "notice": "Creates a fully-configured ComptrollerProxy instance for a VaultProxy and signals the reconfiguration process"
+          },
+          "deregisterBuySharesOnBehalfCallers(address[])": {
+            "notice": "Deregisters allowed callers of ComptrollerProxy.buySharesOnBehalf()"
+          },
+          "deregisterVaultCalls(address[],bytes4[],bytes32[])": {
+            "notice": "De-registers allowed arbitrary contract calls that can be sent from the VaultProxy"
+          },
+          "executeMigration(address,bool)": {
+            "notice": "Executes fund migration"
+          },
+          "executeReconfiguration(address)": {
+            "notice": "Executes a pending reconfiguration request"
+          },
+          "getComptrollerLib()": {
+            "notice": "Gets the `comptrollerLib` variable value"
+          },
+          "getCreator()": {
+            "notice": "Gets the `CREATOR` variable value"
+          },
+          "getDispatcher()": {
+            "notice": "Gets the `DISPATCHER` variable value"
+          },
+          "getGasLimitsForDestructCall()": {
+            "notice": "Gets the amounts of gas to forward to each of the ComptrollerLib.destructActivated() external calls"
+          },
+          "getGasRelayPaymasterFactory()": {
+            "notice": "Gets the `GAS_RELAY_PAYMASTER_FACTORY` variable"
+          },
+          "getGasRelayTrustedForwarder()": {
+            "notice": "Gets the trusted forwarder for GSN relaying"
+          },
+          "getOwner()": {
+            "notice": "Gets the current owner of the contract"
+          },
+          "getProtocolFeeTracker()": {
+            "notice": "Gets the `protocolFeeTracker` variable value"
+          },
+          "getReconfigurationRequestForVaultProxy(address)": {
+            "notice": "Gets the pending ReconfigurationRequest for a given VaultProxy"
+          },
+          "getReconfigurationTimelock()": {
+            "notice": "Gets the amount of time that must pass before executing a ReconfigurationRequest"
+          },
+          "getVaultLib()": {
+            "notice": "Gets the `vaultLib` variable value"
+          },
+          "hasReconfigurationRequest(address)": {
+            "notice": "Checks whether a ReconfigurationRequest exists for a given VaultProxy"
+          },
+          "invokeMigrationInCancelHook(address,address,address,address)": {
+            "notice": "Executes logic when a migration is canceled on the Dispatcher"
+          },
+          "invokeMigrationOutHook(uint8,address,address,address,address)": {
+            "notice": "Allows \"hooking into\" specific moments in the migration pipeline to execute arbitrary logic during a migration out of this release"
+          },
+          "isAllowedBuySharesOnBehalfCaller(address)": {
+            "notice": "Checks if an account is an allowed caller of ComptrollerProxy.buySharesOnBehalf()"
+          },
+          "isAllowedVaultCall(address,bytes4,bytes32)": {
+            "notice": "Checks if a contract call is allowed"
+          },
+          "isRegisteredVaultCall(address,bytes4,bytes32)": {
+            "notice": "Checks if a contract call is registered"
+          },
+          "registerBuySharesOnBehalfCallers(address[])": {
+            "notice": "Registers allowed callers of ComptrollerProxy.buySharesOnBehalf()"
+          },
+          "registerVaultCalls(address[],bytes4[],bytes32[])": {
+            "notice": "Registers allowed arbitrary contract calls that can be sent from the VaultProxy"
+          },
+          "releaseIsLive()": {
+            "notice": "Gets the `isLive` variable value"
+          },
+          "setComptrollerLib(address)": {
+            "notice": "Sets the ComptrollerLib"
+          },
+          "setGasLimitsForDestructCall(uint32,uint32)": {
+            "notice": "Sets the amounts of gas to forward to each of the ComptrollerLib.destructActivated() external calls"
+          },
+          "setProtocolFeeTracker(address)": {
+            "notice": "Sets the ProtocolFeeTracker"
+          },
+          "setReconfigurationTimelock(uint256)": {
+            "notice": "Sets a new reconfiguration timelock"
+          },
+          "setReleaseLive()": {
+            "notice": "Sets the release as live"
+          },
+          "setVaultLib(address)": {
+            "notice": "Sets the VaultLib"
+          }
+        },
+        "notice": "The top-level contract of the release. It primarily coordinates fund deployment and fund migration, but it is also deferred to for contract access control and for allowed calls that can be made with a fund's VaultProxy as the msg.sender.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/release/core/fund-deployer/FundDeployer.sol": "FundDeployer"
+      },
+      "evmVersion": "istanbul",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "none"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": false
+        },
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "sources": {
+      "contracts/external-interfaces/IGsnForwarder.sol": {
+        "keccak256": "0x124db627d62943045acc5af302b0eb1c4b3ec7433e45f210596c1b5bba3accd7",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://507aeecbe4d173ba6e79c862492b530b0b9aa6de94dcbe83eb1bba148f672f78",
+          "dweb:/ipfs/Qmbp1X8aSZ4HDrHjrJNEVH9ZyAM71kFrtAw7zwAZtYvZgV"
+        ]
+      },
+      "contracts/external-interfaces/IGsnPaymaster.sol": {
+        "keccak256": "0xcd3551b8a1d9588562694da0a0a0b39009861024123e0702731500e66feed54d",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://229614b20baea83047697bfa13fe2e0ca1847d4cd20c5368a06d0ff3d1129b12",
+          "dweb:/ipfs/Qmc7UQv1yToe11EhsYEiWJUFxYwwNR5QjcjoaDC8ssnNYe"
+        ]
+      },
+      "contracts/external-interfaces/IGsnTypes.sol": {
+        "keccak256": "0x48a1fef214f91848b6e9c69468a225c23ba4ae930bdabda22c4b5b56cb11ada3",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://36f224779fb65ccd5e0dd0a95766b75a142c3e8e10c490ebe47bc0e7a040d653",
+          "dweb:/ipfs/QmYaFRoCttJ1DZ18ajx3A7e8H4TUyGQgB5SM7t5S7ZzFwv"
+        ]
+      },
+      "contracts/persistent/dispatcher/IDispatcher.sol": {
+        "keccak256": "0x2a4df902058211d49327eb16fc81e49dd4085bd8528101bbaac412805977e04a",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://b54c8c4162c819e35fe972142ba55510ce42a9e7c2ec723eb674c227be8bef15",
+          "dweb:/ipfs/QmVhJZjeuYtHzjd5WXUHNKk4ZHaZAZukRoZBhVvPYYmDFT"
+        ]
+      },
+      "contracts/persistent/dispatcher/IMigrationHookHandler.sol": {
+        "keccak256": "0x8096a8b1d03e4c9cc728fa8c130ec25dc9b41bf970f0beac12f1293912ac764f",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://0d9e3ebd497ab9e54c23bd879beb251c5ebd96c31ea99bb23f9550b5e8370048",
+          "dweb:/ipfs/QmPnL4bDHLjK244eSdTJ3XpNyDrvKWyEwqTjN6rRdqLtcV"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IExternalPositionVault.sol": {
+        "keccak256": "0xb6cf518c8c94ce9f8fae7530a2375e29120b31711fc339f4ce0e714c31282fea",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://fa9d66b8f0452c172b0a655ccb33fc772d7102873a54e1a446413e62632c8cdf",
+          "dweb:/ipfs/Qmdm3UsraUXtTusrJAPg4LYzAhJTkUFwieK31NitNMbDyn"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IFreelyTransferableSharesVault.sol": {
+        "keccak256": "0xdb36ef7f61945f8488b7f0acc74f26d8ce1a41519f03bc6f1fc86fc3c31c0384",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://09b2785ee742e908ae930d5b3ddc3aa96f646d1a17e07a3589eff55eccd77bf3",
+          "dweb:/ipfs/QmRZWjsy94TENGUjymuaFSoLYkjd8jWiqWoqMwAJm2rW49"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+        "keccak256": "0x1b1956b2ac590528410b7f4589d6c3f550c79cfd2532162a6de3a4fceacb5554",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://151ea25b89825b17ba2925932ae76415e8814430341e4cab383e6925609a4ef2",
+          "dweb:/ipfs/QmeqfHJdbupwPp2EEiiRjQhSs7GJFS2N57RhAzkjPRb9gV"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IVaultCore.sol": {
+        "keccak256": "0x0ff4789582215631d19bf47c3f37119881a92d6491a20d44c7cbf961d840a671",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://a41cf871b473629b835c6397f2cdaa4e0aea793e4d02273b3e1b89772ca8a74f",
+          "dweb:/ipfs/QmS8QMM6Sakx6H4F6UjXb24gRSscdJrMpzzgkwTEWaaen8"
+        ]
+      },
+      "contracts/release/core/fund-deployer/FundDeployer.sol": {
+        "keccak256": "0x8c3cfbb79358dc1eefe94a797a044f7ecea427a1058c1d569bcc334a972bad57",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://38c7348ac7a11b7a196bbe8d5bc136b9ee3553aa1de1c4214be242b9713d3cee",
+          "dweb:/ipfs/QmQPHH6toY4owx9mZgwnhmtqeMT4jNAUZmpavnJ3SZQefY"
+        ]
+      },
+      "contracts/release/core/fund-deployer/IFundDeployer.sol": {
+        "keccak256": "0xf960a9f25dc1f64fc5e690c93e43afd57c7ce90575e1adda40b8444994f7074d",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://509d00c03489c1ee57db5912c37471bcedfbd6d7b6d9845e434852920a954549",
+          "dweb:/ipfs/QmQahvKwys3uHEk9J3N8pWfh4SPMTxdKHDVHdbff7fpmKu"
+        ]
+      },
+      "contracts/release/core/fund/comptroller/ComptrollerProxy.sol": {
+        "keccak256": "0x6be8ae26258ea08ea26b836176f1d8a4b102da16d72b20368e33d9e7c0198d75",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://45e0f518ee3e5455320829402222dc65fb924b18f3a67da01260785bccd2a205",
+          "dweb:/ipfs/QmPpbt4wSQM3Kbhg8e8PgBuuHaoejkXD4VyU3uu1RqYT7E"
+        ]
+      },
+      "contracts/release/core/fund/comptroller/IComptroller.sol": {
+        "keccak256": "0xf413b701374fcae1b14c375e994587c3ecb60da500093a462bc85aaddc2f9a4a",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://0f900e775f7d8b57a318dbd5704758e64c6bb41d04ec5c1578e4fbdf5437c696",
+          "dweb:/ipfs/QmQR8x6di6jewrim9kLj14F91r3MKyCjpK9TGYdTdw1JT1"
+        ]
+      },
+      "contracts/release/core/fund/vault/IVault.sol": {
+        "keccak256": "0x5b87dd5ea62691db4aa554b7494afd2578b89adcfb6744879de86c072ade0b20",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://c7be9a0df2d22adce56fb50300ffececacbdb8a7547530d7e4b949b53dd1e27b",
+          "dweb:/ipfs/QmU65178Un3BouvmhxPRKLF6AzBAMp8HRfLgX8a1rPQmhX"
+        ]
+      },
+      "contracts/release/extensions/IExtension.sol": {
+        "keccak256": "0x2bc19e20fe29d99538ea647ccbb47390a9871b8c934642f8dae266373b3d64a7",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://27223d011ef45d2005b04bbf91be5b1251cfc096180a5155635b21f4e7ab618d",
+          "dweb:/ipfs/QmXQ4sQAw77TgiCjWvBzK26tseTB7k2vEYdop2BtxBxqhV"
+        ]
+      },
+      "contracts/release/infrastructure/gas-relayer/GasRelayRecipientMixin.sol": {
+        "keccak256": "0x0cb6145ab0ee1a0e44b1fe5f9b6e0cb83716814232b03625def8154389d0175c",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://7f58b214ae630c3e56287b552e56079db8b0776b8b35bd5037602470dfba1931",
+          "dweb:/ipfs/QmXyC7PYxvj4ThJq53bWcJqks3QkZfv9Rqe9FfHt9Z5GKK"
+        ]
+      },
+      "contracts/release/infrastructure/gas-relayer/IGasRelayPaymaster.sol": {
+        "keccak256": "0x381267edb4610685652e433b8206ad3a6df8d8934e93508a2db507ac27cfbdcb",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://eb73585b6aacdc78dd0b26a292050587842c6f837f73075ca40db7a8d3d16b91",
+          "dweb:/ipfs/QmNjLH1qttC5jLs3Gtuf6toC5nGFbkwztFbnTvQoTzhMBJ"
+        ]
+      },
+      "contracts/release/infrastructure/protocol-fees/IProtocolFeeTracker.sol": {
+        "keccak256": "0xfc7e7845f2e8d2247700e7da1d50c75fdf102f3579f67a5364dc15515c572058",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://d1cdbde8986ac29f595b0e8f591f931ab053dfeba265ae435694951ab7f3a1b3",
+          "dweb:/ipfs/QmPkd3mR1TRMaBiKL4UwZ2d4KmWdsRaM1zoC32ygcbTBzf"
+        ]
+      },
+      "contracts/utils/0.6.12/NonUpgradableProxy.sol": {
+        "keccak256": "0x003c263be85cddf75473e9f90cd1f3476498d40c8f7c59f9089f426ff27465df",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://efe96ec7e0352822fcc9556c2b483610727349c458860413fcca0c2446f222a1",
+          "dweb:/ipfs/QmP9Yt3Sx8kp9oGDxHxScNuZBJA8VV9kYREYdGeG3X1oBT"
+        ]
+      },
+      "contracts/utils/0.6.12/beacon-proxy/IBeacon.sol": {
+        "keccak256": "0x27a585523828a67a1a7c84eadd22b3056e8ffc51ab71992fd97c9ffb4239eeb2",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://da6aab223fcf84060c63266f743443f5bece3cd1b3131c29db925f2c2671cb39",
+          "dweb:/ipfs/Qmd4LvTJHhF6KeRN77ykk5KuV1U7y5ka9gvHChqkg2145V"
+        ]
+      },
+      "contracts/utils/0.6.12/beacon-proxy/IBeaconProxyFactory.sol": {
+        "keccak256": "0x1c27b009e345d4f0a992a1389bff0d9454859ab40cbecaff13623886472c7ed4",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://de0284634148e19ff765a8ebc4d274a8263b66e03b2ab739ae68b4de587763e8",
+          "dweb:/ipfs/QmS3EfbMHmwP6VVkSvXugkgwpNnxsRspChHMJMDksaHeQz"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.6.12+commit.27d51765",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "none",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "details": {
+          "yul": false
+        },
+        "enabled": true
+      },
+      "evmVersion": "istanbul",
+      "remappings": [
+        "@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        "@uniswap/v3-core/=lib/uniswap-v3-core/",
+        "ds-test/=lib/forge-std/lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        "openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        "openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        "uniswap-v3-core/=lib/uniswap-v3-core/",
+        "uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        "uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/",
+        "uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/"
+      ]
+    },
+    "name": "FundDeployer",
+    "fullyQualifiedName": "contracts/release/core/fund-deployer/FundDeployer.sol:FundDeployer"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "6341403",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2025-05-07T03:55:02Z",
+  "match": "match",
+  "chainId": "8453",
+  "address": "0xbB274DF654F71827cca120e0B916AEC1f2cEaaEb"
+}

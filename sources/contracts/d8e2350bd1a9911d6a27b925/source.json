@@ -1,0 +1,517 @@
+{
+  "sources": {
+    "contracts/persistent/dispatcher/IDispatcher.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IDispatcher Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IDispatcher {\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function claimOwnership() external;\n\n    function deployVaultProxy(\n        address _vaultLib,\n        address _owner,\n        address _vaultAccessor,\n        string calldata _fundName\n    ) external returns (address vaultProxy_);\n\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function getCurrentFundDeployer() external view returns (address currentFundDeployer_);\n\n    function getFundDeployerForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (address fundDeployer_);\n\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        );\n\n    function getMigrationTimelock() external view returns (uint256 migrationTimelock_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getOwner() external view returns (address owner_);\n\n    function getSharesTokenSymbol() external view returns (string memory sharesTokenSymbol_);\n\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (uint256 secondsRemaining_);\n\n    function hasExecutableMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (bool hasExecutableRequest_);\n\n    function hasMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (bool hasMigrationRequest_);\n\n    function removeNominatedOwner() external;\n\n    function setCurrentFundDeployer(address _nextFundDeployer) external;\n\n    function setMigrationTimelock(uint256 _nextTimelock) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSharesTokenSymbol(string calldata _nextSymbol) external;\n\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external;\n}\n"
+    },
+    "contracts/persistent/external-positions/IExternalPosition.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IExternalPosition Contract\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IExternalPosition {\n    function getDebtAssets() external returns (address[] memory, uint256[] memory);\n\n    function getManagedAssets() external returns (address[] memory, uint256[] memory);\n\n    function init(bytes memory) external;\n\n    function receiveCallFromVault(bytes memory) external;\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IExternalPositionVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IExternalPositionVault interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// Provides an interface to get the externalPositionLib for a given type from the Vault\ninterface IExternalPositionVault {\n    function getExternalPositionLibForType(uint256) external view returns (address);\n}\n"
+    },
+    "contracts/persistent/external-positions/ExternalPositionProxy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"../vault/interfaces/IExternalPositionVault.sol\";\nimport \"./IExternalPosition.sol\";\nimport \"./IExternalPositionProxy.sol\";\n\n/// @title ExternalPositionProxy Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A proxy for all external positions, modified from EIP-1822\ncontract ExternalPositionProxy is IExternalPositionProxy {\n    uint256 private immutable EXTERNAL_POSITION_TYPE;\n    address private immutable VAULT_PROXY;\n\n    /// @dev Needed to receive ETH on external positions\n    receive() external payable {}\n\n    constructor(\n        address _vaultProxy,\n        uint256 _typeId,\n        address _constructLib,\n        bytes memory _constructData\n    ) public {\n        VAULT_PROXY = _vaultProxy;\n        EXTERNAL_POSITION_TYPE = _typeId;\n\n        (bool success, bytes memory returnData) = _constructLib.delegatecall(_constructData);\n\n        require(success, string(returnData));\n    }\n\n    // solhint-disable-next-line no-complex-fallback\n    fallback() external payable {\n        address contractLogic = IExternalPositionVault(getVaultProxy())\n            .getExternalPositionLibForType(getExternalPositionType());\n        assembly {\n            calldatacopy(0x0, 0x0, calldatasize())\n            let success := delegatecall(\n                sub(gas(), 10000),\n                contractLogic,\n                0x0,\n                calldatasize(),\n                0,\n                0\n            )\n            let retSz := returndatasize()\n            returndatacopy(0, 0, retSz)\n            switch success\n                case 0 {\n                    revert(0, retSz)\n                }\n                default {\n                    return(0, retSz)\n                }\n        }\n    }\n\n    /// @notice Delegates call to IExternalPosition.receiveCallFromVault\n    /// @param _data The bytes data variable to be decoded at the External Position\n    function receiveCallFromVault(bytes calldata _data) external {\n        require(\n            msg.sender == getVaultProxy(),\n            \"receiveCallFromVault: Only the vault can make this call\"\n        );\n        address contractLogic = IExternalPositionVault(getVaultProxy())\n            .getExternalPositionLibForType(getExternalPositionType());\n        (bool success, bytes memory returnData) = contractLogic.delegatecall(\n            abi.encodeWithSelector(IExternalPosition.receiveCallFromVault.selector, _data)\n        );\n\n        require(success, string(returnData));\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the `EXTERNAL_POSITION_TYPE` variable\n    /// @return externalPositionType_ The `EXTERNAL_POSITION_TYPE` variable value\n    function getExternalPositionType()\n        public\n        view\n        override\n        returns (uint256 externalPositionType_)\n    {\n        return EXTERNAL_POSITION_TYPE;\n    }\n\n    /// @notice Gets the `VAULT_PROXY` variable\n    /// @return vaultProxy_ The `VAULT_PROXY` variable value\n    function getVaultProxy() public view override returns (address vaultProxy_) {\n        return VAULT_PROXY;\n    }\n}\n"
+    },
+    "contracts/persistent/external-positions/IExternalPositionProxy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IExternalPositionProxy interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice An interface for publicly accessible functions on the ExternalPositionProxy\ninterface IExternalPositionProxy {\n    function getExternalPositionType() external view returns (uint256);\n\n    function getVaultProxy() external view returns (address);\n}\n"
+    },
+    "contracts/persistent/external-positions/ExternalPositionFactory.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\npragma experimental ABIEncoderV2;\n\nimport \"../dispatcher/IDispatcher.sol\";\nimport \"./ExternalPositionProxy.sol\";\n\n/// @title ExternalPositionFactory Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A contract factory for External Positions\ncontract ExternalPositionFactory {\n    event PositionDeployed(\n        address indexed vaultProxy,\n        uint256 indexed typeId,\n        address indexed constructLib,\n        bytes constructData\n    );\n\n    event PositionDeployerAdded(address positionDeployer);\n\n    event PositionDeployerRemoved(address positionDeployer);\n\n    event PositionTypeAdded(uint256 typeId, string label);\n\n    event PositionTypeLabelUpdated(uint256 indexed typeId, string label);\n\n    address private immutable DISPATCHER;\n\n    uint256 private positionTypeCounter;\n    mapping(uint256 => string) private positionTypeIdToLabel;\n    mapping(address => bool) private accountToIsExternalPositionProxy;\n    mapping(address => bool) private accountToIsPositionDeployer;\n\n    modifier onlyDispatcherOwner {\n        require(\n            msg.sender == IDispatcher(getDispatcher()).getOwner(),\n            \"Only the Dispatcher owner can call this function\"\n        );\n        _;\n    }\n\n    constructor(address _dispatcher) public {\n        DISPATCHER = _dispatcher;\n    }\n\n    /// @notice Creates a new external position proxy and adds it to the list of supported external positions\n    /// @param _constructData Encoded data to be used on the ExternalPositionProxy constructor\n    /// @param _vaultProxy The _vaultProxy owner of the external position\n    /// @param _typeId The type of external position to be created\n    /// @param _constructLib The external position lib contract that will be used on the constructor\n    function deploy(\n        address _vaultProxy,\n        uint256 _typeId,\n        address _constructLib,\n        bytes memory _constructData\n    ) external returns (address externalPositionProxy_) {\n        require(\n            isPositionDeployer(msg.sender),\n            \"deploy: Only a position deployer can call this function\"\n        );\n\n        externalPositionProxy_ = address(\n            new ExternalPositionProxy(_vaultProxy, _typeId, _constructLib, _constructData)\n        );\n\n        accountToIsExternalPositionProxy[externalPositionProxy_] = true;\n\n        emit PositionDeployed(_vaultProxy, _typeId, _constructLib, _constructData);\n\n        return externalPositionProxy_;\n    }\n\n    ////////////////////\n    // TYPES REGISTRY //\n    ////////////////////\n\n    /// @notice Adds a set of new position types\n    /// @param _labels Labels for each new position type\n    function addNewPositionTypes(string[] calldata _labels) external onlyDispatcherOwner {\n        for (uint256 i; i < _labels.length; i++) {\n            uint256 typeId = getPositionTypeCounter();\n            positionTypeCounter++;\n\n            positionTypeIdToLabel[typeId] = _labels[i];\n\n            emit PositionTypeAdded(typeId, _labels[i]);\n        }\n    }\n\n    /// @notice Updates a set of position type labels\n    /// @param _typeIds The position type ids\n    /// @param _labels The updated labels\n    function updatePositionTypeLabels(uint256[] calldata _typeIds, string[] calldata _labels)\n        external\n        onlyDispatcherOwner\n    {\n        require(_typeIds.length == _labels.length, \"updatePositionTypeLabels: Unequal arrays\");\n        for (uint256 i; i < _typeIds.length; i++) {\n            positionTypeIdToLabel[_typeIds[i]] = _labels[i];\n\n            emit PositionTypeLabelUpdated(_typeIds[i], _labels[i]);\n        }\n    }\n\n    /////////////////////////////////\n    // POSITION DEPLOYERS REGISTRY //\n    /////////////////////////////////\n\n    /// @notice Adds a set of new position deployers\n    /// @param _accounts Accounts to be added as position deployers\n    function addPositionDeployers(address[] memory _accounts) external onlyDispatcherOwner {\n        for (uint256 i; i < _accounts.length; i++) {\n            require(\n                !isPositionDeployer(_accounts[i]),\n                \"addPositionDeployers: Account is already a position deployer\"\n            );\n\n            accountToIsPositionDeployer[_accounts[i]] = true;\n\n            emit PositionDeployerAdded(_accounts[i]);\n        }\n    }\n\n    /// @notice Removes a set of existing position deployers\n    /// @param _accounts Existing position deployers to be removed from their role\n    function removePositionDeployers(address[] memory _accounts) external onlyDispatcherOwner {\n        for (uint256 i; i < _accounts.length; i++) {\n            require(\n                isPositionDeployer(_accounts[i]),\n                \"removePositionDeployers: Account is not a position deployer\"\n            );\n\n            accountToIsPositionDeployer[_accounts[i]] = false;\n\n            emit PositionDeployerRemoved(_accounts[i]);\n        }\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    // EXTERNAL FUNCTIONS\n\n    /// @notice Gets the label for a position type\n    /// @param _typeId The position type id\n    /// @return label_ The label\n    function getLabelForPositionType(uint256 _typeId)\n        external\n        view\n        returns (string memory label_)\n    {\n        return positionTypeIdToLabel[_typeId];\n    }\n\n    /// @notice Checks if an account is an external position proxy\n    /// @param _account The account to check\n    /// @return isExternalPositionProxy_ True if the account is an externalPositionProxy\n    function isExternalPositionProxy(address _account)\n        external\n        view\n        returns (bool isExternalPositionProxy_)\n    {\n        return accountToIsExternalPositionProxy[_account];\n    }\n\n    // PUBLIC FUNCTIONS\n\n    /// @notice Gets the `DISPATCHER` variable\n    /// @return dispatcher_ The `DISPATCHER` variable value\n    function getDispatcher() public view returns (address dispatcher_) {\n        return DISPATCHER;\n    }\n\n    /// @notice Gets the `positionTypeCounter` variable\n    /// @return positionTypeCounter_ The `positionTypeCounter` variable value\n    function getPositionTypeCounter() public view returns (uint256 positionTypeCounter_) {\n        return positionTypeCounter;\n    }\n\n    /// @notice Checks if an account is a position deployer\n    /// @param _account The account to check\n    /// @return isPositionDeployer_ True if the account is a position deployer\n    function isPositionDeployer(address _account) public view returns (bool isPositionDeployer_) {\n        return accountToIsPositionDeployer[_account];\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.6.12+commit.27d51765"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_dispatcher",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "typeId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "constructLib",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "constructData",
+              "type": "bytes"
+            }
+          ],
+          "name": "PositionDeployed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "positionDeployer",
+              "type": "address"
+            }
+          ],
+          "name": "PositionDeployerAdded",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "positionDeployer",
+              "type": "address"
+            }
+          ],
+          "name": "PositionDeployerRemoved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "typeId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "string",
+              "name": "label",
+              "type": "string"
+            }
+          ],
+          "name": "PositionTypeAdded",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "typeId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "string",
+              "name": "label",
+              "type": "string"
+            }
+          ],
+          "name": "PositionTypeLabelUpdated",
+          "type": "event"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "string[]",
+              "name": "_labels",
+              "type": "string[]"
+            }
+          ],
+          "name": "addNewPositionTypes",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "_accounts",
+              "type": "address[]"
+            }
+          ],
+          "name": "addPositionDeployers",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_typeId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "_constructLib",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_constructData",
+              "type": "bytes"
+            }
+          ],
+          "name": "deploy",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "externalPositionProxy_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getDispatcher",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "dispatcher_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_typeId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getLabelForPositionType",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "label_",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getPositionTypeCounter",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "positionTypeCounter_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_account",
+              "type": "address"
+            }
+          ],
+          "name": "isExternalPositionProxy",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isExternalPositionProxy_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_account",
+              "type": "address"
+            }
+          ],
+          "name": "isPositionDeployer",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isPositionDeployer_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "_accounts",
+              "type": "address[]"
+            }
+          ],
+          "name": "removePositionDeployers",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "_typeIds",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "string[]",
+              "name": "_labels",
+              "type": "string[]"
+            }
+          ],
+          "name": "updatePositionTypeLabels",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Enzyme Council <security@enzyme.finance>",
+        "kind": "dev",
+        "methods": {
+          "addNewPositionTypes(string[])": {
+            "params": {
+              "_labels": "Labels for each new position type"
+            }
+          },
+          "addPositionDeployers(address[])": {
+            "params": {
+              "_accounts": "Accounts to be added as position deployers"
+            }
+          },
+          "deploy(address,uint256,address,bytes)": {
+            "params": {
+              "_constructData": "Encoded data to be used on the ExternalPositionProxy constructor",
+              "_constructLib": "The external position lib contract that will be used on the constructor",
+              "_typeId": "The type of external position to be created",
+              "_vaultProxy": "The _vaultProxy owner of the external position"
+            }
+          },
+          "getDispatcher()": {
+            "returns": {
+              "dispatcher_": "The `DISPATCHER` variable value"
+            }
+          },
+          "getLabelForPositionType(uint256)": {
+            "params": {
+              "_typeId": "The position type id"
+            },
+            "returns": {
+              "label_": "The label"
+            }
+          },
+          "getPositionTypeCounter()": {
+            "returns": {
+              "positionTypeCounter_": "The `positionTypeCounter` variable value"
+            }
+          },
+          "isExternalPositionProxy(address)": {
+            "params": {
+              "_account": "The account to check"
+            },
+            "returns": {
+              "isExternalPositionProxy_": "True if the account is an externalPositionProxy"
+            }
+          },
+          "isPositionDeployer(address)": {
+            "params": {
+              "_account": "The account to check"
+            },
+            "returns": {
+              "isPositionDeployer_": "True if the account is a position deployer"
+            }
+          },
+          "removePositionDeployers(address[])": {
+            "params": {
+              "_accounts": "Existing position deployers to be removed from their role"
+            }
+          },
+          "updatePositionTypeLabels(uint256[],string[])": {
+            "params": {
+              "_labels": "The updated labels",
+              "_typeIds": "The position type ids"
+            }
+          }
+        },
+        "title": "ExternalPositionFactory Contract",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "addNewPositionTypes(string[])": {
+            "notice": "Adds a set of new position types"
+          },
+          "addPositionDeployers(address[])": {
+            "notice": "Adds a set of new position deployers"
+          },
+          "deploy(address,uint256,address,bytes)": {
+            "notice": "Creates a new external position proxy and adds it to the list of supported external positions"
+          },
+          "getDispatcher()": {
+            "notice": "Gets the `DISPATCHER` variable"
+          },
+          "getLabelForPositionType(uint256)": {
+            "notice": "Gets the label for a position type"
+          },
+          "getPositionTypeCounter()": {
+            "notice": "Gets the `positionTypeCounter` variable"
+          },
+          "isExternalPositionProxy(address)": {
+            "notice": "Checks if an account is an external position proxy"
+          },
+          "isPositionDeployer(address)": {
+            "notice": "Checks if an account is a position deployer"
+          },
+          "removePositionDeployers(address[])": {
+            "notice": "Removes a set of existing position deployers"
+          },
+          "updatePositionTypeLabels(uint256[],string[])": {
+            "notice": "Updates a set of position type labels"
+          }
+        },
+        "notice": "A contract factory for External Positions",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/persistent/external-positions/ExternalPositionFactory.sol": "ExternalPositionFactory"
+      },
+      "evmVersion": "istanbul",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": false
+        },
+        "runs": 200
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/persistent/dispatcher/IDispatcher.sol": {
+        "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IDispatcher Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IDispatcher {\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function claimOwnership() external;\n\n    function deployVaultProxy(\n        address _vaultLib,\n        address _owner,\n        address _vaultAccessor,\n        string calldata _fundName\n    ) external returns (address vaultProxy_);\n\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function getCurrentFundDeployer() external view returns (address currentFundDeployer_);\n\n    function getFundDeployerForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (address fundDeployer_);\n\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        );\n\n    function getMigrationTimelock() external view returns (uint256 migrationTimelock_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getOwner() external view returns (address owner_);\n\n    function getSharesTokenSymbol() external view returns (string memory sharesTokenSymbol_);\n\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (uint256 secondsRemaining_);\n\n    function hasExecutableMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (bool hasExecutableRequest_);\n\n    function hasMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (bool hasMigrationRequest_);\n\n    function removeNominatedOwner() external;\n\n    function setCurrentFundDeployer(address _nextFundDeployer) external;\n\n    function setMigrationTimelock(uint256 _nextTimelock) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSharesTokenSymbol(string calldata _nextSymbol) external;\n\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external;\n}\n",
+        "keccak256": "0x0e6b0e6cf325d4f6332b8eb2b3c446b2ef3ca8456bdf0d12318d0fd9e90aeb30",
+        "license": "GPL-3.0"
+      },
+      "contracts/persistent/external-positions/ExternalPositionFactory.sol": {
+        "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\npragma experimental ABIEncoderV2;\n\nimport \"../dispatcher/IDispatcher.sol\";\nimport \"./ExternalPositionProxy.sol\";\n\n/// @title ExternalPositionFactory Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A contract factory for External Positions\ncontract ExternalPositionFactory {\n    event PositionDeployed(\n        address indexed vaultProxy,\n        uint256 indexed typeId,\n        address indexed constructLib,\n        bytes constructData\n    );\n\n    event PositionDeployerAdded(address positionDeployer);\n\n    event PositionDeployerRemoved(address positionDeployer);\n\n    event PositionTypeAdded(uint256 typeId, string label);\n\n    event PositionTypeLabelUpdated(uint256 indexed typeId, string label);\n\n    address private immutable DISPATCHER;\n\n    uint256 private positionTypeCounter;\n    mapping(uint256 => string) private positionTypeIdToLabel;\n    mapping(address => bool) private accountToIsExternalPositionProxy;\n    mapping(address => bool) private accountToIsPositionDeployer;\n\n    modifier onlyDispatcherOwner {\n        require(\n            msg.sender == IDispatcher(getDispatcher()).getOwner(),\n            \"Only the Dispatcher owner can call this function\"\n        );\n        _;\n    }\n\n    constructor(address _dispatcher) public {\n        DISPATCHER = _dispatcher;\n    }\n\n    /// @notice Creates a new external position proxy and adds it to the list of supported external positions\n    /// @param _constructData Encoded data to be used on the ExternalPositionProxy constructor\n    /// @param _vaultProxy The _vaultProxy owner of the external position\n    /// @param _typeId The type of external position to be created\n    /// @param _constructLib The external position lib contract that will be used on the constructor\n    function deploy(\n        address _vaultProxy,\n        uint256 _typeId,\n        address _constructLib,\n        bytes memory _constructData\n    ) external returns (address externalPositionProxy_) {\n        require(\n            isPositionDeployer(msg.sender),\n            \"deploy: Only a position deployer can call this function\"\n        );\n\n        externalPositionProxy_ = address(\n            new ExternalPositionProxy(_vaultProxy, _typeId, _constructLib, _constructData)\n        );\n\n        accountToIsExternalPositionProxy[externalPositionProxy_] = true;\n\n        emit PositionDeployed(_vaultProxy, _typeId, _constructLib, _constructData);\n\n        return externalPositionProxy_;\n    }\n\n    ////////////////////\n    // TYPES REGISTRY //\n    ////////////////////\n\n    /// @notice Adds a set of new position types\n    /// @param _labels Labels for each new position type\n    function addNewPositionTypes(string[] calldata _labels) external onlyDispatcherOwner {\n        for (uint256 i; i < _labels.length; i++) {\n            uint256 typeId = getPositionTypeCounter();\n            positionTypeCounter++;\n\n            positionTypeIdToLabel[typeId] = _labels[i];\n\n            emit PositionTypeAdded(typeId, _labels[i]);\n        }\n    }\n\n    /// @notice Updates a set of position type labels\n    /// @param _typeIds The position type ids\n    /// @param _labels The updated labels\n    function updatePositionTypeLabels(uint256[] calldata _typeIds, string[] calldata _labels)\n        external\n        onlyDispatcherOwner\n    {\n        require(_typeIds.length == _labels.length, \"updatePositionTypeLabels: Unequal arrays\");\n        for (uint256 i; i < _typeIds.length; i++) {\n            positionTypeIdToLabel[_typeIds[i]] = _labels[i];\n\n            emit PositionTypeLabelUpdated(_typeIds[i], _labels[i]);\n        }\n    }\n\n    /////////////////////////////////\n    // POSITION DEPLOYERS REGISTRY //\n    /////////////////////////////////\n\n    /// @notice Adds a set of new position deployers\n    /// @param _accounts Accounts to be added as position deployers\n    function addPositionDeployers(address[] memory _accounts) external onlyDispatcherOwner {\n        for (uint256 i; i < _accounts.length; i++) {\n            require(\n                !isPositionDeployer(_accounts[i]),\n                \"addPositionDeployers: Account is already a position deployer\"\n            );\n\n            accountToIsPositionDeployer[_accounts[i]] = true;\n\n            emit PositionDeployerAdded(_accounts[i]);\n        }\n    }\n\n    /// @notice Removes a set of existing position deployers\n    /// @param _accounts Existing position deployers to be removed from their role\n    function removePositionDeployers(address[] memory _accounts) external onlyDispatcherOwner {\n        for (uint256 i; i < _accounts.length; i++) {\n            require(\n                isPositionDeployer(_accounts[i]),\n                \"removePositionDeployers: Account is not a position deployer\"\n            );\n\n            accountToIsPositionDeployer[_accounts[i]] = false;\n\n            emit PositionDeployerRemoved(_accounts[i]);\n        }\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    // EXTERNAL FUNCTIONS\n\n    /// @notice Gets the label for a position type\n    /// @param _typeId The position type id\n    /// @return label_ The label\n    function getLabelForPositionType(uint256 _typeId)\n        external\n        view\n        returns (string memory label_)\n    {\n        return positionTypeIdToLabel[_typeId];\n    }\n\n    /// @notice Checks if an account is an external position proxy\n    /// @param _account The account to check\n    /// @return isExternalPositionProxy_ True if the account is an externalPositionProxy\n    function isExternalPositionProxy(address _account)\n        external\n        view\n        returns (bool isExternalPositionProxy_)\n    {\n        return accountToIsExternalPositionProxy[_account];\n    }\n\n    // PUBLIC FUNCTIONS\n\n    /// @notice Gets the `DISPATCHER` variable\n    /// @return dispatcher_ The `DISPATCHER` variable value\n    function getDispatcher() public view returns (address dispatcher_) {\n        return DISPATCHER;\n    }\n\n    /// @notice Gets the `positionTypeCounter` variable\n    /// @return positionTypeCounter_ The `positionTypeCounter` variable value\n    function getPositionTypeCounter() public view returns (uint256 positionTypeCounter_) {\n        return positionTypeCounter;\n    }\n\n    /// @notice Checks if an account is a position deployer\n    /// @param _account The account to check\n    /// @return isPositionDeployer_ True if the account is a position deployer\n    function isPositionDeployer(address _account) public view returns (bool isPositionDeployer_) {\n        return accountToIsPositionDeployer[_account];\n    }\n}\n",
+        "keccak256": "0xb5a7e95aa1adef37005a1d29ec17594b15c2014766da71ae6ee36ab9c6c22508",
+        "license": "GPL-3.0"
+      },
+      "contracts/persistent/external-positions/ExternalPositionProxy.sol": {
+        "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"../vault/interfaces/IExternalPositionVault.sol\";\nimport \"./IExternalPosition.sol\";\nimport \"./IExternalPositionProxy.sol\";\n\n/// @title ExternalPositionProxy Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A proxy for all external positions, modified from EIP-1822\ncontract ExternalPositionProxy is IExternalPositionProxy {\n    uint256 private immutable EXTERNAL_POSITION_TYPE;\n    address private immutable VAULT_PROXY;\n\n    /// @dev Needed to receive ETH on external positions\n    receive() external payable {}\n\n    constructor(\n        address _vaultProxy,\n        uint256 _typeId,\n        address _constructLib,\n        bytes memory _constructData\n    ) public {\n        VAULT_PROXY = _vaultProxy;\n        EXTERNAL_POSITION_TYPE = _typeId;\n\n        (bool success, bytes memory returnData) = _constructLib.delegatecall(_constructData);\n\n        require(success, string(returnData));\n    }\n\n    // solhint-disable-next-line no-complex-fallback\n    fallback() external payable {\n        address contractLogic = IExternalPositionVault(getVaultProxy())\n            .getExternalPositionLibForType(getExternalPositionType());\n        assembly {\n            calldatacopy(0x0, 0x0, calldatasize())\n            let success := delegatecall(\n                sub(gas(), 10000),\n                contractLogic,\n                0x0,\n                calldatasize(),\n                0,\n                0\n            )\n            let retSz := returndatasize()\n            returndatacopy(0, 0, retSz)\n            switch success\n                case 0 {\n                    revert(0, retSz)\n                }\n                default {\n                    return(0, retSz)\n                }\n        }\n    }\n\n    /// @notice Delegates call to IExternalPosition.receiveCallFromVault\n    /// @param _data The bytes data variable to be decoded at the External Position\n    function receiveCallFromVault(bytes calldata _data) external {\n        require(\n            msg.sender == getVaultProxy(),\n            \"receiveCallFromVault: Only the vault can make this call\"\n        );\n        address contractLogic = IExternalPositionVault(getVaultProxy())\n            .getExternalPositionLibForType(getExternalPositionType());\n        (bool success, bytes memory returnData) = contractLogic.delegatecall(\n            abi.encodeWithSelector(IExternalPosition.receiveCallFromVault.selector, _data)\n        );\n\n        require(success, string(returnData));\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the `EXTERNAL_POSITION_TYPE` variable\n    /// @return externalPositionType_ The `EXTERNAL_POSITION_TYPE` variable value\n    function getExternalPositionType()\n        public\n        view\n        override\n        returns (uint256 externalPositionType_)\n    {\n        return EXTERNAL_POSITION_TYPE;\n    }\n\n    /// @notice Gets the `VAULT_PROXY` variable\n    /// @return vaultProxy_ The `VAULT_PROXY` variable value\n    function getVaultProxy() public view override returns (address vaultProxy_) {\n        return VAULT_PROXY;\n    }\n}\n",
+        "keccak256": "0xb7260d1564c6de43cd2a31f9f7d32deb7599fd68b57dad47e0daa787845549e1",
+        "license": "GPL-3.0"
+      },
+      "contracts/persistent/external-positions/IExternalPosition.sol": {
+        "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IExternalPosition Contract\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IExternalPosition {\n    function getDebtAssets() external returns (address[] memory, uint256[] memory);\n\n    function getManagedAssets() external returns (address[] memory, uint256[] memory);\n\n    function init(bytes memory) external;\n\n    function receiveCallFromVault(bytes memory) external;\n}\n",
+        "keccak256": "0x00e6ea9721e5fd1e72215e4c744306097d7f8b1a834cced5d65a17a924f750ad",
+        "license": "GPL-3.0"
+      },
+      "contracts/persistent/external-positions/IExternalPositionProxy.sol": {
+        "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IExternalPositionProxy interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice An interface for publicly accessible functions on the ExternalPositionProxy\ninterface IExternalPositionProxy {\n    function getExternalPositionType() external view returns (uint256);\n\n    function getVaultProxy() external view returns (address);\n}\n",
+        "keccak256": "0xc74e623dbdc949df49e9cef31e0f958b17c715d89198dbbc1754d8f9c21e90de",
+        "license": "GPL-3.0"
+      },
+      "contracts/persistent/vault/interfaces/IExternalPositionVault.sol": {
+        "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IExternalPositionVault interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// Provides an interface to get the externalPositionLib for a given type from the Vault\ninterface IExternalPositionVault {\n    function getExternalPositionLibForType(uint256) external view returns (address);\n}\n",
+        "keccak256": "0x3c047551a9bab8cb84299c4cf17d0435f1d4d0791ecc1d03e0d55cb3450baad6",
+        "license": "GPL-3.0"
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.6.12+commit.27d51765",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "details": {
+          "cse": true,
+          "yul": false,
+          "peephole": true,
+          "deduplicate": true,
+          "orderLiterals": true,
+          "jumpdestRemover": true,
+          "constantOptimizer": true
+        }
+      },
+      "evmVersion": "istanbul",
+      "remappings": []
+    },
+    "name": "ExternalPositionFactory",
+    "fullyQualifiedName": "contracts/persistent/external-positions/ExternalPositionFactory.sol:ExternalPositionFactory"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "21909",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T10:28:31Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0x0AAcb782205dde9eFf4862ACe9849DcE1ca3409f"
+}

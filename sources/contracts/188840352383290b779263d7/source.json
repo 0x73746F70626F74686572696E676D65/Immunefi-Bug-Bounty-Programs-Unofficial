@@ -1,0 +1,310 @@
+{
+  "file_path": "contracts/release/extensions/external-position-manager/external-positions/arbitrary-loan/modules/ArbitraryLoanTotalNominalDeltaOracleModule.sol",
+  "creation_status": "success",
+  "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\npragma experimental ABIEncoderV2;\n\nimport \"@openzeppelin/contracts/math/SafeMath.sol\";\nimport \"@openzeppelin/contracts/math/SignedSafeMath.sol\";\nimport \"./IArbitraryLoanAccountingModule.sol\";\nimport \"../../../../../../persistent/arbitrary-value-oracles/IArbitraryValueOracle.sol\";\n\n/// @title ArbitraryLoanTotalNominalDeltaOracleModule Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice An accounting module for a loan to apply gains or losses,\n/// via an oracle that reports the nominal delta of the total amount borrowed (ignores repayments)\n/// @dev This method of reporting value helps to prevent an oracle getting out-of-sync,\n/// e.g., when new amounts are borrowed or repaid to the loan\ncontract ArbitraryLoanTotalNominalDeltaOracleModule is IArbitraryLoanAccountingModule {\n    using SafeMath for uint256;\n    using SignedSafeMath for int256;\n\n    event OracleSetForLoan(\n        address indexed loan,\n        address indexed oracle,\n        uint32 stalenessThreshold\n    );\n\n    struct OracleInfo {\n        address oracle;\n        uint32 stalenessThreshold;\n    }\n\n    mapping(address => OracleInfo) private loanToOracleInfo;\n\n    /////////////////////\n    // CALLS FROM LOAN //\n    /////////////////////\n\n    /// @notice Calculates the canonical face value of the loan\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _totalRepaid The total repaid amount\n    /// @return faceValue_ The face value\n    function calcFaceValue(uint256 _totalBorrowed, uint256 _totalRepaid)\n        external\n        view\n        override\n        returns (uint256 faceValue_)\n    {\n        return __calcLoanBalance(msg.sender, _totalBorrowed, _totalRepaid);\n    }\n\n    /// @notice Configures options per-loan\n    /// @param _configData Encoded options\n    function configure(bytes memory _configData) external override {\n        address loan = msg.sender;\n        (address oracle, uint32 stalenessThreshold) = abi.decode(_configData, (address, uint32));\n        require(oracle != address(0), \"configure: Empty oracle\");\n\n        loanToOracleInfo[loan] = OracleInfo({\n            oracle: oracle,\n            stalenessThreshold: stalenessThreshold\n        });\n\n        emit OracleSetForLoan(loan, oracle, stalenessThreshold);\n    }\n\n    /// @notice Implements logic immediately prior to effects and interactions during a borrow\n    /// @dev Unimplemented\n    function preBorrow(\n        uint256,\n        uint256,\n        uint256\n    ) external override {}\n\n    /// @notice Implements logic immediately prior to effects and interactions when closing a loan\n    /// @dev Unimplemented\n    function preClose(uint256, uint256) external override {}\n\n    /// @notice Implements logic immediately prior to effects and interactions during a reconciliation,\n    /// and returns the formatted amount to consider as a repayment\n    /// @param _repayableLoanAssetAmount The loanAsset amount available for repayment\n    /// @return repayAmount_ The formatted amount to consider as repayment in terms of the loanAsset\n    /// @dev Should not revert in case of over-repayment.\n    /// Instead, it is recommended to return the full loan balance as repayAmount_ where necessary.\n    function preReconcile(\n        uint256,\n        uint256,\n        uint256 _repayableLoanAssetAmount,\n        address[] calldata\n    ) external override returns (uint256 repayAmount_) {\n        return _repayableLoanAssetAmount;\n    }\n\n    /// @notice Implements logic immediately prior to effects and interactions during a repay,\n    /// and returns the formatted amount to repay (e.g., in the case of a user-input max)\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _prevTotalRepaid The total repaid amount not including the new repay amount\n    /// @param _repayAmountInput The user-input repay amount\n    /// @param repayAmount_ The formatted amount to repay\n    function preRepay(\n        uint256 _totalBorrowed,\n        uint256 _prevTotalRepaid,\n        uint256 _repayAmountInput\n    ) external override returns (uint256 repayAmount_) {\n        // Calc actual repay amount based on user input\n        if (_repayAmountInput == type(uint256).max) {\n            return __calcLoanBalance(msg.sender, _totalBorrowed, _prevTotalRepaid);\n        }\n\n        return _repayAmountInput;\n    }\n\n    /// @notice Receives and executes an arbitrary call from the loan contract\n    /// @dev No actions implemented in this module\n    function receiveCallFromLoan(bytes memory) external override {\n        revert(\"receiveCallFromLoan: Invalid actionId\");\n    }\n\n    // PRIVATE FUNCTIONS\n\n    /// @dev Helper to calculate the loan balance\n    function __calcLoanBalance(\n        address _loan,\n        uint256 _totalBorrowed,\n        uint256 _totalRepaid\n    ) private view returns (uint256 balance_) {\n        OracleInfo memory oracleInfo = getOracleInfoForLoan(_loan);\n        int256 oracleValue;\n\n        // Query value and handle staleness threshold as-necessary\n        if (oracleInfo.stalenessThreshold > 0) {\n            uint256 lastUpdated;\n            (oracleValue, lastUpdated) = IArbitraryValueOracle(oracleInfo.oracle)\n                .getValueWithTimestamp();\n\n            // Does not assert the staleness threshold if the oracle value is 0\n            require(\n                oracleInfo.stalenessThreshold >= block.timestamp.sub(lastUpdated) ||\n                    oracleValue == 0,\n                \"calcFaceValue: Stale oracle\"\n            );\n        } else {\n            oracleValue = IArbitraryValueOracle(oracleInfo.oracle).getValue();\n        }\n\n        int256 totalBalanceInt = int256(_totalBorrowed).add(oracleValue).sub(int256(_totalRepaid));\n        if (totalBalanceInt > 0) {\n            return uint256(totalBalanceInt);\n        }\n\n        return 0;\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the OracleInfo for a given loan\n    /// @param _loan The loan address\n    /// @return oracleInfo_ The oracle info\n    function getOracleInfoForLoan(address _loan)\n        public\n        view\n        returns (OracleInfo memory oracleInfo_)\n    {\n        return loanToOracleInfo[_loan];\n    }\n}\n",
+  "deployed_bytecode": "0x608060405234801561001057600080fd5b50600436106100885760003560e01c80638602074e1161005b5780638602074e146100f15780639e950b2214610104578063b70d1c7e14610117578063e00c34901461013757610088565b80631324041c1461008d5780631770ac3a146100b657806346739e73146100cb5780637bb6668e146100de575b600080fd5b6100a061009b36600461073b565b61014a565b6040516100ad9190610a3a565b60405180910390f35b6100c96100c436600461070b565b610172565b005b6100c96100d9366004610688565b610176565b6100a06100ec36600461070b565b61026d565b6100c96100ff36600461073b565b610283565b6100c9610112366004610688565b610288565b61012a610125366004610628565b6102a0565b6040516100ad9190610a2c565b6100a0610145366004610788565b6102ea565b6000600019821415610168576101613385856102f3565b905061016b565b50805b9392505050565b5050565b600033905060008083806020019051810190610192919061064e565b90925090506001600160a01b0382166101c65760405162461bcd60e51b81526004016101bd906109ec565b60405180910390fd5b6040805180820182526001600160a01b0384811680835263ffffffff8581166020808601918252898516600081815291829052908790209551865492516001600160a01b031990931695169490941763ffffffff60a01b1916600160a01b91909216021790925591519091907fb28cf685cf80ef726582ae8f60c1ee6dfdb57895eac21aa2c752d93495196eb69061025f908590610a48565b60405180910390a350505050565b600061027a3384846102f3565b90505b92915050565b505050565b60405162461bcd60e51b81526004016101bd90610a0c565b6102a861053d565b506001600160a01b03908116600090815260208181526040918290208251808401909352549283168252600160a01b90920463ffffffff169181019190915290565b50909392505050565b60006102fd61053d565b610306856102a0565b9050600080826020015163ffffffff1611156103d957600082600001516001600160a01b0316634def98556040518163ffffffff1660e01b8152600401604080518083038186803b15801561035a57600080fd5b505afa15801561036e573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061039291906106db565b90925090506103a14282610489565b836020015163ffffffff161015806103b7575081155b6103d35760405162461bcd60e51b81526004016101bd906109cc565b50610451565b81600001516001600160a01b031663209652556040518163ffffffff1660e01b815260040160206040518083038186803b15801561041657600080fd5b505afa15801561042a573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061044e91906106bd565b90505b60006104678561046188856104b1565b906104f7565b9050600081131561047c57925061016b915050565b5060009695505050505050565b6000828211156104ab5760405162461bcd60e51b81526004016101bd906109fc565b50900390565b60008282018183128015906104c65750838112155b806104db57506000831280156104db57508381125b61027a5760405162461bcd60e51b81526004016101bd906109dc565b600081830381831280159061050c5750838113155b80610521575060008312801561052157508381135b61027a5760405162461bcd60e51b81526004016101bd90610a1c565b604080518082019091526000808252602082015290565b803561027d81610add565b805161027d81610add565b60008083601f84011261057c57600080fd5b50813567ffffffffffffffff81111561059457600080fd5b6020830191508360208202830111156105ac57600080fd5b9250929050565b600082601f8301126105c457600080fd5b81356105d76105d282610a7d565b610a56565b915080825260208301602083018583830111156105f357600080fd5b6105fe838284610ad1565b50505092915050565b805161027d81610af4565b803561027d81610af4565b805161027d81610afd565b60006020828403121561063a57600080fd5b60006106468484610554565b949350505050565b6000806040838503121561066157600080fd5b600061066d858561055f565b925050602061067e8582860161061d565b9150509250929050565b60006020828403121561069a57600080fd5b813567ffffffffffffffff8111156106b157600080fd5b610646848285016105b3565b6000602082840312156106cf57600080fd5b60006106468484610607565b600080604083850312156106ee57600080fd5b60006106fa8585610607565b925050602061067e85828601610607565b6000806040838503121561071e57600080fd5b600061072a8585610612565b925050602061067e85828601610612565b60008060006060848603121561075057600080fd5b600061075c8686610612565b935050602061076d86828701610612565b925050604061077e86828701610612565b9150509250925092565b6000806000806000608086880312156107a057600080fd5b60006107ac8888610612565b95505060206107bd88828901610612565b94505060406107ce88828901610612565b935050606086013567ffffffffffffffff8111156107eb57600080fd5b6107f78882890161056a565b92509250509295509295909350565b61080f81610aae565b82525050565b6000610822601b83610aa5565b7f63616c634661636556616c75653a205374616c65206f7261636c650000000000815260200192915050565b600061085b602183610aa5565b7f5369676e6564536166654d6174683a206164646974696f6e206f766572666c6f8152607760f81b602082015260400192915050565b600061089e601783610aa5565b7f636f6e6669677572653a20456d707479206f7261636c65000000000000000000815260200192915050565b60006108d7601e83610aa5565b7f536166654d6174683a207375627472616374696f6e206f766572666c6f770000815260200192915050565b6000610910602583610aa5565b7f7265636569766543616c6c46726f6d4c6f616e3a20496e76616c6964206163748152641a5bdb925960da1b602082015260400192915050565b6000610957602483610aa5565b7f5369676e6564536166654d6174683a207375627472616374696f6e206f766572815263666c6f7760e01b602082015260400192915050565b805160408301906109a18482610806565b5060208201516109b460208501826109c3565b50505050565b61080f81610ab9565b61080f81610ac8565b6020808252810161027d81610815565b6020808252810161027d8161084e565b6020808252810161027d81610891565b6020808252810161027d816108ca565b6020808252810161027d81610903565b6020808252810161027d8161094a565b6040810161027d8284610990565b6020810161027d82846109ba565b6020810161027d82846109c3565b60405181810167ffffffffffffffff81118282101715610a7557600080fd5b604052919050565b600067ffffffffffffffff821115610a9457600080fd5b506020601f91909101601f19160190565b90815260200190565b600061027d82610abc565b90565b6001600160a01b031690565b63ffffffff1690565b82818337506000910152565b610ae681610aae565b8114610af157600080fd5b50565b610ae681610ab9565b610ae681610ac856fea26469706673582212206abecadc387dd6db2d5d652249bd1ddbefd6ab1499ae99101a9f538aa9b7276164736f6c634300060c0033",
+  "optimization_enabled": false,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "evmVersion": "istanbul",
+    "libraries": {},
+    "metadata": {
+      "bytecodeHash": "ipfs",
+      "useLiteralContent": true
+    },
+    "optimizer": {
+      "details": {
+        "constantOptimizer": true,
+        "cse": true,
+        "deduplicate": true,
+        "jumpdestRemover": true,
+        "orderLiterals": true,
+        "peephole": true,
+        "yul": false
+      },
+      "runs": 200
+    },
+    "outputSelection": {
+      "*": {
+        "": [
+          "*"
+        ],
+        "*": [
+          "*"
+        ]
+      }
+    }
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": null,
+  "compiler_version": "v0.6.12+commit.27d51765",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-02-14T22:46:08.863227Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x608060405234801561001057600080fd5b50610b3c806100206000396000f3fe608060405234801561001057600080fd5b50600436106100885760003560e01c80638602074e1161005b5780638602074e146100f15780639e950b2214610104578063b70d1c7e14610117578063e00c34901461013757610088565b80631324041c1461008d5780631770ac3a146100b657806346739e73146100cb5780637bb6668e146100de575b600080fd5b6100a061009b36600461073b565b61014a565b6040516100ad9190610a3a565b60405180910390f35b6100c96100c436600461070b565b610172565b005b6100c96100d9366004610688565b610176565b6100a06100ec36600461070b565b61026d565b6100c96100ff36600461073b565b610283565b6100c9610112366004610688565b610288565b61012a610125366004610628565b6102a0565b6040516100ad9190610a2c565b6100a0610145366004610788565b6102ea565b6000600019821415610168576101613385856102f3565b905061016b565b50805b9392505050565b5050565b600033905060008083806020019051810190610192919061064e565b90925090506001600160a01b0382166101c65760405162461bcd60e51b81526004016101bd906109ec565b60405180910390fd5b6040805180820182526001600160a01b0384811680835263ffffffff8581166020808601918252898516600081815291829052908790209551865492516001600160a01b031990931695169490941763ffffffff60a01b1916600160a01b91909216021790925591519091907fb28cf685cf80ef726582ae8f60c1ee6dfdb57895eac21aa2c752d93495196eb69061025f908590610a48565b60405180910390a350505050565b600061027a3384846102f3565b90505b92915050565b505050565b60405162461bcd60e51b81526004016101bd90610a0c565b6102a861053d565b506001600160a01b03908116600090815260208181526040918290208251808401909352549283168252600160a01b90920463ffffffff169181019190915290565b50909392505050565b60006102fd61053d565b610306856102a0565b9050600080826020015163ffffffff1611156103d957600082600001516001600160a01b0316634def98556040518163ffffffff1660e01b8152600401604080518083038186803b15801561035a57600080fd5b505afa15801561036e573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061039291906106db565b90925090506103a14282610489565b836020015163ffffffff161015806103b7575081155b6103d35760405162461bcd60e51b81526004016101bd906109cc565b50610451565b81600001516001600160a01b031663209652556040518163ffffffff1660e01b815260040160206040518083038186803b15801561041657600080fd5b505afa15801561042a573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061044e91906106bd565b90505b60006104678561046188856104b1565b906104f7565b9050600081131561047c57925061016b915050565b5060009695505050505050565b6000828211156104ab5760405162461bcd60e51b81526004016101bd906109fc565b50900390565b60008282018183128015906104c65750838112155b806104db57506000831280156104db57508381125b61027a5760405162461bcd60e51b81526004016101bd906109dc565b600081830381831280159061050c5750838113155b80610521575060008312801561052157508381135b61027a5760405162461bcd60e51b81526004016101bd90610a1c565b604080518082019091526000808252602082015290565b803561027d81610add565b805161027d81610add565b60008083601f84011261057c57600080fd5b50813567ffffffffffffffff81111561059457600080fd5b6020830191508360208202830111156105ac57600080fd5b9250929050565b600082601f8301126105c457600080fd5b81356105d76105d282610a7d565b610a56565b915080825260208301602083018583830111156105f357600080fd5b6105fe838284610ad1565b50505092915050565b805161027d81610af4565b803561027d81610af4565b805161027d81610afd565b60006020828403121561063a57600080fd5b60006106468484610554565b949350505050565b6000806040838503121561066157600080fd5b600061066d858561055f565b925050602061067e8582860161061d565b9150509250929050565b60006020828403121561069a57600080fd5b813567ffffffffffffffff8111156106b157600080fd5b610646848285016105b3565b6000602082840312156106cf57600080fd5b60006106468484610607565b600080604083850312156106ee57600080fd5b60006106fa8585610607565b925050602061067e85828601610607565b6000806040838503121561071e57600080fd5b600061072a8585610612565b925050602061067e85828601610612565b60008060006060848603121561075057600080fd5b600061075c8686610612565b935050602061076d86828701610612565b925050604061077e86828701610612565b9150509250925092565b6000806000806000608086880312156107a057600080fd5b60006107ac8888610612565b95505060206107bd88828901610612565b94505060406107ce88828901610612565b935050606086013567ffffffffffffffff8111156107eb57600080fd5b6107f78882890161056a565b92509250509295509295909350565b61080f81610aae565b82525050565b6000610822601b83610aa5565b7f63616c634661636556616c75653a205374616c65206f7261636c650000000000815260200192915050565b600061085b602183610aa5565b7f5369676e6564536166654d6174683a206164646974696f6e206f766572666c6f8152607760f81b602082015260400192915050565b600061089e601783610aa5565b7f636f6e6669677572653a20456d707479206f7261636c65000000000000000000815260200192915050565b60006108d7601e83610aa5565b7f536166654d6174683a207375627472616374696f6e206f766572666c6f770000815260200192915050565b6000610910602583610aa5565b7f7265636569766543616c6c46726f6d4c6f616e3a20496e76616c6964206163748152641a5bdb925960da1b602082015260400192915050565b6000610957602483610aa5565b7f5369676e6564536166654d6174683a207375627472616374696f6e206f766572815263666c6f7760e01b602082015260400192915050565b805160408301906109a18482610806565b5060208201516109b460208501826109c3565b50505050565b61080f81610ab9565b61080f81610ac8565b6020808252810161027d81610815565b6020808252810161027d8161084e565b6020808252810161027d81610891565b6020808252810161027d816108ca565b6020808252810161027d81610903565b6020808252810161027d8161094a565b6040810161027d8284610990565b6020810161027d82846109ba565b6020810161027d82846109c3565b60405181810167ffffffffffffffff81118282101715610a7557600080fd5b604052919050565b600067ffffffffffffffff821115610a9457600080fd5b506020601f91909101601f19160190565b90815260200190565b600061027d82610abc565b90565b6001600160a01b031690565b63ffffffff1690565b82818337506000910152565b610ae681610aae565b8114610af157600080fd5b50565b610ae681610ab9565b610ae681610ac856fea26469706673582212206abecadc387dd6db2d5d652249bd1ddbefd6ab1499ae99101a9f538aa9b7276164736f6c634300060c0033",
+  "name": "ArbitraryLoanTotalNominalDeltaOracleModule",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": true,
+  "language": "solidity",
+  "evm_version": "istanbul",
+  "can_be_visualized_via_sol2uml": true,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [
+    {
+      "file_path": "@openzeppelin/contracts/math/SafeMath.sol",
+      "source_code": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/**\n * @dev Wrappers over Solidity's arithmetic operations with added overflow\n * checks.\n *\n * Arithmetic operations in Solidity wrap on overflow. This can easily result\n * in bugs, because programmers usually assume that an overflow raises an\n * error, which is the standard behavior in high level programming languages.\n * `SafeMath` restores this intuition by reverting the transaction when an\n * operation overflows.\n *\n * Using this library instead of the unchecked operations eliminates an entire\n * class of bugs, so it's recommended to use it always.\n */\nlibrary SafeMath {\n    /**\n     * @dev Returns the addition of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        uint256 c = a + b;\n        if (c < a) return (false, 0);\n        return (true, c);\n    }\n\n    /**\n     * @dev Returns the substraction of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b > a) return (false, 0);\n        return (true, a - b);\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the\n        // benefit is lost if 'b' is also tested.\n        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522\n        if (a == 0) return (true, 0);\n        uint256 c = a * b;\n        if (c / a != b) return (false, 0);\n        return (true, c);\n    }\n\n    /**\n     * @dev Returns the division of two unsigned integers, with a division by zero flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b == 0) return (false, 0);\n        return (true, a / b);\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b == 0) return (false, 0);\n        return (true, a % b);\n    }\n\n    /**\n     * @dev Returns the addition of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `+` operator.\n     *\n     * Requirements:\n     *\n     * - Addition cannot overflow.\n     */\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        uint256 c = a + b;\n        require(c >= a, \"SafeMath: addition overflow\");\n        return c;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting on\n     * overflow (when the result is negative).\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b <= a, \"SafeMath: subtraction overflow\");\n        return a - b;\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `*` operator.\n     *\n     * Requirements:\n     *\n     * - Multiplication cannot overflow.\n     */\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) return 0;\n        uint256 c = a * b;\n        require(c / a == b, \"SafeMath: multiplication overflow\");\n        return c;\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting on\n     * division by zero. The result is rounded towards zero.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b > 0, \"SafeMath: division by zero\");\n        return a / b;\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting when dividing by zero.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b > 0, \"SafeMath: modulo by zero\");\n        return a % b;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on\n     * overflow (when the result is negative).\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {trySub}.\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b <= a, errorMessage);\n        return a - b;\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting with custom message on\n     * division by zero. The result is rounded towards zero.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryDiv}.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        return a / b;\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting with custom message when dividing by zero.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryMod}.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        return a % b;\n    }\n}\n"
+    },
+    {
+      "file_path": "@openzeppelin/contracts/math/SignedSafeMath.sol",
+      "source_code": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/**\n * @title SignedSafeMath\n * @dev Signed math operations with safety checks that revert on error.\n */\nlibrary SignedSafeMath {\n    int256 constant private _INT256_MIN = -2**255;\n\n    /**\n     * @dev Returns the multiplication of two signed integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `*` operator.\n     *\n     * Requirements:\n     *\n     * - Multiplication cannot overflow.\n     */\n    function mul(int256 a, int256 b) internal pure returns (int256) {\n        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the\n        // benefit is lost if 'b' is also tested.\n        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522\n        if (a == 0) {\n            return 0;\n        }\n\n        require(!(a == -1 && b == _INT256_MIN), \"SignedSafeMath: multiplication overflow\");\n\n        int256 c = a * b;\n        require(c / a == b, \"SignedSafeMath: multiplication overflow\");\n\n        return c;\n    }\n\n    /**\n     * @dev Returns the integer division of two signed integers. Reverts on\n     * division by zero. The result is rounded towards zero.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(int256 a, int256 b) internal pure returns (int256) {\n        require(b != 0, \"SignedSafeMath: division by zero\");\n        require(!(b == -1 && a == _INT256_MIN), \"SignedSafeMath: division overflow\");\n\n        int256 c = a / b;\n\n        return c;\n    }\n\n    /**\n     * @dev Returns the subtraction of two signed integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(int256 a, int256 b) internal pure returns (int256) {\n        int256 c = a - b;\n        require((b >= 0 && c <= a) || (b < 0 && c > a), \"SignedSafeMath: subtraction overflow\");\n\n        return c;\n    }\n\n    /**\n     * @dev Returns the addition of two signed integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `+` operator.\n     *\n     * Requirements:\n     *\n     * - Addition cannot overflow.\n     */\n    function add(int256 a, int256 b) internal pure returns (int256) {\n        int256 c = a + b;\n        require((b >= 0 && c >= a) || (b < 0 && c < a), \"SignedSafeMath: addition overflow\");\n\n        return c;\n    }\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/arbitrary-value-oracles/IArbitraryValueOracle.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IArbitraryValueOracle Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IArbitraryValueOracle {\n    function getLastUpdated() external view returns (uint256 lastUpdated_);\n\n    function getValue() external view returns (int256 value_);\n\n    function getValueWithTimestamp() external view returns (int256 value_, uint256 lastUpdated_);\n}\n"
+    },
+    {
+      "file_path": "contracts/release/extensions/external-position-manager/external-positions/arbitrary-loan/modules/IArbitraryLoanAccountingModule.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IArbitraryLoanAccountingModule Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IArbitraryLoanAccountingModule {\n    /// @notice Calculates the canonical face value of the loan\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _totalRepaid The total repaid amount\n    /// @return faceValue_ The face value\n    function calcFaceValue(uint256 _totalBorrowed, uint256 _totalRepaid)\n        external\n        view\n        returns (uint256 faceValue_);\n\n    /// @notice Configures options per-loan\n    /// @param _configData Encoded options\n    function configure(bytes memory _configData) external;\n\n    /// @notice Implements logic immediately prior to effects and interactions during a borrow\n    /// @param _prevTotalBorrowed The total borrowed amount not including the new borrow amount\n    /// @param _totalRepaid The total repaid amount\n    /// @param _borrowAmount The new borrow amount\n    function preBorrow(\n        uint256 _prevTotalBorrowed,\n        uint256 _totalRepaid,\n        uint256 _borrowAmount\n    ) external;\n\n    /// @notice Implements logic immediately prior to effects and interactions when closing a loan\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _totalRepaid The total repaid amount\n    function preClose(uint256 _totalBorrowed, uint256 _totalRepaid) external;\n\n    /// @notice Implements logic immediately prior to effects and interactions during a reconciliation,\n    /// and returns the formatted amount to consider as a repayment\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _prevTotalRepaid The total repaid amount not including the reconciled assets\n    /// @param _repayableLoanAssetAmount The loanAsset amount available for repayment\n    /// @param _extraAssets The extra assets (non-loanAsset) being swept to the VaultProxy\n    /// @return repayAmount_ The formatted amount to consider as repayment in terms of the loanAsset\n    /// @dev Should not revert in case of over-repayment.\n    /// Instead, it is recommended to return the full loan balance as repayAmount_ where necessary.\n    /// _extraAssets allows a module to use its own pricing to calculate the value of each\n    /// extra asset in terms of the loanAsset, which can be included in the repayAmount_.\n    function preReconcile(\n        uint256 _totalBorrowed,\n        uint256 _prevTotalRepaid,\n        uint256 _repayableLoanAssetAmount,\n        address[] calldata _extraAssets\n    ) external returns (uint256 repayAmount_);\n\n    /// @notice Implements logic immediately prior to effects and interactions during a repay,\n    /// and returns the formatted amount to repay (e.g., in the case of a user-input max)\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _prevTotalRepaid The total repaid amount not including the new repay amount\n    /// @param _repayAmountInput The user-input repay amount\n    /// @return repayAmount_ The formatted amount to repay\n    function preRepay(\n        uint256 _totalBorrowed,\n        uint256 _prevTotalRepaid,\n        uint256 _repayAmountInput\n    ) external returns (uint256 repayAmount_);\n\n    /// @notice Receives and executes an arbitrary call from the loan contract\n    /// @param _actionData Encoded data for the arbitrary call\n    function receiveCallFromLoan(bytes memory _actionData) external;\n}\n"
+    }
+  ],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "loan",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "oracle",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint32",
+          "name": "stalenessThreshold",
+          "type": "uint32"
+        }
+      ],
+      "name": "OracleSetForLoan",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_totalBorrowed",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_totalRepaid",
+          "type": "uint256"
+        }
+      ],
+      "name": "calcFaceValue",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "faceValue_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes",
+          "name": "_configData",
+          "type": "bytes"
+        }
+      ],
+      "name": "configure",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_loan",
+          "type": "address"
+        }
+      ],
+      "name": "getOracleInfoForLoan",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "address",
+              "name": "oracle",
+              "type": "address"
+            },
+            {
+              "internalType": "uint32",
+              "name": "stalenessThreshold",
+              "type": "uint32"
+            }
+          ],
+          "internalType": "struct ArbitraryLoanTotalNominalDeltaOracleModule.OracleInfo",
+          "name": "oracleInfo_",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "preBorrow",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "preClose",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_repayableLoanAssetAmount",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address[]",
+          "name": "",
+          "type": "address[]"
+        }
+      ],
+      "name": "preReconcile",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "repayAmount_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "_totalBorrowed",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_prevTotalRepaid",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_repayAmountInput",
+          "type": "uint256"
+        }
+      ],
+      "name": "preRepay",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "repayAmount_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "bytes",
+          "name": "",
+          "type": "bytes"
+        }
+      ],
+      "name": "receiveCallFromLoan",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": null,
+  "sources": {
+    "contracts/release/extensions/external-position-manager/external-positions/arbitrary-loan/modules/ArbitraryLoanTotalNominalDeltaOracleModule.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\npragma experimental ABIEncoderV2;\n\nimport \"@openzeppelin/contracts/math/SafeMath.sol\";\nimport \"@openzeppelin/contracts/math/SignedSafeMath.sol\";\nimport \"./IArbitraryLoanAccountingModule.sol\";\nimport \"../../../../../../persistent/arbitrary-value-oracles/IArbitraryValueOracle.sol\";\n\n/// @title ArbitraryLoanTotalNominalDeltaOracleModule Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice An accounting module for a loan to apply gains or losses,\n/// via an oracle that reports the nominal delta of the total amount borrowed (ignores repayments)\n/// @dev This method of reporting value helps to prevent an oracle getting out-of-sync,\n/// e.g., when new amounts are borrowed or repaid to the loan\ncontract ArbitraryLoanTotalNominalDeltaOracleModule is IArbitraryLoanAccountingModule {\n    using SafeMath for uint256;\n    using SignedSafeMath for int256;\n\n    event OracleSetForLoan(\n        address indexed loan,\n        address indexed oracle,\n        uint32 stalenessThreshold\n    );\n\n    struct OracleInfo {\n        address oracle;\n        uint32 stalenessThreshold;\n    }\n\n    mapping(address => OracleInfo) private loanToOracleInfo;\n\n    /////////////////////\n    // CALLS FROM LOAN //\n    /////////////////////\n\n    /// @notice Calculates the canonical face value of the loan\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _totalRepaid The total repaid amount\n    /// @return faceValue_ The face value\n    function calcFaceValue(uint256 _totalBorrowed, uint256 _totalRepaid)\n        external\n        view\n        override\n        returns (uint256 faceValue_)\n    {\n        return __calcLoanBalance(msg.sender, _totalBorrowed, _totalRepaid);\n    }\n\n    /// @notice Configures options per-loan\n    /// @param _configData Encoded options\n    function configure(bytes memory _configData) external override {\n        address loan = msg.sender;\n        (address oracle, uint32 stalenessThreshold) = abi.decode(_configData, (address, uint32));\n        require(oracle != address(0), \"configure: Empty oracle\");\n\n        loanToOracleInfo[loan] = OracleInfo({\n            oracle: oracle,\n            stalenessThreshold: stalenessThreshold\n        });\n\n        emit OracleSetForLoan(loan, oracle, stalenessThreshold);\n    }\n\n    /// @notice Implements logic immediately prior to effects and interactions during a borrow\n    /// @dev Unimplemented\n    function preBorrow(\n        uint256,\n        uint256,\n        uint256\n    ) external override {}\n\n    /// @notice Implements logic immediately prior to effects and interactions when closing a loan\n    /// @dev Unimplemented\n    function preClose(uint256, uint256) external override {}\n\n    /// @notice Implements logic immediately prior to effects and interactions during a reconciliation,\n    /// and returns the formatted amount to consider as a repayment\n    /// @param _repayableLoanAssetAmount The loanAsset amount available for repayment\n    /// @return repayAmount_ The formatted amount to consider as repayment in terms of the loanAsset\n    /// @dev Should not revert in case of over-repayment.\n    /// Instead, it is recommended to return the full loan balance as repayAmount_ where necessary.\n    function preReconcile(\n        uint256,\n        uint256,\n        uint256 _repayableLoanAssetAmount,\n        address[] calldata\n    ) external override returns (uint256 repayAmount_) {\n        return _repayableLoanAssetAmount;\n    }\n\n    /// @notice Implements logic immediately prior to effects and interactions during a repay,\n    /// and returns the formatted amount to repay (e.g., in the case of a user-input max)\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _prevTotalRepaid The total repaid amount not including the new repay amount\n    /// @param _repayAmountInput The user-input repay amount\n    /// @param repayAmount_ The formatted amount to repay\n    function preRepay(\n        uint256 _totalBorrowed,\n        uint256 _prevTotalRepaid,\n        uint256 _repayAmountInput\n    ) external override returns (uint256 repayAmount_) {\n        // Calc actual repay amount based on user input\n        if (_repayAmountInput == type(uint256).max) {\n            return __calcLoanBalance(msg.sender, _totalBorrowed, _prevTotalRepaid);\n        }\n\n        return _repayAmountInput;\n    }\n\n    /// @notice Receives and executes an arbitrary call from the loan contract\n    /// @dev No actions implemented in this module\n    function receiveCallFromLoan(bytes memory) external override {\n        revert(\"receiveCallFromLoan: Invalid actionId\");\n    }\n\n    // PRIVATE FUNCTIONS\n\n    /// @dev Helper to calculate the loan balance\n    function __calcLoanBalance(\n        address _loan,\n        uint256 _totalBorrowed,\n        uint256 _totalRepaid\n    ) private view returns (uint256 balance_) {\n        OracleInfo memory oracleInfo = getOracleInfoForLoan(_loan);\n        int256 oracleValue;\n\n        // Query value and handle staleness threshold as-necessary\n        if (oracleInfo.stalenessThreshold > 0) {\n            uint256 lastUpdated;\n            (oracleValue, lastUpdated) = IArbitraryValueOracle(oracleInfo.oracle)\n                .getValueWithTimestamp();\n\n            // Does not assert the staleness threshold if the oracle value is 0\n            require(\n                oracleInfo.stalenessThreshold >= block.timestamp.sub(lastUpdated) ||\n                    oracleValue == 0,\n                \"calcFaceValue: Stale oracle\"\n            );\n        } else {\n            oracleValue = IArbitraryValueOracle(oracleInfo.oracle).getValue();\n        }\n\n        int256 totalBalanceInt = int256(_totalBorrowed).add(oracleValue).sub(int256(_totalRepaid));\n        if (totalBalanceInt > 0) {\n            return uint256(totalBalanceInt);\n        }\n\n        return 0;\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the OracleInfo for a given loan\n    /// @param _loan The loan address\n    /// @return oracleInfo_ The oracle info\n    function getOracleInfoForLoan(address _loan)\n        public\n        view\n        returns (OracleInfo memory oracleInfo_)\n    {\n        return loanToOracleInfo[_loan];\n    }\n}\n"
+    },
+    "@openzeppelin/contracts/math/SafeMath.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/**\n * @dev Wrappers over Solidity's arithmetic operations with added overflow\n * checks.\n *\n * Arithmetic operations in Solidity wrap on overflow. This can easily result\n * in bugs, because programmers usually assume that an overflow raises an\n * error, which is the standard behavior in high level programming languages.\n * `SafeMath` restores this intuition by reverting the transaction when an\n * operation overflows.\n *\n * Using this library instead of the unchecked operations eliminates an entire\n * class of bugs, so it's recommended to use it always.\n */\nlibrary SafeMath {\n    /**\n     * @dev Returns the addition of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        uint256 c = a + b;\n        if (c < a) return (false, 0);\n        return (true, c);\n    }\n\n    /**\n     * @dev Returns the substraction of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b > a) return (false, 0);\n        return (true, a - b);\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the\n        // benefit is lost if 'b' is also tested.\n        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522\n        if (a == 0) return (true, 0);\n        uint256 c = a * b;\n        if (c / a != b) return (false, 0);\n        return (true, c);\n    }\n\n    /**\n     * @dev Returns the division of two unsigned integers, with a division by zero flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b == 0) return (false, 0);\n        return (true, a / b);\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        if (b == 0) return (false, 0);\n        return (true, a % b);\n    }\n\n    /**\n     * @dev Returns the addition of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `+` operator.\n     *\n     * Requirements:\n     *\n     * - Addition cannot overflow.\n     */\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        uint256 c = a + b;\n        require(c >= a, \"SafeMath: addition overflow\");\n        return c;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting on\n     * overflow (when the result is negative).\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b <= a, \"SafeMath: subtraction overflow\");\n        return a - b;\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `*` operator.\n     *\n     * Requirements:\n     *\n     * - Multiplication cannot overflow.\n     */\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) return 0;\n        uint256 c = a * b;\n        require(c / a == b, \"SafeMath: multiplication overflow\");\n        return c;\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting on\n     * division by zero. The result is rounded towards zero.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b > 0, \"SafeMath: division by zero\");\n        return a / b;\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting when dividing by zero.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(uint256 a, uint256 b) internal pure returns (uint256) {\n        require(b > 0, \"SafeMath: modulo by zero\");\n        return a % b;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on\n     * overflow (when the result is negative).\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {trySub}.\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b <= a, errorMessage);\n        return a - b;\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting with custom message on\n     * division by zero. The result is rounded towards zero.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryDiv}.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        return a / b;\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting with custom message when dividing by zero.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryMod}.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        return a % b;\n    }\n}\n"
+    },
+    "@openzeppelin/contracts/math/SignedSafeMath.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.6.0 <0.8.0;\n\n/**\n * @title SignedSafeMath\n * @dev Signed math operations with safety checks that revert on error.\n */\nlibrary SignedSafeMath {\n    int256 constant private _INT256_MIN = -2**255;\n\n    /**\n     * @dev Returns the multiplication of two signed integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `*` operator.\n     *\n     * Requirements:\n     *\n     * - Multiplication cannot overflow.\n     */\n    function mul(int256 a, int256 b) internal pure returns (int256) {\n        // Gas optimization: this is cheaper than requiring 'a' not being zero, but the\n        // benefit is lost if 'b' is also tested.\n        // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522\n        if (a == 0) {\n            return 0;\n        }\n\n        require(!(a == -1 && b == _INT256_MIN), \"SignedSafeMath: multiplication overflow\");\n\n        int256 c = a * b;\n        require(c / a == b, \"SignedSafeMath: multiplication overflow\");\n\n        return c;\n    }\n\n    /**\n     * @dev Returns the integer division of two signed integers. Reverts on\n     * division by zero. The result is rounded towards zero.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(int256 a, int256 b) internal pure returns (int256) {\n        require(b != 0, \"SignedSafeMath: division by zero\");\n        require(!(b == -1 && a == _INT256_MIN), \"SignedSafeMath: division overflow\");\n\n        int256 c = a / b;\n\n        return c;\n    }\n\n    /**\n     * @dev Returns the subtraction of two signed integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(int256 a, int256 b) internal pure returns (int256) {\n        int256 c = a - b;\n        require((b >= 0 && c <= a) || (b < 0 && c > a), \"SignedSafeMath: subtraction overflow\");\n\n        return c;\n    }\n\n    /**\n     * @dev Returns the addition of two signed integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `+` operator.\n     *\n     * Requirements:\n     *\n     * - Addition cannot overflow.\n     */\n    function add(int256 a, int256 b) internal pure returns (int256) {\n        int256 c = a + b;\n        require((b >= 0 && c >= a) || (b < 0 && c < a), \"SignedSafeMath: addition overflow\");\n\n        return c;\n    }\n}\n"
+    },
+    "contracts/persistent/arbitrary-value-oracles/IArbitraryValueOracle.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IArbitraryValueOracle Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IArbitraryValueOracle {\n    function getLastUpdated() external view returns (uint256 lastUpdated_);\n\n    function getValue() external view returns (int256 value_);\n\n    function getValueWithTimestamp() external view returns (int256 value_, uint256 lastUpdated_);\n}\n"
+    },
+    "contracts/release/extensions/external-position-manager/external-positions/arbitrary-loan/modules/IArbitraryLoanAccountingModule.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title IArbitraryLoanAccountingModule Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IArbitraryLoanAccountingModule {\n    /// @notice Calculates the canonical face value of the loan\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _totalRepaid The total repaid amount\n    /// @return faceValue_ The face value\n    function calcFaceValue(uint256 _totalBorrowed, uint256 _totalRepaid)\n        external\n        view\n        returns (uint256 faceValue_);\n\n    /// @notice Configures options per-loan\n    /// @param _configData Encoded options\n    function configure(bytes memory _configData) external;\n\n    /// @notice Implements logic immediately prior to effects and interactions during a borrow\n    /// @param _prevTotalBorrowed The total borrowed amount not including the new borrow amount\n    /// @param _totalRepaid The total repaid amount\n    /// @param _borrowAmount The new borrow amount\n    function preBorrow(\n        uint256 _prevTotalBorrowed,\n        uint256 _totalRepaid,\n        uint256 _borrowAmount\n    ) external;\n\n    /// @notice Implements logic immediately prior to effects and interactions when closing a loan\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _totalRepaid The total repaid amount\n    function preClose(uint256 _totalBorrowed, uint256 _totalRepaid) external;\n\n    /// @notice Implements logic immediately prior to effects and interactions during a reconciliation,\n    /// and returns the formatted amount to consider as a repayment\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _prevTotalRepaid The total repaid amount not including the reconciled assets\n    /// @param _repayableLoanAssetAmount The loanAsset amount available for repayment\n    /// @param _extraAssets The extra assets (non-loanAsset) being swept to the VaultProxy\n    /// @return repayAmount_ The formatted amount to consider as repayment in terms of the loanAsset\n    /// @dev Should not revert in case of over-repayment.\n    /// Instead, it is recommended to return the full loan balance as repayAmount_ where necessary.\n    /// _extraAssets allows a module to use its own pricing to calculate the value of each\n    /// extra asset in terms of the loanAsset, which can be included in the repayAmount_.\n    function preReconcile(\n        uint256 _totalBorrowed,\n        uint256 _prevTotalRepaid,\n        uint256 _repayableLoanAssetAmount,\n        address[] calldata _extraAssets\n    ) external returns (uint256 repayAmount_);\n\n    /// @notice Implements logic immediately prior to effects and interactions during a repay,\n    /// and returns the formatted amount to repay (e.g., in the case of a user-input max)\n    /// @param _totalBorrowed The total borrowed amount\n    /// @param _prevTotalRepaid The total repaid amount not including the new repay amount\n    /// @param _repayAmountInput The user-input repay amount\n    /// @return repayAmount_ The formatted amount to repay\n    function preRepay(\n        uint256 _totalBorrowed,\n        uint256 _prevTotalRepaid,\n        uint256 _repayAmountInput\n    ) external returns (uint256 repayAmount_);\n\n    /// @notice Receives and executes an arbitrary call from the loan contract\n    /// @param _actionData Encoded data for the arbitrary call\n    function receiveCallFromLoan(bytes memory _actionData) external;\n}\n"
+    }
+  }
+}

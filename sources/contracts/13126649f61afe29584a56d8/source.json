@@ -1,0 +1,234 @@
+{
+  "sources": {
+    "contracts/external-interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IERC20 Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IERC20 {\n    // IERC20 - strict\n\n    function allowance(address _owner, address _spender) external view returns (uint256 allowance_);\n\n    function approve(address _spender, uint256 _value) external returns (bool approve_);\n\n    function balanceOf(address _account) external view returns (uint256 balanceOf_);\n\n    function totalSupply() external view returns (uint256 totalSupply_);\n\n    function transfer(address _to, uint256 _value) external returns (bool transfer_);\n\n    function transferFrom(address _from, address _to, uint256 _value) external returns (bool transferFrom_);\n\n    // IERC20 - typical\n\n    function decimals() external view returns (uint8 decimals_);\n\n    function name() external view returns (string memory name_);\n\n    function symbol() external view returns (string memory symbol_);\n}\n"
+    },
+    "contracts/utils/0.8.19/NonUpgradableProxy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.8.19;\n\n/// @title NonUpgradableProxy Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A proxy contract for use with non-upgradable libs\n/// @dev The recommended constructor-fallback pattern of a proxy in EIP-1822, updated for solc 0.8.19,\n/// and using an immutable lib value to save on gas (since not upgradable).\n/// The EIP-1967 storage slot for the lib is still assigned,\n/// for ease of referring to UIs that understand the pattern, i.e., Etherscan.\ncontract NonUpgradableProxy {\n    address private immutable CONTRACT_LOGIC;\n\n    constructor(bytes memory _constructData, address _contractLogic) {\n        CONTRACT_LOGIC = _contractLogic;\n\n        assembly {\n            // EIP-1967 slot: `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`\n            sstore(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc, _contractLogic)\n        }\n        if (_constructData.length > 0) {\n            (bool success, bytes memory returnData) = _contractLogic.delegatecall(_constructData);\n            require(success, string(returnData));\n        }\n    }\n\n    // solhint-disable-next-line no-complex-fallback\n    fallback() external payable {\n        address contractLogic = CONTRACT_LOGIC;\n\n        assembly {\n            calldatacopy(0x0, 0x0, calldatasize())\n            let success := delegatecall(sub(gas(), 10000), contractLogic, 0x0, calldatasize(), 0, 0)\n            let retSz := returndatasize()\n            returndatacopy(0, 0, retSz)\n            switch success\n            case 0 { revert(0, retSz) }\n            default { return(0, retSz) }\n        }\n    }\n}\n"
+    },
+    "contracts/persistent/single-asset-redemption-queue/ISingleAssetRedemptionQueue.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\nimport {IERC20} from \"../../external-interfaces/IERC20.sol\";\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title ISingleAssetRedemptionQueue Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface ISingleAssetRedemptionQueue {\n    function init(\n        address _vaultProxy,\n        IERC20 _redemptionAsset,\n        uint256 _bypassableSharesAmount,\n        address[] calldata _managers\n    ) external;\n\n    function addManagers(address[] calldata _managers) external;\n\n    function getBypassableSharesThreshold() external view returns (uint256 sharesAmount_);\n\n    function getNextNewId() external view returns (uint256 id_);\n\n    function getNextQueuedId() external view returns (uint256 id_);\n\n    function getRedemptionAsset() external view returns (IERC20 asset_);\n\n    function getSharesForRequest(uint256 _id) external view returns (uint256 sharesAmount_);\n\n    function getUserForRequest(uint256 _id) external view returns (address user_);\n\n    function getVaultProxy() external view returns (address vaultProxy_);\n\n    function isManager(address _user) external view returns (bool isManager_);\n\n    function queueIsShutdown() external view returns (bool isShutdown_);\n\n    function redeemFromQueue(uint256 _endId, uint256[] calldata _idsToBypass) external;\n\n    function removeManagers(address[] calldata _managers) external;\n\n    function requestRedeem(uint256 _sharesAmount) external returns (uint256 id_);\n\n    function setBypassableSharesThreshold(uint256 _nextSharesThreshold) external;\n\n    function setRedemptionAsset(IERC20 _nextRedemptionAsset) external;\n\n    function shutdown() external;\n\n    function withdrawRequest(uint256 _id) external;\n}\n"
+    },
+    "contracts/persistent/single-asset-redemption-queue/SingleAssetRedemptionQueueFactory.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.8.19;\n\nimport {NonUpgradableProxy} from \"../../utils/0.8.19/NonUpgradableProxy.sol\";\nimport {ISingleAssetRedemptionQueue} from \"./ISingleAssetRedemptionQueue.sol\";\n\n/// @title SingleAssetRedemptionQueueFactory Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A factory for SingleAssetRedemptionQueue proxy instances\ncontract SingleAssetRedemptionQueueFactory {\n    event ProxyDeployed(address indexed deployer, address indexed proxyAddress, address indexed vaultProxy);\n\n    address internal immutable LIB_ADDRESS;\n\n    constructor(address _libAddress) {\n        LIB_ADDRESS = _libAddress;\n    }\n\n    function deployProxy(\n        address _vaultProxy,\n        address _redemptionAssetAddress,\n        uint256 _bypassableSharesThreshold,\n        address[] calldata _managers\n    ) external returns (address proxyAddress_) {\n        bytes memory constructData = abi.encodeWithSelector(\n            ISingleAssetRedemptionQueue.init.selector,\n            _vaultProxy,\n            _redemptionAssetAddress,\n            _bypassableSharesThreshold,\n            _managers\n        );\n\n        proxyAddress_ = address(new NonUpgradableProxy({_constructData: constructData, _contractLogic: LIB_ADDRESS}));\n\n        emit ProxyDeployed(msg.sender, proxyAddress_, _vaultProxy);\n\n        return proxyAddress_;\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.19+commit.7dd6d404"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_libAddress",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "deployer",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "proxyAddress",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "ProxyDeployed",
+          "type": "event"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_redemptionAssetAddress",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_bypassableSharesThreshold",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "_managers",
+              "type": "address[]"
+            }
+          ],
+          "name": "deployProxy",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "proxyAddress_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Enzyme Council <security@enzyme.finance>",
+        "kind": "dev",
+        "methods": {},
+        "title": "SingleAssetRedemptionQueueFactory Contract",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {},
+        "notice": "A factory for SingleAssetRedemptionQueue proxy instances",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/persistent/single-asset-redemption-queue/SingleAssetRedemptionQueueFactory.sol": "SingleAssetRedemptionQueueFactory"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "appendCBOR": false,
+        "bytecodeHash": "none"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "inliner": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": false
+        },
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "sources": {
+      "contracts/external-interfaces/IERC20.sol": {
+        "keccak256": "0x78213cae725c7a4d3ab033123f0f60742ec091f1c3053035bdc4bd91b706ce8f",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://9ec4dd38598939b111648b78a9a4f82383ff5298276d0cd5845cc64374b61108",
+          "dweb:/ipfs/QmYnUALtVnZ2vTjmqRzcJJ5ETXMg3Jr5x9fGvZrTvmCQxG"
+        ]
+      },
+      "contracts/persistent/single-asset-redemption-queue/ISingleAssetRedemptionQueue.sol": {
+        "keccak256": "0x9723a07646e32eccf5ce901b8caa4bc2c27b1d9716b056901a42c1644173f7e8",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://9f061b5b9b8c802530e224dccc5ba9be9854788ce02350803bc2976fda361340",
+          "dweb:/ipfs/QmPZAwGQPV8W3psKcDdikzCpze1egU3pamgTsWGDnZpLwt"
+        ]
+      },
+      "contracts/persistent/single-asset-redemption-queue/SingleAssetRedemptionQueueFactory.sol": {
+        "keccak256": "0x0bf43431fac505f564c5038220927970be56df5e6bc1b671c308ce5b6b5dbaef",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://a812261b769ab78cb62b85aedbacf8a4a77dfc5ef3fccb797cf1b90c6e66b42c",
+          "dweb:/ipfs/QmQ5T8Mmk6nkGJzxrbp8LM1NsDCKqrDB8MjAQMDXT1NeBF"
+        ]
+      },
+      "contracts/utils/0.8.19/NonUpgradableProxy.sol": {
+        "keccak256": "0x27ce37ef5b740c3b4a1cb53733a7ca0a93a38dfcea4d1922399c865287f16ba6",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://d3702ec67e2a377602f24b7af9806519d369423468eb9788f35d4ffc08c89e00",
+          "dweb:/ipfs/QmY3DEaWgLwAR1Cr4KGw9WhyXz8zBdAJLHoz6Q2t8vREgs"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.19+commit.7dd6d404",
+    "compilerSettings": {
+      "metadata": {
+        "appendCBOR": false,
+        "bytecodeHash": "none"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "details": {
+          "cse": true,
+          "yul": false,
+          "inliner": true,
+          "peephole": true,
+          "deduplicate": true,
+          "orderLiterals": true,
+          "jumpdestRemover": true,
+          "constantOptimizer": true
+        }
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "name": "SingleAssetRedemptionQueueFactory",
+    "fullyQualifiedName": "contracts/persistent/single-asset-redemption-queue/SingleAssetRedemptionQueueFactory.sol:SingleAssetRedemptionQueueFactory"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "37782686",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-06-28T01:23:36Z",
+  "match": "match",
+  "chainId": "137",
+  "address": "0x4b6b342bA8BB29E2D1b542532E6b7bE1cAE026b9"
+}
