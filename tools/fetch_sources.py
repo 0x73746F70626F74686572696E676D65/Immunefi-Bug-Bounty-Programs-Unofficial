@@ -117,7 +117,23 @@ def archive_repo(owner, repo, ref):
         if index.exists():return json.loads(index.read_text())
         dest.mkdir(parents=True,exist_ok=True)
         tmp=WORK/(digest(str(dest))+'.tar.gz')
-        download(f'https://codeload.github.com/{owner}/{repo}/tar.gz/{commit}',tmp,timeout=600)
+        try:
+            download(f'https://codeload.github.com/{owner}/{repo}/tar.gz/{commit}',tmp,timeout=600)
+        except RuntimeError as e:
+            if 'HTTP 404' not in str(e):raise
+            # Redirected repositories and historical Git objects can still be
+            # publicly retrievable when codeload no longer serves the old URL.
+            try:
+                canonical=get_json(f'https://api.github.com/repos/{owner}/{repo}')['full_name']
+                if canonical.lower()==(owner+'/'+repo).lower():raise RuntimeError('No repository redirect')
+                download(f'https://codeload.github.com/{canonical}/tar.gz/{commit}',tmp,timeout=600)
+                info={**info,'html_url':'https://github.com/'+canonical}
+            except Exception:
+                cache=WORK/('archive-git-'+digest(info['html_url']+commit));cache.mkdir(exist_ok=True)
+                subprocess.run(['git','init','--bare',str(cache)],check=True,capture_output=True)
+                proc=subprocess.run(['git','-C',str(cache),'fetch','--depth=1',info['html_url']+'.git',commit],capture_output=True,text=True,timeout=180)
+                if proc.returncode:raise RuntimeError('Codeload archive is unavailable; pinned Git fetch also failed: '+proc.stderr[-500:])
+                subprocess.run(['git','-C',str(cache),'archive','--format=tar.gz','--prefix=source-'+commit+'/', '--output',str(tmp),commit],check=True,capture_output=True)
         file_index=[];modules=None
         with tarfile.open(tmp,'r:gz') as tf:
             for member in tf:
