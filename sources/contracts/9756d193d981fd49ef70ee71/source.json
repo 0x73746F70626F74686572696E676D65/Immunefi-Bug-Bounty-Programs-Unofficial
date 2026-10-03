@@ -1,0 +1,1215 @@
+{
+  "sources": {
+    "src/Kernel.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\n//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████\n//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███\n//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░\n// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████\n// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███\n// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███\n//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████\n//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░\n\n//============================================================================================//\n//                                        GLOBAL TYPES                                        //\n//============================================================================================//\n\n/// @notice Actions to trigger state changes in the kernel. Passed by the executor\nenum Actions {\n    InstallModule,\n    UpgradeModule,\n    ActivatePolicy,\n    DeactivatePolicy,\n    ChangeExecutor,\n    MigrateKernel\n}\n\n/// @notice Used by executor to select an action and a target contract for a kernel action\nstruct Instruction {\n    Actions action;\n    address target;\n}\n\n/// @notice Used to define which module functions a policy needs access to\nstruct Permissions {\n    Keycode keycode;\n    bytes4 funcSelector;\n}\n\ntype Keycode is bytes5;\n\n//============================================================================================//\n//                                       UTIL FUNCTIONS                                       //\n//============================================================================================//\n\nerror TargetNotAContract(address target_);\nerror InvalidKeycode(Keycode keycode_);\n\n// solhint-disable-next-line func-visibility\nfunction toKeycode(bytes5 keycode_) pure returns (Keycode) {\n    return Keycode.wrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction fromKeycode(Keycode keycode_) pure returns (bytes5) {\n    return Keycode.unwrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureContract(address target_) view {\n    if (target_.code.length == 0) revert TargetNotAContract(target_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureValidKeycode(Keycode keycode_) pure {\n    bytes5 unwrapped = Keycode.unwrap(keycode_);\n    for (uint256 i = 0; i < 5; ) {\n        bytes1 char = unwrapped[i];\n        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only\n        unchecked {\n            i++;\n        }\n    }\n}\n\n//============================================================================================//\n//                                        COMPONENTS                                          //\n//============================================================================================//\n\n/// @notice Generic adapter interface for kernel access in modules and policies.\nabstract contract KernelAdapter {\n    error KernelAdapter_OnlyKernel(address caller_);\n\n    Kernel public kernel;\n\n    constructor(Kernel kernel_) {\n        kernel = kernel_;\n    }\n\n    /// @notice Modifier to restrict functions to be called only by kernel.\n    modifier onlyKernel() {\n        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);\n        _;\n    }\n\n    /// @notice Function used by kernel when migrating to a new kernel.\n    function changeKernel(Kernel newKernel_) external onlyKernel {\n        kernel = newKernel_;\n    }\n}\n\n/// @notice Base level extension of the kernel. Modules act as independent state components to be\n///         interacted with and mutated through policies.\n/// @dev    Modules are installed and uninstalled via the executor.\nabstract contract Module is KernelAdapter {\n    error Module_PolicyNotPermitted(address policy_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Modifier to restrict which policies have access to module functions.\n    modifier permissioned() {\n        if (\n            msg.sender == address(kernel) ||\n            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)\n        ) revert Module_PolicyNotPermitted(msg.sender);\n        _;\n    }\n\n    /// @notice 5 byte identifier for a module.\n    function KEYCODE() public pure virtual returns (Keycode) {}\n\n    /// @notice Returns which semantic version of a module is being implemented.\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}\n\n    /// @notice Initialization function for the module\n    /// @dev    This function is called when the module is installed or upgraded by the kernel.\n    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.\n    function INIT() external virtual onlyKernel {}\n}\n\n/// @notice Policies are application logic and external interface for the kernel and installed modules.\n/// @dev    Policies are activated and deactivated in the kernel by the executor.\n/// @dev    Module dependencies and function permissions must be defined in appropriate functions.\nabstract contract Policy is KernelAdapter {\n    error Policy_ModuleDoesNotExist(Keycode keycode_);\n    error Policy_WrongModuleVersion(bytes expected_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Easily accessible indicator for if a policy is activated or not.\n    function isActive() external view returns (bool) {\n        return kernel.isPolicyActive(this);\n    }\n\n    /// @notice Function to grab module address from a given keycode.\n    function getModuleAddress(Keycode keycode_) internal view returns (address) {\n        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));\n        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);\n        return moduleForKeycode;\n    }\n\n    /// @notice Define module dependencies for this policy.\n    /// @return dependencies - Keycode array of module dependencies.\n    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}\n\n    /// @notice Function called by kernel to set module function permissions.\n    /// @return requests - Array of keycodes and function selectors for requested permissions.\n    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}\n}\n\n/// @notice Main contract that acts as a central component registry for the protocol.\n/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,\n/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.\ncontract Kernel {\n    // =========  EVENTS ========= //\n\n    event PermissionsUpdated(\n        Keycode indexed keycode_,\n        Policy indexed policy_,\n        bytes4 funcSelector_,\n        bool granted_\n    );\n    event ActionExecuted(Actions indexed action_, address indexed target_);\n\n    // =========  ERRORS ========= //\n\n    error Kernel_OnlyExecutor(address caller_);\n    error Kernel_ModuleAlreadyInstalled(Keycode module_);\n    error Kernel_InvalidModuleUpgrade(Keycode module_);\n    error Kernel_PolicyAlreadyActivated(address policy_);\n    error Kernel_PolicyNotActivated(address policy_);\n\n    // =========  PRIVILEGED ADDRESSES ========= //\n\n    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.\n    address public executor;\n\n    // =========  MODULE MANAGEMENT ========= //\n\n    /// @notice Array of all modules currently installed.\n    Keycode[] public allKeycodes;\n\n    /// @notice Mapping of module address to keycode.\n    mapping(Keycode => Module) public getModuleForKeycode;\n\n    /// @notice Mapping of keycode to module address.\n    mapping(Module => Keycode) public getKeycodeForModule;\n\n    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.\n    mapping(Keycode => Policy[]) public moduleDependents;\n\n    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.\n    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;\n\n    /// @notice Module <> Policy Permissions.\n    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission\n    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;\n\n    // =========  POLICY MANAGEMENT ========= //\n\n    /// @notice List of all active policies\n    Policy[] public activePolicies;\n\n    /// @notice Helper to get active policy quickly. Prevents need to loop through array.\n    mapping(Policy => uint256) public getPolicyIndex;\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    constructor() {\n        executor = msg.sender;\n    }\n\n    /// @notice Modifier to check if caller is the executor.\n    modifier onlyExecutor() {\n        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);\n        _;\n    }\n\n    function isPolicyActive(Policy policy_) public view returns (bool) {\n        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;\n    }\n\n    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.\n    function executeAction(Actions action_, address target_) external onlyExecutor {\n        if (action_ == Actions.InstallModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _installModule(Module(target_));\n        } else if (action_ == Actions.UpgradeModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _upgradeModule(Module(target_));\n        } else if (action_ == Actions.ActivatePolicy) {\n            ensureContract(target_);\n            _activatePolicy(Policy(target_));\n        } else if (action_ == Actions.DeactivatePolicy) {\n            ensureContract(target_);\n            _deactivatePolicy(Policy(target_));\n        } else if (action_ == Actions.ChangeExecutor) {\n            executor = target_;\n        } else if (action_ == Actions.MigrateKernel) {\n            ensureContract(target_);\n            _migrateKernel(Kernel(target_));\n        }\n\n        emit ActionExecuted(action_, target_);\n    }\n\n    function _installModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n\n        if (address(getModuleForKeycode[keycode]) != address(0))\n            revert Kernel_ModuleAlreadyInstalled(keycode);\n\n        getModuleForKeycode[keycode] = newModule_;\n        getKeycodeForModule[newModule_] = keycode;\n        allKeycodes.push(keycode);\n\n        newModule_.INIT();\n    }\n\n    function _upgradeModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n        Module oldModule = getModuleForKeycode[keycode];\n\n        if (address(oldModule) == address(0) || oldModule == newModule_)\n            revert Kernel_InvalidModuleUpgrade(keycode);\n\n        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));\n        getKeycodeForModule[newModule_] = keycode;\n        getModuleForKeycode[keycode] = newModule_;\n\n        newModule_.INIT();\n\n        _reconfigurePolicies(keycode);\n    }\n\n    function _activatePolicy(Policy policy_) internal {\n        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));\n\n        // Add policy to list of active policies\n        activePolicies.push(policy_);\n        getPolicyIndex[policy_] = activePolicies.length - 1;\n\n        // Record module dependencies\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depLength = dependencies.length;\n\n        for (uint256 i; i < depLength; ) {\n            Keycode keycode = dependencies[i];\n\n            moduleDependents[keycode].push(policy_);\n            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        // Grant permissions for policy to access restricted module functions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, true);\n    }\n\n    function _deactivatePolicy(Policy policy_) internal {\n        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));\n\n        // Revoke permissions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, false);\n\n        // Remove policy from all policy data structures\n        uint256 idx = getPolicyIndex[policy_];\n        Policy lastPolicy = activePolicies[activePolicies.length - 1];\n\n        activePolicies[idx] = lastPolicy;\n        activePolicies.pop();\n        getPolicyIndex[lastPolicy] = idx;\n        delete getPolicyIndex[policy_];\n\n        // Remove policy from module dependents\n        _pruneFromDependents(policy_);\n    }\n\n    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.\n    /// @dev    New kernel must add in all of the modules and policies via executeAction.\n    /// @dev    NOTE: Data does not get cleared from this kernel.\n    function _migrateKernel(Kernel newKernel_) internal {\n        uint256 keycodeLen = allKeycodes.length;\n        for (uint256 i; i < keycodeLen; ) {\n            Module module = Module(getModuleForKeycode[allKeycodes[i]]);\n            module.changeKernel(newKernel_);\n            unchecked {\n                ++i;\n            }\n        }\n\n        uint256 policiesLen = activePolicies.length;\n        for (uint256 j; j < policiesLen; ) {\n            Policy policy = activePolicies[j];\n\n            // Deactivate before changing kernel\n            policy.changeKernel(newKernel_);\n            unchecked {\n                ++j;\n            }\n        }\n    }\n\n    function _reconfigurePolicies(Keycode keycode_) internal {\n        Policy[] memory dependents = moduleDependents[keycode_];\n        uint256 depLength = dependents.length;\n\n        for (uint256 i; i < depLength; ) {\n            dependents[i].configureDependencies();\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _setPolicyPermissions(\n        Policy policy_,\n        Permissions[] memory requests_,\n        bool grant_\n    ) internal {\n        uint256 reqLength = requests_.length;\n        for (uint256 i = 0; i < reqLength; ) {\n            Permissions memory request = requests_[i];\n            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;\n\n            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _pruneFromDependents(Policy policy_) internal {\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depcLength = dependencies.length;\n\n        for (uint256 i; i < depcLength; ) {\n            Keycode keycode = dependencies[i];\n            Policy[] storage dependents = moduleDependents[keycode];\n\n            uint256 origIndex = getDependentIndex[keycode][policy_];\n            Policy lastPolicy = dependents[dependents.length - 1];\n\n            // Swap with last and pop\n            dependents[origIndex] = lastPolicy;\n            dependents.pop();\n\n            // Record new index and delete deactivated policy index\n            getDependentIndex[keycode][lastPolicy] = origIndex;\n            delete getDependentIndex[keycode][policy_];\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n}\n"
+    },
+    "src/external/OlympusERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity >=0.7.5;\n\n/// @notice Olympus OHM token\n/// @dev This contract is the legacy v2 OHM token. Included in the repo for completeness,\n///      since it is not being changed and is imported in some contracts.\n\ninterface IOlympusAuthority {\n    // =========  EVENTS ========= //\n\n    event GovernorPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event GuardianPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event PolicyPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event VaultPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n\n    event GovernorPulled(address indexed from, address indexed to);\n    event GuardianPulled(address indexed from, address indexed to);\n    event PolicyPulled(address indexed from, address indexed to);\n    event VaultPulled(address indexed from, address indexed to);\n\n    // =========  VIEW ========= //\n\n    function governor() external view returns (address);\n\n    function guardian() external view returns (address);\n\n    function policy() external view returns (address);\n\n    function vault() external view returns (address);\n}\n\n// File: types/OlympusAccessControlled.sol\n\nabstract contract OlympusAccessControlled {\n    // =========  EVENTS ========= //\n\n    event AuthorityUpdated(IOlympusAuthority indexed authority);\n\n    string internal UNAUTHORIZED = \"UNAUTHORIZED\"; // save gas\n\n    // =========  STATE VARIABLES ========= //\n\n    IOlympusAuthority public authority;\n\n    // =========  Constructor ========= //\n\n    constructor(IOlympusAuthority _authority) {\n        authority = _authority;\n        emit AuthorityUpdated(_authority);\n    }\n\n    // =========  MODIFIERS ========= //\n\n    modifier onlyGovernor() {\n        require(msg.sender == authority.governor(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyGuardian() {\n        require(msg.sender == authority.guardian(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyPermitted() {\n        require(msg.sender == authority.policy(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyVault() {\n        require(msg.sender == authority.vault(), UNAUTHORIZED);\n        _;\n    }\n\n    // =========  GOV ONLY ========= //\n\n    function setAuthority(IOlympusAuthority _newAuthority) external onlyGovernor {\n        authority = _newAuthority;\n        emit AuthorityUpdated(_newAuthority);\n    }\n}\n\n// File: cryptography/ECDSA.sol\n\n/**\n * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.\n *\n * These functions can be used to verify that a message was signed by the holder\n * of the private keys of a given address.\n */\nlibrary ECDSA {\n    enum RecoverError {\n        NoError,\n        InvalidSignature,\n        InvalidSignatureLength,\n        InvalidSignatureS,\n        InvalidSignatureV\n    }\n\n    function _throwError(RecoverError error) private pure {\n        if (error == RecoverError.NoError) {\n            return; // no error: do nothing\n        } else if (error == RecoverError.InvalidSignature) {\n            revert(\"ECDSA: invalid signature\");\n        } else if (error == RecoverError.InvalidSignatureLength) {\n            revert(\"ECDSA: invalid signature length\");\n        } else if (error == RecoverError.InvalidSignatureS) {\n            revert(\"ECDSA: invalid signature 's' value\");\n        } else if (error == RecoverError.InvalidSignatureV) {\n            revert(\"ECDSA: invalid signature 'v' value\");\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature` or error string. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     *\n     * Documentation for signature generation:\n     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]\n     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes memory signature\n    ) internal pure returns (address, RecoverError) {\n        // Check the signature length\n        // - case 65: r,s,v signature (standard)\n        // - case 64: r,vs signature (cf https://eips.ethereum.org/EIPS/eip-2098) _Available since v4.1._\n        if (signature.length == 65) {\n            bytes32 r;\n            bytes32 s;\n            uint8 v;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                s := mload(add(signature, 0x40))\n                v := byte(0, mload(add(signature, 0x60)))\n            }\n            return tryRecover(hash, v, r, s);\n        } else if (signature.length == 64) {\n            bytes32 r;\n            bytes32 vs;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                vs := mload(add(signature, 0x40))\n            }\n            return tryRecover(hash, r, vs);\n        } else {\n            return (address(0), RecoverError.InvalidSignatureLength);\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature`. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     */\n    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, signature);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.\n     *\n     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address, RecoverError) {\n        bytes32 s;\n        uint8 v;\n        assembly {\n            s := and(vs, 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)\n            v := add(shr(255, vs), 27)\n        }\n        return tryRecover(hash, v, r, s);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.\n     *\n     * _Available since v4.2._\n     */\n    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, r, vs);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address, RecoverError) {\n        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature\n        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most\n        // signatures from current libraries generate a unique signature with an s-value in the lower half order.\n        //\n        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value\n        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or\n        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept\n        // these malleable signatures as well.\n        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {\n            return (address(0), RecoverError.InvalidSignatureS);\n        }\n        if (v != 27 && v != 28) {\n            return (address(0), RecoverError.InvalidSignatureV);\n        }\n\n        // If the signature is valid (and not malleable), return the signer address\n        address signer = ecrecover(hash, v, r, s);\n        if (signer == address(0)) {\n            return (address(0), RecoverError.InvalidSignature);\n        }\n\n        return (signer, RecoverError.NoError);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from a `hash`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {\n        // 32 is the length in bytes of hash,\n        // enforced by the type signature above\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", hash));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Typed Data, created from a\n     * `domainSeparator` and a `structHash`. This produces hash corresponding\n     * to the one signed with the\n     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]\n     * JSON-RPC method as part of EIP-712.\n     *\n     * See {recover}.\n     */\n    function toTypedDataHash(\n        bytes32 domainSeparator,\n        bytes32 structHash\n    ) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19\\x01\", domainSeparator, structHash));\n    }\n}\n\n// File: cryptography/EIP712.sol\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.\n *\n * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,\n * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding\n * they need in their contracts using a combination of `abi.encode` and `keccak256`.\n *\n * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding\n * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA\n * ({_hashTypedDataV4}).\n *\n * The implementation of the domain separator was designed to be as efficient as possible while still properly updating\n * the chain id to protect against replay attacks on an eventual fork of the chain.\n *\n * NOTE: This contract implements the version of the encoding known as \"v4\", as implemented by the JSON RPC method\n * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].\n *\n * _Available since v3.4._\n */\nabstract contract EIP712 {\n    /* solhint-disable var-name-mixedcase */\n    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to\n    // invalidate the cached domain separator if the chain id changes.\n    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;\n    uint256 private immutable _CACHED_CHAIN_ID;\n\n    bytes32 private immutable _HASHED_NAME;\n    bytes32 private immutable _HASHED_VERSION;\n    bytes32 private immutable _TYPE_HASH;\n\n    /* solhint-enable var-name-mixedcase */\n\n    /**\n     * @dev Initializes the domain separator and parameter caches.\n     *\n     * The meaning of `name` and `version` is specified in\n     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:\n     *\n     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.\n     * - `version`: the current major version of the signing domain.\n     *\n     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart\n     * contract upgrade].\n     */\n    constructor(string memory name, string memory version) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        bytes32 hashedName = keccak256(bytes(name));\n        bytes32 hashedVersion = keccak256(bytes(version));\n        bytes32 typeHash = keccak256(\n            \"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"\n        );\n        _HASHED_NAME = hashedName;\n        _HASHED_VERSION = hashedVersion;\n        _CACHED_CHAIN_ID = chainID;\n        _CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator(typeHash, hashedName, hashedVersion);\n        _TYPE_HASH = typeHash;\n    }\n\n    /**\n     * @dev Returns the domain separator for the current chain.\n     */\n    function _domainSeparatorV4() internal view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        if (chainID == _CACHED_CHAIN_ID) {\n            return _CACHED_DOMAIN_SEPARATOR;\n        } else {\n            return _buildDomainSeparator(_TYPE_HASH, _HASHED_NAME, _HASHED_VERSION);\n        }\n    }\n\n    function _buildDomainSeparator(\n        bytes32 typeHash,\n        bytes32 nameHash,\n        bytes32 versionHash\n    ) private view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        return keccak256(abi.encode(typeHash, nameHash, versionHash, chainID, address(this)));\n    }\n\n    /**\n     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this\n     * function returns the hash of the fully encoded EIP712 message for this domain.\n     *\n     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:\n     *\n     * ```solidity\n     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(\n     *     keccak256(\"Mail(address to,string contents)\"),\n     *     mailTo,\n     *     keccak256(bytes(mailContents))\n     * )));\n     * address signer = ECDSA.recover(digest, signature);\n     * ```\n     */\n    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {\n        return ECDSA.toTypedDataHash(_domainSeparatorV4(), structHash);\n    }\n}\n\n// File: interfaces/IERC20Permit.sol\n\n/**\n * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n */\ninterface IERC20Permit {\n    /**\n     * @dev Sets `value` as th xe allowance of `spender` over ``owner``'s tokens,\n     * given ``owner``'s signed approval.\n     *\n     * IMPORTANT: The same issues {IERC20-approve} has related to transaction\n     * ordering also apply here.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `deadline` must be a timestamp in the future.\n     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`\n     * over the EIP712-formatted function arguments.\n     * - the signature must use ``owner``'s current nonce (see {nonces}).\n     *\n     * For more information on the signature format, see the\n     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP\n     * section].\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n\n    /**\n     * @dev Returns the current nonce for `owner`. This value must be\n     * included whenever a signature is generated for {permit}.\n     *\n     * Every successful call to {permit} increases ``owner``'s nonce by one. This\n     * prevents a signature from being used multiple times.\n     */\n    function nonces(address owner) external view returns (uint256);\n\n    /**\n     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n}\n\n// File: interfaces/IERC20.sol\n\ninterface IERC20 {\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `recipient`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address recipient, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `sender` to `recipient` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) external returns (bool);\n\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n\n// File: interfaces/IOHM.sol\n\ninterface IOHM is IERC20 {\n    function mint(address account_, uint256 amount_) external;\n\n    function burn(uint256 amount) external;\n\n    function burnFrom(address account_, uint256 amount_) external;\n}\n\n// File: libraries/SafeMath.sol\n\nlibrary SafeMath {\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        uint256 c = a + b;\n        require(c >= a, \"SafeMath: addition overflow\");\n\n        return c;\n    }\n\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return sub(a, b, \"SafeMath: subtraction overflow\");\n    }\n\n    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b <= a, errorMessage);\n        uint256 c = a - b;\n\n        return c;\n    }\n\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        uint256 c = a * b;\n        require(c / a == b, \"SafeMath: multiplication overflow\");\n\n        return c;\n    }\n\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        return div(a, b, \"SafeMath: division by zero\");\n    }\n\n    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        uint256 c = a / b;\n        assert(a == b * c + (a % b)); // There is no case in which this doesn't hold\n\n        return c;\n    }\n\n    // Only used in the  BondingCalculator.sol\n    function sqrrt(uint256 a) internal pure returns (uint256 c) {\n        if (a > 3) {\n            c = a;\n            uint256 b = add(div(a, 2), 1);\n            while (b < c) {\n                c = b;\n                b = div(add(div(a, b), b), 2);\n            }\n        } else if (a != 0) {\n            c = 1;\n        }\n    }\n}\n\n// File: libraries/Counters.sol\n\nlibrary Counters {\n    using SafeMath for uint256;\n\n    struct Counter {\n        // This variable should never be directly accessed by users of the library: interactions must be restricted to\n        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add\n        // this feature: see https://github.com/ethereum/solidity/issues/4637\n        uint256 _value; // default: 0\n    }\n\n    function current(Counter storage counter) internal view returns (uint256) {\n        return counter._value;\n    }\n\n    function increment(Counter storage counter) internal {\n        // The {SafeMath} overflow check can be skipped here, see the comment at the top\n        counter._value += 1;\n    }\n\n    function decrement(Counter storage counter) internal {\n        counter._value = counter._value.sub(1);\n    }\n}\n\n// File: types/ERC20.sol\n\nabstract contract ERC20 is IERC20 {\n    using SafeMath for uint256;\n\n    // TODO comment actual hash value.\n    bytes32 private constant ERC20TOKEN_ERC1820_INTERFACE_ID = keccak256(\"ERC20Token\");\n\n    mapping(address => uint256) internal _balances;\n\n    mapping(address => mapping(address => uint256)) internal _allowances;\n\n    uint256 internal _totalSupply;\n\n    string internal _name;\n\n    string internal _symbol;\n\n    uint8 internal immutable _decimals;\n\n    constructor(string memory name_, string memory symbol_, uint8 decimals_) {\n        _name = name_;\n        _symbol = symbol_;\n        _decimals = decimals_;\n    }\n\n    function name() public view returns (string memory) {\n        return _name;\n    }\n\n    function symbol() public view returns (string memory) {\n        return _symbol;\n    }\n\n    function decimals() public view virtual returns (uint8) {\n        return _decimals;\n    }\n\n    function totalSupply() public view override returns (uint256) {\n        return _totalSupply;\n    }\n\n    function balanceOf(address account) public view virtual override returns (uint256) {\n        return _balances[account];\n    }\n\n    function transfer(address recipient, uint256 amount) public virtual override returns (bool) {\n        _transfer(msg.sender, recipient, amount);\n        return true;\n    }\n\n    function allowance(\n        address owner,\n        address spender\n    ) public view virtual override returns (uint256) {\n        return _allowances[owner][spender];\n    }\n\n    function approve(address spender, uint256 amount) public virtual override returns (bool) {\n        _approve(msg.sender, spender, amount);\n        return true;\n    }\n\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) public virtual override returns (bool) {\n        _transfer(sender, recipient, amount);\n        _approve(\n            sender,\n            msg.sender,\n            _allowances[sender][msg.sender].sub(amount, \"ERC20: transfer amount exceeds allowance\")\n        );\n        return true;\n    }\n\n    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {\n        _approve(msg.sender, spender, _allowances[msg.sender][spender].add(addedValue));\n        return true;\n    }\n\n    function decreaseAllowance(\n        address spender,\n        uint256 subtractedValue\n    ) public virtual returns (bool) {\n        _approve(\n            msg.sender,\n            spender,\n            _allowances[msg.sender][spender].sub(\n                subtractedValue,\n                \"ERC20: decreased allowance below zero\"\n            )\n        );\n        return true;\n    }\n\n    function _transfer(address sender, address recipient, uint256 amount) internal virtual {\n        require(sender != address(0), \"ERC20: transfer from the zero address\");\n        require(recipient != address(0), \"ERC20: transfer to the zero address\");\n\n        _beforeTokenTransfer(sender, recipient, amount);\n\n        _balances[sender] = _balances[sender].sub(amount, \"ERC20: transfer amount exceeds balance\");\n        _balances[recipient] = _balances[recipient].add(amount);\n        emit Transfer(sender, recipient, amount);\n    }\n\n    function _mint(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: mint to the zero address\");\n        _beforeTokenTransfer(address(0), account, amount);\n        _totalSupply = _totalSupply.add(amount);\n        _balances[account] = _balances[account].add(amount);\n        emit Transfer(address(0), account, amount);\n    }\n\n    function _burn(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: burn from the zero address\");\n\n        _beforeTokenTransfer(account, address(0), amount);\n\n        _balances[account] = _balances[account].sub(amount, \"ERC20: burn amount exceeds balance\");\n        _totalSupply = _totalSupply.sub(amount);\n        emit Transfer(account, address(0), amount);\n    }\n\n    function _approve(address owner, address spender, uint256 amount) internal virtual {\n        require(owner != address(0), \"ERC20: approve from the zero address\");\n        require(spender != address(0), \"ERC20: approve to the zero address\");\n\n        _allowances[owner][spender] = amount;\n        emit Approval(owner, spender, amount);\n    }\n\n    function _beforeTokenTransfer(address from_, address to_, uint256 amount_) internal virtual {}\n}\n\n// File: types/ERC20Permit.sol\n\n/**\n * @dev Implementation of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on `{IERC20-approve}`, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n *\n * _Available since v3.4._\n */\nabstract contract ERC20Permit is ERC20, IERC20Permit, EIP712 {\n    using Counters for Counters.Counter;\n\n    mapping(address => Counters.Counter) private _nonces;\n\n    // solhint-disable-next-line var-name-mixedcase\n    bytes32 private immutable _PERMIT_TYPEHASH =\n        keccak256(\n            \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n        );\n\n    /**\n     * @dev Initializes the {EIP712} domain separator using the `name` parameter, and setting `version` to `\"1\"`.\n     *\n     * It's a good idea to use the same `name` that is defined as the ERC20 token name.\n     */\n    constructor(string memory name) EIP712(name, \"1\") {}\n\n    /**\n     * @dev See {IERC20Permit-permit}.\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual override {\n        require(block.timestamp <= deadline, \"ERC20Permit: expired deadline\");\n\n        bytes32 structHash = keccak256(\n            abi.encode(_PERMIT_TYPEHASH, owner, spender, value, _useNonce(owner), deadline)\n        );\n\n        bytes32 hash = _hashTypedDataV4(structHash);\n\n        address signer = ECDSA.recover(hash, v, r, s);\n        require(signer == owner, \"ERC20Permit: invalid signature\");\n\n        _approve(owner, spender, value);\n    }\n\n    /**\n     * @dev See {IERC20Permit-nonces}.\n     */\n    function nonces(address owner) public view virtual override returns (uint256) {\n        return _nonces[owner].current();\n    }\n\n    /**\n     * @dev See {IERC20Permit-DOMAIN_SEPARATOR}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view override returns (bytes32) {\n        return _domainSeparatorV4();\n    }\n\n    /**\n     * @dev \"Consume a nonce\": return the current value and increment.\n     *\n     * _Available since v4.1._\n     */\n    function _useNonce(address owner) internal virtual returns (uint256 current) {\n        Counters.Counter storage nonce = _nonces[owner];\n        current = nonce.current();\n        nonce.increment();\n    }\n}\n\n// File: OlympusERC20.sol\n\ncontract OlympusERC20Token is ERC20Permit, IOHM, OlympusAccessControlled {\n    using SafeMath for uint256;\n\n    constructor(\n        address _authority\n    )\n        ERC20(\"Olympus\", \"OHM\", 9)\n        ERC20Permit(\"Olympus\")\n        OlympusAccessControlled(IOlympusAuthority(_authority))\n    {}\n\n    function mint(address account_, uint256 amount_) external override onlyVault {\n        _mint(account_, amount_);\n    }\n\n    function burn(uint256 amount) external override {\n        _burn(msg.sender, amount);\n    }\n\n    function burnFrom(address account_, uint256 amount_) external override {\n        _burnFrom(account_, amount_);\n    }\n\n    function _burnFrom(address account_, uint256 amount_) internal {\n        uint256 decreasedAllowance_ = allowance(account_, msg.sender).sub(\n            amount_,\n            \"ERC20: burn amount exceeds allowance\"\n        );\n\n        _approve(account_, msg.sender, decreasedAllowance_);\n        _burn(account_, amount_);\n    }\n}\n"
+    },
+    "src/modules/MINTR/MINTR.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {OlympusERC20Token as OHM} from \"src/external/OlympusERC20.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Wrapper for minting and burning functions of OHM token.\nabstract contract MINTRv1 is Module {\n    // =========  EVENTS ========= //\n\n    event IncreaseMintApproval(address indexed policy_, uint256 newAmount_);\n    event DecreaseMintApproval(address indexed policy_, uint256 newAmount_);\n    event Mint(address indexed policy_, address indexed to_, uint256 amount_);\n    event Burn(address indexed policy_, address indexed from_, uint256 amount_);\n\n    // ========= ERRORS ========= //\n\n    error MINTR_NotApproved();\n    error MINTR_ZeroAmount();\n    error MINTR_NotActive();\n\n    // =========  STATE ========= //\n\n    OHM public ohm;\n\n    /// @notice Status of the minter. If false, minting and burning OHM is disabled.\n    bool public active;\n\n    /// @notice Mapping of who is approved for minting.\n    /// @dev    minter -> amount. Infinite approval is max(uint256).\n    mapping(address => uint256) public mintApproval;\n\n    // =========  FUNCTIONS ========= //\n\n    modifier onlyWhileActive() {\n        if (!active) revert MINTR_NotActive();\n        _;\n    }\n\n    /// @notice Mint OHM to an address.\n    function mintOhm(address to_, uint256 amount_) external virtual;\n\n    /// @notice Burn OHM from an address. Must have approval.\n    function burnOhm(address from_, uint256 amount_) external virtual;\n\n    /// @notice Increase approval for specific withdrawer addresses\n    /// @dev    Policies must explicity request how much they want approved before withdrawing.\n    function increaseMintApproval(address policy_, uint256 amount_) external virtual;\n\n    /// @notice Decrease approval for specific withdrawer addresses\n    function decreaseMintApproval(address policy_, uint256 amount_) external virtual;\n\n    /// @notice Emergency shutdown of minting and burning.\n    function deactivate() external virtual;\n\n    /// @notice Re-activate minting and burning after shutdown.\n    function activate() external virtual;\n}\n"
+    },
+    "src/modules/ROLES/ROLES.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport \"src/Kernel.sol\";\n\nabstract contract ROLESv1 is Module {\n    // =========  EVENTS ========= //\n\n    event RoleGranted(bytes32 indexed role_, address indexed addr_);\n    event RoleRevoked(bytes32 indexed role_, address indexed addr_);\n\n    // =========  ERRORS ========= //\n\n    error ROLES_InvalidRole(bytes32 role_);\n    error ROLES_RequireRole(bytes32 role_);\n    error ROLES_AddressAlreadyHasRole(address addr_, bytes32 role_);\n    error ROLES_AddressDoesNotHaveRole(address addr_, bytes32 role_);\n    error ROLES_RoleDoesNotExist(bytes32 role_);\n\n    // =========  STATE ========= //\n\n    /// @notice Mapping for if an address has a policy-defined role.\n    mapping(address => mapping(bytes32 => bool)) public hasRole;\n\n    // =========  FUNCTIONS ========= //\n\n    /// @notice Function to grant policy-defined roles to some address. Can only be called by admin.\n    function saveRole(bytes32 role_, address addr_) external virtual;\n\n    /// @notice Function to revoke policy-defined roles from some address. Can only be called by admin.\n    function removeRole(bytes32 role_, address addr_) external virtual;\n\n    /// @notice \"Modifier\" to restrict policy function access to certain addresses with a role.\n    /// @dev    Roles are defined in the policy and granted by the ROLES admin.\n    function requireRole(bytes32 role_, address caller_) external virtual;\n\n    /// @notice Function that checks if role is valid (all lower case)\n    function ensureValidRole(bytes32 role_) external pure virtual;\n}\n"
+    },
+    "lib/solmate/src/tokens/ERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)\n/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)\n/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.\nabstract contract ERC20 {\n    /*//////////////////////////////////////////////////////////////\n                                 EVENTS\n    //////////////////////////////////////////////////////////////*/\n\n    event Transfer(address indexed from, address indexed to, uint256 amount);\n\n    event Approval(address indexed owner, address indexed spender, uint256 amount);\n\n    /*//////////////////////////////////////////////////////////////\n                            METADATA STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    string public name;\n\n    string public symbol;\n\n    uint8 public immutable decimals;\n\n    /*//////////////////////////////////////////////////////////////\n                              ERC20 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 public totalSupply;\n\n    mapping(address => uint256) public balanceOf;\n\n    mapping(address => mapping(address => uint256)) public allowance;\n\n    /*//////////////////////////////////////////////////////////////\n                            EIP-2612 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 internal immutable INITIAL_CHAIN_ID;\n\n    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;\n\n    mapping(address => uint256) public nonces;\n\n    /*//////////////////////////////////////////////////////////////\n                               CONSTRUCTOR\n    //////////////////////////////////////////////////////////////*/\n\n    constructor(\n        string memory _name,\n        string memory _symbol,\n        uint8 _decimals\n    ) {\n        name = _name;\n        symbol = _symbol;\n        decimals = _decimals;\n\n        INITIAL_CHAIN_ID = block.chainid;\n        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                               ERC20 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function approve(address spender, uint256 amount) public virtual returns (bool) {\n        allowance[msg.sender][spender] = amount;\n\n        emit Approval(msg.sender, spender, amount);\n\n        return true;\n    }\n\n    function transfer(address to, uint256 amount) public virtual returns (bool) {\n        balanceOf[msg.sender] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(msg.sender, to, amount);\n\n        return true;\n    }\n\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) public virtual returns (bool) {\n        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.\n\n        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;\n\n        balanceOf[from] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(from, to, amount);\n\n        return true;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                             EIP-2612 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual {\n        require(deadline >= block.timestamp, \"PERMIT_DEADLINE_EXPIRED\");\n\n        // Unchecked because the only math done is incrementing\n        // the owner's nonce which cannot realistically overflow.\n        unchecked {\n            address recoveredAddress = ecrecover(\n                keccak256(\n                    abi.encodePacked(\n                        \"\\x19\\x01\",\n                        DOMAIN_SEPARATOR(),\n                        keccak256(\n                            abi.encode(\n                                keccak256(\n                                    \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n                                ),\n                                owner,\n                                spender,\n                                value,\n                                nonces[owner]++,\n                                deadline\n                            )\n                        )\n                    )\n                ),\n                v,\n                r,\n                s\n            );\n\n            require(recoveredAddress != address(0) && recoveredAddress == owner, \"INVALID_SIGNER\");\n\n            allowance[recoveredAddress][spender] = value;\n        }\n\n        emit Approval(owner, spender, value);\n    }\n\n    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {\n        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();\n    }\n\n    function computeDomainSeparator() internal view virtual returns (bytes32) {\n        return\n            keccak256(\n                abi.encode(\n                    keccak256(\"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"),\n                    keccak256(bytes(name)),\n                    keccak256(\"1\"),\n                    block.chainid,\n                    address(this)\n                )\n            );\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                        INTERNAL MINT/BURN LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function _mint(address to, uint256 amount) internal virtual {\n        totalSupply += amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(address(0), to, amount);\n    }\n\n    function _burn(address from, uint256 amount) internal virtual {\n        balanceOf[from] -= amount;\n\n        // Cannot underflow because a user's balance\n        // will never be larger than the total supply.\n        unchecked {\n            totalSupply -= amount;\n        }\n\n        emit Transfer(from, address(0), amount);\n    }\n}\n"
+    },
+    "src/policies/CrossChainBridge.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\n\nimport {ILayerZeroUserApplicationConfig} from \"layer-zero/interfaces/ILayerZeroUserApplicationConfig.sol\";\nimport {ILayerZeroEndpoint} from \"layer-zero/interfaces/ILayerZeroEndpoint.sol\";\nimport {ILayerZeroReceiver} from \"layer-zero/interfaces/ILayerZeroReceiver.sol\";\nimport {BytesLib} from \"layer-zero/util/BytesLib.sol\";\n\nimport {RolesConsumer} from \"modules/ROLES/OlympusRoles.sol\";\nimport {ROLESv1} from \"modules/ROLES/ROLES.v1.sol\";\nimport {MINTRv1} from \"modules/MINTR/MINTR.v1.sol\";\n\nimport \"src/Kernel.sol\";\n\n/// @notice Message bridge for cross-chain OHM transfers.\n/// @dev Uses LayerZero as communication protocol.\n/// @dev Each chain needs to `setTrustedRemoteAddress` for each remote address\n///      it intends to receive from.\ncontract CrossChainBridge is\n    Policy,\n    RolesConsumer,\n    ILayerZeroReceiver,\n    ILayerZeroUserApplicationConfig\n{\n    using BytesLib for bytes;\n\n    // Bridge errors\n    error Bridge_InsufficientAmount();\n    error Bridge_InvalidCaller();\n    error Bridge_InvalidMessageSource();\n    error Bridge_NoStoredMessage();\n    error Bridge_InvalidPayload();\n    error Bridge_DestinationNotTrusted();\n    error Bridge_NoTrustedPath();\n    error Bridge_Deactivated();\n    error Bridge_TrustedRemoteUninitialized();\n\n    // Bridge-specific events\n    event BridgeTransferred(address indexed sender_, uint256 amount_, uint16 indexed dstChain_);\n    event BridgeReceived(address indexed receiver_, uint256 amount_, uint16 indexed srcChain_);\n\n    // LZ app events\n    event MessageFailed(\n        uint16 srcChainId_,\n        bytes srcAddress_,\n        uint64 nonce_,\n        bytes payload_,\n        bytes reason_\n    );\n    event RetryMessageSuccess(\n        uint16 srcChainId_,\n        bytes srcAddress_,\n        uint64 nonce_,\n        bytes32 payloadHash_\n    );\n    event SetPrecrime(address precrime_);\n    event SetTrustedRemote(uint16 remoteChainId_, bytes path_);\n    event SetTrustedRemoteAddress(uint16 remoteChainId_, bytes remoteAddress_);\n    event SetMinDstGas(uint16 dstChainId_, uint16 type_, uint256 _minDstGas);\n    event BridgeStatusSet(bool isActive_);\n\n    // Modules\n    MINTRv1 public MINTR;\n\n    ILayerZeroEndpoint public immutable lzEndpoint;\n    ERC20 public ohm;\n\n    /// @notice Flag to determine if bridge is allowed to send messages or not\n    bool public bridgeActive;\n\n    // LZ app state\n\n    /// @notice Storage for failed messages on receive.\n    /// @notice chainID => source address => endpoint nonce\n    mapping(uint16 => mapping(bytes => mapping(uint64 => bytes32))) public failedMessages;\n\n    /// @notice Trusted remote paths. Must be set by admin.\n    mapping(uint16 => bytes) public trustedRemoteLookup;\n\n    /// @notice LZ precrime address. Currently unused.\n    address public precrime;\n\n    //============================================================================================//\n    //                                        POLICY SETUP                                        //\n    //============================================================================================//\n\n    constructor(Kernel kernel_, address endpoint_) Policy(kernel_) {\n        lzEndpoint = ILayerZeroEndpoint(endpoint_);\n        bridgeActive = true;\n    }\n\n    /// @inheritdoc Policy\n    function configureDependencies() external override returns (Keycode[] memory dependencies) {\n        dependencies = new Keycode[](2);\n        dependencies[0] = toKeycode(\"MINTR\");\n        dependencies[1] = toKeycode(\"ROLES\");\n\n        MINTR = MINTRv1(getModuleAddress(dependencies[0]));\n        ROLES = ROLESv1(getModuleAddress(dependencies[1]));\n\n        (uint8 MINTR_MAJOR, ) = MINTR.VERSION();\n        (uint8 ROLES_MAJOR, ) = ROLES.VERSION();\n\n        // Ensure Modules are using the expected major version.\n        // Modules should be sorted in alphabetical order.\n        bytes memory expected = abi.encode([1, 1]);\n        if (MINTR_MAJOR != 1 || ROLES_MAJOR != 1) revert Policy_WrongModuleVersion(expected);\n\n        ohm = ERC20(address(MINTR.ohm()));\n    }\n\n    /// @inheritdoc Policy\n    function requestPermissions()\n        external\n        view\n        override\n        returns (Permissions[] memory permissions)\n    {\n        Keycode MINTR_KEYCODE = MINTR.KEYCODE();\n\n        permissions = new Permissions[](3);\n        permissions[0] = Permissions(MINTR_KEYCODE, MINTR.mintOhm.selector);\n        permissions[1] = Permissions(MINTR_KEYCODE, MINTR.burnOhm.selector);\n        permissions[2] = Permissions(MINTR_KEYCODE, MINTR.increaseMintApproval.selector);\n    }\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @notice Send OHM to an eligible chain\n    function sendOhm(uint16 dstChainId_, address to_, uint256 amount_) external payable {\n        if (!bridgeActive) revert Bridge_Deactivated();\n        if (ohm.balanceOf(msg.sender) < amount_) revert Bridge_InsufficientAmount();\n\n        bytes memory payload = abi.encode(to_, amount_);\n\n        MINTR.burnOhm(msg.sender, amount_);\n        _sendMessage(dstChainId_, payload, payable(msg.sender), address(0x0), bytes(\"\"), msg.value);\n\n        emit BridgeTransferred(msg.sender, amount_, dstChainId_);\n    }\n\n    /// @notice Implementation of receiving an LZ message\n    /// @dev    Function must be public to be called by low-level call in lzReceive\n    function _receiveMessage(\n        uint16 srcChainId_,\n        bytes memory,\n        uint64,\n        bytes memory payload_\n    ) internal {\n        (address to, uint256 amount) = abi.decode(payload_, (address, uint256));\n\n        MINTR.increaseMintApproval(address(this), amount);\n        MINTR.mintOhm(to, amount);\n\n        emit BridgeReceived(to, amount, srcChainId_);\n    }\n\n    // ========= LZ Receive Functions ========= //\n\n    /// @inheritdoc ILayerZeroReceiver\n    function lzReceive(\n        uint16 srcChainId_,\n        bytes calldata srcAddress_,\n        uint64 nonce_,\n        bytes calldata payload_\n    ) public virtual override {\n        // lzReceive must be called by the endpoint for security\n        if (msg.sender != address(lzEndpoint)) revert Bridge_InvalidCaller();\n\n        // Will still block the message pathway from (srcChainId, srcAddress).\n        // Should not receive messages from untrusted remote.\n        bytes memory trustedRemote = trustedRemoteLookup[srcChainId_];\n        if (\n            trustedRemote.length == 0 ||\n            srcAddress_.length != trustedRemote.length ||\n            keccak256(srcAddress_) != keccak256(trustedRemote)\n        ) revert Bridge_InvalidMessageSource();\n\n        // NOTE: Use low-level call to handle any errors. We trust the underlying receive\n        // implementation, so we are doing a regular call vs using ExcessivelySafeCall\n        (bool success, bytes memory reason) = address(this).call(\n            abi.encodeWithSelector(\n                this.receiveMessage.selector,\n                srcChainId_,\n                srcAddress_,\n                nonce_,\n                payload_\n            )\n        );\n\n        // If message fails, store message for retry\n        if (!success) {\n            failedMessages[srcChainId_][srcAddress_][nonce_] = keccak256(payload_);\n            emit MessageFailed(srcChainId_, srcAddress_, nonce_, payload_, reason);\n        }\n    }\n\n    /// @notice Implementation of receiving an LZ message\n    /// @dev    Function must be public to be called by low-level call in lzReceive\n    function receiveMessage(\n        uint16 srcChainId_,\n        bytes memory srcAddress_,\n        uint64 nonce_,\n        bytes memory payload_\n    ) public {\n        // Needed to restrict access to low-level call from lzReceive\n        if (msg.sender != address(this)) revert Bridge_InvalidCaller();\n        _receiveMessage(srcChainId_, srcAddress_, nonce_, payload_);\n    }\n\n    /// @notice Retry a failed receive message\n    function retryMessage(\n        uint16 srcChainId_,\n        bytes calldata srcAddress_,\n        uint64 nonce_,\n        bytes calldata payload_\n    ) public payable virtual {\n        // Assert there is message to retry\n        bytes32 payloadHash = failedMessages[srcChainId_][srcAddress_][nonce_];\n        if (payloadHash == bytes32(0)) revert Bridge_NoStoredMessage();\n        if (keccak256(payload_) != payloadHash) revert Bridge_InvalidPayload();\n\n        // Clear the stored message\n        failedMessages[srcChainId_][srcAddress_][nonce_] = bytes32(0);\n\n        // Execute the message. revert if it fails again\n        _receiveMessage(srcChainId_, srcAddress_, nonce_, payload_);\n\n        emit RetryMessageSuccess(srcChainId_, srcAddress_, nonce_, payloadHash);\n    }\n\n    // ========= LZ Send Functions ========= //\n\n    /// @notice Internal function for sending a message across chains.\n    /// @dev    Params defined in ILayerZeroEndpoint `send` function.\n    function _sendMessage(\n        uint16 dstChainId_,\n        bytes memory payload_,\n        address payable refundAddress_,\n        address zroPaymentAddress_,\n        bytes memory adapterParams_,\n        uint256 nativeFee_\n    ) internal {\n        bytes memory trustedRemote = trustedRemoteLookup[dstChainId_];\n        if (trustedRemote.length == 0) revert Bridge_DestinationNotTrusted();\n\n        // solhint-disable-next-line\n        lzEndpoint.send{value: nativeFee_}(\n            dstChainId_,\n            trustedRemote,\n            payload_,\n            refundAddress_,\n            zroPaymentAddress_,\n            adapterParams_\n        );\n    }\n\n    /// @notice Function to estimate how much gas is needed to send OHM\n    /// @dev    Should be called by frontend before making sendOhm call.\n    /// @return nativeFee - Native token amount to send to sendOhm\n    /// @return zroFee - Fee paid in ZRO token. Unused.\n    function estimateSendFee(\n        uint16 dstChainId_,\n        address to_,\n        uint256 amount_,\n        bytes calldata adapterParams_\n    ) external view returns (uint256 nativeFee, uint256 zroFee) {\n        // Mock the payload for sendOhm()\n        bytes memory payload = abi.encode(to_, amount_);\n        return lzEndpoint.estimateFees(dstChainId_, address(this), payload, false, adapterParams_);\n    }\n\n    // ========= LZ UserApplication & Admin config ========= //\n\n    /// @notice Generic config for LayerZero User Application\n    function setConfig(\n        uint16 version_,\n        uint16 chainId_,\n        uint256 configType_,\n        bytes calldata config_\n    ) external override onlyRole(\"bridge_admin\") {\n        lzEndpoint.setConfig(version_, chainId_, configType_, config_);\n    }\n\n    /// @notice Set send version of endpoint to be used by LayerZero User Application\n    function setSendVersion(uint16 version_) external override onlyRole(\"bridge_admin\") {\n        lzEndpoint.setSendVersion(version_);\n    }\n\n    /// @notice Set receive version of endpoint to be used by LayerZero User Application\n    function setReceiveVersion(uint16 version_) external override onlyRole(\"bridge_admin\") {\n        lzEndpoint.setReceiveVersion(version_);\n    }\n\n    /// @notice Retries a received message. Used as last resort if retryPayload fails.\n    /// @dev    Unblocks queue and DESTROYS transaction forever. USE WITH CAUTION.\n    function forceResumeReceive(\n        uint16 srcChainId_,\n        bytes calldata srcAddress_\n    ) external override onlyRole(\"bridge_admin\") {\n        lzEndpoint.forceResumeReceive(srcChainId_, srcAddress_);\n    }\n\n    /// @notice Sets the trusted path for the cross-chain communication\n    /// @dev    path_ = abi.encodePacked(remoteAddress, localAddress)\n    function setTrustedRemote(\n        uint16 srcChainId_,\n        bytes calldata path_\n    ) external onlyRole(\"bridge_admin\") {\n        trustedRemoteLookup[srcChainId_] = path_;\n        emit SetTrustedRemote(srcChainId_, path_);\n    }\n\n    /// @notice Convenience function for setting trusted paths between EVM addresses\n    function setTrustedRemoteAddress(\n        uint16 remoteChainId_,\n        bytes calldata remoteAddress_\n    ) external onlyRole(\"bridge_admin\") {\n        trustedRemoteLookup[remoteChainId_] = abi.encodePacked(remoteAddress_, address(this));\n        emit SetTrustedRemoteAddress(remoteChainId_, remoteAddress_);\n    }\n\n    /// @notice Sets precrime address\n    function setPrecrime(address precrime_) external onlyRole(\"bridge_admin\") {\n        precrime = precrime_;\n        emit SetPrecrime(precrime_);\n    }\n\n    /// @notice Activate or deactivate the bridge\n    function setBridgeStatus(bool isActive_) external onlyRole(\"bridge_admin\") {\n        bridgeActive = isActive_;\n        emit BridgeStatusSet(isActive_);\n    }\n\n    // ========= View Functions ========= //\n\n    /// @notice Gets endpoint config for this contract\n    function getConfig(\n        uint16 version_,\n        uint16 chainId_,\n        address,\n        uint256 configType_\n    ) external view returns (bytes memory) {\n        return lzEndpoint.getConfig(version_, chainId_, address(this), configType_);\n    }\n\n    /// @notice Get trusted remote for the given chain as an\n    function getTrustedRemoteAddress(uint16 remoteChainId_) external view returns (bytes memory) {\n        bytes memory path = trustedRemoteLookup[remoteChainId_];\n        if (path.length == 0) revert Bridge_NoTrustedPath();\n\n        // The last 20 bytes should be address(this)\n        return path.slice(0, path.length - 20);\n    }\n\n    function isTrustedRemote(\n        uint16 srcChainId_,\n        bytes calldata srcAddress_\n    ) external view returns (bool) {\n        bytes memory trustedSource = trustedRemoteLookup[srcChainId_];\n        if (srcAddress_.length == 0 || trustedSource.length == 0)\n            revert Bridge_TrustedRemoteUninitialized();\n        return (srcAddress_.length == trustedSource.length &&\n            keccak256(srcAddress_) == keccak256(trustedSource));\n    }\n}\n"
+    },
+    "src/modules/ROLES/OlympusRoles.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {ROLESv1} from \"src/modules/ROLES/ROLES.v1.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Abstract contract to have the `onlyRole` modifier\n/// @dev    Inheriting this automatically makes ROLES module a dependency\nabstract contract RolesConsumer {\n    ROLESv1 public ROLES;\n\n    modifier onlyRole(bytes32 role_) {\n        ROLES.requireRole(role_, msg.sender);\n        _;\n    }\n}\n\n/// @notice Module that holds multisig roles needed by various policies.\ncontract OlympusRoles is ROLESv1 {\n    //============================================================================================//\n    //                                        MODULE SETUP                                        //\n    //============================================================================================//\n\n    constructor(Kernel kernel_) Module(kernel_) {}\n\n    /// @inheritdoc Module\n    function KEYCODE() public pure override returns (Keycode) {\n        return toKeycode(\"ROLES\");\n    }\n\n    /// @inheritdoc Module\n    function VERSION() external pure override returns (uint8 major, uint8 minor) {\n        major = 1;\n        minor = 0;\n    }\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc ROLESv1\n    function saveRole(bytes32 role_, address addr_) external override permissioned {\n        if (hasRole[addr_][role_]) revert ROLES_AddressAlreadyHasRole(addr_, role_);\n\n        ensureValidRole(role_);\n\n        // Grant role to the address\n        hasRole[addr_][role_] = true;\n\n        emit RoleGranted(role_, addr_);\n    }\n\n    /// @inheritdoc ROLESv1\n    function removeRole(bytes32 role_, address addr_) external override permissioned {\n        if (!hasRole[addr_][role_]) revert ROLES_AddressDoesNotHaveRole(addr_, role_);\n\n        hasRole[addr_][role_] = false;\n\n        emit RoleRevoked(role_, addr_);\n    }\n\n    //============================================================================================//\n    //                                       VIEW FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc ROLESv1\n    function requireRole(bytes32 role_, address caller_) external view override {\n        if (!hasRole[caller_][role_]) revert ROLES_RequireRole(role_);\n    }\n\n    /// @inheritdoc ROLESv1\n    function ensureValidRole(bytes32 role_) public pure override {\n        for (uint256 i = 0; i < 32; ) {\n            bytes1 char = role_[i];\n            if ((char < 0x61 || char > 0x7A) && char != 0x5f && char != 0x00) {\n                revert ROLES_InvalidRole(role_); // a-z only\n            }\n            unchecked {\n                i++;\n            }\n        }\n    }\n}\n"
+    },
+    "lib/solidity-examples/contracts/util/BytesLib.sol": {
+      "content": "// SPDX-License-Identifier: Unlicense\n/*\n * @title Solidity Bytes Arrays Utils\n * @author Gonçalo Sá <goncalo.sa@consensys.net>\n *\n * @dev Bytes tightly packed arrays utility library for ethereum contracts written in Solidity.\n *      The library lets you concatenate, slice and type cast bytes arrays both in memory and storage.\n */\npragma solidity >=0.8.0 <0.9.0;\n\n\nlibrary BytesLib {\n    function concat(\n        bytes memory _preBytes,\n        bytes memory _postBytes\n    )\n    internal\n    pure\n    returns (bytes memory)\n    {\n        bytes memory tempBytes;\n\n        assembly {\n        // Get a location of some free memory and store it in tempBytes as\n        // Solidity does for memory variables.\n            tempBytes := mload(0x40)\n\n        // Store the length of the first bytes array at the beginning of\n        // the memory for tempBytes.\n            let length := mload(_preBytes)\n            mstore(tempBytes, length)\n\n        // Maintain a memory counter for the current write location in the\n        // temp bytes array by adding the 32 bytes for the array length to\n        // the starting location.\n            let mc := add(tempBytes, 0x20)\n        // Stop copying when the memory counter reaches the length of the\n        // first bytes array.\n            let end := add(mc, length)\n\n            for {\n            // Initialize a copy counter to the start of the _preBytes data,\n            // 32 bytes into its memory.\n                let cc := add(_preBytes, 0x20)\n            } lt(mc, end) {\n            // Increase both counters by 32 bytes each iteration.\n                mc := add(mc, 0x20)\n                cc := add(cc, 0x20)\n            } {\n            // Write the _preBytes data into the tempBytes memory 32 bytes\n            // at a time.\n                mstore(mc, mload(cc))\n            }\n\n        // Add the length of _postBytes to the current length of tempBytes\n        // and store it as the new length in the first 32 bytes of the\n        // tempBytes memory.\n            length := mload(_postBytes)\n            mstore(tempBytes, add(length, mload(tempBytes)))\n\n        // Move the memory counter back from a multiple of 0x20 to the\n        // actual end of the _preBytes data.\n            mc := end\n        // Stop copying when the memory counter reaches the new combined\n        // length of the arrays.\n            end := add(mc, length)\n\n            for {\n                let cc := add(_postBytes, 0x20)\n            } lt(mc, end) {\n                mc := add(mc, 0x20)\n                cc := add(cc, 0x20)\n            } {\n                mstore(mc, mload(cc))\n            }\n\n        // Update the free-memory pointer by padding our last write location\n        // to 32 bytes: add 31 bytes to the end of tempBytes to move to the\n        // next 32 byte block, then round down to the nearest multiple of\n        // 32. If the sum of the length of the two arrays is zero then add\n        // one before rounding down to leave a blank 32 bytes (the length block with 0).\n            mstore(0x40, and(\n            add(add(end, iszero(add(length, mload(_preBytes)))), 31),\n            not(31) // Round down to the nearest 32 bytes.\n            ))\n        }\n\n        return tempBytes;\n    }\n\n    function concatStorage(bytes storage _preBytes, bytes memory _postBytes) internal {\n        assembly {\n        // Read the first 32 bytes of _preBytes storage, which is the length\n        // of the array. (We don't need to use the offset into the slot\n        // because arrays use the entire slot.)\n            let fslot := sload(_preBytes.slot)\n        // Arrays of 31 bytes or less have an even value in their slot,\n        // while longer arrays have an odd value. The actual length is\n        // the slot divided by two for odd values, and the lowest order\n        // byte divided by two for even values.\n        // If the slot is even, bitwise and the slot with 255 and divide by\n        // two to get the length. If the slot is odd, bitwise and the slot\n        // with -1 and divide by two.\n            let slength := div(and(fslot, sub(mul(0x100, iszero(and(fslot, 1))), 1)), 2)\n            let mlength := mload(_postBytes)\n            let newlength := add(slength, mlength)\n        // slength can contain both the length and contents of the array\n        // if length < 32 bytes so let's prepare for that\n        // v. http://solidity.readthedocs.io/en/latest/miscellaneous.html#layout-of-state-variables-in-storage\n            switch add(lt(slength, 32), lt(newlength, 32))\n            case 2 {\n            // Since the new array still fits in the slot, we just need to\n            // update the contents of the slot.\n            // uint256(bytes_storage) = uint256(bytes_storage) + uint256(bytes_memory) + new_length\n                sstore(\n                _preBytes.slot,\n                // all the modifications to the slot are inside this\n                // next block\n                add(\n                // we can just add to the slot contents because the\n                // bytes we want to change are the LSBs\n                fslot,\n                add(\n                mul(\n                div(\n                // load the bytes from memory\n                mload(add(_postBytes, 0x20)),\n                // zero all bytes to the right\n                exp(0x100, sub(32, mlength))\n                ),\n                // and now shift left the number of bytes to\n                // leave space for the length in the slot\n                exp(0x100, sub(32, newlength))\n                ),\n                // increase length by the double of the memory\n                // bytes length\n                mul(mlength, 2)\n                )\n                )\n                )\n            }\n            case 1 {\n            // The stored value fits in the slot, but the combined value\n            // will exceed it.\n            // get the keccak hash to get the contents of the array\n                mstore(0x0, _preBytes.slot)\n                let sc := add(keccak256(0x0, 0x20), div(slength, 32))\n\n            // save new length\n                sstore(_preBytes.slot, add(mul(newlength, 2), 1))\n\n            // The contents of the _postBytes array start 32 bytes into\n            // the structure. Our first read should obtain the `submod`\n            // bytes that can fit into the unused space in the last word\n            // of the stored array. To get this, we read 32 bytes starting\n            // from `submod`, so the data we read overlaps with the array\n            // contents by `submod` bytes. Masking the lowest-order\n            // `submod` bytes allows us to add that value directly to the\n            // stored value.\n\n                let submod := sub(32, slength)\n                let mc := add(_postBytes, submod)\n                let end := add(_postBytes, mlength)\n                let mask := sub(exp(0x100, submod), 1)\n\n                sstore(\n                sc,\n                add(\n                and(\n                fslot,\n                0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00\n                ),\n                and(mload(mc), mask)\n                )\n                )\n\n                for {\n                    mc := add(mc, 0x20)\n                    sc := add(sc, 1)\n                } lt(mc, end) {\n                    sc := add(sc, 1)\n                    mc := add(mc, 0x20)\n                } {\n                    sstore(sc, mload(mc))\n                }\n\n                mask := exp(0x100, sub(mc, end))\n\n                sstore(sc, mul(div(mload(mc), mask), mask))\n            }\n            default {\n            // get the keccak hash to get the contents of the array\n                mstore(0x0, _preBytes.slot)\n            // Start copying to the last used word of the stored array.\n                let sc := add(keccak256(0x0, 0x20), div(slength, 32))\n\n            // save new length\n                sstore(_preBytes.slot, add(mul(newlength, 2), 1))\n\n            // Copy over the first `submod` bytes of the new data as in\n            // case 1 above.\n                let slengthmod := mod(slength, 32)\n                let mlengthmod := mod(mlength, 32)\n                let submod := sub(32, slengthmod)\n                let mc := add(_postBytes, submod)\n                let end := add(_postBytes, mlength)\n                let mask := sub(exp(0x100, submod), 1)\n\n                sstore(sc, add(sload(sc), and(mload(mc), mask)))\n\n                for {\n                    sc := add(sc, 1)\n                    mc := add(mc, 0x20)\n                } lt(mc, end) {\n                    sc := add(sc, 1)\n                    mc := add(mc, 0x20)\n                } {\n                    sstore(sc, mload(mc))\n                }\n\n                mask := exp(0x100, sub(mc, end))\n\n                sstore(sc, mul(div(mload(mc), mask), mask))\n            }\n        }\n    }\n\n    function slice(\n        bytes memory _bytes,\n        uint256 _start,\n        uint256 _length\n    )\n    internal\n    pure\n    returns (bytes memory)\n    {\n        require(_length + 31 >= _length, \"slice_overflow\");\n        require(_bytes.length >= _start + _length, \"slice_outOfBounds\");\n\n        bytes memory tempBytes;\n\n        assembly {\n            switch iszero(_length)\n            case 0 {\n            // Get a location of some free memory and store it in tempBytes as\n            // Solidity does for memory variables.\n                tempBytes := mload(0x40)\n\n            // The first word of the slice result is potentially a partial\n            // word read from the original array. To read it, we calculate\n            // the length of that partial word and start copying that many\n            // bytes into the array. The first word we copy will start with\n            // data we don't care about, but the last `lengthmod` bytes will\n            // land at the beginning of the contents of the new array. When\n            // we're done copying, we overwrite the full first word with\n            // the actual length of the slice.\n                let lengthmod := and(_length, 31)\n\n            // The multiplication in the next line is necessary\n            // because when slicing multiples of 32 bytes (lengthmod == 0)\n            // the following copy loop was copying the origin's length\n            // and then ending prematurely not copying everything it should.\n                let mc := add(add(tempBytes, lengthmod), mul(0x20, iszero(lengthmod)))\n                let end := add(mc, _length)\n\n                for {\n                // The multiplication in the next line has the same exact purpose\n                // as the one above.\n                    let cc := add(add(add(_bytes, lengthmod), mul(0x20, iszero(lengthmod))), _start)\n                } lt(mc, end) {\n                    mc := add(mc, 0x20)\n                    cc := add(cc, 0x20)\n                } {\n                    mstore(mc, mload(cc))\n                }\n\n                mstore(tempBytes, _length)\n\n            //update free-memory pointer\n            //allocating the array padded to 32 bytes like the compiler does now\n                mstore(0x40, and(add(mc, 31), not(31)))\n            }\n            //if we want a zero-length slice let's just return a zero-length array\n            default {\n                tempBytes := mload(0x40)\n            //zero out the 32 bytes slice we are about to return\n            //we need to do it because Solidity does not garbage collect\n                mstore(tempBytes, 0)\n\n                mstore(0x40, add(tempBytes, 0x20))\n            }\n        }\n\n        return tempBytes;\n    }\n\n    function toAddress(bytes memory _bytes, uint256 _start) internal pure returns (address) {\n        require(_bytes.length >= _start + 20, \"toAddress_outOfBounds\");\n        address tempAddress;\n\n        assembly {\n            tempAddress := div(mload(add(add(_bytes, 0x20), _start)), 0x1000000000000000000000000)\n        }\n\n        return tempAddress;\n    }\n\n    function toUint8(bytes memory _bytes, uint256 _start) internal pure returns (uint8) {\n        require(_bytes.length >= _start + 1 , \"toUint8_outOfBounds\");\n        uint8 tempUint;\n\n        assembly {\n            tempUint := mload(add(add(_bytes, 0x1), _start))\n        }\n\n        return tempUint;\n    }\n\n    function toUint16(bytes memory _bytes, uint256 _start) internal pure returns (uint16) {\n        require(_bytes.length >= _start + 2, \"toUint16_outOfBounds\");\n        uint16 tempUint;\n\n        assembly {\n            tempUint := mload(add(add(_bytes, 0x2), _start))\n        }\n\n        return tempUint;\n    }\n\n    function toUint32(bytes memory _bytes, uint256 _start) internal pure returns (uint32) {\n        require(_bytes.length >= _start + 4, \"toUint32_outOfBounds\");\n        uint32 tempUint;\n\n        assembly {\n            tempUint := mload(add(add(_bytes, 0x4), _start))\n        }\n\n        return tempUint;\n    }\n\n    function toUint64(bytes memory _bytes, uint256 _start) internal pure returns (uint64) {\n        require(_bytes.length >= _start + 8, \"toUint64_outOfBounds\");\n        uint64 tempUint;\n\n        assembly {\n            tempUint := mload(add(add(_bytes, 0x8), _start))\n        }\n\n        return tempUint;\n    }\n\n    function toUint96(bytes memory _bytes, uint256 _start) internal pure returns (uint96) {\n        require(_bytes.length >= _start + 12, \"toUint96_outOfBounds\");\n        uint96 tempUint;\n\n        assembly {\n            tempUint := mload(add(add(_bytes, 0xc), _start))\n        }\n\n        return tempUint;\n    }\n\n    function toUint128(bytes memory _bytes, uint256 _start) internal pure returns (uint128) {\n        require(_bytes.length >= _start + 16, \"toUint128_outOfBounds\");\n        uint128 tempUint;\n\n        assembly {\n            tempUint := mload(add(add(_bytes, 0x10), _start))\n        }\n\n        return tempUint;\n    }\n\n    function toUint256(bytes memory _bytes, uint256 _start) internal pure returns (uint256) {\n        require(_bytes.length >= _start + 32, \"toUint256_outOfBounds\");\n        uint256 tempUint;\n\n        assembly {\n            tempUint := mload(add(add(_bytes, 0x20), _start))\n        }\n\n        return tempUint;\n    }\n\n    function toBytes32(bytes memory _bytes, uint256 _start) internal pure returns (bytes32) {\n        require(_bytes.length >= _start + 32, \"toBytes32_outOfBounds\");\n        bytes32 tempBytes32;\n\n        assembly {\n            tempBytes32 := mload(add(add(_bytes, 0x20), _start))\n        }\n\n        return tempBytes32;\n    }\n\n    function equal(bytes memory _preBytes, bytes memory _postBytes) internal pure returns (bool) {\n        bool success = true;\n\n        assembly {\n            let length := mload(_preBytes)\n\n        // if lengths don't match the arrays are not equal\n            switch eq(length, mload(_postBytes))\n            case 1 {\n            // cb is a circuit breaker in the for loop since there's\n            //  no said feature for inline assembly loops\n            // cb = 1 - don't breaker\n            // cb = 0 - break\n                let cb := 1\n\n                let mc := add(_preBytes, 0x20)\n                let end := add(mc, length)\n\n                for {\n                    let cc := add(_postBytes, 0x20)\n                // the next line is the loop condition:\n                // while(uint256(mc < end) + cb == 2)\n                } eq(add(lt(mc, end), cb), 2) {\n                    mc := add(mc, 0x20)\n                    cc := add(cc, 0x20)\n                } {\n                // if any of these checks fails then arrays are not equal\n                    if iszero(eq(mload(mc), mload(cc))) {\n                    // unsuccess:\n                        success := 0\n                        cb := 0\n                    }\n                }\n            }\n            default {\n            // unsuccess:\n                success := 0\n            }\n        }\n\n        return success;\n    }\n\n    function equalStorage(\n        bytes storage _preBytes,\n        bytes memory _postBytes\n    )\n    internal\n    view\n    returns (bool)\n    {\n        bool success = true;\n\n        assembly {\n        // we know _preBytes_offset is 0\n            let fslot := sload(_preBytes.slot)\n        // Decode the length of the stored array like in concatStorage().\n            let slength := div(and(fslot, sub(mul(0x100, iszero(and(fslot, 1))), 1)), 2)\n            let mlength := mload(_postBytes)\n\n        // if lengths don't match the arrays are not equal\n            switch eq(slength, mlength)\n            case 1 {\n            // slength can contain both the length and contents of the array\n            // if length < 32 bytes so let's prepare for that\n            // v. http://solidity.readthedocs.io/en/latest/miscellaneous.html#layout-of-state-variables-in-storage\n                if iszero(iszero(slength)) {\n                    switch lt(slength, 32)\n                    case 1 {\n                    // blank the last byte which is the length\n                        fslot := mul(div(fslot, 0x100), 0x100)\n\n                        if iszero(eq(fslot, mload(add(_postBytes, 0x20)))) {\n                        // unsuccess:\n                            success := 0\n                        }\n                    }\n                    default {\n                    // cb is a circuit breaker in the for loop since there's\n                    //  no said feature for inline assembly loops\n                    // cb = 1 - don't breaker\n                    // cb = 0 - break\n                        let cb := 1\n\n                    // get the keccak hash to get the contents of the array\n                        mstore(0x0, _preBytes.slot)\n                        let sc := keccak256(0x0, 0x20)\n\n                        let mc := add(_postBytes, 0x20)\n                        let end := add(mc, mlength)\n\n                    // the next line is the loop condition:\n                    // while(uint256(mc < end) + cb == 2)\n                        for {} eq(add(lt(mc, end), cb), 2) {\n                            sc := add(sc, 1)\n                            mc := add(mc, 0x20)\n                        } {\n                            if iszero(eq(sload(sc), mload(mc))) {\n                            // unsuccess:\n                                success := 0\n                                cb := 0\n                            }\n                        }\n                    }\n                }\n            }\n            default {\n            // unsuccess:\n                success := 0\n            }\n        }\n\n        return success;\n    }\n}\n"
+    },
+    "lib/solidity-examples/contracts/interfaces/ILayerZeroEndpoint.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.5.0;\n\nimport \"./ILayerZeroUserApplicationConfig.sol\";\n\ninterface ILayerZeroEndpoint is ILayerZeroUserApplicationConfig {\n    // @notice send a LayerZero message to the specified address at a LayerZero endpoint.\n    // @param _dstChainId - the destination chain identifier\n    // @param _destination - the address on destination chain (in bytes). address length/format may vary by chains\n    // @param _payload - a custom bytes payload to send to the destination contract\n    // @param _refundAddress - if the source transaction is cheaper than the amount of value passed, refund the additional amount to this address\n    // @param _zroPaymentAddress - the address of the ZRO token holder who would pay for the transaction\n    // @param _adapterParams - parameters for custom functionality. e.g. receive airdropped native gas from the relayer on destination\n    function send(uint16 _dstChainId, bytes calldata _destination, bytes calldata _payload, address payable _refundAddress, address _zroPaymentAddress, bytes calldata _adapterParams) external payable;\n\n    // @notice used by the messaging library to publish verified payload\n    // @param _srcChainId - the source chain identifier\n    // @param _srcAddress - the source contract (as bytes) at the source chain\n    // @param _dstAddress - the address on destination chain\n    // @param _nonce - the unbound message ordering nonce\n    // @param _gasLimit - the gas limit for external contract execution\n    // @param _payload - verified payload to send to the destination contract\n    function receivePayload(uint16 _srcChainId, bytes calldata _srcAddress, address _dstAddress, uint64 _nonce, uint _gasLimit, bytes calldata _payload) external;\n\n    // @notice get the inboundNonce of a lzApp from a source chain which could be EVM or non-EVM chain\n    // @param _srcChainId - the source chain identifier\n    // @param _srcAddress - the source chain contract address\n    function getInboundNonce(uint16 _srcChainId, bytes calldata _srcAddress) external view returns (uint64);\n\n    // @notice get the outboundNonce from this source chain which, consequently, is always an EVM\n    // @param _srcAddress - the source chain contract address\n    function getOutboundNonce(uint16 _dstChainId, address _srcAddress) external view returns (uint64);\n\n    // @notice gets a quote in source native gas, for the amount that send() requires to pay for message delivery\n    // @param _dstChainId - the destination chain identifier\n    // @param _userApplication - the user app address on this EVM chain\n    // @param _payload - the custom message to send over LayerZero\n    // @param _payInZRO - if false, user app pays the protocol fee in native token\n    // @param _adapterParam - parameters for the adapter service, e.g. send some dust native token to dstChain\n    function estimateFees(uint16 _dstChainId, address _userApplication, bytes calldata _payload, bool _payInZRO, bytes calldata _adapterParam) external view returns (uint nativeFee, uint zroFee);\n\n    // @notice get this Endpoint's immutable source identifier\n    function getChainId() external view returns (uint16);\n\n    // @notice the interface to retry failed message on this Endpoint destination\n    // @param _srcChainId - the source chain identifier\n    // @param _srcAddress - the source chain contract address\n    // @param _payload - the payload to be retried\n    function retryPayload(uint16 _srcChainId, bytes calldata _srcAddress, bytes calldata _payload) external;\n\n    // @notice query if any STORED payload (message blocking) at the endpoint.\n    // @param _srcChainId - the source chain identifier\n    // @param _srcAddress - the source chain contract address\n    function hasStoredPayload(uint16 _srcChainId, bytes calldata _srcAddress) external view returns (bool);\n\n    // @notice query if the _libraryAddress is valid for sending msgs.\n    // @param _userApplication - the user app address on this EVM chain\n    function getSendLibraryAddress(address _userApplication) external view returns (address);\n\n    // @notice query if the _libraryAddress is valid for receiving msgs.\n    // @param _userApplication - the user app address on this EVM chain\n    function getReceiveLibraryAddress(address _userApplication) external view returns (address);\n\n    // @notice query if the non-reentrancy guard for send() is on\n    // @return true if the guard is on. false otherwise\n    function isSendingPayload() external view returns (bool);\n\n    // @notice query if the non-reentrancy guard for receive() is on\n    // @return true if the guard is on. false otherwise\n    function isReceivingPayload() external view returns (bool);\n\n    // @notice get the configuration of the LayerZero messaging library of the specified version\n    // @param _version - messaging library version\n    // @param _chainId - the chainId for the pending config change\n    // @param _userApplication - the contract address of the user application\n    // @param _configType - type of configuration. every messaging library has its own convention.\n    function getConfig(uint16 _version, uint16 _chainId, address _userApplication, uint _configType) external view returns (bytes memory);\n\n    // @notice get the send() LayerZero messaging library version\n    // @param _userApplication - the contract address of the user application\n    function getSendVersion(address _userApplication) external view returns (uint16);\n\n    // @notice get the lzReceive() LayerZero messaging library version\n    // @param _userApplication - the contract address of the user application\n    function getReceiveVersion(address _userApplication) external view returns (uint16);\n}\n"
+    },
+    "lib/solidity-examples/contracts/interfaces/ILayerZeroReceiver.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.5.0;\n\ninterface ILayerZeroReceiver {\n    // @notice LayerZero endpoint will invoke this function to deliver the message on the destination\n    // @param _srcChainId - the source endpoint identifier\n    // @param _srcAddress - the source sending contract address from the source chain\n    // @param _nonce - the ordered message nonce\n    // @param _payload - the signed payload is the UA bytes has encoded to be sent\n    function lzReceive(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes calldata _payload) external;\n}\n"
+    },
+    "lib/solidity-examples/contracts/interfaces/ILayerZeroUserApplicationConfig.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity >=0.5.0;\n\ninterface ILayerZeroUserApplicationConfig {\n    // @notice set the configuration of the LayerZero messaging library of the specified version\n    // @param _version - messaging library version\n    // @param _chainId - the chainId for the pending config change\n    // @param _configType - type of configuration. every messaging library has its own convention.\n    // @param _config - configuration in the bytes. can encode arbitrary content.\n    function setConfig(uint16 _version, uint16 _chainId, uint _configType, bytes calldata _config) external;\n\n    // @notice set the send() LayerZero messaging library version to _version\n    // @param _version - new messaging library version\n    function setSendVersion(uint16 _version) external;\n\n    // @notice set the lzReceive() LayerZero messaging library version to _version\n    // @param _version - new messaging library version\n    function setReceiveVersion(uint16 _version) external;\n\n    // @notice Only when the UA needs to resume the message flow in blocking mode and clear the stored payload\n    // @param _srcChainId - the chainId of the source chain\n    // @param _srcAddress - the contract address of the source contract at the source chain\n    function forceResumeReceive(uint16 _srcChainId, bytes calldata _srcAddress) external;\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.15+commit.e14f2714"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "kernel_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "endpoint_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_Deactivated",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_DestinationNotTrusted",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_InsufficientAmount",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_InvalidCaller",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_InvalidMessageSource",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_InvalidPayload",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_NoStoredMessage",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_NoTrustedPath",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_TrustedRemoteUninitialized",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "caller_",
+              "type": "address"
+            }
+          ],
+          "name": "KernelAdapter_OnlyKernel",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "Keycode",
+              "name": "keycode_",
+              "type": "bytes5"
+            }
+          ],
+          "name": "Policy_ModuleDoesNotExist",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "expected_",
+              "type": "bytes"
+            }
+          ],
+          "name": "Policy_WrongModuleVersion",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "receiver_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint16",
+              "name": "srcChain_",
+              "type": "uint16"
+            }
+          ],
+          "name": "BridgeReceived",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "isActive_",
+              "type": "bool"
+            }
+          ],
+          "name": "BridgeStatusSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint16",
+              "name": "dstChain_",
+              "type": "uint16"
+            }
+          ],
+          "name": "BridgeTransferred",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "srcChainId_",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "srcAddress_",
+              "type": "bytes"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "nonce_",
+              "type": "uint64"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "payload_",
+              "type": "bytes"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "reason_",
+              "type": "bytes"
+            }
+          ],
+          "name": "MessageFailed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "srcChainId_",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "srcAddress_",
+              "type": "bytes"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "nonce_",
+              "type": "uint64"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "payloadHash_",
+              "type": "bytes32"
+            }
+          ],
+          "name": "RetryMessageSuccess",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "dstChainId_",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "type_",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_minDstGas",
+              "type": "uint256"
+            }
+          ],
+          "name": "SetMinDstGas",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "precrime_",
+              "type": "address"
+            }
+          ],
+          "name": "SetPrecrime",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "remoteChainId_",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "path_",
+              "type": "bytes"
+            }
+          ],
+          "name": "SetTrustedRemote",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "remoteChainId_",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "remoteAddress_",
+              "type": "bytes"
+            }
+          ],
+          "name": "SetTrustedRemoteAddress",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "MINTR",
+          "outputs": [
+            {
+              "internalType": "contract MINTRv1",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ROLES",
+          "outputs": [
+            {
+              "internalType": "contract ROLESv1",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "bridgeActive",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "newKernel_",
+              "type": "address"
+            }
+          ],
+          "name": "changeKernel",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "configureDependencies",
+          "outputs": [
+            {
+              "internalType": "Keycode[]",
+              "name": "dependencies",
+              "type": "bytes5[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "dstChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "address",
+              "name": "to_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "adapterParams_",
+              "type": "bytes"
+            }
+          ],
+          "name": "estimateSendFee",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "nativeFee",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "zroFee",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint64",
+              "name": "",
+              "type": "uint64"
+            }
+          ],
+          "name": "failedMessages",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "srcChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes",
+              "name": "srcAddress_",
+              "type": "bytes"
+            }
+          ],
+          "name": "forceResumeReceive",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "version_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "uint16",
+              "name": "chainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "configType_",
+              "type": "uint256"
+            }
+          ],
+          "name": "getConfig",
+          "outputs": [
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "remoteChainId_",
+              "type": "uint16"
+            }
+          ],
+          "name": "getTrustedRemoteAddress",
+          "outputs": [
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isActive",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "srcChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes",
+              "name": "srcAddress_",
+              "type": "bytes"
+            }
+          ],
+          "name": "isTrustedRemote",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "kernel",
+          "outputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lzEndpoint",
+          "outputs": [
+            {
+              "internalType": "contract ILayerZeroEndpoint",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "srcChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes",
+              "name": "srcAddress_",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint64",
+              "name": "nonce_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "bytes",
+              "name": "payload_",
+              "type": "bytes"
+            }
+          ],
+          "name": "lzReceive",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ohm",
+          "outputs": [
+            {
+              "internalType": "contract ERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "precrime",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "srcChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes",
+              "name": "srcAddress_",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint64",
+              "name": "nonce_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "bytes",
+              "name": "payload_",
+              "type": "bytes"
+            }
+          ],
+          "name": "receiveMessage",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "requestPermissions",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "Keycode",
+                  "name": "keycode",
+                  "type": "bytes5"
+                },
+                {
+                  "internalType": "bytes4",
+                  "name": "funcSelector",
+                  "type": "bytes4"
+                }
+              ],
+              "internalType": "struct Permissions[]",
+              "name": "permissions",
+              "type": "tuple[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "srcChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes",
+              "name": "srcAddress_",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint64",
+              "name": "nonce_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "bytes",
+              "name": "payload_",
+              "type": "bytes"
+            }
+          ],
+          "name": "retryMessage",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "dstChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "address",
+              "name": "to_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "sendOhm",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bool",
+              "name": "isActive_",
+              "type": "bool"
+            }
+          ],
+          "name": "setBridgeStatus",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "version_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "uint16",
+              "name": "chainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "uint256",
+              "name": "configType_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "config_",
+              "type": "bytes"
+            }
+          ],
+          "name": "setConfig",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "precrime_",
+              "type": "address"
+            }
+          ],
+          "name": "setPrecrime",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "version_",
+              "type": "uint16"
+            }
+          ],
+          "name": "setReceiveVersion",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "version_",
+              "type": "uint16"
+            }
+          ],
+          "name": "setSendVersion",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "srcChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes",
+              "name": "path_",
+              "type": "bytes"
+            }
+          ],
+          "name": "setTrustedRemote",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "remoteChainId_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "bytes",
+              "name": "remoteAddress_",
+              "type": "bytes"
+            }
+          ],
+          "name": "setTrustedRemoteAddress",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "",
+              "type": "uint16"
+            }
+          ],
+          "name": "trustedRemoteLookup",
+          "outputs": [
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "details": "Uses LayerZero as communication protocol.Each chain needs to `setTrustedRemoteAddress` for each remote address      it intends to receive from.",
+        "kind": "dev",
+        "methods": {
+          "configureDependencies()": {
+            "returns": {
+              "dependencies": "- Keycode array of module dependencies."
+            }
+          },
+          "estimateSendFee(uint16,address,uint256,bytes)": {
+            "details": "Should be called by frontend before making sendOhm call.",
+            "returns": {
+              "nativeFee": "- Native token amount to send to sendOhm",
+              "zroFee": "- Fee paid in ZRO token. Unused."
+            }
+          },
+          "forceResumeReceive(uint16,bytes)": {
+            "details": "Unblocks queue and DESTROYS transaction forever. USE WITH CAUTION."
+          },
+          "receiveMessage(uint16,bytes,uint64,bytes)": {
+            "details": "Function must be public to be called by low-level call in lzReceive"
+          },
+          "requestPermissions()": {
+            "returns": {
+              "permissions": "- Array of keycodes and function selectors for requested permissions."
+            }
+          },
+          "setTrustedRemote(uint16,bytes)": {
+            "details": "path_ = abi.encodePacked(remoteAddress, localAddress)"
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "bridgeActive()": {
+            "notice": "Flag to determine if bridge is allowed to send messages or not"
+          },
+          "changeKernel(address)": {
+            "notice": "Function used by kernel when migrating to a new kernel."
+          },
+          "configureDependencies()": {
+            "notice": "Define module dependencies for this policy."
+          },
+          "estimateSendFee(uint16,address,uint256,bytes)": {
+            "notice": "Function to estimate how much gas is needed to send OHM"
+          },
+          "failedMessages(uint16,bytes,uint64)": {
+            "notice": "Storage for failed messages on receive.chainID => source address => endpoint nonce"
+          },
+          "forceResumeReceive(uint16,bytes)": {
+            "notice": "Retries a received message. Used as last resort if retryPayload fails."
+          },
+          "getConfig(uint16,uint16,address,uint256)": {
+            "notice": "Gets endpoint config for this contract"
+          },
+          "getTrustedRemoteAddress(uint16)": {
+            "notice": "Get trusted remote for the given chain as an"
+          },
+          "isActive()": {
+            "notice": "Easily accessible indicator for if a policy is activated or not."
+          },
+          "precrime()": {
+            "notice": "LZ precrime address. Currently unused."
+          },
+          "receiveMessage(uint16,bytes,uint64,bytes)": {
+            "notice": "Implementation of receiving an LZ message"
+          },
+          "requestPermissions()": {
+            "notice": "Function called by kernel to set module function permissions."
+          },
+          "retryMessage(uint16,bytes,uint64,bytes)": {
+            "notice": "Retry a failed receive message"
+          },
+          "sendOhm(uint16,address,uint256)": {
+            "notice": "Send OHM to an eligible chain"
+          },
+          "setBridgeStatus(bool)": {
+            "notice": "Activate or deactivate the bridge"
+          },
+          "setConfig(uint16,uint16,uint256,bytes)": {
+            "notice": "Generic config for LayerZero User Application"
+          },
+          "setPrecrime(address)": {
+            "notice": "Sets precrime address"
+          },
+          "setReceiveVersion(uint16)": {
+            "notice": "Set receive version of endpoint to be used by LayerZero User Application"
+          },
+          "setSendVersion(uint16)": {
+            "notice": "Set send version of endpoint to be used by LayerZero User Application"
+          },
+          "setTrustedRemote(uint16,bytes)": {
+            "notice": "Sets the trusted path for the cross-chain communication"
+          },
+          "setTrustedRemoteAddress(uint16,bytes)": {
+            "notice": "Convenience function for setting trusted paths between EVM addresses"
+          },
+          "trustedRemoteLookup(uint16)": {
+            "notice": "Trusted remote paths. Must be set by admin."
+          }
+        },
+        "notice": "Message bridge for cross-chain OHM transfers.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/policies/CrossChainBridge.sol": "CrossChainBridge"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10
+      },
+      "remappings": [
+        ":@addresses/=lib/forge-proposal-simulator/addresses/",
+        ":@examples/=lib/forge-proposal-simulator/examples/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@proposals/=lib/forge-proposal-simulator/proposals/",
+        ":@script/=lib/forge-proposal-simulator/script/",
+        ":@test/=lib/forge-proposal-simulator/test/",
+        ":@utils/=lib/forge-proposal-simulator/utils/",
+        ":balancer-v2/=lib/balancer-v2/",
+        ":bonds/=lib/bonds/src/",
+        ":clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        ":clones/=lib/clones-with-immutable-args/src/",
+        ":comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        ":forge-std/=lib/forge-std/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero/=lib/solidity-examples/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/openzeppelin-contracts/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=lib/forge-proposal-simulator/",
+        ":proposal-sim/proposals/=lib/forge-proposal-simulator/proposals/",
+        ":proposals/=src/proposals/",
+        ":solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        ":solidity-examples/=lib/solidity-examples/contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":test/=src/test/"
+      ]
+    },
+    "sources": {
+      "lib/solidity-examples/contracts/interfaces/ILayerZeroEndpoint.sol": {
+        "keccak256": "0xe9617a9f6db351b6ac4c9d5b1097798af59ad7f813e370e8cf69bb44addd8548",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c691237391ee55bd86a25ec5b55bda9c4889f7fca32e3e7480e4cdbae990bb94",
+          "dweb:/ipfs/QmWpYa73LcL3FGtd3EA9U5UBhyRgrRjvkebrBDPxjTLj2p"
+        ]
+      },
+      "lib/solidity-examples/contracts/interfaces/ILayerZeroReceiver.sol": {
+        "keccak256": "0x909bf72002c91806f39a64172c12b4188219e8649deefbe8d862604d4f9d3faf",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://410d50515d10db0c0b532c0fd10b0d87df5966bc5736f86d301351b500fd0fe8",
+          "dweb:/ipfs/QmS51GHejUcqgU7Zum2GHtz6bduzRFT9fFnFfCLZW3ttUe"
+        ]
+      },
+      "lib/solidity-examples/contracts/interfaces/ILayerZeroUserApplicationConfig.sol": {
+        "keccak256": "0xe3e50134e39aa3c0f916447d36367970c6e4df972d488b794227e0b052ce80d5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://279b81b8f22bf8ea5f53053419e36a003f59af7f2501ecff84cfd8d578e2bdde",
+          "dweb:/ipfs/QmQz9oaKnAKb9MGbtsoRJXWddKeSWJqaP1zBvFKqokB97h"
+        ]
+      },
+      "lib/solidity-examples/contracts/util/BytesLib.sol": {
+        "keccak256": "0x2255aadad70e87ed42b158776330175644b07fbbc7e77ed32cd6330974abbcee",
+        "license": "Unlicense",
+        "urls": [
+          "bzz-raw://28df268fb1b8265ff82ab700d845b999e835686f746830b4f6e91a96303cc808",
+          "dweb:/ipfs/QmWbr9ASJpVyU3y1muwuaFbKMQAdseh5xGw8E8vCFpGZmd"
+        ]
+      },
+      "lib/solmate/src/tokens/ERC20.sol": {
+        "keccak256": "0xcdfd8db76b2a3415620e4d18cc5545f3d50de792dbf2c3dd5adb40cbe6f94b10",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://57b3ab70cde374af1cf2c9888636e8de6cf660f087b1c9abd805e9271e19fa35",
+          "dweb:/ipfs/QmNrLDBAHYFjpjSd12jerm1AdBkDqEYUUaXgnT854BUZ97"
+        ]
+      },
+      "src/Kernel.sol": {
+        "keccak256": "0x5798deae5f5ce704f699ef3b5022e16825a4470972212a9b55ec66746fcd5fc2",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://67b6284b459b3d3e8781975a85b08778d14850a09dc51aff80de76de54f12129",
+          "dweb:/ipfs/QmarPSzUc6TckbSd2sGovhstAiNTbWBDTbQB9mwPXeX1A5"
+        ]
+      },
+      "src/external/OlympusERC20.sol": {
+        "keccak256": "0x615c2c31c85f680c81bf456550f0dc8da0e45abc6cc7846bb87a067d04772601",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://e5cde097f699ccd42d77e87ca2c7f89cf8e1b1ec40c3da4984489522c1b9b793",
+          "dweb:/ipfs/QmWdb7aBcGG3Fiy1eyfgpsmykeUghZbwx4E53NyGXheraX"
+        ]
+      },
+      "src/modules/MINTR/MINTR.v1.sol": {
+        "keccak256": "0xe6c2b75f3c9bb366ca8e62081b4c79f537ed5f286b37280b178aeb6c4eb1ad9f",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://bda861f3e9fdf14eed2987d49eee0c83ae184a5efafcd438c6fb0f5ba122c9ac",
+          "dweb:/ipfs/QmfMZbkobLL77dezr93ko9KE75NMjv9F7SKmPvoVK9TDHr"
+        ]
+      },
+      "src/modules/ROLES/OlympusRoles.sol": {
+        "keccak256": "0xaa6d6bd245d7fb437ff39fa8a6d7f7a4c246e5284a65ddece396238f0011b1a7",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://d321c286098da23a1ddaa1fb51a1351b71357859f7568b38f733971bc4b5ddae",
+          "dweb:/ipfs/QmdPasx52MrHtGoNRWMUPCTPkBceyZijaqfkAGSoSQJxAR"
+        ]
+      },
+      "src/modules/ROLES/ROLES.v1.sol": {
+        "keccak256": "0x9adeb15569648e1dc977b5ae44d48ce79a63790625510a616b37df9d9e093985",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://d16866adf6987025ea2f89c1e20613a5df351eaeb46d6b0fc5caf88d41734300",
+          "dweb:/ipfs/QmZbRoJcUhe4eUzYriPpGFx5NEbmh7Q2DZzrgYLanvqYKd"
+        ]
+      },
+      "src/policies/CrossChainBridge.sol": {
+        "keccak256": "0xccff3862b1955503e69655d0422e7a1b493477b92895ccd4808abd17d1b9e045",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://a3de3e419f21b97d863e070bd6b6f73108b0253b5005fac3dcdb997f14d320d0",
+          "dweb:/ipfs/Qmc3yeFbVZwzjYKfwT8HQdDKx2fGzF895FtgmeBqHWdim5"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.15+commit.e14f2714",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 10,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": [
+        ":@addresses/=lib/forge-proposal-simulator/addresses/",
+        ":@examples/=lib/forge-proposal-simulator/examples/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@proposals/=lib/forge-proposal-simulator/proposals/",
+        ":@script/=lib/forge-proposal-simulator/script/",
+        ":@test/=lib/forge-proposal-simulator/test/",
+        ":@utils/=lib/forge-proposal-simulator/utils/",
+        ":balancer-v2/=lib/balancer-v2/",
+        ":bonds/=lib/bonds/src/",
+        ":clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        ":clones/=lib/clones-with-immutable-args/src/",
+        ":comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        ":forge-std/=lib/forge-std/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero/=lib/solidity-examples/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/openzeppelin-contracts/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=lib/forge-proposal-simulator/",
+        ":proposal-sim/proposals/=lib/forge-proposal-simulator/proposals/",
+        ":proposals/=src/proposals/",
+        ":solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        ":solidity-examples/=lib/solidity-examples/contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":test/=src/test/"
+      ]
+    },
+    "name": "CrossChainBridge",
+    "fullyQualifiedName": "src/policies/CrossChainBridge.sol:CrossChainBridge"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "877880",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T12:08:07Z",
+  "match": "exact_match",
+  "chainId": "8453",
+  "address": "0x6CA1a916e883c7ce2BFBcF59dc70F2c1EF9dac6e"
+}

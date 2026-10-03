@@ -1,0 +1,2276 @@
+{
+  "sources": {
+    "src/external/governance/GovernorBravoDelegate.sol": {
+      "content": "// SPDX-License-Identifier: BSD-3-Clause\npragma solidity 0.8.15;\n\nimport {ContractUtils} from \"src/external/governance/lib/ContractUtils.sol\";\nimport {ECDSA} from \"@openzeppelin/contracts/utils/cryptography/ECDSA.sol\";\n\nimport {IgOHM} from \"src/interfaces/IgOHM.sol\";\nimport {ITimelock} from \"./interfaces/ITimelock.sol\";\nimport {IGovernorBravoEventsAndErrors} from \"./interfaces/IGovernorBravoEvents.sol\";\n\nimport {GovernorBravoDelegateStorageV2} from \"./abstracts/GovernorBravoStorage.sol\";\n\nimport \"src/Kernel.sol\";\n\ncontract GovernorBravoDelegate is GovernorBravoDelegateStorageV2, IGovernorBravoEventsAndErrors {\n    // --- CONSTANTS ---------------------------------------------------------------\n\n    /// @notice The name of this contract\n    string public constant name = \"Olympus Governor Bravo\";\n\n    /// @notice The minimum setable proposal threshold\n    uint256 public constant MIN_PROPOSAL_THRESHOLD_PCT = 15_000; // 0.015% (out of 100_000_000)\n\n    /// @notice The maximum setable proposal threshold\n    uint256 public constant MAX_PROPOSAL_THRESHOLD_PCT = 1_000_000; // 1% (out of 100_000_000)\n\n    /// @notice The minimum setable voting period\n    uint256 public constant MIN_VOTING_PERIOD = 21600; // About 3 days (12s block time)\n\n    /// @notice The max setable voting period\n    uint256 public constant MAX_VOTING_PERIOD = 100800; // About 2 weeks (12s block time)\n\n    /// @notice The min setable voting delay\n    uint256 public constant MIN_VOTING_DELAY = 7200; // About 1 day (12s block time)\n\n    /// @notice The max setable voting delay\n    uint256 public constant MAX_VOTING_DELAY = 50400; // About 1 week (12s block time)\n\n    /// @notice The minimum level of gOHM supply acceptable for OCG operations\n    uint256 public constant MIN_GOHM_SUPPLY = 1_000e18;\n\n    /// @notice The percentage of total supply in support of a proposal required in order for a quorum to be reached and for a vote to succeed\n    /// @dev    Olympus has a variable supply system, that actively fluctuates fairly significantly, so it is better to use\n    ///         a percentage of total supply, rather than a fixed number of tokens.\n    uint256 public constant quorumPct = 20_000_000; // 20% (out of 100_000_000)\n\n    /// @notice The percentage of total supply in support of a proposal related to a high risk module in the Default system required\n    ///         in order for a quorum to be reached and for a vote to succeed\n    /// @dev    Olympus has a variable supply system, that actively fluctuates fairly significantly, so it is better to use\n    ///         a percentage of total supply, rather than a fixed number of tokens.\n    uint256 public constant highRiskQuorum = 20_000_000; // 20% (out of 100_000_000)\n\n    /// @notice The percentage of votes that must be in favor of a proposal for it to succeed\n    uint256 public constant approvalThresholdPct = 60_000_000; // 60% (out of 100_000_000)\n\n    /// @notice The maximum number of actions that can be included in a proposal\n    uint256 public constant proposalMaxOperations = 15; // 15 actions\n\n    /// @notice The EIP-712 typehash for the contract's domain\n    bytes32 public constant DOMAIN_TYPEHASH =\n        keccak256(\"EIP712Domain(string name,uint256 chainId,address verifyingContract)\");\n\n    /// @notice The EIP-712 typehash for the ballot struct used by the contract\n    bytes32 public constant BALLOT_TYPEHASH = keccak256(\"Ballot(uint256 proposalId,uint8 support)\");\n\n    // --- INITIALIZE --------------------------------------------------------------\n\n    /**\n     * @notice Used to initialize the contract during delegator constructor\n     * @param timelock_ The address of the Timelock\n     * @param gohm_ The address of the gOHM token\n     * @param kernel_ The address of the kernel\n     * @param vetoGuardian_ The address of the veto guardian\n     * @param votingPeriod_ The initial voting period\n     * @param votingDelay_ The initial voting delay\n     * @param proposalThreshold_ The initial proposal threshold (percentage of total supply. out of 1000)\n     */\n    function initialize(\n        address timelock_,\n        address gohm_,\n        address kernel_,\n        address vetoGuardian_,\n        uint256 votingPeriod_,\n        uint256 votingDelay_,\n        uint256 activationGracePeriod_,\n        uint256 proposalThreshold_\n    ) public virtual {\n        if (msg.sender != admin) revert GovernorBravo_OnlyAdmin();\n        if (address(timelock) != address(0)) revert GovernorBravo_AlreadyInitialized();\n        if (timelock_ == address(0) || gohm_ == address(0) || kernel_ == address(0) || vetoGuardian_ == address(0))\n            revert GovernorBravo_AddressZero();\n        if (votingPeriod_ < MIN_VOTING_PERIOD || votingPeriod_ > MAX_VOTING_PERIOD)\n            revert GovernorBravo_InvalidPeriod();\n        if (votingDelay_ < MIN_VOTING_DELAY || votingDelay_ > MAX_VOTING_DELAY)\n            revert GovernorBravo_InvalidDelay();\n        if (\n            proposalThreshold_ < MIN_PROPOSAL_THRESHOLD_PCT ||\n            proposalThreshold_ > MAX_PROPOSAL_THRESHOLD_PCT\n        ) revert GovernorBravo_InvalidThreshold();\n\n        // Set up contract dependencies\n        timelock = ITimelock(timelock_);\n        gohm = IgOHM(gohm_);\n        kernel = kernel_;\n\n        // Configure voting parameters\n        vetoGuardian = vetoGuardian_;\n        votingDelay = votingDelay_;\n        votingPeriod = votingPeriod_;\n        activationGracePeriod = activationGracePeriod_;\n        proposalThreshold = proposalThreshold_;\n    }\n\n    // --- GOVERNANCE LOGIC --------------------------------------------------------\n\n    /**\n     * @notice Function used to propose a new proposal. Sender must have delegates above the proposal threshold\n     * @param targets Target addresses for proposal calls\n     * @param values Eth values for proposal calls\n     * @param signatures Function signatures for proposal calls\n     * @param calldatas Calldatas for proposal calls\n     * @param description String description of the proposal\n     * @return Proposal id of new proposal\n     */\n    function propose(\n        address[] memory targets,\n        uint256[] memory values,\n        string[] memory signatures,\n        bytes[] memory calldatas,\n        string memory description\n    ) public returns (uint256) {\n        if (_isEmergency()) revert GovernorBravo_Emergency_SupplyTooLow();\n        // Allow addresses above proposal threshold and whitelisted addresses to propose\n        if (gohm.getPriorVotes(msg.sender, block.number - 1) <= getProposalThresholdVotes())\n            revert GovernorBravo_Proposal_ThresholdNotMet();\n        if (\n            targets.length != values.length ||\n            targets.length != signatures.length ||\n            targets.length != calldatas.length\n        ) revert GovernorBravo_Proposal_LengthMismatch();\n        if (targets.length == 0) revert GovernorBravo_Proposal_NoActions();\n        if (targets.length > proposalMaxOperations) revert GovernorBravo_Proposal_TooManyActions();\n\n        uint256 latestProposalId = latestProposalIds[msg.sender];\n        if (latestProposalId != 0) {\n            ProposalState proposersLatestProposalState = state(latestProposalId);\n            if (proposersLatestProposalState == ProposalState.Active)\n                revert GovernorBravo_Proposal_AlreadyActive();\n            if (proposersLatestProposalState == ProposalState.Pending)\n                revert GovernorBravo_Proposal_AlreadyPending();\n        }\n\n        uint256 startBlock = block.number + votingDelay;\n\n        proposalCount++;\n        uint256 newProposalID = proposalCount;\n\n        // Get codehashes for each target\n        // NOTE: using targets.length here rather than caching it before IS less efficient, but allows us to avoid\n        // a stack-too-deep error while avoiding the much more expensive read of lengths for each loop iteration\n        bytes32[] memory codehashes = new bytes32[](targets.length);\n        {\n            uint256 numTargets = targets.length;\n            for (uint256 i; i < numTargets; ) {\n                codehashes[i] = ContractUtils.getCodeHash(targets[i]);\n                unchecked {\n                    ++i;\n                }\n            }\n        }\n\n        {\n            // Given Olympus's dynamic supply, we need to capture quorum and proposal thresholds in terms\n            // of the total supply at the time of proposal creation.\n            uint256 proposalThresholdVotes = getProposalThresholdVotes();\n\n            Proposal storage newProposal = proposals[newProposalID];\n            // This should never happen but add a check in case.\n            if (newProposal.id != 0) revert GovernorBravo_Proposal_IdCollision();\n\n            // Set basic proposal data to prevent reentrancy\n            latestProposalIds[msg.sender] = newProposalID;\n            newProposal.startBlock = startBlock;\n\n            newProposal.id = newProposalID;\n            newProposal.proposer = msg.sender;\n            newProposal.proposalThreshold = proposalThresholdVotes;\n            newProposal.targets = targets;\n            newProposal.values = values;\n            newProposal.signatures = signatures;\n            newProposal.calldatas = calldatas;\n            newProposal.codehashes = codehashes;\n        }\n\n        emit ProposalCreated(\n            newProposalID,\n            msg.sender,\n            targets,\n            values,\n            signatures,\n            calldatas,\n            startBlock,\n            description\n        );\n        return newProposalID;\n    }\n\n    /**\n     * @notice Create proposal in case of emergency\n     * @dev Can only be called by the veto guardian in the event of an emergency\n     * @param targets Target addresses for proposal calls\n     * @param values Eth values for proposal calls\n     * @param signatures Function signatures for proposal calls\n     * @param calldatas Calldatas for proposal calls\n     */\n    function emergencyPropose(\n        address[] memory targets,\n        uint256[] memory values,\n        string[] memory signatures,\n        bytes[] memory calldatas\n    ) external returns (uint256) {\n        if (!_isEmergency()) revert GovernorBravo_NotEmergency();\n        if (msg.sender != vetoGuardian) revert GovernorBravo_OnlyVetoGuardian();\n\n        // Perform basic checks on the proposal data\n        uint256 numActions = targets.length;\n        if (\n            numActions != values.length ||\n            numActions != signatures.length ||\n            numActions != calldatas.length\n        ) revert GovernorBravo_Proposal_LengthMismatch();\n        if (numActions == 0) revert GovernorBravo_Proposal_NoActions();\n        if (numActions > proposalMaxOperations) revert GovernorBravo_Proposal_TooManyActions();\n\n        // Increment the proposal count to avoid collisions with future normal proposals\n        // and to allow for proper queueing and execution on the Timelock\n        proposalCount++;\n        uint256 newProposalID = proposalCount;\n\n        // Get codehashes for each target\n        bytes32[] memory codehashes = new bytes32[](numActions);\n        {\n            for (uint256 i; i < numActions; ) {\n                codehashes[i] = ContractUtils.getCodeHash(targets[i]);\n                unchecked {\n                    ++i;\n                }\n            }\n        }\n\n        {\n            // Set basic proposal data so there is a record\n            Proposal storage newProposal = proposals[newProposalID];\n            // This should never happen but add a check in case.\n            if (newProposal.id != 0) revert GovernorBravo_Proposal_IdCollision();\n\n            newProposal.id = newProposalID;\n            newProposal.proposer = msg.sender;\n            newProposal.targets = targets;\n            newProposal.values = values;\n            newProposal.signatures = signatures;\n            newProposal.calldatas = calldatas;\n            newProposal.codehashes = codehashes;\n        }\n\n        emit ProposalCreated(\n            newProposalID,\n            msg.sender,\n            targets,\n            values,\n            signatures,\n            calldatas,\n            block.number,\n            \"Emergency Proposal\"\n        );\n        return newProposalID;\n    }\n\n    /**\n     * @notice Activates voting for a proposal\n     * @dev This also captures quorum based on total supply to ensure it's as close as possible to the proposal start time\n     */\n    function activate(uint256 proposalId) external {\n        if (_isEmergency()) revert GovernorBravo_Emergency_SupplyTooLow();\n        if (state(proposalId) != ProposalState.Pending) revert GovernorBravo_Vote_Closed();\n\n        Proposal storage proposal = proposals[proposalId];\n        if (block.number <= proposal.startBlock) revert GovernorBravo_Proposal_TooEarly();\n        if (proposal.votingStarted || proposal.endBlock != 0)\n            revert GovernorBravo_Proposal_AlreadyActivated();\n\n        proposal.votingStarted = true;\n        proposal.endBlock = block.number + votingPeriod;\n\n        // In the future we can use this to set quorum based on a classification of the proposals risk\n        // for the time being, we will use a single quorum value for all proposals\n        // uint256 quorumVotes;\n        // if (_isHighRiskProposal(proposal.targets, proposal.signatures, proposal.calldatas)) {\n        //     quorumVotes = getHighRiskQuorumVotes();\n        // } else {\n        //     quorumVotes = getQuorumVotes();\n        // }\n\n        proposal.quorumVotes = getQuorumVotes();\n        emit ProposalVotingStarted(proposalId);\n    }\n\n    /**\n     * @notice Queues a successful proposal\n     * @param proposalId The id of the proposal to queue\n     */\n    function queue(uint256 proposalId) external {\n        Proposal storage proposal = proposals[proposalId];\n\n        if (_isEmergency()) {\n            // In an emergency state, only the veto guardian can queue proposals\n            if (msg.sender != vetoGuardian) revert GovernorBravo_OnlyVetoGuardian();\n        } else {\n            // Check if proposal is succeeded\n            if (state(proposalId) != ProposalState.Succeeded)\n                revert GovernorBravo_Queue_FailedProposal();\n\n            // Check that proposer has not fallen below proposal threshold since proposal creation\n            if (gohm.getPriorVotes(proposal.proposer, block.number - 1) < proposal.proposalThreshold)\n                revert GovernorBravo_Queue_BelowThreshold();\n        }\n\n        uint256 eta = block.timestamp + timelock.delay();\n        uint256 numActions = proposal.targets.length;\n        for (uint256 i = 0; i < numActions; i++) {\n            _queueOrRevertInternal(\n                proposalId,\n                proposal.targets[i],\n                proposal.values[i],\n                proposal.signatures[i],\n                proposal.calldatas[i],\n                eta\n            );\n        }\n        proposal.eta = eta;\n        emit ProposalQueued(proposalId, eta);\n    }\n\n    function _queueOrRevertInternal(\n        uint256 proposalId,\n        address target,\n        uint256 value,\n        string memory signature,\n        bytes memory data,\n        uint256 eta\n    ) internal {\n        if (\n            timelock.queuedTransactions(\n                keccak256(abi.encode(proposalId, target, value, signature, data, eta))\n            )\n        ) revert GovernorBravo_Queue_AlreadyQueued();\n\n        timelock.queueTransaction(proposalId, target, value, signature, data, eta);\n    }\n\n    /**\n     * @notice Executes a queued proposal if eta has passed\n     * @param proposalId The id of the proposal to execute\n     */\n    function execute(uint256 proposalId) external payable {\n        Proposal storage proposal = proposals[proposalId];\n\n        if (_isEmergency()) {\n            // In an emergency state, only the veto guardian can queue proposals\n            if (msg.sender != vetoGuardian) revert GovernorBravo_OnlyVetoGuardian();\n        } else {\n            // Check if proposal is succeeded\n            if (state(proposalId) != ProposalState.Queued) revert GovernorBravo_Execute_NotQueued();\n            // Check that proposer has not fallen below proposal threshold since proposal creation\n            if (gohm.getPriorVotes(proposal.proposer, block.number - 1) < proposal.proposalThreshold)\n                revert GovernorBravo_Execute_BelowThreshold();\n        }\n\n        proposal.executed = true;\n        uint256 numActions = proposal.targets.length;\n        for (uint256 i = 0; i < numActions; i++) {\n            timelock.executeTransaction{value: proposal.values[i]}(\n                proposalId,\n                proposal.targets[i],\n                proposal.values[i],\n                proposal.signatures[i],\n                proposal.calldatas[i],\n                proposal.codehashes[i],\n                proposal.eta\n            );\n        }\n        emit ProposalExecuted(proposalId);\n    }\n\n    /**\n     * @notice Cancels a proposal only if sender is the proposer, or proposer delegates dropped below proposal threshold\n     * @param proposalId The id of the proposal to cancel\n     */\n    function cancel(uint256 proposalId) external {\n        if (state(proposalId) == ProposalState.Executed)\n            revert GovernorBravo_Cancel_AlreadyExecuted();\n\n        Proposal storage proposal = proposals[proposalId];\n\n        // Proposer can cancel\n        if (msg.sender != proposal.proposer) {\n            if (gohm.getPriorVotes(proposal.proposer, block.number - 1) >= proposal.proposalThreshold)\n                revert GovernorBravo_Cancel_AboveThreshold();\n        }\n\n        proposal.canceled = true;\n        for (uint256 i = 0; i < proposal.targets.length; i++) {\n            timelock.cancelTransaction(\n                proposalId,\n                proposal.targets[i],\n                proposal.values[i],\n                proposal.signatures[i],\n                proposal.calldatas[i],\n                proposal.eta\n            );\n        }\n\n        emit ProposalCanceled(proposalId);\n    }\n\n    /**\n     * @notice Vetoes a proposal only if sender is the veto guardian\n     * @param proposalId The id of the proposal to veto\n     */\n    function veto(uint256 proposalId) external {\n        if (msg.sender != vetoGuardian) revert GovernorBravo_OnlyVetoGuardian();\n        if (state(proposalId) == ProposalState.Executed)\n            revert GovernorBravo_Veto_AlreadyExecuted();\n\n        Proposal storage proposal = proposals[proposalId];\n\n        proposal.vetoed = true;\n        for (uint256 i; i < proposal.targets.length; ) {\n            // If the proposal has been queued, cancel on the timelock\n            if (\n                timelock.queuedTransactions(\n                    keccak256(\n                        abi.encode(\n                            proposalId,\n                            proposal.targets[i],\n                            proposal.values[i],\n                            proposal.signatures[i],\n                            proposal.calldatas[i],\n                            proposal.eta\n                        )\n                    )\n                )\n            ) {\n                timelock.cancelTransaction(\n                    proposalId,\n                    proposal.targets[i],\n                    proposal.values[i],\n                    proposal.signatures[i],\n                    proposal.calldatas[i],\n                    proposal.eta\n                );\n            }\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        emit ProposalVetoed(proposalId);\n    }\n\n    /**\n     * @notice Cast a vote for a proposal\n     * @param proposalId The id of the proposal to vote on\n     * @param support The support value for the vote. 0=against, 1=for, 2=abstain\n     */\n    function castVote(uint256 proposalId, uint8 support) external {\n        emit VoteCast(\n            msg.sender,\n            proposalId,\n            support,\n            castVoteInternal(msg.sender, proposalId, support),\n            \"\"\n        );\n    }\n\n    /**\n     * @notice Cast a vote for a proposal with a reason\n     * @param proposalId The id of the proposal to vote on\n     * @param support The support value for the vote. 0=against, 1=for, 2=abstain\n     * @param reason The reason given for the vote by the voter\n     */\n    function castVoteWithReason(\n        uint256 proposalId,\n        uint8 support,\n        string calldata reason\n    ) external {\n        emit VoteCast(\n            msg.sender,\n            proposalId,\n            support,\n            castVoteInternal(msg.sender, proposalId, support),\n            reason\n        );\n    }\n\n    /**\n     * @notice Cast a vote for a proposal by signature\n     * @dev External function that accepts EIP-712 signatures for voting on proposals.\n     */\n    function castVoteBySig(\n        uint256 proposalId,\n        uint8 support,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external {\n        bytes32 domainSeparator = keccak256(\n            abi.encode(DOMAIN_TYPEHASH, keccak256(bytes(name)), getChainIdInternal(), address(this))\n        );\n        bytes32 structHash = keccak256(abi.encode(BALLOT_TYPEHASH, proposalId, support));\n        bytes32 digest = keccak256(abi.encodePacked(\"\\x19\\x01\", domainSeparator, structHash));\n        address signatory = ECDSA.recover(digest, v, r, s);\n        if (signatory == address(0)) revert GovernorBravo_InvalidSignature();\n        emit VoteCast(\n            signatory,\n            proposalId,\n            support,\n            castVoteInternal(signatory, proposalId, support),\n            \"\"\n        );\n    }\n\n    /**\n     * @notice Internal function that caries out voting logic\n     * @param voter The voter that is casting their vote\n     * @param proposalId The id of the proposal to vote on\n     * @param support The support value for the vote. 0=against, 1=for, 2=abstain\n     * @return The number of votes cast\n     */\n    function castVoteInternal(\n        address voter,\n        uint256 proposalId,\n        uint8 support\n    ) internal returns (uint256) {\n        if (state(proposalId) != ProposalState.Active) revert GovernorBravo_Vote_Closed();\n        if (support > 2) revert GovernorBravo_Vote_InvalidType();\n        Proposal storage proposal = proposals[proposalId];\n        Receipt storage receipt = proposal.receipts[voter];\n        if (receipt.hasVoted) revert GovernorBravo_Vote_AlreadyCast();\n\n        // Get the user's votes at the start of the proposal and at the time of voting. Take the minimum.\n        uint256 originalVotes = gohm.getPriorVotes(voter, proposal.startBlock);\n        uint256 currentVotes = gohm.getPriorVotes(voter, block.number - 1);\n        uint256 votes = currentVotes > originalVotes ? originalVotes : currentVotes;\n\n        if (support == 0) {\n            proposal.againstVotes = proposal.againstVotes + votes;\n        } else if (support == 1) {\n            proposal.forVotes = proposal.forVotes + votes;\n        } else if (support == 2) {\n            proposal.abstainVotes = proposal.abstainVotes + votes;\n        }\n\n        receipt.hasVoted = true;\n        receipt.support = support;\n        receipt.votes = votes;\n\n        return votes;\n    }\n\n    // --- ADMIN FUNCTIONS ---------------------------------------------------------\n\n    /**\n     * @notice Admin function for setting the voting delay\n     * @param newVotingDelay new voting delay, in blocks\n     */\n    function _setVotingDelay(uint256 newVotingDelay) external {\n        if (msg.sender != admin) revert GovernorBravo_OnlyAdmin();\n        if (newVotingDelay < MIN_VOTING_DELAY || newVotingDelay > MAX_VOTING_DELAY)\n            revert GovernorBravo_InvalidDelay();\n\n        uint256 oldVotingDelay = votingDelay;\n        votingDelay = newVotingDelay;\n\n        emit VotingDelaySet(oldVotingDelay, votingDelay);\n    }\n\n    /**\n     * @notice Admin function for setting the voting period\n     * @param newVotingPeriod new voting period, in blocks\n     */\n    function _setVotingPeriod(uint256 newVotingPeriod) external {\n        if (msg.sender != admin) revert GovernorBravo_OnlyAdmin();\n        if (newVotingPeriod < MIN_VOTING_PERIOD || newVotingPeriod > MAX_VOTING_PERIOD)\n            revert GovernorBravo_InvalidPeriod();\n\n        uint256 oldVotingPeriod = votingPeriod;\n        votingPeriod = newVotingPeriod;\n\n        emit VotingPeriodSet(oldVotingPeriod, votingPeriod);\n    }\n\n    /**\n     * @notice Admin function for setting the proposal threshold\n     * @dev newProposalThreshold must be greater than the hardcoded min\n     * @param newProposalThreshold new proposal threshold\n     */\n    function _setProposalThreshold(uint256 newProposalThreshold) external {\n        if (msg.sender != admin) revert GovernorBravo_OnlyAdmin();\n        if (\n            newProposalThreshold < MIN_PROPOSAL_THRESHOLD_PCT ||\n            newProposalThreshold > MAX_PROPOSAL_THRESHOLD_PCT\n        ) revert GovernorBravo_InvalidThreshold();\n\n        uint256 oldProposalThreshold = proposalThreshold;\n        proposalThreshold = newProposalThreshold;\n\n        emit ProposalThresholdSet(oldProposalThreshold, proposalThreshold);\n    }\n\n    /**\n     * @notice Admin function for setting the vetoGuardian. vetoGuardian can veto any proposal\n     * @param account Account to set vetoGuardian to (0x0 to remove vetoGuardian)\n     */\n    function _setVetoGuardian(address account) external {\n        if (msg.sender != admin) revert GovernorBravo_OnlyAdmin();\n        address oldGuardian = vetoGuardian;\n        vetoGuardian = account;\n\n        emit VetoGuardianSet(oldGuardian, vetoGuardian);\n    }\n\n    /**\n     * @notice Begins transfer of admin rights. The newPendingAdmin must call `_acceptAdmin` to finalize the transfer.\n     * @dev Admin function to begin change of admin. The newPendingAdmin must call `_acceptAdmin` to finalize the transfer.\n     * @param newPendingAdmin New pending admin.\n     */\n    function _setPendingAdmin(address newPendingAdmin) external {\n        // Check caller = admin\n        if (msg.sender != admin) revert GovernorBravo_OnlyAdmin();\n\n        // Save current value, if any, for inclusion in log\n        address oldPendingAdmin = pendingAdmin;\n\n        // Store pendingAdmin with value newPendingAdmin\n        pendingAdmin = newPendingAdmin;\n\n        // Emit NewPendingAdmin(oldPendingAdmin, newPendingAdmin)\n        emit NewPendingAdmin(oldPendingAdmin, newPendingAdmin);\n    }\n\n    /**\n     * @notice Accepts transfer of admin rights. msg.sender must be pendingAdmin\n     * @dev Admin function for pending admin to accept role and update admin\n     */\n    function _acceptAdmin() external {\n        // Check caller is pendingAdmin and pendingAdmin ≠ address(0)\n        if (msg.sender != pendingAdmin || msg.sender == address(0))\n            revert GovernorBravo_OnlyPendingAdmin();\n\n        // Save current values for inclusion in log\n        address oldAdmin = admin;\n        address oldPendingAdmin = pendingAdmin;\n\n        // Store admin with value pendingAdmin\n        admin = pendingAdmin;\n\n        // Clear the pending value\n        pendingAdmin = address(0);\n\n        emit NewAdmin(oldAdmin, admin);\n        emit NewPendingAdmin(oldPendingAdmin, pendingAdmin);\n    }\n\n    /**\n     * @notice Sets whether a module is considered high risk\n     * @dev Admin function to set whether a module in the Default Framework is considered high risk\n     * @param module_ The module to set the risk of\n     * @param isHighRisk_ If the module is high risk\n     */\n    function _setModuleRiskLevel(bytes5 module_, bool isHighRisk_) external {\n        if (msg.sender != admin) revert GovernorBravo_OnlyAdmin();\n        isKeycodeHighRisk[toKeycode(module_)] = isHighRisk_;\n    }\n\n    // --- HELPER FUNCTIONS: INTERNAL ----------------------------------------------\n\n    /**\n     * @dev Checks if the system should be set to an emergency state due to a collapsing supply of gOHM\n     */\n    function _isEmergency() internal view returns (bool) {\n        return gohm.totalSupply() < MIN_GOHM_SUPPLY;\n    }\n\n    /**\n     * @dev Checks if a proposal is high risk by identifying actions where the Default Framework kernel\n     *      is the target, if so, checking if it's installing or deactivating a policy, and if so,\n     *      checking if the policy is touching a high risk module. This makes external calls, so when\n     *      for future updates to the Governor, make sure that functions where it is used cannot be re-entered.\n     */\n    function _isHighRiskProposal(\n        address[] memory targets,\n        string[] memory signatures,\n        bytes[] memory calldatas\n    ) internal returns (bool) {\n        // If proposal interacts with the kernel, and is touching a policy that interacts with\n        // a flagged module, then it is high risk.\n        uint256 numActions = targets.length;\n\n        for (uint256 i = 0; i < numActions; i++) {\n            address target = targets[i];\n            string memory signature = signatures[i];\n            bytes memory data = calldatas[i];\n\n            if (target == address(this) || target == address(timelock)) {\n                return true;\n            }\n\n            if (target == kernel) {\n                // Get function selector\n                bytes4 selector = bytes(signature).length == 0\n                    ? bytes4(data)\n                    : bytes4(keccak256(bytes(signature)));\n\n                // Check if the action is making a core change to system via the kernel\n                if (selector == Kernel.executeAction.selector) {\n                    uint8 action;\n                    address actionTarget;\n\n                    // We know the proper size of calldata for an `executeAction` call, so we can parse it\n                    if (bytes(signature).length == 0 && data.length == 0x44) {\n                        assembly {\n                            action := mload(add(data, 0x24)) // accounting for length and selector in first 4 bytes\n                            actionTarget := mload(add(data, 0x44))\n                        }\n                    } else if (data.length == 0x40) {\n                        (action, actionTarget) = abi.decode(data, (uint8, address));\n                    } else {\n                        revert GovernorBravo_InvalidCalldata();\n                    }\n\n                    // If the action is changing the executor (4) or migrating the kernel (5)\n                    if (action == 4 || action == 5) {\n                        return true;\n                    }\n                    // If the action is upgrading a module (1)\n                    else if (action == 1) {\n                        // Check if the module has a high risk keycode\n                        if (isKeycodeHighRisk[Module(actionTarget).KEYCODE()]) return true;\n                    }\n                    // If the action is installing (2) or deactivating (3) a policy, pull the list of dependencies\n                    else if (action == 2 || action == 3) {\n                        // Call `configureDependencies` on the policy\n                        Keycode[] memory dependencies = Policy(actionTarget)\n                            .configureDependencies();\n\n                        // Iterate over dependencies and looks for high risk keycodes\n                        uint256 numDeps = dependencies.length;\n                        for (uint256 j; j < numDeps; j++) {\n                            Keycode dep = dependencies[j];\n                            if (isKeycodeHighRisk[dep]) return true;\n                        }\n                    }\n                }\n            }\n        }\n\n        return false;\n    }\n\n    // --- GETTER FUNCTIONS: SYSTEM ------------------------------------------------\n\n    /**\n     * @notice View function that gets the chain ID of the current network\n     * @return The chain ID\n     */\n    function getChainIdInternal() internal view returns (uint256) {\n        uint256 chainId;\n        assembly {\n            chainId := chainid()\n        }\n        return chainId;\n    }\n\n    /**\n     * @notice View function that gets the proposal threshold in number of gOHM based on current supply\n     * @return The proposal threshold in number of gOHM\n     */\n    function getProposalThresholdVotes() public view returns (uint256) {\n        return (gohm.totalSupply() * proposalThreshold) / 100_000_000;\n    }\n\n    /**\n     * @notice View function that gets the quorum in number of gOHM based on current supply\n     * @return The quorum in number of gOHM\n     */\n    function getQuorumVotes() public view returns (uint256) {\n        return (gohm.totalSupply() * quorumPct) / 100_000_000;\n    }\n\n    /**\n     * @notice View function that gets the high risk quorum in number of gOHM based on current supply\n     * @return The high risk quorum in number of gOHM\n     */\n    function getHighRiskQuorumVotes() public view returns (uint256) {\n        return (gohm.totalSupply() * highRiskQuorum) / 100_000_000;\n    }\n\n    // --- GETTER FUNCTIONS: PROPOSAL ----------------------------------------------\n\n    /**\n     * @notice Gets the quorum required for a given proposal\n     * @param proposalId the id of the proposal\n     * @return The quorum required for the given proposal\n     */\n    function getProposalQuorum(uint256 proposalId) external view returns (uint256) {\n        return proposals[proposalId].quorumVotes;\n    }\n\n    /**\n     * @notice Gets the proposer votes threshold required for a given proposal\n     * @param proposalId the id of the proposal\n     * @return The proposer votes threshold required for the given proposal\n     */\n    function getProposalThreshold(uint256 proposalId) external view returns (uint256) {\n        return proposals[proposalId].proposalThreshold;\n    }\n\n    /**\n     * @notice Gets the eta value for a given proposal\n     * @param proposalId the id of the proposal\n     * @return The eta value for the given proposal\n     */\n    function getProposalEta(uint256 proposalId) external view returns (uint256) {\n        return proposals[proposalId].eta;\n    }\n\n    /**\n     * @notice Gets the against, for, and abstain votes for a given proposal\n     * @param proposalId the id of the proposal\n     * @return The against, for, and abstain votes for the given proposal\n     */\n    function getProposalVotes(\n        uint256 proposalId\n    ) external view returns (uint256, uint256, uint256) {\n        Proposal storage p = proposals[proposalId];\n        return (p.againstVotes, p.forVotes, p.abstainVotes);\n    }\n\n    /**\n     * @notice Gets actions of a proposal\n     * @param proposalId the id of the proposal\n     * @return targets of the proposal actions\n     * @return values of the proposal actions\n     * @return signatures of the proposal actions\n     * @return calldatas of the proposal actions\n     */\n    function getActions(\n        uint256 proposalId\n    )\n        external\n        view\n        returns (\n            address[] memory targets,\n            uint256[] memory values,\n            string[] memory signatures,\n            bytes[] memory calldatas\n        )\n    {\n        Proposal storage p = proposals[proposalId];\n        return (p.targets, p.values, p.signatures, p.calldatas);\n    }\n\n    /**\n     * @notice Gets the receipt for a voter on a given proposal\n     * @param proposalId the id of proposal\n     * @param voter The address of the voter\n     * @return The voting receipt\n     */\n    function getReceipt(uint256 proposalId, address voter) external view returns (Receipt memory) {\n        return proposals[proposalId].receipts[voter];\n    }\n\n    /**\n     * @notice Gets the voting outcome of the proposal\n     * @param proposalId the id of proposal\n     * @return The voting outcome\n     */\n    function getVoteOutcome(uint256 proposalId) public view returns (bool) {\n        Proposal storage proposal = proposals[proposalId];\n\n        if (proposal.forVotes == 0 && proposal.againstVotes == 0) {\n            return false;\n        } else if (\n            (proposal.forVotes * 100_000_000) / (proposal.forVotes + proposal.againstVotes) <\n            approvalThresholdPct ||\n            proposal.forVotes < proposal.quorumVotes\n        ) {\n            return false;\n        }\n\n        return true;\n    }\n\n    /**\n     * @notice Gets the state of a proposal\n     * @param proposalId The id of the proposal\n     * @return Proposal state\n     */\n    function state(uint256 proposalId) public view returns (ProposalState) {\n        if (proposalCount < proposalId) revert GovernorBravo_Proposal_IdInvalid();\n        Proposal storage proposal = proposals[proposalId];\n        if (\n            proposal.startBlock == 0 &&\n            proposal.proposer == vetoGuardian &&\n            proposal.targets.length > 0\n        ) {\n            // We want to short circuit the proposal state if it's an emergency proposal\n            // We do not want to leave the proposal in a perpetual pending state (or otherwise)\n            // where a user may be able to cancel or reuse it\n            return ProposalState.Emergency;\n        } else if (proposal.vetoed) {\n            return ProposalState.Vetoed;\n        } else if (proposal.canceled) {\n            return ProposalState.Canceled;\n        } else if (\n            block.number <= proposal.startBlock || !proposal.votingStarted || proposal.endBlock == 0\n        ) {\n            if (block.number > proposal.startBlock + activationGracePeriod) {\n                return ProposalState.Expired;\n            }\n\n            return ProposalState.Pending;\n        } else if (block.number <= proposal.endBlock) {\n            return ProposalState.Active;\n        } else if (!getVoteOutcome(proposalId)) {\n            return ProposalState.Defeated;\n        } else if (proposal.eta == 0) {\n            return ProposalState.Succeeded;\n        } else if (proposal.executed) {\n            return ProposalState.Executed;\n        } else if (block.timestamp >= proposal.eta + timelock.GRACE_PERIOD()) {\n            return ProposalState.Expired;\n        } else {\n            return ProposalState.Queued;\n        }\n    }\n}\n"
+    },
+    "src/external/governance/lib/ContractUtils.sol": {
+      "content": "// SPDX-License-Identifier: BSD-3-Clause\npragma solidity 0.8.15;\n\nlibrary ContractUtils {\n    /**\n     * @notice Gets the codehash for a given address\n     * @param target_ The address to get the codehash for\n     * @return The codehash\n     */\n    function getCodeHash(address target_) internal view returns (bytes32) {\n        bytes32 codehash;\n        assembly {\n            codehash := extcodehash(target_)\n        }\n        return codehash;\n    }\n}"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (utils/cryptography/ECDSA.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../Strings.sol\";\n\n/**\n * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.\n *\n * These functions can be used to verify that a message was signed by the holder\n * of the private keys of a given address.\n */\nlibrary ECDSA {\n    enum RecoverError {\n        NoError,\n        InvalidSignature,\n        InvalidSignatureLength,\n        InvalidSignatureS,\n        InvalidSignatureV // Deprecated in v4.8\n    }\n\n    function _throwError(RecoverError error) private pure {\n        if (error == RecoverError.NoError) {\n            return; // no error: do nothing\n        } else if (error == RecoverError.InvalidSignature) {\n            revert(\"ECDSA: invalid signature\");\n        } else if (error == RecoverError.InvalidSignatureLength) {\n            revert(\"ECDSA: invalid signature length\");\n        } else if (error == RecoverError.InvalidSignatureS) {\n            revert(\"ECDSA: invalid signature 's' value\");\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature` or error string. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     *\n     * Documentation for signature generation:\n     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]\n     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(bytes32 hash, bytes memory signature) internal pure returns (address, RecoverError) {\n        if (signature.length == 65) {\n            bytes32 r;\n            bytes32 s;\n            uint8 v;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            /// @solidity memory-safe-assembly\n            assembly {\n                r := mload(add(signature, 0x20))\n                s := mload(add(signature, 0x40))\n                v := byte(0, mload(add(signature, 0x60)))\n            }\n            return tryRecover(hash, v, r, s);\n        } else {\n            return (address(0), RecoverError.InvalidSignatureLength);\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature`. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     */\n    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, signature);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.\n     *\n     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address, RecoverError) {\n        bytes32 s = vs & bytes32(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);\n        uint8 v = uint8((uint256(vs) >> 255) + 27);\n        return tryRecover(hash, v, r, s);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.\n     *\n     * _Available since v4.2._\n     */\n    function recover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, r, vs);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address, RecoverError) {\n        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature\n        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most\n        // signatures from current libraries generate a unique signature with an s-value in the lower half order.\n        //\n        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value\n        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or\n        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept\n        // these malleable signatures as well.\n        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {\n            return (address(0), RecoverError.InvalidSignatureS);\n        }\n\n        // If the signature is valid (and not malleable), return the signer address\n        address signer = ecrecover(hash, v, r, s);\n        if (signer == address(0)) {\n            return (address(0), RecoverError.InvalidSignature);\n        }\n\n        return (signer, RecoverError.NoError);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function recover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from a `hash`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {\n        // 32 is the length in bytes of hash,\n        // enforced by the type signature above\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", hash));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from `s`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes memory s) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n\", Strings.toString(s.length), s));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Typed Data, created from a\n     * `domainSeparator` and a `structHash`. This produces hash corresponding\n     * to the one signed with the\n     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]\n     * JSON-RPC method as part of EIP-712.\n     *\n     * See {recover}.\n     */\n    function toTypedDataHash(bytes32 domainSeparator, bytes32 structHash) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19\\x01\", domainSeparator, structHash));\n    }\n}\n"
+    },
+    "src/interfaces/IgOHM.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0\npragma solidity 0.8.15;\n\nimport {IERC20} from \"src/external/OlympusERC20.sol\";\n\ninterface IgOHM is IERC20 {\n    function mint(address _to, uint256 _amount) external;\n\n    function burn(address _from, uint256 _amount) external;\n\n    function index() external view returns (uint256);\n\n    /**\n        @notice converts gOHM amount to OHM\n        @param _amount uint\n        @return uint\n     */\n    function balanceFrom(uint256 _amount) external view returns (uint256);\n\n    /**\n        @notice converts OHM amount to gOHM\n        @param _amount uint\n        @return uint\n     */\n    function balanceTo(uint256 _amount) external view returns (uint256);\n\n    function migrate(address _staking, address _sOHM) external;\n\n    function getPriorVotes(address account, uint256 blockNumber) external view returns (uint256);\n\n    function totalSupply() external view override returns (uint256);\n}\n"
+    },
+    "src/external/governance/interfaces/ITimelock.sol": {
+      "content": "// SPDX-License-Identifier: BSD-3-Clause\npragma solidity 0.8.15;\n\ninterface ITimelock {\n    function delay() external view returns (uint256);\n\n    function GRACE_PERIOD() external view returns (uint256);\n\n    function acceptAdmin() external;\n\n    function queuedTransactions(bytes32 hash) external view returns (bool);\n\n    function queueTransaction(\n        uint256 proposalId,\n        address target,\n        uint256 value,\n        string calldata signature,\n        bytes calldata data,\n        uint256 eta\n    ) external returns (bytes32);\n\n    function cancelTransaction(\n        uint256 proposalId,\n        address target,\n        uint256 value,\n        string calldata signature,\n        bytes calldata data,\n        uint256 eta\n    ) external;\n\n    function executeTransaction(\n        uint256 proposalId,\n        address target,\n        uint256 value,\n        string calldata signature,\n        bytes calldata data,\n        bytes32 codehash,\n        uint256 eta\n    ) external payable returns (bytes memory);\n}\n"
+    },
+    "src/external/governance/interfaces/IGovernorBravoEvents.sol": {
+      "content": "// SPDX-License-Identifier: BSD-3-Clause\npragma solidity 0.8.15;\n\ninterface IGovernorBravoEventsAndErrors {\n    // --- ERRORS ---------------------------------------------------------\n\n    // Admin Errors\n    error GovernorBravo_OnlyAdmin();\n    error GovernorBravo_OnlyPendingAdmin();\n    error GovernorBravo_OnlyVetoGuardian();\n    error GovernorBravo_AlreadyInitialized();\n    error GovernorBravo_NotActive();\n    error GovernorBravo_AddressZero();\n    error GovernorBravo_InvalidDelay();\n    error GovernorBravo_InvalidPeriod();\n    error GovernorBravo_InvalidGracePeriod();\n    error GovernorBravo_InvalidThreshold();\n    error GovernorBravo_InvalidCalldata();\n    error GovernorBravo_Emergency_SupplyTooLow();\n    error GovernorBravo_NotEmergency();\n    // Proposal Errors\n    error GovernorBravo_Proposal_ThresholdNotMet();\n    error GovernorBravo_Proposal_LengthMismatch();\n    error GovernorBravo_Proposal_NoActions();\n    error GovernorBravo_Proposal_TooManyActions();\n    error GovernorBravo_Proposal_AlreadyActive();\n    error GovernorBravo_Proposal_AlreadyPending();\n    error GovernorBravo_Proposal_IdCollision();\n    error GovernorBravo_Proposal_IdInvalid();\n    error GovernorBravo_Proposal_TooEarly();\n    error GovernorBravo_Proposal_AlreadyActivated();\n    // Voting Errors\n    error GovernorBravo_InvalidSignature();\n    error GovernorBravo_Vote_Closed();\n    error GovernorBravo_Vote_InvalidType();\n    error GovernorBravo_Vote_AlreadyCast();\n    // Workflow Errors\n    error GovernorBravo_Queue_FailedProposal();\n    error GovernorBravo_Queue_AlreadyQueued();\n    error GovernorBravo_Queue_BelowThreshold();\n    error GovernorBravo_Queue_VetoedProposal();\n    error GovernorBravo_Execute_NotQueued();\n    error GovernorBravo_Execute_BelowThreshold();\n    error GovernorBravo_Execute_VetoedProposal();\n    error GovernorBravo_Cancel_AlreadyExecuted();\n    error GovernorBravo_Cancel_WhitelistedProposer();\n    error GovernorBravo_Cancel_AboveThreshold();\n    error GovernorBravo_Veto_AlreadyExecuted();\n\n    // --- EVENTS ------------------------------------------------------------------\n\n    /// @notice An event emitted when a new proposal is created\n    event ProposalCreated(\n        uint256 id,\n        address proposer,\n        address[] targets,\n        uint256[] values,\n        string[] signatures,\n        bytes[] calldatas,\n        uint256 startBlock,\n        string description\n    );\n\n    /// @notice Event emitted when a proposal's voting period is activated\n    event ProposalVotingStarted(uint256 id);\n\n    /// @notice An event emitted when a vote has been cast on a proposal\n    /// @param voter The address which casted a vote\n    /// @param proposalId The proposal id which was voted on\n    /// @param support Support value for the vote. 0=against, 1=for, 2=abstain\n    /// @param votes Number of votes which were cast by the voter\n    /// @param reason The reason given for the vote by the voter\n    event VoteCast(\n        address indexed voter,\n        uint256 proposalId,\n        uint8 support,\n        uint256 votes,\n        string reason\n    );\n\n    /// @notice An event emitted when a proposal has been vetoed\n    event ProposalVetoed(uint256 id);\n\n    /// @notice An event emitted when a proposal has been canceled\n    event ProposalCanceled(uint256 id);\n\n    /// @notice An event emitted when a proposal has been queued in the Timelock\n    event ProposalQueued(uint256 id, uint256 eta);\n\n    /// @notice An event emitted when a proposal has been executed in the Timelock\n    event ProposalExecuted(uint256 id);\n\n    /// @notice An event emitted when the voting delay is set\n    event VotingDelaySet(uint256 oldVotingDelay, uint256 newVotingDelay);\n\n    /// @notice An event emitted when the voting period is set\n    event VotingPeriodSet(uint256 oldVotingPeriod, uint256 newVotingPeriod);\n\n    /// @notice Emitted when implementation is changed\n    event NewImplementation(address oldImplementation, address newImplementation);\n\n    /// @notice Emitted when proposal threshold is set\n    event ProposalThresholdSet(uint256 oldProposalThreshold, uint256 newProposalThreshold);\n\n    /// @notice Emitted when pendingAdmin is changed\n    event NewPendingAdmin(address oldPendingAdmin, address newPendingAdmin);\n\n    /// @notice Emitted when pendingAdmin is accepted, which means admin is updated\n    event NewAdmin(address oldAdmin, address newAdmin);\n\n    /// @notice Emitted when whitelist account expiration is set\n    event WhitelistAccountExpirationSet(address account, uint256 expiration);\n\n    /// @notice Emitted when the whitelistGuardian is set\n    event WhitelistGuardianSet(address oldGuardian, address newGuardian);\n\n    /// @notice Emitted when the vetoGuardian is set\n    event VetoGuardianSet(address oldGuardian, address newGuardian);\n}\n"
+    },
+    "src/external/governance/abstracts/GovernorBravoStorage.sol": {
+      "content": "// SPDX-License-Identifier: BSD-3-Clause\npragma solidity 0.8.15;\n\nimport {IgOHM} from \"src/interfaces/IgOHM.sol\";\nimport {ITimelock} from \"../interfaces/ITimelock.sol\";\nimport \"src/Kernel.sol\";\n\nabstract contract GovernorBravoDelegatorStorage {\n    // --- PROXY STATE VARIABLES ---------------------------------------------------\n\n    /// @notice Administrator for this contract\n    address public admin;\n\n    /// @notice Pending administrator for this contract\n    address public pendingAdmin;\n\n    /// @notice Active brains of Governor\n    address public implementation;\n}\n\n/**\n * @title Storage for Governor Bravo Delegate\n * @notice For future upgrades, do not change GovernorBravoDelegateStorageV1. Create a new\n * contract which implements GovernorBravoDelegateStorageV1 and following the naming convention\n * GovernorBravoDelegateStorageVX.\n */\nabstract contract GovernorBravoDelegateStorageV1 is GovernorBravoDelegatorStorage {\n    // --- DATA STRUCTURES ---------------------------------------------------------\n\n    struct Proposal {\n        /// @notice Unique id for looking up a proposal\n        uint256 id;\n        /// @notice Creator of the proposal\n        address proposer;\n        /// @notice The proposal balance threshold that the proposer must stay above to keep their proposal active\n        uint256 proposalThreshold;\n        /// @notice The quorum for this proposal based on gOHM total supply at the time of proposal creation\n        uint256 quorumVotes;\n        /// @notice The timestamp that the proposal will be available for execution, set once the vote succeeds\n        uint256 eta;\n        /// @notice the ordered list of target addresses for calls to be made\n        address[] targets;\n        /// @notice The ordered list of values (i.e. msg.value) to be passed to the calls to be made\n        uint256[] values;\n        /// @notice The ordered list of function signatures to be called\n        string[] signatures;\n        /// @notice The ordered list of calldata to be passed to each call\n        bytes[] calldatas;\n        /// @notice The codehash for each target contract\n        bytes32[] codehashes;\n        /// @notice The block at which voting begins: holders must delegate their votes prior to this block\n        uint256 startBlock;\n        /// @notice The block at which voting ends: votes must be cast prior to this block\n        uint256 endBlock;\n        /// @notice Current number of votes in favor of this proposal\n        uint256 forVotes;\n        /// @notice Current number of votes in opposition to this proposal\n        uint256 againstVotes;\n        /// @notice Current number of votes for abstaining for this proposal\n        uint256 abstainVotes;\n        /// @notice Flag marking whether the voting period for a proposal has been activated\n        bool votingStarted;\n        /// @notice Flag marking whether the proposal has been vetoed\n        bool vetoed;\n        /// @notice Flag marking whether the proposal has been canceled\n        bool canceled;\n        /// @notice Flag marking whether the proposal has been executed\n        bool executed;\n        /// @notice Receipts of ballots for the entire set of voters\n        mapping(address => Receipt) receipts;\n    }\n\n    /// @notice Ballot receipt record for a voter\n    struct Receipt {\n        /// @notice Whether or not a vote has been cast\n        bool hasVoted;\n        /// @notice Whether or not the voter supports the proposal or abstains\n        uint8 support;\n        /// @notice The number of votes the voter had, which were cast\n        uint256 votes;\n    }\n\n    /// @notice Possible states that a proposal may be in\n    enum ProposalState {\n        Pending,\n        Active,\n        Canceled,\n        Defeated,\n        Succeeded,\n        Queued,\n        Expired,\n        Executed,\n        Vetoed,\n        Emergency\n    }\n\n    // --- STATE VARIABLES ---------------------------------------------------------\n\n    /// @notice The delay before voting on a proposal may take place, once proposed, in blocks\n    uint256 public votingDelay;\n\n    /// @notice The duration of voting on a proposal, in blocks\n    uint256 public votingPeriod;\n\n    /// @notice The grace period after the voting delay through which a proposal may be activated\n    uint256 public activationGracePeriod;\n\n    /// @notice The percentage of total supply required in order for a voter to become a proposer\n    /// @dev    Out of 1000\n    uint256 public proposalThreshold;\n\n    /// @notice The total number of proposals\n    uint256 public proposalCount;\n\n    /// @notice The address of the Olympus Protocol Timelock\n    ITimelock public timelock;\n\n    /// @notice The address of the Olympus governance token\n    IgOHM public gohm;\n\n    /// @notice The official record of all proposals ever proposed\n    mapping(uint256 => Proposal) public proposals;\n\n    /// @notice The latest proposal for each proposer\n    mapping(address => uint256) public latestProposalIds;\n}\n\nabstract contract GovernorBravoDelegateStorageV2 is GovernorBravoDelegateStorageV1 {\n    // --- STATE VARIABLES ---------------------------------------------------------\n\n    /// @notice Modules in the Default system that are considered high risk\n    /// @dev    In Default Framework, Keycodes are used to uniquely identify modules. They are a\n    ///         wrapper over the bytes5 data type, and allow us to easily check if a proposal is\n    ///         touching any specific modules\n    mapping(Keycode => bool) public isKeycodeHighRisk;\n\n    /// @notice Address which has veto power over all proposals\n    address public vetoGuardian;\n\n    /// @notice The central hub of the Default Framework system that manages modules and policies\n    /// @dev    Used in this adaptation of Governor Bravo to identify high risk proposals\n    address public kernel;\n}\n"
+    },
+    "src/Kernel.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\n//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████\n//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███\n//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░\n// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████\n// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███\n// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███\n//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████\n//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░\n\n//============================================================================================//\n//                                        GLOBAL TYPES                                        //\n//============================================================================================//\n\n/// @notice Actions to trigger state changes in the kernel. Passed by the executor\nenum Actions {\n    InstallModule,\n    UpgradeModule,\n    ActivatePolicy,\n    DeactivatePolicy,\n    ChangeExecutor,\n    MigrateKernel\n}\n\n/// @notice Used by executor to select an action and a target contract for a kernel action\nstruct Instruction {\n    Actions action;\n    address target;\n}\n\n/// @notice Used to define which module functions a policy needs access to\nstruct Permissions {\n    Keycode keycode;\n    bytes4 funcSelector;\n}\n\ntype Keycode is bytes5;\n\n//============================================================================================//\n//                                       UTIL FUNCTIONS                                       //\n//============================================================================================//\n\nerror TargetNotAContract(address target_);\nerror InvalidKeycode(Keycode keycode_);\n\n// solhint-disable-next-line func-visibility\nfunction toKeycode(bytes5 keycode_) pure returns (Keycode) {\n    return Keycode.wrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction fromKeycode(Keycode keycode_) pure returns (bytes5) {\n    return Keycode.unwrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureContract(address target_) view {\n    if (target_.code.length == 0) revert TargetNotAContract(target_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureValidKeycode(Keycode keycode_) pure {\n    bytes5 unwrapped = Keycode.unwrap(keycode_);\n    for (uint256 i = 0; i < 5; ) {\n        bytes1 char = unwrapped[i];\n        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only\n        unchecked {\n            i++;\n        }\n    }\n}\n\n//============================================================================================//\n//                                        COMPONENTS                                          //\n//============================================================================================//\n\n/// @notice Generic adapter interface for kernel access in modules and policies.\nabstract contract KernelAdapter {\n    error KernelAdapter_OnlyKernel(address caller_);\n\n    Kernel public kernel;\n\n    constructor(Kernel kernel_) {\n        kernel = kernel_;\n    }\n\n    /// @notice Modifier to restrict functions to be called only by kernel.\n    modifier onlyKernel() {\n        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);\n        _;\n    }\n\n    /// @notice Function used by kernel when migrating to a new kernel.\n    function changeKernel(Kernel newKernel_) external onlyKernel {\n        kernel = newKernel_;\n    }\n}\n\n/// @notice Base level extension of the kernel. Modules act as independent state components to be\n///         interacted with and mutated through policies.\n/// @dev    Modules are installed and uninstalled via the executor.\nabstract contract Module is KernelAdapter {\n    error Module_PolicyNotPermitted(address policy_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Modifier to restrict which policies have access to module functions.\n    modifier permissioned() {\n        if (\n            msg.sender == address(kernel) ||\n            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)\n        ) revert Module_PolicyNotPermitted(msg.sender);\n        _;\n    }\n\n    /// @notice 5 byte identifier for a module.\n    function KEYCODE() public pure virtual returns (Keycode) {}\n\n    /// @notice Returns which semantic version of a module is being implemented.\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}\n\n    /// @notice Initialization function for the module\n    /// @dev    This function is called when the module is installed or upgraded by the kernel.\n    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.\n    function INIT() external virtual onlyKernel {}\n}\n\n/// @notice Policies are application logic and external interface for the kernel and installed modules.\n/// @dev    Policies are activated and deactivated in the kernel by the executor.\n/// @dev    Module dependencies and function permissions must be defined in appropriate functions.\nabstract contract Policy is KernelAdapter {\n    error Policy_ModuleDoesNotExist(Keycode keycode_);\n    error Policy_WrongModuleVersion(bytes expected_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Easily accessible indicator for if a policy is activated or not.\n    function isActive() external view returns (bool) {\n        return kernel.isPolicyActive(this);\n    }\n\n    /// @notice Function to grab module address from a given keycode.\n    function getModuleAddress(Keycode keycode_) internal view returns (address) {\n        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));\n        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);\n        return moduleForKeycode;\n    }\n\n    /// @notice Define module dependencies for this policy.\n    /// @return dependencies - Keycode array of module dependencies.\n    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}\n\n    /// @notice Function called by kernel to set module function permissions.\n    /// @return requests - Array of keycodes and function selectors for requested permissions.\n    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}\n}\n\n/// @notice Main contract that acts as a central component registry for the protocol.\n/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,\n/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.\ncontract Kernel {\n    // =========  EVENTS ========= //\n\n    event PermissionsUpdated(\n        Keycode indexed keycode_,\n        Policy indexed policy_,\n        bytes4 funcSelector_,\n        bool granted_\n    );\n    event ActionExecuted(Actions indexed action_, address indexed target_);\n\n    // =========  ERRORS ========= //\n\n    error Kernel_OnlyExecutor(address caller_);\n    error Kernel_ModuleAlreadyInstalled(Keycode module_);\n    error Kernel_InvalidModuleUpgrade(Keycode module_);\n    error Kernel_PolicyAlreadyActivated(address policy_);\n    error Kernel_PolicyNotActivated(address policy_);\n\n    // =========  PRIVILEGED ADDRESSES ========= //\n\n    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.\n    address public executor;\n\n    // =========  MODULE MANAGEMENT ========= //\n\n    /// @notice Array of all modules currently installed.\n    Keycode[] public allKeycodes;\n\n    /// @notice Mapping of module address to keycode.\n    mapping(Keycode => Module) public getModuleForKeycode;\n\n    /// @notice Mapping of keycode to module address.\n    mapping(Module => Keycode) public getKeycodeForModule;\n\n    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.\n    mapping(Keycode => Policy[]) public moduleDependents;\n\n    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.\n    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;\n\n    /// @notice Module <> Policy Permissions.\n    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission\n    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;\n\n    // =========  POLICY MANAGEMENT ========= //\n\n    /// @notice List of all active policies\n    Policy[] public activePolicies;\n\n    /// @notice Helper to get active policy quickly. Prevents need to loop through array.\n    mapping(Policy => uint256) public getPolicyIndex;\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    constructor() {\n        executor = msg.sender;\n    }\n\n    /// @notice Modifier to check if caller is the executor.\n    modifier onlyExecutor() {\n        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);\n        _;\n    }\n\n    function isPolicyActive(Policy policy_) public view returns (bool) {\n        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;\n    }\n\n    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.\n    function executeAction(Actions action_, address target_) external onlyExecutor {\n        if (action_ == Actions.InstallModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _installModule(Module(target_));\n        } else if (action_ == Actions.UpgradeModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _upgradeModule(Module(target_));\n        } else if (action_ == Actions.ActivatePolicy) {\n            ensureContract(target_);\n            _activatePolicy(Policy(target_));\n        } else if (action_ == Actions.DeactivatePolicy) {\n            ensureContract(target_);\n            _deactivatePolicy(Policy(target_));\n        } else if (action_ == Actions.ChangeExecutor) {\n            executor = target_;\n        } else if (action_ == Actions.MigrateKernel) {\n            ensureContract(target_);\n            _migrateKernel(Kernel(target_));\n        }\n\n        emit ActionExecuted(action_, target_);\n    }\n\n    function _installModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n\n        if (address(getModuleForKeycode[keycode]) != address(0))\n            revert Kernel_ModuleAlreadyInstalled(keycode);\n\n        getModuleForKeycode[keycode] = newModule_;\n        getKeycodeForModule[newModule_] = keycode;\n        allKeycodes.push(keycode);\n\n        newModule_.INIT();\n    }\n\n    function _upgradeModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n        Module oldModule = getModuleForKeycode[keycode];\n\n        if (address(oldModule) == address(0) || oldModule == newModule_)\n            revert Kernel_InvalidModuleUpgrade(keycode);\n\n        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));\n        getKeycodeForModule[newModule_] = keycode;\n        getModuleForKeycode[keycode] = newModule_;\n\n        newModule_.INIT();\n\n        _reconfigurePolicies(keycode);\n    }\n\n    function _activatePolicy(Policy policy_) internal {\n        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));\n\n        // Add policy to list of active policies\n        activePolicies.push(policy_);\n        getPolicyIndex[policy_] = activePolicies.length - 1;\n\n        // Record module dependencies\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depLength = dependencies.length;\n\n        for (uint256 i; i < depLength; ) {\n            Keycode keycode = dependencies[i];\n\n            moduleDependents[keycode].push(policy_);\n            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        // Grant permissions for policy to access restricted module functions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, true);\n    }\n\n    function _deactivatePolicy(Policy policy_) internal {\n        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));\n\n        // Revoke permissions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, false);\n\n        // Remove policy from all policy data structures\n        uint256 idx = getPolicyIndex[policy_];\n        Policy lastPolicy = activePolicies[activePolicies.length - 1];\n\n        activePolicies[idx] = lastPolicy;\n        activePolicies.pop();\n        getPolicyIndex[lastPolicy] = idx;\n        delete getPolicyIndex[policy_];\n\n        // Remove policy from module dependents\n        _pruneFromDependents(policy_);\n    }\n\n    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.\n    /// @dev    New kernel must add in all of the modules and policies via executeAction.\n    /// @dev    NOTE: Data does not get cleared from this kernel.\n    function _migrateKernel(Kernel newKernel_) internal {\n        uint256 keycodeLen = allKeycodes.length;\n        for (uint256 i; i < keycodeLen; ) {\n            Module module = Module(getModuleForKeycode[allKeycodes[i]]);\n            module.changeKernel(newKernel_);\n            unchecked {\n                ++i;\n            }\n        }\n\n        uint256 policiesLen = activePolicies.length;\n        for (uint256 j; j < policiesLen; ) {\n            Policy policy = activePolicies[j];\n\n            // Deactivate before changing kernel\n            policy.changeKernel(newKernel_);\n            unchecked {\n                ++j;\n            }\n        }\n    }\n\n    function _reconfigurePolicies(Keycode keycode_) internal {\n        Policy[] memory dependents = moduleDependents[keycode_];\n        uint256 depLength = dependents.length;\n\n        for (uint256 i; i < depLength; ) {\n            dependents[i].configureDependencies();\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _setPolicyPermissions(\n        Policy policy_,\n        Permissions[] memory requests_,\n        bool grant_\n    ) internal {\n        uint256 reqLength = requests_.length;\n        for (uint256 i = 0; i < reqLength; ) {\n            Permissions memory request = requests_[i];\n            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;\n\n            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _pruneFromDependents(Policy policy_) internal {\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depcLength = dependencies.length;\n\n        for (uint256 i; i < depcLength; ) {\n            Keycode keycode = dependencies[i];\n            Policy[] storage dependents = moduleDependents[keycode];\n\n            uint256 origIndex = getDependentIndex[keycode][policy_];\n            Policy lastPolicy = dependents[dependents.length - 1];\n\n            // Swap with last and pop\n            dependents[origIndex] = lastPolicy;\n            dependents.pop();\n\n            // Record new index and delete deactivated policy index\n            getDependentIndex[keycode][lastPolicy] = origIndex;\n            delete getDependentIndex[keycode][policy_];\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/Strings.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (utils/Strings.sol)\n\npragma solidity ^0.8.0;\n\nimport \"./math/Math.sol\";\n\n/**\n * @dev String operations.\n */\nlibrary Strings {\n    bytes16 private constant _SYMBOLS = \"0123456789abcdef\";\n    uint8 private constant _ADDRESS_LENGTH = 20;\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` decimal representation.\n     */\n    function toString(uint256 value) internal pure returns (string memory) {\n        unchecked {\n            uint256 length = Math.log10(value) + 1;\n            string memory buffer = new string(length);\n            uint256 ptr;\n            /// @solidity memory-safe-assembly\n            assembly {\n                ptr := add(buffer, add(32, length))\n            }\n            while (true) {\n                ptr--;\n                /// @solidity memory-safe-assembly\n                assembly {\n                    mstore8(ptr, byte(mod(value, 10), _SYMBOLS))\n                }\n                value /= 10;\n                if (value == 0) break;\n            }\n            return buffer;\n        }\n    }\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.\n     */\n    function toHexString(uint256 value) internal pure returns (string memory) {\n        unchecked {\n            return toHexString(value, Math.log256(value) + 1);\n        }\n    }\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.\n     */\n    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {\n        bytes memory buffer = new bytes(2 * length + 2);\n        buffer[0] = \"0\";\n        buffer[1] = \"x\";\n        for (uint256 i = 2 * length + 1; i > 1; --i) {\n            buffer[i] = _SYMBOLS[value & 0xf];\n            value >>= 4;\n        }\n        require(value == 0, \"Strings: hex length insufficient\");\n        return string(buffer);\n    }\n\n    /**\n     * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal representation.\n     */\n    function toHexString(address addr) internal pure returns (string memory) {\n        return toHexString(uint256(uint160(addr)), _ADDRESS_LENGTH);\n    }\n}\n"
+    },
+    "src/external/OlympusERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity >=0.7.5;\n\n/// @notice Olympus OHM token\n/// @dev This contract is the legacy v2 OHM token. Included in the repo for completeness,\n///      since it is not being changed and is imported in some contracts.\n\ninterface IOlympusAuthority {\n    // =========  EVENTS ========= //\n\n    event GovernorPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event GuardianPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event PolicyPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event VaultPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n\n    event GovernorPulled(address indexed from, address indexed to);\n    event GuardianPulled(address indexed from, address indexed to);\n    event PolicyPulled(address indexed from, address indexed to);\n    event VaultPulled(address indexed from, address indexed to);\n\n    // =========  VIEW ========= //\n\n    function governor() external view returns (address);\n\n    function guardian() external view returns (address);\n\n    function policy() external view returns (address);\n\n    function vault() external view returns (address);\n}\n\n// File: types/OlympusAccessControlled.sol\n\nabstract contract OlympusAccessControlled {\n    // =========  EVENTS ========= //\n\n    event AuthorityUpdated(IOlympusAuthority indexed authority);\n\n    string internal UNAUTHORIZED = \"UNAUTHORIZED\"; // save gas\n\n    // =========  STATE VARIABLES ========= //\n\n    IOlympusAuthority public authority;\n\n    // =========  Constructor ========= //\n\n    constructor(IOlympusAuthority _authority) {\n        authority = _authority;\n        emit AuthorityUpdated(_authority);\n    }\n\n    // =========  MODIFIERS ========= //\n\n    modifier onlyGovernor() {\n        require(msg.sender == authority.governor(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyGuardian() {\n        require(msg.sender == authority.guardian(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyPermitted() {\n        require(msg.sender == authority.policy(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyVault() {\n        require(msg.sender == authority.vault(), UNAUTHORIZED);\n        _;\n    }\n\n    // =========  GOV ONLY ========= //\n\n    function setAuthority(IOlympusAuthority _newAuthority) external onlyGovernor {\n        authority = _newAuthority;\n        emit AuthorityUpdated(_newAuthority);\n    }\n}\n\n// File: cryptography/ECDSA.sol\n\n/**\n * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.\n *\n * These functions can be used to verify that a message was signed by the holder\n * of the private keys of a given address.\n */\nlibrary ECDSA {\n    enum RecoverError {\n        NoError,\n        InvalidSignature,\n        InvalidSignatureLength,\n        InvalidSignatureS,\n        InvalidSignatureV\n    }\n\n    function _throwError(RecoverError error) private pure {\n        if (error == RecoverError.NoError) {\n            return; // no error: do nothing\n        } else if (error == RecoverError.InvalidSignature) {\n            revert(\"ECDSA: invalid signature\");\n        } else if (error == RecoverError.InvalidSignatureLength) {\n            revert(\"ECDSA: invalid signature length\");\n        } else if (error == RecoverError.InvalidSignatureS) {\n            revert(\"ECDSA: invalid signature 's' value\");\n        } else if (error == RecoverError.InvalidSignatureV) {\n            revert(\"ECDSA: invalid signature 'v' value\");\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature` or error string. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     *\n     * Documentation for signature generation:\n     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]\n     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes memory signature\n    ) internal pure returns (address, RecoverError) {\n        // Check the signature length\n        // - case 65: r,s,v signature (standard)\n        // - case 64: r,vs signature (cf https://eips.ethereum.org/EIPS/eip-2098) _Available since v4.1._\n        if (signature.length == 65) {\n            bytes32 r;\n            bytes32 s;\n            uint8 v;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                s := mload(add(signature, 0x40))\n                v := byte(0, mload(add(signature, 0x60)))\n            }\n            return tryRecover(hash, v, r, s);\n        } else if (signature.length == 64) {\n            bytes32 r;\n            bytes32 vs;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                vs := mload(add(signature, 0x40))\n            }\n            return tryRecover(hash, r, vs);\n        } else {\n            return (address(0), RecoverError.InvalidSignatureLength);\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature`. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     */\n    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, signature);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.\n     *\n     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address, RecoverError) {\n        bytes32 s;\n        uint8 v;\n        assembly {\n            s := and(vs, 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)\n            v := add(shr(255, vs), 27)\n        }\n        return tryRecover(hash, v, r, s);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.\n     *\n     * _Available since v4.2._\n     */\n    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, r, vs);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address, RecoverError) {\n        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature\n        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most\n        // signatures from current libraries generate a unique signature with an s-value in the lower half order.\n        //\n        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value\n        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or\n        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept\n        // these malleable signatures as well.\n        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {\n            return (address(0), RecoverError.InvalidSignatureS);\n        }\n        if (v != 27 && v != 28) {\n            return (address(0), RecoverError.InvalidSignatureV);\n        }\n\n        // If the signature is valid (and not malleable), return the signer address\n        address signer = ecrecover(hash, v, r, s);\n        if (signer == address(0)) {\n            return (address(0), RecoverError.InvalidSignature);\n        }\n\n        return (signer, RecoverError.NoError);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from a `hash`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {\n        // 32 is the length in bytes of hash,\n        // enforced by the type signature above\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", hash));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Typed Data, created from a\n     * `domainSeparator` and a `structHash`. This produces hash corresponding\n     * to the one signed with the\n     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]\n     * JSON-RPC method as part of EIP-712.\n     *\n     * See {recover}.\n     */\n    function toTypedDataHash(\n        bytes32 domainSeparator,\n        bytes32 structHash\n    ) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19\\x01\", domainSeparator, structHash));\n    }\n}\n\n// File: cryptography/EIP712.sol\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.\n *\n * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,\n * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding\n * they need in their contracts using a combination of `abi.encode` and `keccak256`.\n *\n * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding\n * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA\n * ({_hashTypedDataV4}).\n *\n * The implementation of the domain separator was designed to be as efficient as possible while still properly updating\n * the chain id to protect against replay attacks on an eventual fork of the chain.\n *\n * NOTE: This contract implements the version of the encoding known as \"v4\", as implemented by the JSON RPC method\n * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].\n *\n * _Available since v3.4._\n */\nabstract contract EIP712 {\n    /* solhint-disable var-name-mixedcase */\n    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to\n    // invalidate the cached domain separator if the chain id changes.\n    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;\n    uint256 private immutable _CACHED_CHAIN_ID;\n\n    bytes32 private immutable _HASHED_NAME;\n    bytes32 private immutable _HASHED_VERSION;\n    bytes32 private immutable _TYPE_HASH;\n\n    /* solhint-enable var-name-mixedcase */\n\n    /**\n     * @dev Initializes the domain separator and parameter caches.\n     *\n     * The meaning of `name` and `version` is specified in\n     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:\n     *\n     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.\n     * - `version`: the current major version of the signing domain.\n     *\n     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart\n     * contract upgrade].\n     */\n    constructor(string memory name, string memory version) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        bytes32 hashedName = keccak256(bytes(name));\n        bytes32 hashedVersion = keccak256(bytes(version));\n        bytes32 typeHash = keccak256(\n            \"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"\n        );\n        _HASHED_NAME = hashedName;\n        _HASHED_VERSION = hashedVersion;\n        _CACHED_CHAIN_ID = chainID;\n        _CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator(typeHash, hashedName, hashedVersion);\n        _TYPE_HASH = typeHash;\n    }\n\n    /**\n     * @dev Returns the domain separator for the current chain.\n     */\n    function _domainSeparatorV4() internal view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        if (chainID == _CACHED_CHAIN_ID) {\n            return _CACHED_DOMAIN_SEPARATOR;\n        } else {\n            return _buildDomainSeparator(_TYPE_HASH, _HASHED_NAME, _HASHED_VERSION);\n        }\n    }\n\n    function _buildDomainSeparator(\n        bytes32 typeHash,\n        bytes32 nameHash,\n        bytes32 versionHash\n    ) private view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        return keccak256(abi.encode(typeHash, nameHash, versionHash, chainID, address(this)));\n    }\n\n    /**\n     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this\n     * function returns the hash of the fully encoded EIP712 message for this domain.\n     *\n     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:\n     *\n     * ```solidity\n     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(\n     *     keccak256(\"Mail(address to,string contents)\"),\n     *     mailTo,\n     *     keccak256(bytes(mailContents))\n     * )));\n     * address signer = ECDSA.recover(digest, signature);\n     * ```\n     */\n    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {\n        return ECDSA.toTypedDataHash(_domainSeparatorV4(), structHash);\n    }\n}\n\n// File: interfaces/IERC20Permit.sol\n\n/**\n * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n */\ninterface IERC20Permit {\n    /**\n     * @dev Sets `value` as th xe allowance of `spender` over ``owner``'s tokens,\n     * given ``owner``'s signed approval.\n     *\n     * IMPORTANT: The same issues {IERC20-approve} has related to transaction\n     * ordering also apply here.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `deadline` must be a timestamp in the future.\n     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`\n     * over the EIP712-formatted function arguments.\n     * - the signature must use ``owner``'s current nonce (see {nonces}).\n     *\n     * For more information on the signature format, see the\n     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP\n     * section].\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n\n    /**\n     * @dev Returns the current nonce for `owner`. This value must be\n     * included whenever a signature is generated for {permit}.\n     *\n     * Every successful call to {permit} increases ``owner``'s nonce by one. This\n     * prevents a signature from being used multiple times.\n     */\n    function nonces(address owner) external view returns (uint256);\n\n    /**\n     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n}\n\n// File: interfaces/IERC20.sol\n\ninterface IERC20 {\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `recipient`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address recipient, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `sender` to `recipient` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) external returns (bool);\n\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n\n// File: interfaces/IOHM.sol\n\ninterface IOHM is IERC20 {\n    function mint(address account_, uint256 amount_) external;\n\n    function burn(uint256 amount) external;\n\n    function burnFrom(address account_, uint256 amount_) external;\n}\n\n// File: libraries/SafeMath.sol\n\nlibrary SafeMath {\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        uint256 c = a + b;\n        require(c >= a, \"SafeMath: addition overflow\");\n\n        return c;\n    }\n\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return sub(a, b, \"SafeMath: subtraction overflow\");\n    }\n\n    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b <= a, errorMessage);\n        uint256 c = a - b;\n\n        return c;\n    }\n\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        uint256 c = a * b;\n        require(c / a == b, \"SafeMath: multiplication overflow\");\n\n        return c;\n    }\n\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        return div(a, b, \"SafeMath: division by zero\");\n    }\n\n    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        uint256 c = a / b;\n        assert(a == b * c + (a % b)); // There is no case in which this doesn't hold\n\n        return c;\n    }\n\n    // Only used in the  BondingCalculator.sol\n    function sqrrt(uint256 a) internal pure returns (uint256 c) {\n        if (a > 3) {\n            c = a;\n            uint256 b = add(div(a, 2), 1);\n            while (b < c) {\n                c = b;\n                b = div(add(div(a, b), b), 2);\n            }\n        } else if (a != 0) {\n            c = 1;\n        }\n    }\n}\n\n// File: libraries/Counters.sol\n\nlibrary Counters {\n    using SafeMath for uint256;\n\n    struct Counter {\n        // This variable should never be directly accessed by users of the library: interactions must be restricted to\n        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add\n        // this feature: see https://github.com/ethereum/solidity/issues/4637\n        uint256 _value; // default: 0\n    }\n\n    function current(Counter storage counter) internal view returns (uint256) {\n        return counter._value;\n    }\n\n    function increment(Counter storage counter) internal {\n        // The {SafeMath} overflow check can be skipped here, see the comment at the top\n        counter._value += 1;\n    }\n\n    function decrement(Counter storage counter) internal {\n        counter._value = counter._value.sub(1);\n    }\n}\n\n// File: types/ERC20.sol\n\nabstract contract ERC20 is IERC20 {\n    using SafeMath for uint256;\n\n    // TODO comment actual hash value.\n    bytes32 private constant ERC20TOKEN_ERC1820_INTERFACE_ID = keccak256(\"ERC20Token\");\n\n    mapping(address => uint256) internal _balances;\n\n    mapping(address => mapping(address => uint256)) internal _allowances;\n\n    uint256 internal _totalSupply;\n\n    string internal _name;\n\n    string internal _symbol;\n\n    uint8 internal immutable _decimals;\n\n    constructor(string memory name_, string memory symbol_, uint8 decimals_) {\n        _name = name_;\n        _symbol = symbol_;\n        _decimals = decimals_;\n    }\n\n    function name() public view returns (string memory) {\n        return _name;\n    }\n\n    function symbol() public view returns (string memory) {\n        return _symbol;\n    }\n\n    function decimals() public view virtual returns (uint8) {\n        return _decimals;\n    }\n\n    function totalSupply() public view override returns (uint256) {\n        return _totalSupply;\n    }\n\n    function balanceOf(address account) public view virtual override returns (uint256) {\n        return _balances[account];\n    }\n\n    function transfer(address recipient, uint256 amount) public virtual override returns (bool) {\n        _transfer(msg.sender, recipient, amount);\n        return true;\n    }\n\n    function allowance(\n        address owner,\n        address spender\n    ) public view virtual override returns (uint256) {\n        return _allowances[owner][spender];\n    }\n\n    function approve(address spender, uint256 amount) public virtual override returns (bool) {\n        _approve(msg.sender, spender, amount);\n        return true;\n    }\n\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) public virtual override returns (bool) {\n        _transfer(sender, recipient, amount);\n        _approve(\n            sender,\n            msg.sender,\n            _allowances[sender][msg.sender].sub(amount, \"ERC20: transfer amount exceeds allowance\")\n        );\n        return true;\n    }\n\n    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {\n        _approve(msg.sender, spender, _allowances[msg.sender][spender].add(addedValue));\n        return true;\n    }\n\n    function decreaseAllowance(\n        address spender,\n        uint256 subtractedValue\n    ) public virtual returns (bool) {\n        _approve(\n            msg.sender,\n            spender,\n            _allowances[msg.sender][spender].sub(\n                subtractedValue,\n                \"ERC20: decreased allowance below zero\"\n            )\n        );\n        return true;\n    }\n\n    function _transfer(address sender, address recipient, uint256 amount) internal virtual {\n        require(sender != address(0), \"ERC20: transfer from the zero address\");\n        require(recipient != address(0), \"ERC20: transfer to the zero address\");\n\n        _beforeTokenTransfer(sender, recipient, amount);\n\n        _balances[sender] = _balances[sender].sub(amount, \"ERC20: transfer amount exceeds balance\");\n        _balances[recipient] = _balances[recipient].add(amount);\n        emit Transfer(sender, recipient, amount);\n    }\n\n    function _mint(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: mint to the zero address\");\n        _beforeTokenTransfer(address(0), account, amount);\n        _totalSupply = _totalSupply.add(amount);\n        _balances[account] = _balances[account].add(amount);\n        emit Transfer(address(0), account, amount);\n    }\n\n    function _burn(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: burn from the zero address\");\n\n        _beforeTokenTransfer(account, address(0), amount);\n\n        _balances[account] = _balances[account].sub(amount, \"ERC20: burn amount exceeds balance\");\n        _totalSupply = _totalSupply.sub(amount);\n        emit Transfer(account, address(0), amount);\n    }\n\n    function _approve(address owner, address spender, uint256 amount) internal virtual {\n        require(owner != address(0), \"ERC20: approve from the zero address\");\n        require(spender != address(0), \"ERC20: approve to the zero address\");\n\n        _allowances[owner][spender] = amount;\n        emit Approval(owner, spender, amount);\n    }\n\n    function _beforeTokenTransfer(address from_, address to_, uint256 amount_) internal virtual {}\n}\n\n// File: types/ERC20Permit.sol\n\n/**\n * @dev Implementation of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on `{IERC20-approve}`, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n *\n * _Available since v3.4._\n */\nabstract contract ERC20Permit is ERC20, IERC20Permit, EIP712 {\n    using Counters for Counters.Counter;\n\n    mapping(address => Counters.Counter) private _nonces;\n\n    // solhint-disable-next-line var-name-mixedcase\n    bytes32 private immutable _PERMIT_TYPEHASH =\n        keccak256(\n            \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n        );\n\n    /**\n     * @dev Initializes the {EIP712} domain separator using the `name` parameter, and setting `version` to `\"1\"`.\n     *\n     * It's a good idea to use the same `name` that is defined as the ERC20 token name.\n     */\n    constructor(string memory name) EIP712(name, \"1\") {}\n\n    /**\n     * @dev See {IERC20Permit-permit}.\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual override {\n        require(block.timestamp <= deadline, \"ERC20Permit: expired deadline\");\n\n        bytes32 structHash = keccak256(\n            abi.encode(_PERMIT_TYPEHASH, owner, spender, value, _useNonce(owner), deadline)\n        );\n\n        bytes32 hash = _hashTypedDataV4(structHash);\n\n        address signer = ECDSA.recover(hash, v, r, s);\n        require(signer == owner, \"ERC20Permit: invalid signature\");\n\n        _approve(owner, spender, value);\n    }\n\n    /**\n     * @dev See {IERC20Permit-nonces}.\n     */\n    function nonces(address owner) public view virtual override returns (uint256) {\n        return _nonces[owner].current();\n    }\n\n    /**\n     * @dev See {IERC20Permit-DOMAIN_SEPARATOR}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view override returns (bytes32) {\n        return _domainSeparatorV4();\n    }\n\n    /**\n     * @dev \"Consume a nonce\": return the current value and increment.\n     *\n     * _Available since v4.1._\n     */\n    function _useNonce(address owner) internal virtual returns (uint256 current) {\n        Counters.Counter storage nonce = _nonces[owner];\n        current = nonce.current();\n        nonce.increment();\n    }\n}\n\n// File: OlympusERC20.sol\n\ncontract OlympusERC20Token is ERC20Permit, IOHM, OlympusAccessControlled {\n    using SafeMath for uint256;\n\n    constructor(\n        address _authority\n    )\n        ERC20(\"Olympus\", \"OHM\", 9)\n        ERC20Permit(\"Olympus\")\n        OlympusAccessControlled(IOlympusAuthority(_authority))\n    {}\n\n    function mint(address account_, uint256 amount_) external override onlyVault {\n        _mint(account_, amount_);\n    }\n\n    function burn(uint256 amount) external override {\n        _burn(msg.sender, amount);\n    }\n\n    function burnFrom(address account_, uint256 amount_) external override {\n        _burnFrom(account_, amount_);\n    }\n\n    function _burnFrom(address account_, uint256 amount_) internal {\n        uint256 decreasedAllowance_ = allowance(account_, msg.sender).sub(\n            amount_,\n            \"ERC20: burn amount exceeds allowance\"\n        );\n\n        _approve(account_, msg.sender, decreasedAllowance_);\n        _burn(account_, amount_);\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (utils/math/Math.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Standard math utilities missing in the Solidity language.\n */\nlibrary Math {\n    enum Rounding {\n        Down, // Toward negative infinity\n        Up, // Toward infinity\n        Zero // Toward zero\n    }\n\n    /**\n     * @dev Returns the largest of two numbers.\n     */\n    function max(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a > b ? a : b;\n    }\n\n    /**\n     * @dev Returns the smallest of two numbers.\n     */\n    function min(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a < b ? a : b;\n    }\n\n    /**\n     * @dev Returns the average of two numbers. The result is rounded towards\n     * zero.\n     */\n    function average(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b) / 2 can overflow.\n        return (a & b) + (a ^ b) / 2;\n    }\n\n    /**\n     * @dev Returns the ceiling of the division of two numbers.\n     *\n     * This differs from standard division with `/` in that it rounds up instead\n     * of rounding down.\n     */\n    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b - 1) / b can overflow on addition, so we distribute.\n        return a == 0 ? 0 : (a - 1) / b + 1;\n    }\n\n    /**\n     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or denominator == 0\n     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv)\n     * with further edits by Uniswap Labs also under MIT license.\n     */\n    function mulDiv(\n        uint256 x,\n        uint256 y,\n        uint256 denominator\n    ) internal pure returns (uint256 result) {\n        unchecked {\n            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use\n            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256\n            // variables such that product = prod1 * 2^256 + prod0.\n            uint256 prod0; // Least significant 256 bits of the product\n            uint256 prod1; // Most significant 256 bits of the product\n            assembly {\n                let mm := mulmod(x, y, not(0))\n                prod0 := mul(x, y)\n                prod1 := sub(sub(mm, prod0), lt(mm, prod0))\n            }\n\n            // Handle non-overflow cases, 256 by 256 division.\n            if (prod1 == 0) {\n                return prod0 / denominator;\n            }\n\n            // Make sure the result is less than 2^256. Also prevents denominator == 0.\n            require(denominator > prod1);\n\n            ///////////////////////////////////////////////\n            // 512 by 256 division.\n            ///////////////////////////////////////////////\n\n            // Make division exact by subtracting the remainder from [prod1 prod0].\n            uint256 remainder;\n            assembly {\n                // Compute remainder using mulmod.\n                remainder := mulmod(x, y, denominator)\n\n                // Subtract 256 bit number from 512 bit number.\n                prod1 := sub(prod1, gt(remainder, prod0))\n                prod0 := sub(prod0, remainder)\n            }\n\n            // Factor powers of two out of denominator and compute largest power of two divisor of denominator. Always >= 1.\n            // See https://cs.stackexchange.com/q/138556/92363.\n\n            // Does not overflow because the denominator cannot be zero at this stage in the function.\n            uint256 twos = denominator & (~denominator + 1);\n            assembly {\n                // Divide denominator by twos.\n                denominator := div(denominator, twos)\n\n                // Divide [prod1 prod0] by twos.\n                prod0 := div(prod0, twos)\n\n                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.\n                twos := add(div(sub(0, twos), twos), 1)\n            }\n\n            // Shift in bits from prod1 into prod0.\n            prod0 |= prod1 * twos;\n\n            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such\n            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for\n            // four bits. That is, denominator * inv = 1 mod 2^4.\n            uint256 inverse = (3 * denominator) ^ 2;\n\n            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also works\n            // in modular arithmetic, doubling the correct bits in each step.\n            inverse *= 2 - denominator * inverse; // inverse mod 2^8\n            inverse *= 2 - denominator * inverse; // inverse mod 2^16\n            inverse *= 2 - denominator * inverse; // inverse mod 2^32\n            inverse *= 2 - denominator * inverse; // inverse mod 2^64\n            inverse *= 2 - denominator * inverse; // inverse mod 2^128\n            inverse *= 2 - denominator * inverse; // inverse mod 2^256\n\n            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.\n            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is\n            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1\n            // is no longer required.\n            result = prod0 * inverse;\n            return result;\n        }\n    }\n\n    /**\n     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.\n     */\n    function mulDiv(\n        uint256 x,\n        uint256 y,\n        uint256 denominator,\n        Rounding rounding\n    ) internal pure returns (uint256) {\n        uint256 result = mulDiv(x, y, denominator);\n        if (rounding == Rounding.Up && mulmod(x, y, denominator) > 0) {\n            result += 1;\n        }\n        return result;\n    }\n\n    /**\n     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded down.\n     *\n     * Inspired by Henry S. Warren, Jr.'s \"Hacker's Delight\" (Chapter 11).\n     */\n    function sqrt(uint256 a) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.\n        //\n        // We know that the \"msb\" (most significant bit) of our target number `a` is a power of 2 such that we have\n        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.\n        //\n        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`\n        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`\n        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`\n        //\n        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.\n        uint256 result = 1 << (log2(a) >> 1);\n\n        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,\n        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at\n        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision\n        // into the expected uint128 result.\n        unchecked {\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            return min(result, a / result);\n        }\n    }\n\n    /**\n     * @notice Calculates sqrt(a), following the selected rounding direction.\n     */\n    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = sqrt(a);\n            return result + (rounding == Rounding.Up && result * result < a ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 2, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log2(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >> 128 > 0) {\n                value >>= 128;\n                result += 128;\n            }\n            if (value >> 64 > 0) {\n                value >>= 64;\n                result += 64;\n            }\n            if (value >> 32 > 0) {\n                value >>= 32;\n                result += 32;\n            }\n            if (value >> 16 > 0) {\n                value >>= 16;\n                result += 16;\n            }\n            if (value >> 8 > 0) {\n                value >>= 8;\n                result += 8;\n            }\n            if (value >> 4 > 0) {\n                value >>= 4;\n                result += 4;\n            }\n            if (value >> 2 > 0) {\n                value >>= 2;\n                result += 2;\n            }\n            if (value >> 1 > 0) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log2(value);\n            return result + (rounding == Rounding.Up && 1 << result < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 10, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log10(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >= 10**64) {\n                value /= 10**64;\n                result += 64;\n            }\n            if (value >= 10**32) {\n                value /= 10**32;\n                result += 32;\n            }\n            if (value >= 10**16) {\n                value /= 10**16;\n                result += 16;\n            }\n            if (value >= 10**8) {\n                value /= 10**8;\n                result += 8;\n            }\n            if (value >= 10**4) {\n                value /= 10**4;\n                result += 4;\n            }\n            if (value >= 10**2) {\n                value /= 10**2;\n                result += 2;\n            }\n            if (value >= 10**1) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log10(value);\n            return result + (rounding == Rounding.Up && 10**result < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 256, rounded down, of a positive value.\n     * Returns 0 if given 0.\n     *\n     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.\n     */\n    function log256(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >> 128 > 0) {\n                value >>= 128;\n                result += 16;\n            }\n            if (value >> 64 > 0) {\n                value >>= 64;\n                result += 8;\n            }\n            if (value >> 32 > 0) {\n                value >>= 32;\n                result += 4;\n            }\n            if (value >> 16 > 0) {\n                value >>= 16;\n                result += 2;\n            }\n            if (value >> 8 > 0) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log256(value);\n            return result + (rounding == Rounding.Up && 1 << (result * 8) < value ? 1 : 0);\n        }\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.15+commit.e14f2714"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [],
+          "name": "GovernorBravo_AddressZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_AlreadyInitialized",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Cancel_AboveThreshold",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Cancel_AlreadyExecuted",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Cancel_WhitelistedProposer",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Emergency_SupplyTooLow",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Execute_BelowThreshold",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Execute_NotQueued",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Execute_VetoedProposal",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_InvalidCalldata",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_InvalidDelay",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_InvalidGracePeriod",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_InvalidPeriod",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_InvalidSignature",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_InvalidThreshold",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_NotActive",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_NotEmergency",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_OnlyAdmin",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_OnlyPendingAdmin",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_OnlyVetoGuardian",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_AlreadyActivated",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_AlreadyActive",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_AlreadyPending",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_IdCollision",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_IdInvalid",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_LengthMismatch",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_NoActions",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_ThresholdNotMet",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_TooEarly",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Proposal_TooManyActions",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Queue_AlreadyQueued",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Queue_BelowThreshold",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Queue_FailedProposal",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Queue_VetoedProposal",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Veto_AlreadyExecuted",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Vote_AlreadyCast",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Vote_Closed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GovernorBravo_Vote_InvalidType",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "oldAdmin",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "NewAdmin",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "oldImplementation",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newImplementation",
+              "type": "address"
+            }
+          ],
+          "name": "NewImplementation",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "oldPendingAdmin",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newPendingAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "NewPendingAdmin",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalCanceled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "proposer",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address[]",
+              "name": "targets",
+              "type": "address[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "values",
+              "type": "uint256[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "string[]",
+              "name": "signatures",
+              "type": "string[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes[]",
+              "name": "calldatas",
+              "type": "bytes[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "startBlock",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "string",
+              "name": "description",
+              "type": "string"
+            }
+          ],
+          "name": "ProposalCreated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalExecuted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "eta",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalQueued",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "oldProposalThreshold",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newProposalThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalThresholdSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalVetoed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalVotingStarted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "oldGuardian",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newGuardian",
+              "type": "address"
+            }
+          ],
+          "name": "VetoGuardianSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "voter",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint8",
+              "name": "support",
+              "type": "uint8"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "votes",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "string",
+              "name": "reason",
+              "type": "string"
+            }
+          ],
+          "name": "VoteCast",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "oldVotingDelay",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newVotingDelay",
+              "type": "uint256"
+            }
+          ],
+          "name": "VotingDelaySet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "oldVotingPeriod",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newVotingPeriod",
+              "type": "uint256"
+            }
+          ],
+          "name": "VotingPeriodSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "expiration",
+              "type": "uint256"
+            }
+          ],
+          "name": "WhitelistAccountExpirationSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "oldGuardian",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newGuardian",
+              "type": "address"
+            }
+          ],
+          "name": "WhitelistGuardianSet",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "BALLOT_TYPEHASH",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DOMAIN_TYPEHASH",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_PROPOSAL_THRESHOLD_PCT",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_VOTING_DELAY",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_VOTING_PERIOD",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MIN_GOHM_SUPPLY",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MIN_PROPOSAL_THRESHOLD_PCT",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MIN_VOTING_DELAY",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MIN_VOTING_PERIOD",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "_acceptAdmin",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes5",
+              "name": "module_",
+              "type": "bytes5"
+            },
+            {
+              "internalType": "bool",
+              "name": "isHighRisk_",
+              "type": "bool"
+            }
+          ],
+          "name": "_setModuleRiskLevel",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newPendingAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "_setPendingAdmin",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "newProposalThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "_setProposalThreshold",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "_setVetoGuardian",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "newVotingDelay",
+              "type": "uint256"
+            }
+          ],
+          "name": "_setVotingDelay",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "newVotingPeriod",
+              "type": "uint256"
+            }
+          ],
+          "name": "_setVotingPeriod",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "activate",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "activationGracePeriod",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "admin",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "approvalThresholdPct",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "cancel",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint8",
+              "name": "support",
+              "type": "uint8"
+            }
+          ],
+          "name": "castVote",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint8",
+              "name": "support",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint8",
+              "name": "v",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "r",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "s",
+              "type": "bytes32"
+            }
+          ],
+          "name": "castVoteBySig",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint8",
+              "name": "support",
+              "type": "uint8"
+            },
+            {
+              "internalType": "string",
+              "name": "reason",
+              "type": "string"
+            }
+          ],
+          "name": "castVoteWithReason",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "targets",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "values",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "string[]",
+              "name": "signatures",
+              "type": "string[]"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "calldatas",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "emergencyPropose",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "execute",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getActions",
+          "outputs": [
+            {
+              "internalType": "address[]",
+              "name": "targets",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "values",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "string[]",
+              "name": "signatures",
+              "type": "string[]"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "calldatas",
+              "type": "bytes[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getHighRiskQuorumVotes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getProposalEta",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getProposalQuorum",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getProposalThreshold",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getProposalThresholdVotes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getProposalVotes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getQuorumVotes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "voter",
+              "type": "address"
+            }
+          ],
+          "name": "getReceipt",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bool",
+                  "name": "hasVoted",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "uint8",
+                  "name": "support",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "votes",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct GovernorBravoDelegateStorageV1.Receipt",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getVoteOutcome",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gohm",
+          "outputs": [
+            {
+              "internalType": "contract IgOHM",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "highRiskQuorum",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "implementation",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "timelock_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "gohm_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "kernel_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "vetoGuardian_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "votingPeriod_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "votingDelay_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "activationGracePeriod_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "proposalThreshold_",
+              "type": "uint256"
+            }
+          ],
+          "name": "initialize",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "Keycode",
+              "name": "",
+              "type": "bytes5"
+            }
+          ],
+          "name": "isKeycodeHighRisk",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "kernel",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "latestProposalIds",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "name",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pendingAdmin",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "proposalCount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "proposalMaxOperations",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "proposalThreshold",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "proposals",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "proposer",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "proposalThreshold",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "quorumVotes",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "eta",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "startBlock",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "endBlock",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "forVotes",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "againstVotes",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "abstainVotes",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "votingStarted",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "vetoed",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "canceled",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "executed",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "targets",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "values",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "string[]",
+              "name": "signatures",
+              "type": "string[]"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "calldatas",
+              "type": "bytes[]"
+            },
+            {
+              "internalType": "string",
+              "name": "description",
+              "type": "string"
+            }
+          ],
+          "name": "propose",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "queue",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "quorumPct",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "state",
+          "outputs": [
+            {
+              "internalType": "enum GovernorBravoDelegateStorageV1.ProposalState",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "timelock",
+          "outputs": [
+            {
+              "internalType": "contract ITimelock",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "veto",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "vetoGuardian",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "votingDelay",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "votingPeriod",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "_acceptAdmin()": {
+            "details": "Admin function for pending admin to accept role and update admin"
+          },
+          "_setModuleRiskLevel(bytes5,bool)": {
+            "details": "Admin function to set whether a module in the Default Framework is considered high risk",
+            "params": {
+              "isHighRisk_": "If the module is high risk",
+              "module_": "The module to set the risk of"
+            }
+          },
+          "_setPendingAdmin(address)": {
+            "details": "Admin function to begin change of admin. The newPendingAdmin must call `_acceptAdmin` to finalize the transfer.",
+            "params": {
+              "newPendingAdmin": "New pending admin."
+            }
+          },
+          "_setProposalThreshold(uint256)": {
+            "details": "newProposalThreshold must be greater than the hardcoded min",
+            "params": {
+              "newProposalThreshold": "new proposal threshold"
+            }
+          },
+          "_setVetoGuardian(address)": {
+            "params": {
+              "account": "Account to set vetoGuardian to (0x0 to remove vetoGuardian)"
+            }
+          },
+          "_setVotingDelay(uint256)": {
+            "params": {
+              "newVotingDelay": "new voting delay, in blocks"
+            }
+          },
+          "_setVotingPeriod(uint256)": {
+            "params": {
+              "newVotingPeriod": "new voting period, in blocks"
+            }
+          },
+          "activate(uint256)": {
+            "details": "This also captures quorum based on total supply to ensure it's as close as possible to the proposal start time"
+          },
+          "cancel(uint256)": {
+            "params": {
+              "proposalId": "The id of the proposal to cancel"
+            }
+          },
+          "castVote(uint256,uint8)": {
+            "params": {
+              "proposalId": "The id of the proposal to vote on",
+              "support": "The support value for the vote. 0=against, 1=for, 2=abstain"
+            }
+          },
+          "castVoteBySig(uint256,uint8,uint8,bytes32,bytes32)": {
+            "details": "External function that accepts EIP-712 signatures for voting on proposals."
+          },
+          "castVoteWithReason(uint256,uint8,string)": {
+            "params": {
+              "proposalId": "The id of the proposal to vote on",
+              "reason": "The reason given for the vote by the voter",
+              "support": "The support value for the vote. 0=against, 1=for, 2=abstain"
+            }
+          },
+          "emergencyPropose(address[],uint256[],string[],bytes[])": {
+            "details": "Can only be called by the veto guardian in the event of an emergency",
+            "params": {
+              "calldatas": "Calldatas for proposal calls",
+              "signatures": "Function signatures for proposal calls",
+              "targets": "Target addresses for proposal calls",
+              "values": "Eth values for proposal calls"
+            }
+          },
+          "execute(uint256)": {
+            "params": {
+              "proposalId": "The id of the proposal to execute"
+            }
+          },
+          "getActions(uint256)": {
+            "params": {
+              "proposalId": "the id of the proposal"
+            },
+            "returns": {
+              "calldatas": "of the proposal actions",
+              "signatures": "of the proposal actions",
+              "targets": "of the proposal actions",
+              "values": "of the proposal actions"
+            }
+          },
+          "getHighRiskQuorumVotes()": {
+            "returns": {
+              "_0": "The high risk quorum in number of gOHM"
+            }
+          },
+          "getProposalEta(uint256)": {
+            "params": {
+              "proposalId": "the id of the proposal"
+            },
+            "returns": {
+              "_0": "The eta value for the given proposal"
+            }
+          },
+          "getProposalQuorum(uint256)": {
+            "params": {
+              "proposalId": "the id of the proposal"
+            },
+            "returns": {
+              "_0": "The quorum required for the given proposal"
+            }
+          },
+          "getProposalThreshold(uint256)": {
+            "params": {
+              "proposalId": "the id of the proposal"
+            },
+            "returns": {
+              "_0": "The proposer votes threshold required for the given proposal"
+            }
+          },
+          "getProposalThresholdVotes()": {
+            "returns": {
+              "_0": "The proposal threshold in number of gOHM"
+            }
+          },
+          "getProposalVotes(uint256)": {
+            "params": {
+              "proposalId": "the id of the proposal"
+            },
+            "returns": {
+              "_0": "The against, for, and abstain votes for the given proposal"
+            }
+          },
+          "getQuorumVotes()": {
+            "returns": {
+              "_0": "The quorum in number of gOHM"
+            }
+          },
+          "getReceipt(uint256,address)": {
+            "params": {
+              "proposalId": "the id of proposal",
+              "voter": "The address of the voter"
+            },
+            "returns": {
+              "_0": "The voting receipt"
+            }
+          },
+          "getVoteOutcome(uint256)": {
+            "params": {
+              "proposalId": "the id of proposal"
+            },
+            "returns": {
+              "_0": "The voting outcome"
+            }
+          },
+          "initialize(address,address,address,address,uint256,uint256,uint256,uint256)": {
+            "params": {
+              "gohm_": "The address of the gOHM token",
+              "kernel_": "The address of the kernel",
+              "proposalThreshold_": "The initial proposal threshold (percentage of total supply. out of 1000)",
+              "timelock_": "The address of the Timelock",
+              "vetoGuardian_": "The address of the veto guardian",
+              "votingDelay_": "The initial voting delay",
+              "votingPeriod_": "The initial voting period"
+            }
+          },
+          "propose(address[],uint256[],string[],bytes[],string)": {
+            "params": {
+              "calldatas": "Calldatas for proposal calls",
+              "description": "String description of the proposal",
+              "signatures": "Function signatures for proposal calls",
+              "targets": "Target addresses for proposal calls",
+              "values": "Eth values for proposal calls"
+            },
+            "returns": {
+              "_0": "Proposal id of new proposal"
+            }
+          },
+          "queue(uint256)": {
+            "params": {
+              "proposalId": "The id of the proposal to queue"
+            }
+          },
+          "state(uint256)": {
+            "params": {
+              "proposalId": "The id of the proposal"
+            },
+            "returns": {
+              "_0": "Proposal state"
+            }
+          },
+          "veto(uint256)": {
+            "params": {
+              "proposalId": "The id of the proposal to veto"
+            }
+          }
+        },
+        "stateVariables": {
+          "highRiskQuorum": {
+            "details": "Olympus has a variable supply system, that actively fluctuates fairly significantly, so it is better to use         a percentage of total supply, rather than a fixed number of tokens."
+          },
+          "quorumPct": {
+            "details": "Olympus has a variable supply system, that actively fluctuates fairly significantly, so it is better to use         a percentage of total supply, rather than a fixed number of tokens."
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "events": {
+          "NewAdmin(address,address)": {
+            "notice": "Emitted when pendingAdmin is accepted, which means admin is updated"
+          },
+          "NewImplementation(address,address)": {
+            "notice": "Emitted when implementation is changed"
+          },
+          "NewPendingAdmin(address,address)": {
+            "notice": "Emitted when pendingAdmin is changed"
+          },
+          "ProposalCanceled(uint256)": {
+            "notice": "An event emitted when a proposal has been canceled"
+          },
+          "ProposalCreated(uint256,address,address[],uint256[],string[],bytes[],uint256,string)": {
+            "notice": "An event emitted when a new proposal is created"
+          },
+          "ProposalExecuted(uint256)": {
+            "notice": "An event emitted when a proposal has been executed in the Timelock"
+          },
+          "ProposalQueued(uint256,uint256)": {
+            "notice": "An event emitted when a proposal has been queued in the Timelock"
+          },
+          "ProposalThresholdSet(uint256,uint256)": {
+            "notice": "Emitted when proposal threshold is set"
+          },
+          "ProposalVetoed(uint256)": {
+            "notice": "An event emitted when a proposal has been vetoed"
+          },
+          "ProposalVotingStarted(uint256)": {
+            "notice": "Event emitted when a proposal's voting period is activated"
+          },
+          "VetoGuardianSet(address,address)": {
+            "notice": "Emitted when the vetoGuardian is set"
+          },
+          "VoteCast(address,uint256,uint8,uint256,string)": {
+            "notice": "An event emitted when a vote has been cast on a proposal"
+          },
+          "VotingDelaySet(uint256,uint256)": {
+            "notice": "An event emitted when the voting delay is set"
+          },
+          "VotingPeriodSet(uint256,uint256)": {
+            "notice": "An event emitted when the voting period is set"
+          },
+          "WhitelistAccountExpirationSet(address,uint256)": {
+            "notice": "Emitted when whitelist account expiration is set"
+          },
+          "WhitelistGuardianSet(address,address)": {
+            "notice": "Emitted when the whitelistGuardian is set"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "BALLOT_TYPEHASH()": {
+            "notice": "The EIP-712 typehash for the ballot struct used by the contract"
+          },
+          "DOMAIN_TYPEHASH()": {
+            "notice": "The EIP-712 typehash for the contract's domain"
+          },
+          "MAX_PROPOSAL_THRESHOLD_PCT()": {
+            "notice": "The maximum setable proposal threshold"
+          },
+          "MAX_VOTING_DELAY()": {
+            "notice": "The max setable voting delay"
+          },
+          "MAX_VOTING_PERIOD()": {
+            "notice": "The max setable voting period"
+          },
+          "MIN_GOHM_SUPPLY()": {
+            "notice": "The minimum level of gOHM supply acceptable for OCG operations"
+          },
+          "MIN_PROPOSAL_THRESHOLD_PCT()": {
+            "notice": "The minimum setable proposal threshold"
+          },
+          "MIN_VOTING_DELAY()": {
+            "notice": "The min setable voting delay"
+          },
+          "MIN_VOTING_PERIOD()": {
+            "notice": "The minimum setable voting period"
+          },
+          "_acceptAdmin()": {
+            "notice": "Accepts transfer of admin rights. msg.sender must be pendingAdmin"
+          },
+          "_setModuleRiskLevel(bytes5,bool)": {
+            "notice": "Sets whether a module is considered high risk"
+          },
+          "_setPendingAdmin(address)": {
+            "notice": "Begins transfer of admin rights. The newPendingAdmin must call `_acceptAdmin` to finalize the transfer."
+          },
+          "_setProposalThreshold(uint256)": {
+            "notice": "Admin function for setting the proposal threshold"
+          },
+          "_setVetoGuardian(address)": {
+            "notice": "Admin function for setting the vetoGuardian. vetoGuardian can veto any proposal"
+          },
+          "_setVotingDelay(uint256)": {
+            "notice": "Admin function for setting the voting delay"
+          },
+          "_setVotingPeriod(uint256)": {
+            "notice": "Admin function for setting the voting period"
+          },
+          "activate(uint256)": {
+            "notice": "Activates voting for a proposal"
+          },
+          "activationGracePeriod()": {
+            "notice": "The grace period after the voting delay through which a proposal may be activated"
+          },
+          "admin()": {
+            "notice": "Administrator for this contract"
+          },
+          "approvalThresholdPct()": {
+            "notice": "The percentage of votes that must be in favor of a proposal for it to succeed"
+          },
+          "cancel(uint256)": {
+            "notice": "Cancels a proposal only if sender is the proposer, or proposer delegates dropped below proposal threshold"
+          },
+          "castVote(uint256,uint8)": {
+            "notice": "Cast a vote for a proposal"
+          },
+          "castVoteBySig(uint256,uint8,uint8,bytes32,bytes32)": {
+            "notice": "Cast a vote for a proposal by signature"
+          },
+          "castVoteWithReason(uint256,uint8,string)": {
+            "notice": "Cast a vote for a proposal with a reason"
+          },
+          "emergencyPropose(address[],uint256[],string[],bytes[])": {
+            "notice": "Create proposal in case of emergency"
+          },
+          "execute(uint256)": {
+            "notice": "Executes a queued proposal if eta has passed"
+          },
+          "getActions(uint256)": {
+            "notice": "Gets actions of a proposal"
+          },
+          "getHighRiskQuorumVotes()": {
+            "notice": "View function that gets the high risk quorum in number of gOHM based on current supply"
+          },
+          "getProposalEta(uint256)": {
+            "notice": "Gets the eta value for a given proposal"
+          },
+          "getProposalQuorum(uint256)": {
+            "notice": "Gets the quorum required for a given proposal"
+          },
+          "getProposalThreshold(uint256)": {
+            "notice": "Gets the proposer votes threshold required for a given proposal"
+          },
+          "getProposalThresholdVotes()": {
+            "notice": "View function that gets the proposal threshold in number of gOHM based on current supply"
+          },
+          "getProposalVotes(uint256)": {
+            "notice": "Gets the against, for, and abstain votes for a given proposal"
+          },
+          "getQuorumVotes()": {
+            "notice": "View function that gets the quorum in number of gOHM based on current supply"
+          },
+          "getReceipt(uint256,address)": {
+            "notice": "Gets the receipt for a voter on a given proposal"
+          },
+          "getVoteOutcome(uint256)": {
+            "notice": "Gets the voting outcome of the proposal"
+          },
+          "gohm()": {
+            "notice": "The address of the Olympus governance token"
+          },
+          "highRiskQuorum()": {
+            "notice": "The percentage of total supply in support of a proposal related to a high risk module in the Default system required         in order for a quorum to be reached and for a vote to succeed"
+          },
+          "implementation()": {
+            "notice": "Active brains of Governor"
+          },
+          "initialize(address,address,address,address,uint256,uint256,uint256,uint256)": {
+            "notice": "Used to initialize the contract during delegator constructor"
+          },
+          "isKeycodeHighRisk(bytes5)": {
+            "notice": "Modules in the Default system that are considered high risk"
+          },
+          "kernel()": {
+            "notice": "The central hub of the Default Framework system that manages modules and policies"
+          },
+          "latestProposalIds(address)": {
+            "notice": "The latest proposal for each proposer"
+          },
+          "name()": {
+            "notice": "The name of this contract"
+          },
+          "pendingAdmin()": {
+            "notice": "Pending administrator for this contract"
+          },
+          "proposalCount()": {
+            "notice": "The total number of proposals"
+          },
+          "proposalMaxOperations()": {
+            "notice": "The maximum number of actions that can be included in a proposal"
+          },
+          "proposalThreshold()": {
+            "notice": "The percentage of total supply required in order for a voter to become a proposer"
+          },
+          "proposals(uint256)": {
+            "notice": "The official record of all proposals ever proposed"
+          },
+          "propose(address[],uint256[],string[],bytes[],string)": {
+            "notice": "Function used to propose a new proposal. Sender must have delegates above the proposal threshold"
+          },
+          "queue(uint256)": {
+            "notice": "Queues a successful proposal"
+          },
+          "quorumPct()": {
+            "notice": "The percentage of total supply in support of a proposal required in order for a quorum to be reached and for a vote to succeed"
+          },
+          "state(uint256)": {
+            "notice": "Gets the state of a proposal"
+          },
+          "timelock()": {
+            "notice": "The address of the Olympus Protocol Timelock"
+          },
+          "veto(uint256)": {
+            "notice": "Vetoes a proposal only if sender is the veto guardian"
+          },
+          "vetoGuardian()": {
+            "notice": "Address which has veto power over all proposals"
+          },
+          "votingDelay()": {
+            "notice": "The delay before voting on a proposal may take place, once proposed, in blocks"
+          },
+          "votingPeriod()": {
+            "notice": "The duration of voting on a proposal, in blocks"
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/external/governance/GovernorBravoDelegate.sol": "GovernorBravoDelegate"
+      },
+      "evmVersion": "london",
+      "libraries": {
+        "src/libraries/UniswapV3/BunniHelper.sol:BunniHelper": "0xed2519d8a47fa10c6ba062e7156cc391bcdaa300",
+        "src/libraries/UniswapV3/Oracle.sol:UniswapV3OracleHelper": "0xaa95ea383bbaade037cac896450ab97b6da7669a",
+        "src/libraries/UniswapV3/Positions.sol:UniswapV3Positions": "0x7e264d73b7deef953acf123b077d086b00571a1c"
+      },
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10
+      },
+      "remappings": [
+        ":@addresses/=lib/forge-proposal-simulator/addresses/",
+        ":@examples/=lib/forge-proposal-simulator/examples/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@proposals/=lib/forge-proposal-simulator/proposals/",
+        ":@script/=lib/forge-proposal-simulator/script/",
+        ":@test/=lib/forge-proposal-simulator/test/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":@uniswap/v3-periphery/=lib/uniswap-v3-periphery/",
+        ":@utils/=lib/forge-proposal-simulator/utils/",
+        ":Cooler/=lib/Cooler/src/",
+        ":balancer-v2/=lib/balancer-v2/",
+        ":bonds/=lib/bonds/src/",
+        ":clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        ":clones/=lib/clones-with-immutable-args/src/",
+        ":comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":cooler/=lib/Cooler/src/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        ":forge-std/=lib/forge-std/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero/=lib/solidity-examples/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":olympus-v3/=lib/Cooler/lib/olympus-v3/src/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/",
+        ":policies/=src/policies/",
+        ":solidity-examples/=lib/solidity-examples/contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":test/=src/test/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "sources": {
+      "lib/openzeppelin-contracts/contracts/utils/Strings.sol": {
+        "keccak256": "0xa4d1d62251f8574deb032a35fc948386a9b4de74b812d4f545a1ac120486b48a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8c969013129ba9e651a20735ef659fef6d8a1139ea3607bd4b26ddea2d645634",
+          "dweb:/ipfs/QmVhVa6LGuzAcB8qgDtVHRkucn4ihj5UZr8xBLcJkP6ucb"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol": {
+        "keccak256": "0xda898fa084aa1ddfdb346e6a40459e00a59d87071cce7c315a46d648dd71d0ba",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ce501a941f4aa1555c04dabb5e07992503bb6a9b32ff8f7cdcefdb4a742210cb",
+          "dweb:/ipfs/QmeScPrUpdrGYs9BytV3Z5ZWJcBXtuAgCW4BLHua4xFUxx"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+        "keccak256": "0xa1e8e83cd0087785df04ac79fb395d9f3684caeaf973d9e2c71caef723a3a5d6",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://33bbf48cc069be677705037ba7520c22b1b622c23b33e1a71495f2d36549d40b",
+          "dweb:/ipfs/Qmct36zWXv3j7LZB83uwbg7TXwnZSN1fqHNDZ93GG98bGz"
+        ]
+      },
+      "src/Kernel.sol": {
+        "keccak256": "0x5798deae5f5ce704f699ef3b5022e16825a4470972212a9b55ec66746fcd5fc2",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://67b6284b459b3d3e8781975a85b08778d14850a09dc51aff80de76de54f12129",
+          "dweb:/ipfs/QmarPSzUc6TckbSd2sGovhstAiNTbWBDTbQB9mwPXeX1A5"
+        ]
+      },
+      "src/external/OlympusERC20.sol": {
+        "keccak256": "0x615c2c31c85f680c81bf456550f0dc8da0e45abc6cc7846bb87a067d04772601",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://e5cde097f699ccd42d77e87ca2c7f89cf8e1b1ec40c3da4984489522c1b9b793",
+          "dweb:/ipfs/QmWdb7aBcGG3Fiy1eyfgpsmykeUghZbwx4E53NyGXheraX"
+        ]
+      },
+      "src/external/governance/GovernorBravoDelegate.sol": {
+        "keccak256": "0x5a29ee5f2e73abf53024bfc88962a2830d8f353c1adb0fda57aab7035753cd3f",
+        "license": "BSD-3-Clause",
+        "urls": [
+          "bzz-raw://7c1972b9ee34051f8625c1bc3bf8c0107ce64cb05d21f8b88445971829e2321e",
+          "dweb:/ipfs/QmR4cbzXChijLsB1SXFV2Zk4QCifPDqdgbPFRjuZz5edby"
+        ]
+      },
+      "src/external/governance/abstracts/GovernorBravoStorage.sol": {
+        "keccak256": "0xea1bebe0947f6cdbd5b2f1cb119c9973a3b56ed2761fa069f26691a7d6537eb0",
+        "license": "BSD-3-Clause",
+        "urls": [
+          "bzz-raw://1fedc53e99df8d90ebc27dc221fd7b4f25b600078803b51ec36bc287cf7a27e6",
+          "dweb:/ipfs/QmaQwQNg6EcZG3R568MVSqszhmvUQCXz6qZA1TBuAxAN6Y"
+        ]
+      },
+      "src/external/governance/interfaces/IGovernorBravoEvents.sol": {
+        "keccak256": "0xaa664db7439cff16ff4e0797a7b80cb16db65292918eb82d38192b5d6adf9a25",
+        "license": "BSD-3-Clause",
+        "urls": [
+          "bzz-raw://7537514d621900f29aa72a60be68bcb9832010999d85f2c185b3150b5abe4246",
+          "dweb:/ipfs/QmYHBkzzMfxHwkLyrTUSXJHe2Q5x2oG2mVYTPmKrGtyAuG"
+        ]
+      },
+      "src/external/governance/interfaces/ITimelock.sol": {
+        "keccak256": "0x42a8a4fd4855246a52f3c199142e66e26bbe0c29a560182e5a85a69d2c9c325e",
+        "license": "BSD-3-Clause",
+        "urls": [
+          "bzz-raw://1b5921cb48e9e4e9f070c2e82d6c4559e59d98a2ff2f724fa5c45ea3bde6b6db",
+          "dweb:/ipfs/QmdhYBunmUUzDia6VAfUbpTP1BLueTamzrxFDfJpNMcRJa"
+        ]
+      },
+      "src/external/governance/lib/ContractUtils.sol": {
+        "keccak256": "0x07dadac7dc4144713b09c874292a9384ef062d4a32ed9ef0b29b4a498e330072",
+        "license": "BSD-3-Clause",
+        "urls": [
+          "bzz-raw://d2aa196ed020508dac936862b48545ffa72c3bd104d7f6246c5d260a37e1efe3",
+          "dweb:/ipfs/QmSBQb6pZJvWeCFBTRV1eFK9JStmm7egynDtQd3Xk8zUuo"
+        ]
+      },
+      "src/interfaces/IgOHM.sol": {
+        "keccak256": "0xf41fc0db85d7792d3c180fe9bc7b5eb5c74b71b0db35528b5f054d8595004023",
+        "license": "AGPL-3.0",
+        "urls": [
+          "bzz-raw://0a7b5406d3b31bd3cc7d68135d33a0a7113be33a44d6252bb35dae8d6df94171",
+          "dweb:/ipfs/QmcLaxCsBSPELS9sbNgGyUeXZ4j75ZsBakncLZu2eFxykU"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.15+commit.e14f2714",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {
+        "src/libraries/UniswapV3/Oracle.sol": {
+          "UniswapV3OracleHelper": "0xaa95ea383bbaade037cac896450ab97b6da7669a"
+        },
+        "src/libraries/UniswapV3/Positions.sol": {
+          "UniswapV3Positions": "0x7e264d73b7deef953acf123b077d086b00571a1c"
+        },
+        "src/libraries/UniswapV3/BunniHelper.sol": {
+          "BunniHelper": "0xed2519d8a47fa10c6ba062e7156cc391bcdaa300"
+        }
+      },
+      "optimizer": {
+        "runs": 10,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": [
+        "ds-test/=lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "interfaces/=src/interfaces/",
+        "modules/=src/modules/",
+        "policies/=src/policies/",
+        "libraries/=src/libraries/",
+        "solmate/=lib/solmate/src/",
+        "layer-zero/=lib/solidity-examples/contracts/",
+        "@openzeppelin/=lib/openzeppelin-contracts/",
+        "bonds/=lib/bonds/src/",
+        "test/=src/test/",
+        "clones/=lib/clones-with-immutable-args/src/",
+        "@uniswap/v3-core/=lib/uniswap-v3-core/",
+        "@uniswap/v3-periphery/=lib/uniswap-v3-periphery/",
+        "cooler/=lib/Cooler/src/",
+        "balancer-v2/=lib/balancer-v2/",
+        "@addresses/=lib/forge-proposal-simulator/addresses/",
+        "@examples/=lib/forge-proposal-simulator/examples/",
+        "@proposals/=lib/forge-proposal-simulator/proposals/",
+        "@script/=lib/forge-proposal-simulator/script/",
+        "@test/=lib/forge-proposal-simulator/test/",
+        "@utils/=lib/forge-proposal-simulator/utils/",
+        "Cooler/=lib/Cooler/src/",
+        "clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        "comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        "compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        "erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        "forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        "olympus-v3/=lib/Cooler/lib/olympus-v3/src/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        "openzeppelin/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/",
+        "solidity-examples/=lib/solidity-examples/contracts/",
+        "uniswap-v3-core/=lib/uniswap-v3-core/contracts/",
+        "uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "name": "GovernorBravoDelegate",
+    "fullyQualifiedName": "src/external/governance/GovernorBravoDelegate.sol:GovernorBravoDelegate"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "14111090",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-01-19T05:18:22Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0xa6013bBFd70d6190FA1cc1afD0cB3859847711B4"
+}

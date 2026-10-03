@@ -1,0 +1,568 @@
+{
+  "sources": {
+    "src/Kernel.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\n//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████\n//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███\n//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░\n// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████\n// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███\n// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███\n//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████\n//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░\n\n//============================================================================================//\n//                                        GLOBAL TYPES                                        //\n//============================================================================================//\n\n/// @notice Actions to trigger state changes in the kernel. Passed by the executor\nenum Actions {\n    InstallModule,\n    UpgradeModule,\n    ActivatePolicy,\n    DeactivatePolicy,\n    ChangeExecutor,\n    MigrateKernel\n}\n\n/// @notice Used by executor to select an action and a target contract for a kernel action\nstruct Instruction {\n    Actions action;\n    address target;\n}\n\n/// @notice Used to define which module functions a policy needs access to\nstruct Permissions {\n    Keycode keycode;\n    bytes4 funcSelector;\n}\n\ntype Keycode is bytes5;\n\n//============================================================================================//\n//                                       UTIL FUNCTIONS                                       //\n//============================================================================================//\n\nerror TargetNotAContract(address target_);\nerror InvalidKeycode(Keycode keycode_);\n\n// solhint-disable-next-line func-visibility\nfunction toKeycode(bytes5 keycode_) pure returns (Keycode) {\n    return Keycode.wrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction fromKeycode(Keycode keycode_) pure returns (bytes5) {\n    return Keycode.unwrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureContract(address target_) view {\n    if (target_.code.length == 0) revert TargetNotAContract(target_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureValidKeycode(Keycode keycode_) pure {\n    bytes5 unwrapped = Keycode.unwrap(keycode_);\n    for (uint256 i = 0; i < 5; ) {\n        bytes1 char = unwrapped[i];\n        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only\n        unchecked {\n            i++;\n        }\n    }\n}\n\n//============================================================================================//\n//                                        COMPONENTS                                          //\n//============================================================================================//\n\n/// @notice Generic adapter interface for kernel access in modules and policies.\nabstract contract KernelAdapter {\n    error KernelAdapter_OnlyKernel(address caller_);\n\n    Kernel public kernel;\n\n    constructor(Kernel kernel_) {\n        kernel = kernel_;\n    }\n\n    /// @notice Modifier to restrict functions to be called only by kernel.\n    modifier onlyKernel() {\n        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);\n        _;\n    }\n\n    /// @notice Function used by kernel when migrating to a new kernel.\n    function changeKernel(Kernel newKernel_) external onlyKernel {\n        kernel = newKernel_;\n    }\n}\n\n/// @notice Base level extension of the kernel. Modules act as independent state components to be\n///         interacted with and mutated through policies.\n/// @dev    Modules are installed and uninstalled via the executor.\nabstract contract Module is KernelAdapter {\n    error Module_PolicyNotPermitted(address policy_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Modifier to restrict which policies have access to module functions.\n    modifier permissioned() {\n        if (\n            msg.sender == address(kernel) ||\n            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)\n        ) revert Module_PolicyNotPermitted(msg.sender);\n        _;\n    }\n\n    /// @notice 5 byte identifier for a module.\n    function KEYCODE() public pure virtual returns (Keycode) {}\n\n    /// @notice Returns which semantic version of a module is being implemented.\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}\n\n    /// @notice Initialization function for the module\n    /// @dev    This function is called when the module is installed or upgraded by the kernel.\n    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.\n    function INIT() external virtual onlyKernel {}\n}\n\n/// @notice Policies are application logic and external interface for the kernel and installed modules.\n/// @dev    Policies are activated and deactivated in the kernel by the executor.\n/// @dev    Module dependencies and function permissions must be defined in appropriate functions.\nabstract contract Policy is KernelAdapter {\n    error Policy_ModuleDoesNotExist(Keycode keycode_);\n    error Policy_WrongModuleVersion(bytes expected_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Easily accessible indicator for if a policy is activated or not.\n    function isActive() external view returns (bool) {\n        return kernel.isPolicyActive(this);\n    }\n\n    /// @notice Function to grab module address from a given keycode.\n    function getModuleAddress(Keycode keycode_) internal view returns (address) {\n        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));\n        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);\n        return moduleForKeycode;\n    }\n\n    /// @notice Define module dependencies for this policy.\n    /// @return dependencies - Keycode array of module dependencies.\n    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}\n\n    /// @notice Function called by kernel to set module function permissions.\n    /// @return requests - Array of keycodes and function selectors for requested permissions.\n    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}\n}\n\n/// @notice Main contract that acts as a central component registry for the protocol.\n/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,\n/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.\ncontract Kernel {\n    // =========  EVENTS ========= //\n\n    event PermissionsUpdated(\n        Keycode indexed keycode_,\n        Policy indexed policy_,\n        bytes4 funcSelector_,\n        bool granted_\n    );\n    event ActionExecuted(Actions indexed action_, address indexed target_);\n\n    // =========  ERRORS ========= //\n\n    error Kernel_OnlyExecutor(address caller_);\n    error Kernel_ModuleAlreadyInstalled(Keycode module_);\n    error Kernel_InvalidModuleUpgrade(Keycode module_);\n    error Kernel_PolicyAlreadyActivated(address policy_);\n    error Kernel_PolicyNotActivated(address policy_);\n\n    // =========  PRIVILEGED ADDRESSES ========= //\n\n    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.\n    address public executor;\n\n    // =========  MODULE MANAGEMENT ========= //\n\n    /// @notice Array of all modules currently installed.\n    Keycode[] public allKeycodes;\n\n    /// @notice Mapping of module address to keycode.\n    mapping(Keycode => Module) public getModuleForKeycode;\n\n    /// @notice Mapping of keycode to module address.\n    mapping(Module => Keycode) public getKeycodeForModule;\n\n    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.\n    mapping(Keycode => Policy[]) public moduleDependents;\n\n    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.\n    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;\n\n    /// @notice Module <> Policy Permissions.\n    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission\n    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;\n\n    // =========  POLICY MANAGEMENT ========= //\n\n    /// @notice List of all active policies\n    Policy[] public activePolicies;\n\n    /// @notice Helper to get active policy quickly. Prevents need to loop through array.\n    mapping(Policy => uint256) public getPolicyIndex;\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    constructor() {\n        executor = msg.sender;\n    }\n\n    /// @notice Modifier to check if caller is the executor.\n    modifier onlyExecutor() {\n        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);\n        _;\n    }\n\n    function isPolicyActive(Policy policy_) public view returns (bool) {\n        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;\n    }\n\n    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.\n    function executeAction(Actions action_, address target_) external onlyExecutor {\n        if (action_ == Actions.InstallModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _installModule(Module(target_));\n        } else if (action_ == Actions.UpgradeModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _upgradeModule(Module(target_));\n        } else if (action_ == Actions.ActivatePolicy) {\n            ensureContract(target_);\n            _activatePolicy(Policy(target_));\n        } else if (action_ == Actions.DeactivatePolicy) {\n            ensureContract(target_);\n            _deactivatePolicy(Policy(target_));\n        } else if (action_ == Actions.ChangeExecutor) {\n            executor = target_;\n        } else if (action_ == Actions.MigrateKernel) {\n            ensureContract(target_);\n            _migrateKernel(Kernel(target_));\n        }\n\n        emit ActionExecuted(action_, target_);\n    }\n\n    function _installModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n\n        if (address(getModuleForKeycode[keycode]) != address(0))\n            revert Kernel_ModuleAlreadyInstalled(keycode);\n\n        getModuleForKeycode[keycode] = newModule_;\n        getKeycodeForModule[newModule_] = keycode;\n        allKeycodes.push(keycode);\n\n        newModule_.INIT();\n    }\n\n    function _upgradeModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n        Module oldModule = getModuleForKeycode[keycode];\n\n        if (address(oldModule) == address(0) || oldModule == newModule_)\n            revert Kernel_InvalidModuleUpgrade(keycode);\n\n        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));\n        getKeycodeForModule[newModule_] = keycode;\n        getModuleForKeycode[keycode] = newModule_;\n\n        newModule_.INIT();\n\n        _reconfigurePolicies(keycode);\n    }\n\n    function _activatePolicy(Policy policy_) internal {\n        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));\n\n        // Add policy to list of active policies\n        activePolicies.push(policy_);\n        getPolicyIndex[policy_] = activePolicies.length - 1;\n\n        // Record module dependencies\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depLength = dependencies.length;\n\n        for (uint256 i; i < depLength; ) {\n            Keycode keycode = dependencies[i];\n\n            moduleDependents[keycode].push(policy_);\n            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        // Grant permissions for policy to access restricted module functions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, true);\n    }\n\n    function _deactivatePolicy(Policy policy_) internal {\n        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));\n\n        // Revoke permissions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, false);\n\n        // Remove policy from all policy data structures\n        uint256 idx = getPolicyIndex[policy_];\n        Policy lastPolicy = activePolicies[activePolicies.length - 1];\n\n        activePolicies[idx] = lastPolicy;\n        activePolicies.pop();\n        getPolicyIndex[lastPolicy] = idx;\n        delete getPolicyIndex[policy_];\n\n        // Remove policy from module dependents\n        _pruneFromDependents(policy_);\n    }\n\n    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.\n    /// @dev    New kernel must add in all of the modules and policies via executeAction.\n    /// @dev    NOTE: Data does not get cleared from this kernel.\n    function _migrateKernel(Kernel newKernel_) internal {\n        uint256 keycodeLen = allKeycodes.length;\n        for (uint256 i; i < keycodeLen; ) {\n            Module module = Module(getModuleForKeycode[allKeycodes[i]]);\n            module.changeKernel(newKernel_);\n            unchecked {\n                ++i;\n            }\n        }\n\n        uint256 policiesLen = activePolicies.length;\n        for (uint256 j; j < policiesLen; ) {\n            Policy policy = activePolicies[j];\n\n            // Deactivate before changing kernel\n            policy.changeKernel(newKernel_);\n            unchecked {\n                ++j;\n            }\n        }\n    }\n\n    function _reconfigurePolicies(Keycode keycode_) internal {\n        Policy[] memory dependents = moduleDependents[keycode_];\n        uint256 depLength = dependents.length;\n\n        for (uint256 i; i < depLength; ) {\n            dependents[i].configureDependencies();\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _setPolicyPermissions(\n        Policy policy_,\n        Permissions[] memory requests_,\n        bool grant_\n    ) internal {\n        uint256 reqLength = requests_.length;\n        for (uint256 i = 0; i < reqLength; ) {\n            Permissions memory request = requests_[i];\n            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;\n\n            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _pruneFromDependents(Policy policy_) internal {\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depcLength = dependencies.length;\n\n        for (uint256 i; i < depcLength; ) {\n            Keycode keycode = dependencies[i];\n            Policy[] storage dependents = moduleDependents[keycode];\n\n            uint256 origIndex = getDependentIndex[keycode][policy_];\n            Policy lastPolicy = dependents[dependents.length - 1];\n\n            // Swap with last and pop\n            dependents[origIndex] = lastPolicy;\n            dependents.pop();\n\n            // Record new index and delete deactivated policy index\n            getDependentIndex[keycode][lastPolicy] = origIndex;\n            delete getDependentIndex[keycode][policy_];\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n}\n"
+    },
+    "src/external/OlympusERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity >=0.7.5;\n\n/// @notice Olympus OHM token\n/// @dev This contract is the legacy v2 OHM token. Included in the repo for completeness,\n///      since it is not being changed and is imported in some contracts.\n\ninterface IOlympusAuthority {\n    // =========  EVENTS ========= //\n\n    event GovernorPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event GuardianPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event PolicyPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event VaultPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n\n    event GovernorPulled(address indexed from, address indexed to);\n    event GuardianPulled(address indexed from, address indexed to);\n    event PolicyPulled(address indexed from, address indexed to);\n    event VaultPulled(address indexed from, address indexed to);\n\n    // =========  VIEW ========= //\n\n    function governor() external view returns (address);\n\n    function guardian() external view returns (address);\n\n    function policy() external view returns (address);\n\n    function vault() external view returns (address);\n}\n\n// File: types/OlympusAccessControlled.sol\n\nabstract contract OlympusAccessControlled {\n    // =========  EVENTS ========= //\n\n    event AuthorityUpdated(IOlympusAuthority indexed authority);\n\n    string internal UNAUTHORIZED = \"UNAUTHORIZED\"; // save gas\n\n    // =========  STATE VARIABLES ========= //\n\n    IOlympusAuthority public authority;\n\n    // =========  Constructor ========= //\n\n    constructor(IOlympusAuthority _authority) {\n        authority = _authority;\n        emit AuthorityUpdated(_authority);\n    }\n\n    // =========  MODIFIERS ========= //\n\n    modifier onlyGovernor() {\n        require(msg.sender == authority.governor(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyGuardian() {\n        require(msg.sender == authority.guardian(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyPermitted() {\n        require(msg.sender == authority.policy(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyVault() {\n        require(msg.sender == authority.vault(), UNAUTHORIZED);\n        _;\n    }\n\n    // =========  GOV ONLY ========= //\n\n    function setAuthority(IOlympusAuthority _newAuthority) external onlyGovernor {\n        authority = _newAuthority;\n        emit AuthorityUpdated(_newAuthority);\n    }\n}\n\n// File: cryptography/ECDSA.sol\n\n/**\n * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.\n *\n * These functions can be used to verify that a message was signed by the holder\n * of the private keys of a given address.\n */\nlibrary ECDSA {\n    enum RecoverError {\n        NoError,\n        InvalidSignature,\n        InvalidSignatureLength,\n        InvalidSignatureS,\n        InvalidSignatureV\n    }\n\n    function _throwError(RecoverError error) private pure {\n        if (error == RecoverError.NoError) {\n            return; // no error: do nothing\n        } else if (error == RecoverError.InvalidSignature) {\n            revert(\"ECDSA: invalid signature\");\n        } else if (error == RecoverError.InvalidSignatureLength) {\n            revert(\"ECDSA: invalid signature length\");\n        } else if (error == RecoverError.InvalidSignatureS) {\n            revert(\"ECDSA: invalid signature 's' value\");\n        } else if (error == RecoverError.InvalidSignatureV) {\n            revert(\"ECDSA: invalid signature 'v' value\");\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature` or error string. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     *\n     * Documentation for signature generation:\n     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]\n     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes memory signature\n    ) internal pure returns (address, RecoverError) {\n        // Check the signature length\n        // - case 65: r,s,v signature (standard)\n        // - case 64: r,vs signature (cf https://eips.ethereum.org/EIPS/eip-2098) _Available since v4.1._\n        if (signature.length == 65) {\n            bytes32 r;\n            bytes32 s;\n            uint8 v;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                s := mload(add(signature, 0x40))\n                v := byte(0, mload(add(signature, 0x60)))\n            }\n            return tryRecover(hash, v, r, s);\n        } else if (signature.length == 64) {\n            bytes32 r;\n            bytes32 vs;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                vs := mload(add(signature, 0x40))\n            }\n            return tryRecover(hash, r, vs);\n        } else {\n            return (address(0), RecoverError.InvalidSignatureLength);\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature`. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     */\n    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, signature);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.\n     *\n     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address, RecoverError) {\n        bytes32 s;\n        uint8 v;\n        assembly {\n            s := and(vs, 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)\n            v := add(shr(255, vs), 27)\n        }\n        return tryRecover(hash, v, r, s);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.\n     *\n     * _Available since v4.2._\n     */\n    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, r, vs);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address, RecoverError) {\n        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature\n        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most\n        // signatures from current libraries generate a unique signature with an s-value in the lower half order.\n        //\n        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value\n        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or\n        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept\n        // these malleable signatures as well.\n        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {\n            return (address(0), RecoverError.InvalidSignatureS);\n        }\n        if (v != 27 && v != 28) {\n            return (address(0), RecoverError.InvalidSignatureV);\n        }\n\n        // If the signature is valid (and not malleable), return the signer address\n        address signer = ecrecover(hash, v, r, s);\n        if (signer == address(0)) {\n            return (address(0), RecoverError.InvalidSignature);\n        }\n\n        return (signer, RecoverError.NoError);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from a `hash`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {\n        // 32 is the length in bytes of hash,\n        // enforced by the type signature above\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", hash));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Typed Data, created from a\n     * `domainSeparator` and a `structHash`. This produces hash corresponding\n     * to the one signed with the\n     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]\n     * JSON-RPC method as part of EIP-712.\n     *\n     * See {recover}.\n     */\n    function toTypedDataHash(\n        bytes32 domainSeparator,\n        bytes32 structHash\n    ) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19\\x01\", domainSeparator, structHash));\n    }\n}\n\n// File: cryptography/EIP712.sol\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.\n *\n * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,\n * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding\n * they need in their contracts using a combination of `abi.encode` and `keccak256`.\n *\n * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding\n * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA\n * ({_hashTypedDataV4}).\n *\n * The implementation of the domain separator was designed to be as efficient as possible while still properly updating\n * the chain id to protect against replay attacks on an eventual fork of the chain.\n *\n * NOTE: This contract implements the version of the encoding known as \"v4\", as implemented by the JSON RPC method\n * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].\n *\n * _Available since v3.4._\n */\nabstract contract EIP712 {\n    /* solhint-disable var-name-mixedcase */\n    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to\n    // invalidate the cached domain separator if the chain id changes.\n    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;\n    uint256 private immutable _CACHED_CHAIN_ID;\n\n    bytes32 private immutable _HASHED_NAME;\n    bytes32 private immutable _HASHED_VERSION;\n    bytes32 private immutable _TYPE_HASH;\n\n    /* solhint-enable var-name-mixedcase */\n\n    /**\n     * @dev Initializes the domain separator and parameter caches.\n     *\n     * The meaning of `name` and `version` is specified in\n     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:\n     *\n     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.\n     * - `version`: the current major version of the signing domain.\n     *\n     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart\n     * contract upgrade].\n     */\n    constructor(string memory name, string memory version) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        bytes32 hashedName = keccak256(bytes(name));\n        bytes32 hashedVersion = keccak256(bytes(version));\n        bytes32 typeHash = keccak256(\n            \"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"\n        );\n        _HASHED_NAME = hashedName;\n        _HASHED_VERSION = hashedVersion;\n        _CACHED_CHAIN_ID = chainID;\n        _CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator(typeHash, hashedName, hashedVersion);\n        _TYPE_HASH = typeHash;\n    }\n\n    /**\n     * @dev Returns the domain separator for the current chain.\n     */\n    function _domainSeparatorV4() internal view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        if (chainID == _CACHED_CHAIN_ID) {\n            return _CACHED_DOMAIN_SEPARATOR;\n        } else {\n            return _buildDomainSeparator(_TYPE_HASH, _HASHED_NAME, _HASHED_VERSION);\n        }\n    }\n\n    function _buildDomainSeparator(\n        bytes32 typeHash,\n        bytes32 nameHash,\n        bytes32 versionHash\n    ) private view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        return keccak256(abi.encode(typeHash, nameHash, versionHash, chainID, address(this)));\n    }\n\n    /**\n     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this\n     * function returns the hash of the fully encoded EIP712 message for this domain.\n     *\n     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:\n     *\n     * ```solidity\n     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(\n     *     keccak256(\"Mail(address to,string contents)\"),\n     *     mailTo,\n     *     keccak256(bytes(mailContents))\n     * )));\n     * address signer = ECDSA.recover(digest, signature);\n     * ```\n     */\n    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {\n        return ECDSA.toTypedDataHash(_domainSeparatorV4(), structHash);\n    }\n}\n\n// File: interfaces/IERC20Permit.sol\n\n/**\n * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n */\ninterface IERC20Permit {\n    /**\n     * @dev Sets `value` as th xe allowance of `spender` over ``owner``'s tokens,\n     * given ``owner``'s signed approval.\n     *\n     * IMPORTANT: The same issues {IERC20-approve} has related to transaction\n     * ordering also apply here.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `deadline` must be a timestamp in the future.\n     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`\n     * over the EIP712-formatted function arguments.\n     * - the signature must use ``owner``'s current nonce (see {nonces}).\n     *\n     * For more information on the signature format, see the\n     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP\n     * section].\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n\n    /**\n     * @dev Returns the current nonce for `owner`. This value must be\n     * included whenever a signature is generated for {permit}.\n     *\n     * Every successful call to {permit} increases ``owner``'s nonce by one. This\n     * prevents a signature from being used multiple times.\n     */\n    function nonces(address owner) external view returns (uint256);\n\n    /**\n     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n}\n\n// File: interfaces/IERC20.sol\n\ninterface IERC20 {\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `recipient`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address recipient, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `sender` to `recipient` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) external returns (bool);\n\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n\n// File: interfaces/IOHM.sol\n\ninterface IOHM is IERC20 {\n    function mint(address account_, uint256 amount_) external;\n\n    function burn(uint256 amount) external;\n\n    function burnFrom(address account_, uint256 amount_) external;\n}\n\n// File: libraries/SafeMath.sol\n\nlibrary SafeMath {\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        uint256 c = a + b;\n        require(c >= a, \"SafeMath: addition overflow\");\n\n        return c;\n    }\n\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return sub(a, b, \"SafeMath: subtraction overflow\");\n    }\n\n    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b <= a, errorMessage);\n        uint256 c = a - b;\n\n        return c;\n    }\n\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        uint256 c = a * b;\n        require(c / a == b, \"SafeMath: multiplication overflow\");\n\n        return c;\n    }\n\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        return div(a, b, \"SafeMath: division by zero\");\n    }\n\n    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        uint256 c = a / b;\n        assert(a == b * c + (a % b)); // There is no case in which this doesn't hold\n\n        return c;\n    }\n\n    // Only used in the  BondingCalculator.sol\n    function sqrrt(uint256 a) internal pure returns (uint256 c) {\n        if (a > 3) {\n            c = a;\n            uint256 b = add(div(a, 2), 1);\n            while (b < c) {\n                c = b;\n                b = div(add(div(a, b), b), 2);\n            }\n        } else if (a != 0) {\n            c = 1;\n        }\n    }\n}\n\n// File: libraries/Counters.sol\n\nlibrary Counters {\n    using SafeMath for uint256;\n\n    struct Counter {\n        // This variable should never be directly accessed by users of the library: interactions must be restricted to\n        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add\n        // this feature: see https://github.com/ethereum/solidity/issues/4637\n        uint256 _value; // default: 0\n    }\n\n    function current(Counter storage counter) internal view returns (uint256) {\n        return counter._value;\n    }\n\n    function increment(Counter storage counter) internal {\n        // The {SafeMath} overflow check can be skipped here, see the comment at the top\n        counter._value += 1;\n    }\n\n    function decrement(Counter storage counter) internal {\n        counter._value = counter._value.sub(1);\n    }\n}\n\n// File: types/ERC20.sol\n\nabstract contract ERC20 is IERC20 {\n    using SafeMath for uint256;\n\n    // TODO comment actual hash value.\n    bytes32 private constant ERC20TOKEN_ERC1820_INTERFACE_ID = keccak256(\"ERC20Token\");\n\n    mapping(address => uint256) internal _balances;\n\n    mapping(address => mapping(address => uint256)) internal _allowances;\n\n    uint256 internal _totalSupply;\n\n    string internal _name;\n\n    string internal _symbol;\n\n    uint8 internal immutable _decimals;\n\n    constructor(string memory name_, string memory symbol_, uint8 decimals_) {\n        _name = name_;\n        _symbol = symbol_;\n        _decimals = decimals_;\n    }\n\n    function name() public view returns (string memory) {\n        return _name;\n    }\n\n    function symbol() public view returns (string memory) {\n        return _symbol;\n    }\n\n    function decimals() public view virtual returns (uint8) {\n        return _decimals;\n    }\n\n    function totalSupply() public view override returns (uint256) {\n        return _totalSupply;\n    }\n\n    function balanceOf(address account) public view virtual override returns (uint256) {\n        return _balances[account];\n    }\n\n    function transfer(address recipient, uint256 amount) public virtual override returns (bool) {\n        _transfer(msg.sender, recipient, amount);\n        return true;\n    }\n\n    function allowance(\n        address owner,\n        address spender\n    ) public view virtual override returns (uint256) {\n        return _allowances[owner][spender];\n    }\n\n    function approve(address spender, uint256 amount) public virtual override returns (bool) {\n        _approve(msg.sender, spender, amount);\n        return true;\n    }\n\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) public virtual override returns (bool) {\n        _transfer(sender, recipient, amount);\n        _approve(\n            sender,\n            msg.sender,\n            _allowances[sender][msg.sender].sub(amount, \"ERC20: transfer amount exceeds allowance\")\n        );\n        return true;\n    }\n\n    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {\n        _approve(msg.sender, spender, _allowances[msg.sender][spender].add(addedValue));\n        return true;\n    }\n\n    function decreaseAllowance(\n        address spender,\n        uint256 subtractedValue\n    ) public virtual returns (bool) {\n        _approve(\n            msg.sender,\n            spender,\n            _allowances[msg.sender][spender].sub(\n                subtractedValue,\n                \"ERC20: decreased allowance below zero\"\n            )\n        );\n        return true;\n    }\n\n    function _transfer(address sender, address recipient, uint256 amount) internal virtual {\n        require(sender != address(0), \"ERC20: transfer from the zero address\");\n        require(recipient != address(0), \"ERC20: transfer to the zero address\");\n\n        _beforeTokenTransfer(sender, recipient, amount);\n\n        _balances[sender] = _balances[sender].sub(amount, \"ERC20: transfer amount exceeds balance\");\n        _balances[recipient] = _balances[recipient].add(amount);\n        emit Transfer(sender, recipient, amount);\n    }\n\n    function _mint(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: mint to the zero address\");\n        _beforeTokenTransfer(address(0), account, amount);\n        _totalSupply = _totalSupply.add(amount);\n        _balances[account] = _balances[account].add(amount);\n        emit Transfer(address(0), account, amount);\n    }\n\n    function _burn(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: burn from the zero address\");\n\n        _beforeTokenTransfer(account, address(0), amount);\n\n        _balances[account] = _balances[account].sub(amount, \"ERC20: burn amount exceeds balance\");\n        _totalSupply = _totalSupply.sub(amount);\n        emit Transfer(account, address(0), amount);\n    }\n\n    function _approve(address owner, address spender, uint256 amount) internal virtual {\n        require(owner != address(0), \"ERC20: approve from the zero address\");\n        require(spender != address(0), \"ERC20: approve to the zero address\");\n\n        _allowances[owner][spender] = amount;\n        emit Approval(owner, spender, amount);\n    }\n\n    function _beforeTokenTransfer(address from_, address to_, uint256 amount_) internal virtual {}\n}\n\n// File: types/ERC20Permit.sol\n\n/**\n * @dev Implementation of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on `{IERC20-approve}`, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n *\n * _Available since v3.4._\n */\nabstract contract ERC20Permit is ERC20, IERC20Permit, EIP712 {\n    using Counters for Counters.Counter;\n\n    mapping(address => Counters.Counter) private _nonces;\n\n    // solhint-disable-next-line var-name-mixedcase\n    bytes32 private immutable _PERMIT_TYPEHASH =\n        keccak256(\n            \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n        );\n\n    /**\n     * @dev Initializes the {EIP712} domain separator using the `name` parameter, and setting `version` to `\"1\"`.\n     *\n     * It's a good idea to use the same `name` that is defined as the ERC20 token name.\n     */\n    constructor(string memory name) EIP712(name, \"1\") {}\n\n    /**\n     * @dev See {IERC20Permit-permit}.\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual override {\n        require(block.timestamp <= deadline, \"ERC20Permit: expired deadline\");\n\n        bytes32 structHash = keccak256(\n            abi.encode(_PERMIT_TYPEHASH, owner, spender, value, _useNonce(owner), deadline)\n        );\n\n        bytes32 hash = _hashTypedDataV4(structHash);\n\n        address signer = ECDSA.recover(hash, v, r, s);\n        require(signer == owner, \"ERC20Permit: invalid signature\");\n\n        _approve(owner, spender, value);\n    }\n\n    /**\n     * @dev See {IERC20Permit-nonces}.\n     */\n    function nonces(address owner) public view virtual override returns (uint256) {\n        return _nonces[owner].current();\n    }\n\n    /**\n     * @dev See {IERC20Permit-DOMAIN_SEPARATOR}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view override returns (bytes32) {\n        return _domainSeparatorV4();\n    }\n\n    /**\n     * @dev \"Consume a nonce\": return the current value and increment.\n     *\n     * _Available since v4.1._\n     */\n    function _useNonce(address owner) internal virtual returns (uint256 current) {\n        Counters.Counter storage nonce = _nonces[owner];\n        current = nonce.current();\n        nonce.increment();\n    }\n}\n\n// File: OlympusERC20.sol\n\ncontract OlympusERC20Token is ERC20Permit, IOHM, OlympusAccessControlled {\n    using SafeMath for uint256;\n\n    constructor(\n        address _authority\n    )\n        ERC20(\"Olympus\", \"OHM\", 9)\n        ERC20Permit(\"Olympus\")\n        OlympusAccessControlled(IOlympusAuthority(_authority))\n    {}\n\n    function mint(address account_, uint256 amount_) external override onlyVault {\n        _mint(account_, amount_);\n    }\n\n    function burn(uint256 amount) external override {\n        _burn(msg.sender, amount);\n    }\n\n    function burnFrom(address account_, uint256 amount_) external override {\n        _burnFrom(account_, amount_);\n    }\n\n    function _burnFrom(address account_, uint256 amount_) internal {\n        uint256 decreasedAllowance_ = allowance(account_, msg.sender).sub(\n            amount_,\n            \"ERC20: burn amount exceeds allowance\"\n        );\n\n        _approve(account_, msg.sender, decreasedAllowance_);\n        _burn(account_, amount_);\n    }\n}\n"
+    },
+    "src/modules/MINTR/MINTR.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {OlympusERC20Token as OHM} from \"src/external/OlympusERC20.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Wrapper for minting and burning functions of OHM token.\nabstract contract MINTRv1 is Module {\n    // =========  EVENTS ========= //\n\n    event IncreaseMintApproval(address indexed policy_, uint256 newAmount_);\n    event DecreaseMintApproval(address indexed policy_, uint256 newAmount_);\n    event Mint(address indexed policy_, address indexed to_, uint256 amount_);\n    event Burn(address indexed policy_, address indexed from_, uint256 amount_);\n\n    // ========= ERRORS ========= //\n\n    error MINTR_NotApproved();\n    error MINTR_ZeroAmount();\n    error MINTR_NotActive();\n\n    // =========  STATE ========= //\n\n    OHM public ohm;\n\n    /// @notice Status of the minter. If false, minting and burning OHM is disabled.\n    bool public active;\n\n    /// @notice Mapping of who is approved for minting.\n    /// @dev    minter -> amount. Infinite approval is max(uint256).\n    mapping(address => uint256) public mintApproval;\n\n    // =========  FUNCTIONS ========= //\n\n    modifier onlyWhileActive() {\n        if (!active) revert MINTR_NotActive();\n        _;\n    }\n\n    /// @notice Mint OHM to an address.\n    function mintOhm(address to_, uint256 amount_) external virtual;\n\n    /// @notice Burn OHM from an address. Must have approval.\n    function burnOhm(address from_, uint256 amount_) external virtual;\n\n    /// @notice Increase approval for specific withdrawer addresses\n    /// @dev    Policies must explicity request how much they want approved before withdrawing.\n    function increaseMintApproval(address policy_, uint256 amount_) external virtual;\n\n    /// @notice Decrease approval for specific withdrawer addresses\n    function decreaseMintApproval(address policy_, uint256 amount_) external virtual;\n\n    /// @notice Emergency shutdown of minting and burning.\n    function deactivate() external virtual;\n\n    /// @notice Re-activate minting and burning after shutdown.\n    function activate() external virtual;\n}\n"
+    },
+    "src/modules/MINTR/OlympusMinter.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {MINTRv1, OHM} from \"src/modules/MINTR/MINTR.v1.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Wrapper for minting and burning functions of OHM token.\ncontract OlympusMinter is MINTRv1 {\n    //============================================================================================//\n    //                                      MODULE SETUP                                          //\n    //============================================================================================//\n\n    constructor(Kernel kernel_, address ohm_) Module(kernel_) {\n        ohm = OHM(ohm_);\n        active = true;\n    }\n\n    /// @inheritdoc Module\n    function KEYCODE() public pure override returns (Keycode) {\n        return toKeycode(\"MINTR\");\n    }\n\n    /// @inheritdoc Module\n    function VERSION() external pure override returns (uint8 major, uint8 minor) {\n        major = 1;\n        minor = 0;\n    }\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc MINTRv1\n    function mintOhm(address to_, uint256 amount_) external override permissioned onlyWhileActive {\n        if (amount_ == 0) revert MINTR_ZeroAmount();\n\n        uint256 approval = mintApproval[msg.sender];\n        if (approval < amount_) revert MINTR_NotApproved();\n\n        unchecked {\n            mintApproval[msg.sender] = approval - amount_;\n        }\n\n        ohm.mint(to_, amount_);\n\n        emit Mint(msg.sender, to_, amount_);\n    }\n\n    /// @inheritdoc MINTRv1\n    function burnOhm(\n        address from_,\n        uint256 amount_\n    ) external override permissioned onlyWhileActive {\n        if (amount_ == 0) revert MINTR_ZeroAmount();\n\n        ohm.burnFrom(from_, amount_);\n\n        emit Burn(msg.sender, from_, amount_);\n    }\n\n    /// @inheritdoc MINTRv1\n    function increaseMintApproval(address policy_, uint256 amount_) external override permissioned {\n        uint256 approval = mintApproval[policy_];\n\n        uint256 newAmount = type(uint256).max - approval <= amount_\n            ? type(uint256).max\n            : approval + amount_;\n        mintApproval[policy_] = newAmount;\n\n        emit IncreaseMintApproval(policy_, newAmount);\n    }\n\n    /// @inheritdoc MINTRv1\n    function decreaseMintApproval(address policy_, uint256 amount_) external override permissioned {\n        uint256 approval = mintApproval[policy_];\n\n        uint256 newAmount = approval <= amount_ ? 0 : approval - amount_;\n        mintApproval[policy_] = newAmount;\n\n        emit DecreaseMintApproval(policy_, newAmount);\n    }\n\n    /// @inheritdoc MINTRv1\n    function deactivate() external override permissioned {\n        active = false;\n    }\n\n    /// @inheritdoc MINTRv1\n    function activate() external override permissioned {\n        active = true;\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.15+commit.e14f2714"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "kernel_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "ohm_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "caller_",
+              "type": "address"
+            }
+          ],
+          "name": "KernelAdapter_OnlyKernel",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "MINTR_NotActive",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "MINTR_NotApproved",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "MINTR_ZeroAmount",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "policy_",
+              "type": "address"
+            }
+          ],
+          "name": "Module_PolicyNotPermitted",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "policy_",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "from_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "Burn",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "policy_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newAmount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "DecreaseMintApproval",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "policy_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newAmount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncreaseMintApproval",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "policy_",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "Mint",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "INIT",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "KEYCODE",
+          "outputs": [
+            {
+              "internalType": "Keycode",
+              "name": "",
+              "type": "bytes5"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "VERSION",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "major",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint8",
+              "name": "minor",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "activate",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "active",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "from_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "burnOhm",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "newKernel_",
+              "type": "address"
+            }
+          ],
+          "name": "changeKernel",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "deactivate",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "policy_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "decreaseMintApproval",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "policy_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "increaseMintApproval",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "kernel",
+          "outputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "mintApproval",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "to_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "mintOhm",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ohm",
+          "outputs": [
+            {
+              "internalType": "contract OlympusERC20Token",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "INIT()": {
+            "details": "This function is called when the module is installed or upgraded by the kernel.MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic."
+          },
+          "VERSION()": {
+            "returns": {
+              "major": "- Major version upgrade indicates breaking change to the interface.",
+              "minor": "- Minor version change retains backward-compatible interface."
+            }
+          },
+          "increaseMintApproval(address,uint256)": {
+            "details": "Policies must explicity request how much they want approved before withdrawing."
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "INIT()": {
+            "notice": "Initialization function for the module"
+          },
+          "KEYCODE()": {
+            "notice": "5 byte identifier for a module."
+          },
+          "VERSION()": {
+            "notice": "Returns which semantic version of a module is being implemented."
+          },
+          "activate()": {
+            "notice": "Re-activate minting and burning after shutdown."
+          },
+          "active()": {
+            "notice": "Status of the minter. If false, minting and burning OHM is disabled."
+          },
+          "burnOhm(address,uint256)": {
+            "notice": "Burn OHM from an address. Must have approval."
+          },
+          "changeKernel(address)": {
+            "notice": "Function used by kernel when migrating to a new kernel."
+          },
+          "deactivate()": {
+            "notice": "Emergency shutdown of minting and burning."
+          },
+          "decreaseMintApproval(address,uint256)": {
+            "notice": "Decrease approval for specific withdrawer addresses"
+          },
+          "increaseMintApproval(address,uint256)": {
+            "notice": "Increase approval for specific withdrawer addresses"
+          },
+          "mintApproval(address)": {
+            "notice": "Mapping of who is approved for minting."
+          },
+          "mintOhm(address,uint256)": {
+            "notice": "Mint OHM to an address."
+          }
+        },
+        "notice": "Wrapper for minting and burning functions of OHM token.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/modules/MINTR/OlympusMinter.sol": "OlympusMinter"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10
+      },
+      "remappings": [
+        ":@addresses/=lib/forge-proposal-simulator/addresses/",
+        ":@examples/=lib/forge-proposal-simulator/examples/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@proposals/=lib/forge-proposal-simulator/proposals/",
+        ":@script/=lib/forge-proposal-simulator/script/",
+        ":@test/=lib/forge-proposal-simulator/test/",
+        ":@utils/=lib/forge-proposal-simulator/utils/",
+        ":balancer-v2/=lib/balancer-v2/",
+        ":bonds/=lib/bonds/src/",
+        ":clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        ":clones/=lib/clones-with-immutable-args/src/",
+        ":comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        ":forge-std/=lib/forge-std/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero/=lib/solidity-examples/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/openzeppelin-contracts/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=lib/forge-proposal-simulator/",
+        ":proposal-sim/proposals/=lib/forge-proposal-simulator/proposals/",
+        ":proposals/=src/proposals/",
+        ":solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        ":solidity-examples/=lib/solidity-examples/contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":test/=src/test/"
+      ]
+    },
+    "sources": {
+      "src/Kernel.sol": {
+        "keccak256": "0x5798deae5f5ce704f699ef3b5022e16825a4470972212a9b55ec66746fcd5fc2",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://67b6284b459b3d3e8781975a85b08778d14850a09dc51aff80de76de54f12129",
+          "dweb:/ipfs/QmarPSzUc6TckbSd2sGovhstAiNTbWBDTbQB9mwPXeX1A5"
+        ]
+      },
+      "src/external/OlympusERC20.sol": {
+        "keccak256": "0x615c2c31c85f680c81bf456550f0dc8da0e45abc6cc7846bb87a067d04772601",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://e5cde097f699ccd42d77e87ca2c7f89cf8e1b1ec40c3da4984489522c1b9b793",
+          "dweb:/ipfs/QmWdb7aBcGG3Fiy1eyfgpsmykeUghZbwx4E53NyGXheraX"
+        ]
+      },
+      "src/modules/MINTR/MINTR.v1.sol": {
+        "keccak256": "0xe6c2b75f3c9bb366ca8e62081b4c79f537ed5f286b37280b178aeb6c4eb1ad9f",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://bda861f3e9fdf14eed2987d49eee0c83ae184a5efafcd438c6fb0f5ba122c9ac",
+          "dweb:/ipfs/QmfMZbkobLL77dezr93ko9KE75NMjv9F7SKmPvoVK9TDHr"
+        ]
+      },
+      "src/modules/MINTR/OlympusMinter.sol": {
+        "keccak256": "0x8bb7052b7b49297146ff60672498f2b0bd1a4c772d9411095ae0271a25861305",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://f84b11a041e12043bef2ce11c5fc35f8b6f930d3e73c62b788ec3b7e58392300",
+          "dweb:/ipfs/QmeCEeLyXxMx714cdGQUtbeqjpFRCdSskhwA3mZeTHsq4u"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.15+commit.e14f2714",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 10,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": [
+        ":@addresses/=lib/forge-proposal-simulator/addresses/",
+        ":@examples/=lib/forge-proposal-simulator/examples/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@proposals/=lib/forge-proposal-simulator/proposals/",
+        ":@script/=lib/forge-proposal-simulator/script/",
+        ":@test/=lib/forge-proposal-simulator/test/",
+        ":@utils/=lib/forge-proposal-simulator/utils/",
+        ":balancer-v2/=lib/balancer-v2/",
+        ":bonds/=lib/bonds/src/",
+        ":clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        ":clones/=lib/clones-with-immutable-args/src/",
+        ":comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        ":forge-std/=lib/forge-std/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero/=lib/solidity-examples/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/openzeppelin-contracts/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=lib/forge-proposal-simulator/",
+        ":proposal-sim/proposals/=lib/forge-proposal-simulator/proposals/",
+        ":proposals/=src/proposals/",
+        ":solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        ":solidity-examples/=lib/solidity-examples/contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":test/=src/test/"
+      ]
+    },
+    "name": "OlympusMinter",
+    "fullyQualifiedName": "src/modules/MINTR/OlympusMinter.sol:OlympusMinter"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "827246",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T12:02:47Z",
+  "match": "exact_match",
+  "chainId": "8453",
+  "address": "0x623164A9Ee2556D524b08f34F1d2389d7B4e1A1C"
+}

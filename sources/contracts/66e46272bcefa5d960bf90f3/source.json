@@ -1,0 +1,1353 @@
+{
+  "sources": {
+    "src/policies/V1Migrator.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n/// forge-lint: disable-start(mixed-case-function,mixed-case-variable)\npragma solidity >=0.8.15;\n\n// ============  INTERFACES ============ //\n\nimport {IERC165} from \"@openzeppelin-5.3.0/interfaces/IERC165.sol\";\nimport {IERC20} from \"src/interfaces/IERC20.sol\";\nimport {IERC20BurnableMintable} from \"src/interfaces/IERC20BurnableMintable.sol\";\nimport {IV1Migrator} from \"src/policies/interfaces/IV1Migrator.sol\";\nimport {IVersioned} from \"src/interfaces/IVersioned.sol\";\nimport {IgOHM} from \"src/interfaces/IgOHM.sol\";\n\n// ============  LIBRARIES ============ //\n\nimport {MerkleProof} from \"@openzeppelin-5.3.0/utils/cryptography/MerkleProof.sol\";\nimport {SafeTransferLib} from \"@solmate-6.2.0/utils/SafeTransferLib.sol\";\nimport {ERC20} from \"@solmate-6.2.0/tokens/ERC20.sol\";\n\n// ============  EXTERNAL CONTRACTS ============ //\n\n// ============  INTERNAL CONTRACTS ============ //\n\nimport {Kernel, Policy, Keycode, Permissions, toKeycode} from \"src/Kernel.sol\";\nimport {ROLESv1} from \"modules/ROLES/ROLES.v1.sol\";\nimport {MINTRv1} from \"modules/MINTR/MINTR.v1.sol\";\nimport {PolicyEnabler} from \"src/policies/utils/PolicyEnabler.sol\";\n\n/// @title V1Migrator\n/// @notice Policy to allow OHM v1 holders to migrate to OHM v2 via merkle proof verification\n/// @dev    Migration flow (partial migrations allowed):\n///         1. User has OHM v1 balance\n///         2. User proves eligibility via merkle proof with their allocated amount\n///         3. User can migrate any amount up to their allocation in multiple transactions\n///         4. Contract calculates OHM v2 amount using gOHM conversion (to match production flow):\n///            - Convert OHM v1 to gOHM via gOHM.balanceTo(ohmV1Amount)\n///            - Convert gOHM back to OHM v2 via gOHM.balanceFrom(gOHMAmount)\n///            - This matches the production flow: OHM v1 -> gOHM -> OHM v2\n///            - When gOHM index is not at base level, the result may be slightly less due to rounding\n///         5. Contract burns OHM v1 and mints calculated OHM v2 amount to user\n///         6. User's migrated amount is tracked by OHM v1 amount (original allocation)\n///\n///         Admin functions:\n///         - setMerkleRoot: Update eligibility tree (resets all migrated amounts)\n///         - setRemainingMintApproval: Update remaining MINTR approval for migration\n///         - enable/disable: Emergency pause/resume\ncontract V1Migrator is Policy, PolicyEnabler, IVersioned, IV1Migrator {\n    using MerkleProof for bytes32[];\n    using SafeTransferLib for ERC20;\n\n    // =========  CONSTANTS ========= //\n\n    /// @notice The role required to set merkle root\n    bytes32 internal constant LEGACY_MIGRATION_ADMIN_ROLE = \"legacy_migration_admin\";\n\n    // =========  STATE VARIABLES ========= //\n\n    /// @notice The MINTR module reference for minting OHM v2\n    MINTRv1 internal MINTR;\n\n    // ROLES is already declared in PolicyAdmin/PolicyEnabler\n\n    /// @notice The gOHM token contract used for OHM v2 amount calculation\n    IgOHM internal immutable _GOHM;\n\n    /// @notice The OHM v1 token contract (9 decimals)\n    IERC20 internal immutable _OHMV1;\n\n    /// @notice The OHM v2 token contract from MINTR (9 decimals)\n    /// @dev    Set in configureDependencies via MINTR.ohm()\n    IERC20 internal _OHMV2;\n\n    /// @inheritdoc IV1Migrator\n    bytes32 public override merkleRoot;\n\n    /// @notice Current merkle root nonce for invalidating old migrations on root update\n    uint256 internal _currentMerkleNonce = 1;\n\n    /// @notice Mapping of user => nonce => migrated amount\n    /// @dev    Nonce-based invalidation allows O(1) merkle root updates\n    mapping(address user => mapping(uint256 nonce => uint256 amount)) private _migratedAmounts;\n\n    /// @inheritdoc IV1Migrator\n    uint256 public override totalMigrated;\n\n    // =========  CONSTRUCTOR ========= //\n\n    constructor(Kernel kernel_, IERC20 ohmV1_, IgOHM gOHM_, bytes32 merkleRoot_) Policy(kernel_) {\n        if (address(ohmV1_) == address(0)) revert ZeroAddress();\n        if (address(gOHM_) == address(0)) revert ZeroAddress();\n        _OHMV1 = ohmV1_;\n        _GOHM = gOHM_;\n\n        // Set the merkle root\n        merkleRoot = merkleRoot_;\n        emit MerkleRootUpdated(merkleRoot_, msg.sender);\n\n        // Disabled by default\n    }\n\n    // =========  INTERFACE GETTERS ========= //\n\n    /// @inheritdoc IV1Migrator\n    function ohmV1() external view returns (IERC20 ohmV1_) {\n        return _OHMV1;\n    }\n\n    /// @inheritdoc IV1Migrator\n    function ohmV2() external view returns (IERC20 ohmV2_) {\n        return _OHMV2;\n    }\n\n    /// @inheritdoc IV1Migrator\n    function gOHM() external view returns (address gOHM_) {\n        return address(_GOHM);\n    }\n\n    /// @inheritdoc IV1Migrator\n    function remainingMintApproval() external view returns (uint256 remaining_) {\n        remaining_ = MINTR.mintApproval(address(this));\n    }\n\n    /// @inheritdoc IV1Migrator\n    /// @dev    Returns the migrated amount for the current merkle root nonce\n    function migratedAmounts(address account_) external view returns (uint256 migratedAmount_) {\n        migratedAmount_ = _migratedAmounts[account_][_currentMerkleNonce];\n    }\n\n    /// @notice Calculate OHM v2 amount from OHM v1 amount using gOHM conversion\n    /// @dev    Used by both migrate() and previewMigrate() to ensure consistency\n    /// @param amount_ The OHM v1 amount (9 decimals)\n    /// @return ohmV2Amount_ The OHM v2 amount (9 decimals), or 0 if conversion rounds to zero\n    function _calculateOHMv2Amount(uint256 amount_) internal view returns (uint256 ohmV2Amount_) {\n        // Migration flow: OHM v1 -> gOHM (balanceTo) -> OHM v2 (balanceFrom)\n        uint256 gohmAmount = _GOHM.balanceTo(amount_);\n        ohmV2Amount_ = _GOHM.balanceFrom(gohmAmount);\n    }\n\n    /// @inheritdoc IV1Migrator\n    function previewMigrate(uint256 amount_) external view returns (uint256 ohmV2Amount_) {\n        ohmV2Amount_ = _calculateOHMv2Amount(amount_);\n    }\n\n    // =========  POLICY SETUP ========= //\n\n    /// @inheritdoc Policy\n    function configureDependencies() external override returns (Keycode[] memory dependencies) {\n        dependencies = new Keycode[](2);\n        dependencies[0] = toKeycode(\"MINTR\");\n        dependencies[1] = toKeycode(\"ROLES\");\n\n        MINTR = MINTRv1(getModuleAddress(dependencies[0]));\n        ROLES = ROLESv1(getModuleAddress(dependencies[1]));\n\n        (uint8 MINTR_MAJOR, ) = MINTR.VERSION();\n        (uint8 ROLES_MAJOR, ) = ROLES.VERSION();\n\n        // Ensure Modules are using the expected major version.\n        bytes memory expected = abi.encode([1, 1]);\n        if (MINTR_MAJOR != 1 || ROLES_MAJOR != 1) revert Policy_WrongModuleVersion(expected);\n\n        // Set ohmV2 from MINTR\n        _OHMV2 = IERC20(address(MINTR.ohm()));\n    }\n\n    /// @inheritdoc Policy\n    function requestPermissions() external view override returns (Permissions[] memory requests) {\n        Keycode MINTR_KEYCODE = toKeycode(\"MINTR\");\n\n        requests = new Permissions[](3);\n        requests[0] = Permissions({keycode: MINTR_KEYCODE, funcSelector: MINTR.mintOhm.selector});\n        requests[1] = Permissions({\n            keycode: MINTR_KEYCODE,\n            funcSelector: MINTR.increaseMintApproval.selector\n        });\n        requests[2] = Permissions({\n            keycode: MINTR_KEYCODE,\n            funcSelector: MINTR.decreaseMintApproval.selector\n        });\n    }\n\n    // =========  ENABLE/DISABLE OVERRIDES ========= //\n\n    /// @notice Override _enable to accept initial remaining mint approval\n    /// @dev    The enableData should be ABI-encoded as (uint256 remainingApproval)\n    ///\n    ///         This allows setting the initial remaining mint approval when enabling the contract.\n    ///         The merkle root is set in the constructor and cannot be changed via enable().\n    ///\n    ///         On re-enable, the MINTR approval is adjusted to match the provided remaining approval.\n    ///\n    /// @param enableData_ ABI-encoded (uint256 remainingApproval)\n    function _enable(bytes calldata enableData_) internal override {\n        // Decode enableData: (uint256 remainingApproval)\n        uint256 remainingApproval = abi.decode(enableData_, (uint256));\n        _setRemainingMintApproval(remainingApproval);\n    }\n\n    // =========  INTERNAL FUNCTIONS ========= //\n\n    /// @notice Internal function to set the remaining MINTR mint approval\n    /// @dev    This sets the remaining allowance (not a lifetime total). The MINTR approval\n    ///         represents how much OHM v2 can still be minted. When users migrate, the\n    ///         approval decreases. This function synchronizes the approval to a target value.\n    /// @param approval_ The target remaining mint approval (in OHM v2 units)\n    function _setRemainingMintApproval(uint256 approval_) internal {\n        // Get current MINTR approval\n        uint256 currentApproval = MINTR.mintApproval(address(this));\n\n        // Increase or decrease MINTR approval to reach the target approval\n        if (approval_ > currentApproval) {\n            MINTR.increaseMintApproval(address(this), approval_ - currentApproval);\n        } else if (approval_ < currentApproval) {\n            MINTR.decreaseMintApproval(address(this), currentApproval - approval_);\n        }\n\n        // Emit event\n        emit RemainingMintApprovalUpdated(approval_, currentApproval);\n    }\n\n    // =========  VERSION ========= //\n\n    /// @inheritdoc IVersioned\n    function VERSION() external pure returns (uint8, uint8) {\n        return (1, 0);\n    }\n\n    // =========  ERC165 ========= //\n\n    /// @notice ERC165 interface support\n    /// @dev    Supports IERC165, IVersioned, IV1Migrator, and IEnabler (via PolicyEnabler)\n    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {\n        return\n            interfaceId == type(IERC165).interfaceId ||\n            interfaceId == type(IVersioned).interfaceId ||\n            interfaceId == type(IV1Migrator).interfaceId ||\n            super.supportsInterface(interfaceId);\n    }\n\n    // =========  MODIFIERS ========= //\n\n    function _onlyAdminOrLegacyMigrationAdmin() internal view {\n        if (!ROLES.hasRole(msg.sender, LEGACY_MIGRATION_ADMIN_ROLE) && !_isAdmin(msg.sender)) {\n            revert NotAuthorised();\n        }\n    }\n\n    modifier onlyAdminOrLegacyMigrationAdmin() {\n        _onlyAdminOrLegacyMigrationAdmin();\n        _;\n    }\n\n    // =========  MIGRATE FUNCTIONS ========= //\n\n    /// @notice Internal function to verify a merkle proof\n    /// @dev Uses double-hashing to prevent leaf collision attacks (OpenZeppelin standard)\n    /// @param account_ The account to verify\n    /// @param allocatedAmount_ The allocated amount to verify\n    /// @param proof_ The merkle proof\n    /// @return valid True if the proof is valid\n    function _verifyClaim(\n        address account_,\n        uint256 allocatedAmount_,\n        bytes32[] calldata proof_\n    ) internal view returns (bool valid) {\n        // Generate leaf for this account and allocated amount (double-hashed)\n        /// forge-lint: disable-next-line(asm-keccak256)\n        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(account_, allocatedAmount_))));\n\n        // Verify proof against current root\n        return proof_.verify(merkleRoot, leaf);\n    }\n\n    /// @inheritdoc IV1Migrator\n    function verifyClaim(\n        address account_,\n        uint256 allocatedAmount_,\n        bytes32[] calldata proof_\n    ) external view returns (bool valid_) {\n        return _verifyClaim(account_, allocatedAmount_, proof_);\n    }\n\n    /// @inheritdoc IV1Migrator\n    function migrate(\n        uint256 amount_,\n        bytes32[] calldata proof_,\n        uint256 allocatedAmount_\n    ) external onlyEnabled {\n        // Verify merkle proof for this claim with the allocated amount\n        if (!_verifyClaim(msg.sender, allocatedAmount_, proof_)) revert InvalidProof();\n\n        // Check that amount doesn't exceed user's allocation\n        uint256 userMigrated = _migratedAmounts[msg.sender][_currentMerkleNonce];\n        if (userMigrated + amount_ > allocatedAmount_) {\n            revert AmountExceedsAllowance(amount_, allocatedAmount_, userMigrated);\n        }\n\n        // Calculate OHM v2 amount using gOHM conversion to match the migration flow\n        // Migration flow: OHM v1 -> gOHM (balanceTo) -> OHM v2 (balanceFrom)\n        uint256 ohmV2Amount = _calculateOHMv2Amount(amount_);\n\n        // Check that OHM v2 amount is not zero (may happen due to gOHM rounding)\n        if (ohmV2Amount == 0) revert ZeroAmount();\n\n        // Check MINTR approval (represents remaining amount that can be minted)\n        uint256 mintrApproval = MINTR.mintApproval(address(this));\n        if (ohmV2Amount > mintrApproval) {\n            revert CapExceeded(ohmV2Amount, mintrApproval);\n        }\n\n        // Update user's migrated amount for current nonce (tracked by OHM v1 amount)\n        _migratedAmounts[msg.sender][_currentMerkleNonce] = userMigrated + amount_;\n\n        // Update tracking (use OHM v1 amount for total migrated)\n        totalMigrated += amount_;\n\n        // Burn OHM v1 from user (user must have approved this contract)\n        IERC20BurnableMintable(address(_OHMV1)).burnFrom(msg.sender, amount_);\n\n        // Mint OHM v2 to user (amount calculated via gOHM conversion)\n        MINTR.mintOhm(msg.sender, ohmV2Amount);\n\n        emit Migrated(msg.sender, amount_, ohmV2Amount);\n    }\n\n    /// @inheritdoc IV1Migrator\n    /// @dev    When the merkle root is updated, the nonce is incremented.\n    ///         This resets all previous migrations without needing to iterate over users.\n    ///         The new merkle tree should reflect the amount each user can migrate going\n    ///         forward (i.e., their current OHM v1 balance).\n    function setMerkleRoot(bytes32 merkleRoot_) external onlyAdminOrLegacyMigrationAdmin {\n        // Guard against setting the same root (would reset nonce and allow re-migration)\n        if (merkleRoot_ == merkleRoot) revert SameMerkleRoot();\n\n        // Increment nonce to reset all previous migrations\n        _currentMerkleNonce++;\n\n        // Update merkle root\n        merkleRoot = merkleRoot_;\n        emit MerkleRootUpdated(merkleRoot_, msg.sender);\n    }\n\n    /// @inheritdoc IV1Migrator\n    function setRemainingMintApproval(uint256 approval_) external onlyAdminRole {\n        _setRemainingMintApproval(approval_);\n    }\n\n    /// @inheritdoc IV1Migrator\n    /// @dev    Only callable by admin or legacy migration admin. Sweeps entire balance to caller.\n    function rescue(IERC20 token_) external onlyAdminOrLegacyMigrationAdmin {\n        if (address(token_) == address(0)) revert ZeroAddress();\n\n        uint256 balance = token_.balanceOf(address(this));\n        if (balance == 0) revert ZeroAmount();\n\n        ERC20(address(token_)).safeTransfer(msg.sender, balance);\n        emit Rescued(address(token_), msg.sender, balance);\n    }\n}\n/// forge-lint: disable-end(mixed-case-function,mixed-case-variable)\n"
+    },
+    "dependencies/openzeppelin-new-5.3.0/contracts/interfaces/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/IERC165.sol)\n\npragma solidity ^0.8.20;\n\nimport {IERC165} from \"../utils/introspection/IERC165.sol\";\n"
+    },
+    "src/interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\n// Imported from forge-std\n\n/// @dev Interface of the ERC20 standard as defined in the EIP.\n/// @dev This includes the optional name, symbol, and decimals metadata.\ninterface IERC20 {\n    /// @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /// @dev Emitted when the allowance of a `spender` for an `owner` is set, where `value`\n    /// is the new allowance.\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /// @notice Returns the amount of tokens in existence.\n    function totalSupply() external view returns (uint256);\n\n    /// @notice Returns the amount of tokens owned by `account`.\n    function balanceOf(address account) external view returns (uint256);\n\n    /// @notice Moves `amount` tokens from the caller's account to `to`.\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the remaining number of tokens that `spender` is allowed\n    /// to spend on behalf of `owner`\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /// @notice Sets `amount` as the allowance of `spender` over the caller's tokens.\n    /// @dev Be aware of front-running risks: https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /// @notice Moves `amount` tokens from `from` to `to` using the allowance mechanism.\n    /// `amount` is then deducted from the caller's allowance.\n    function transferFrom(address from, address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the name of the token.\n    function name() external view returns (string memory);\n\n    /// @notice Returns the symbol of the token.\n    function symbol() external view returns (string memory);\n\n    /// @notice Returns the decimals places of the token.\n    function decimals() external view returns (uint8);\n}\n"
+    },
+    "src/interfaces/IERC20BurnableMintable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\nimport {IERC20} from \"src/interfaces/IERC20.sol\";\n\ninterface IERC20BurnableMintable is IERC20 {\n    /// @notice Mints tokens to the specified address\n    ///\n    /// @param to_      The address to mint tokens to\n    /// @param amount_  The amount of tokens to mint\n    function mintFor(address to_, uint256 amount_) external;\n\n    /// @notice Burns tokens from the specified address\n    ///\n    /// @param from_    The address to burn tokens from\n    /// @param amount_  The amount of tokens to burn\n    function burnFrom(address from_, uint256 amount_) external;\n}\n"
+    },
+    "src/policies/interfaces/IV1Migrator.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n/// forge-lint: disable-start(mixed-case-function,mixed-case-variable)\npragma solidity >=0.8.15;\n\nimport {IERC20} from \"src/interfaces/IERC20.sol\";\nimport {IEnabler} from \"src/periphery/interfaces/IEnabler.sol\";\nimport {IVersioned} from \"src/interfaces/IVersioned.sol\";\n\n/// @title IV1Migrator\n/// @notice Interface for the V1Migrator policy that allows OHM v1 holders to migrate to OHM v2\n///         via merkle proof verification\ninterface IV1Migrator is IEnabler, IVersioned {\n    // ============ EVENTS ============ //\n\n    /// @notice Emitted when a user successfully migrates OHM v1 to OHM v2\n    ///\n    /// @param user The address of the user migrating\n    /// @param ohmV1Amount The amount of OHM v1 burned\n    /// @param ohmV2Amount The amount of OHM v2 minted\n    event Migrated(address indexed user, uint256 ohmV1Amount, uint256 ohmV2Amount);\n\n    /// @notice Emitted when the merkle root is updated\n    ///\n    /// @param newRoot The new merkle root\n    /// @param updater The address that updated the root\n    event MerkleRootUpdated(bytes32 indexed newRoot, address indexed updater);\n\n    /// @notice Emitted when the remaining mint approval is updated\n    ///\n    /// @param newApproval The new remaining mint approval\n    /// @param oldApproval The old remaining mint approval\n    event RemainingMintApprovalUpdated(uint256 indexed newApproval, uint256 indexed oldApproval);\n\n    /// @notice Emitted when tokens are rescued from the contract\n    ///\n    /// @param token The rescued token address\n    /// @param to The recipient address\n    /// @param amount The amount rescued\n    event Rescued(address indexed token, address indexed to, uint256 amount);\n\n    // ============ ERRORS ============ //\n\n    /// @notice Thrown when the provided merkle proof is invalid\n    error InvalidProof();\n\n    /// @notice Thrown when the amount exceeds the user's allocation\n    ///\n    /// @param requested The amount requested to migrate\n    /// @param allocated The user's allocated amount from the merkle tree\n    /// @param migrated The amount already migrated by the user\n    error AmountExceedsAllowance(uint256 requested, uint256 allocated, uint256 migrated);\n\n    /// @notice Thrown when the migration cap would be exceeded\n    ///\n    /// @param amount The amount requested to migrate\n    /// @param remaining The remaining MINTR approval for the migrator contract\n    error CapExceeded(uint256 amount, uint256 remaining);\n\n    /// @notice Thrown when the OHM v2 amount after gOHM conversion is zero\n    /// @dev    This can happen when the input OHM v1 amount is very small and\n    ///         gOHM conversion rounds down to zero\n    error ZeroAmount();\n\n    /// @notice Thrown when an address parameter is zero\n    error ZeroAddress();\n\n    /// @notice Thrown when attempting to set the same merkle root that is already set\n    error SameMerkleRoot();\n\n    // ============ STATE VARIABLES ============ //\n\n    /// @notice The OHM v1 token contract\n    ///\n    /// @return ohmV1_ The OHM v1 token\n    function ohmV1() external view returns (IERC20 ohmV1_);\n\n    /// @notice The OHM v2 token contract\n    ///\n    /// @return ohmV2_ The OHM v2 token\n    function ohmV2() external view returns (IERC20 ohmV2_);\n\n    /// @notice The gOHM token contract used for conversion calculations\n    /// @dev    Used to calculate OHM v2 amount via balanceTo/balanceFrom to match production flow\n    ///\n    /// @return gOHM_ The gOHM token\n    function gOHM() external view returns (address gOHM_);\n\n    /// @notice The current merkle root for verifying eligible claims\n    ///\n    /// @return merkleRoot_ The current merkle root\n    function merkleRoot() external view returns (bytes32 merkleRoot_);\n\n    /// @notice The amount a user has migrated under the current root\n    /// @param account_ The account to check\n    /// @return migratedAmount_ The amount migrated by the user\n    function migratedAmounts(address account_) external view returns (uint256 migratedAmount_);\n\n    /// @notice The remaining amount of OHM that can be minted by this contract\n    /// @dev    Returns the actual MINTR mint approval, not a stored value. This is the\n    ///         remaining amount available for migration and is always in sync with MINTR state.\n    ///\n    /// @return remaining_ The remaining OHM that can be minted\n    function remainingMintApproval() external view returns (uint256 remaining_);\n\n    /// @notice The total amount of OHM v1 migrated so far\n    ///\n    /// @return totalMigrated_ The total migrated amount\n    function totalMigrated() external view returns (uint256 totalMigrated_);\n\n    /// @notice Preview the OHM v2 amount that will be received for a given OHM v1 amount\n    /// @dev    Performs the same gOHM conversion as migrate() without state changes.\n    ///         Users migrating multiple times will lose dust on each transaction.\n    ///         Recommended: migrate full allocation in one transaction.\n    ///\n    /// @param amount_ The amount of OHM v1 to preview (9 decimals)\n    /// @return ohmV2Amount_ The amount of OHM v2 that would be received (9 decimals), or 0 if conversion rounds to zero\n    function previewMigrate(uint256 amount_) external view returns (uint256 ohmV2Amount_);\n\n    // ============ FUNCTIONS ============ //\n\n    /// @notice Migrate OHM v1 to OHM v2\n    /// @dev    User must approve this contract to transfer their OHM v1\n    ///         Users can migrate any amount up to their allocated amount in multiple transactions\n    ///\n    /// @param amount_ The amount of OHM v1 to migrate (9 decimals)\n    /// @param proof_ The merkle proof proving the user is eligible\n    /// @param allocatedAmount_ The user's allocated amount from the merkle tree\n    function migrate(uint256 amount_, bytes32[] calldata proof_, uint256 allocatedAmount_) external;\n\n    /// @notice Update the merkle root for eligible claims\n    ///\n    /// @param merkleRoot_ The new merkle root\n    function setMerkleRoot(bytes32 merkleRoot_) external;\n\n    /// @notice Set the remaining MINTR mint approval for migration\n    /// @dev    This sets the remaining amount that can be minted, NOT a lifetime total.\n    ///         If you want 1000 OHM v2 to be available for migration and 600 has already\n    ///         been minted, call this with 1000 (not 400). Queries the current MINTR\n    ///         approval and adjusts it to the target approval.\n    ///\n    /// @param approval_ The target remaining mint approval (9 decimals)\n    function setRemainingMintApproval(uint256 approval_) external;\n\n    /// @notice Rescue accidentally sent tokens\n    /// @dev    Only callable by admin or legacy migration admin. Sweeps entire balance to caller.\n    ///\n    /// @param token_ The ERC20 token to rescue\n    function rescue(IERC20 token_) external;\n\n    /// @notice Verify if a claim is valid for a given account and allocated amount\n    ///\n    /// @param account_ The account to verify\n    /// @param allocatedAmount_ The allocated amount to verify\n    /// @param proof_ The merkle proof\n    /// @return valid_ True if the claim is valid\n    function verifyClaim(\n        address account_,\n        uint256 allocatedAmount_,\n        bytes32[] calldata proof_\n    ) external view returns (bool valid_);\n}\n/// forge-lint: disable-end(mixed-case-function,mixed-case-variable)\n"
+    },
+    "src/interfaces/IVersioned.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n/// forge-lint: disable-start(mixed-case-function)\npragma solidity >=0.8.0;\n\n/// @title IVersioned\n/// @notice Interface for contracts that have a version\ninterface IVersioned {\n    /// @notice Returns the version of the contract\n    ///\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external view returns (uint8 major, uint8 minor);\n}\n/// forge-lint: disable-end(mixed-case-function)\n"
+    },
+    "src/interfaces/IgOHM.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0\npragma solidity >=0.8.15;\n\nimport {IERC20} from \"src/external/OlympusERC20.sol\";\n\ninterface IgOHM is IERC20 {\n    function mint(address _to, uint256 _amount) external;\n\n    function burn(address _from, uint256 _amount) external;\n\n    function index() external view returns (uint256);\n\n    /**\n        @notice converts gOHM amount to OHM\n        @param _amount uint\n        @return uint\n     */\n    function balanceFrom(uint256 _amount) external view returns (uint256);\n\n    /**\n        @notice converts OHM amount to gOHM\n        @param _amount uint\n        @return uint\n     */\n    function balanceTo(uint256 _amount) external view returns (uint256);\n\n    function migrate(address _staking, address _sOHM) external;\n\n    function getPriorVotes(address account, uint256 blockNumber) external view returns (uint256);\n\n    function totalSupply() external view override returns (uint256);\n}\n"
+    },
+    "dependencies/openzeppelin-new-5.3.0/contracts/utils/cryptography/MerkleProof.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.1.0) (utils/cryptography/MerkleProof.sol)\n// This file was procedurally generated from scripts/generate/templates/MerkleProof.js.\n\npragma solidity ^0.8.20;\n\nimport {Hashes} from \"./Hashes.sol\";\n\n/**\n * @dev These functions deal with verification of Merkle Tree proofs.\n *\n * The tree and the proofs can be generated using our\n * https://github.com/OpenZeppelin/merkle-tree[JavaScript library].\n * You will find a quickstart guide in the readme.\n *\n * WARNING: You should avoid using leaf values that are 64 bytes long prior to\n * hashing, or use a hash function other than keccak256 for hashing leaves.\n * This is because the concatenation of a sorted pair of internal nodes in\n * the Merkle tree could be reinterpreted as a leaf value.\n * OpenZeppelin's JavaScript library generates Merkle trees that are safe\n * against this attack out of the box.\n *\n * IMPORTANT: Consider memory side-effects when using custom hashing functions\n * that access memory in an unsafe way.\n *\n * NOTE: This library supports proof verification for merkle trees built using\n * custom _commutative_ hashing functions (i.e. `H(a, b) == H(b, a)`). Proving\n * leaf inclusion in trees built using non-commutative hashing functions requires\n * additional logic that is not supported by this library.\n */\nlibrary MerkleProof {\n    /**\n     *@dev The multiproof provided is not valid.\n     */\n    error MerkleProofInvalidMultiproof();\n\n    /**\n     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree\n     * defined by `root`. For this, a `proof` must be provided, containing\n     * sibling hashes on the branch from the leaf to the root of the tree. Each\n     * pair of leaves and each pair of pre-images are assumed to be sorted.\n     *\n     * This version handles proofs in memory with the default hashing function.\n     */\n    function verify(bytes32[] memory proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {\n        return processProof(proof, leaf) == root;\n    }\n\n    /**\n     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up\n     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt\n     * hash matches the root of the tree. When processing the proof, the pairs\n     * of leaves & pre-images are assumed to be sorted.\n     *\n     * This version handles proofs in memory with the default hashing function.\n     */\n    function processProof(bytes32[] memory proof, bytes32 leaf) internal pure returns (bytes32) {\n        bytes32 computedHash = leaf;\n        for (uint256 i = 0; i < proof.length; i++) {\n            computedHash = Hashes.commutativeKeccak256(computedHash, proof[i]);\n        }\n        return computedHash;\n    }\n\n    /**\n     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree\n     * defined by `root`. For this, a `proof` must be provided, containing\n     * sibling hashes on the branch from the leaf to the root of the tree. Each\n     * pair of leaves and each pair of pre-images are assumed to be sorted.\n     *\n     * This version handles proofs in memory with a custom hashing function.\n     */\n    function verify(\n        bytes32[] memory proof,\n        bytes32 root,\n        bytes32 leaf,\n        function(bytes32, bytes32) view returns (bytes32) hasher\n    ) internal view returns (bool) {\n        return processProof(proof, leaf, hasher) == root;\n    }\n\n    /**\n     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up\n     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt\n     * hash matches the root of the tree. When processing the proof, the pairs\n     * of leaves & pre-images are assumed to be sorted.\n     *\n     * This version handles proofs in memory with a custom hashing function.\n     */\n    function processProof(\n        bytes32[] memory proof,\n        bytes32 leaf,\n        function(bytes32, bytes32) view returns (bytes32) hasher\n    ) internal view returns (bytes32) {\n        bytes32 computedHash = leaf;\n        for (uint256 i = 0; i < proof.length; i++) {\n            computedHash = hasher(computedHash, proof[i]);\n        }\n        return computedHash;\n    }\n\n    /**\n     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree\n     * defined by `root`. For this, a `proof` must be provided, containing\n     * sibling hashes on the branch from the leaf to the root of the tree. Each\n     * pair of leaves and each pair of pre-images are assumed to be sorted.\n     *\n     * This version handles proofs in calldata with the default hashing function.\n     */\n    function verifyCalldata(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {\n        return processProofCalldata(proof, leaf) == root;\n    }\n\n    /**\n     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up\n     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt\n     * hash matches the root of the tree. When processing the proof, the pairs\n     * of leaves & pre-images are assumed to be sorted.\n     *\n     * This version handles proofs in calldata with the default hashing function.\n     */\n    function processProofCalldata(bytes32[] calldata proof, bytes32 leaf) internal pure returns (bytes32) {\n        bytes32 computedHash = leaf;\n        for (uint256 i = 0; i < proof.length; i++) {\n            computedHash = Hashes.commutativeKeccak256(computedHash, proof[i]);\n        }\n        return computedHash;\n    }\n\n    /**\n     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree\n     * defined by `root`. For this, a `proof` must be provided, containing\n     * sibling hashes on the branch from the leaf to the root of the tree. Each\n     * pair of leaves and each pair of pre-images are assumed to be sorted.\n     *\n     * This version handles proofs in calldata with a custom hashing function.\n     */\n    function verifyCalldata(\n        bytes32[] calldata proof,\n        bytes32 root,\n        bytes32 leaf,\n        function(bytes32, bytes32) view returns (bytes32) hasher\n    ) internal view returns (bool) {\n        return processProofCalldata(proof, leaf, hasher) == root;\n    }\n\n    /**\n     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up\n     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt\n     * hash matches the root of the tree. When processing the proof, the pairs\n     * of leaves & pre-images are assumed to be sorted.\n     *\n     * This version handles proofs in calldata with a custom hashing function.\n     */\n    function processProofCalldata(\n        bytes32[] calldata proof,\n        bytes32 leaf,\n        function(bytes32, bytes32) view returns (bytes32) hasher\n    ) internal view returns (bytes32) {\n        bytes32 computedHash = leaf;\n        for (uint256 i = 0; i < proof.length; i++) {\n            computedHash = hasher(computedHash, proof[i]);\n        }\n        return computedHash;\n    }\n\n    /**\n     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by\n     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.\n     *\n     * This version handles multiproofs in memory with the default hashing function.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     *\n     * NOTE: Consider the case where `root == proof[0] && leaves.length == 0` as it will return `true`.\n     * The `leaves` must be validated independently. See {processMultiProof}.\n     */\n    function multiProofVerify(\n        bytes32[] memory proof,\n        bool[] memory proofFlags,\n        bytes32 root,\n        bytes32[] memory leaves\n    ) internal pure returns (bool) {\n        return processMultiProof(proof, proofFlags, leaves) == root;\n    }\n\n    /**\n     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction\n     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another\n     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false\n     * respectively.\n     *\n     * This version handles multiproofs in memory with the default hashing function.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree\n     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the\n     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).\n     *\n     * NOTE: The _empty set_ (i.e. the case where `proof.length == 1 && leaves.length == 0`) is considered a no-op,\n     * and therefore a valid multiproof (i.e. it returns `proof[0]`). Consider disallowing this case if you're not\n     * validating the leaves elsewhere.\n     */\n    function processMultiProof(\n        bytes32[] memory proof,\n        bool[] memory proofFlags,\n        bytes32[] memory leaves\n    ) internal pure returns (bytes32 merkleRoot) {\n        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by\n        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the\n        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of\n        // the Merkle tree.\n        uint256 leavesLen = leaves.length;\n        uint256 proofFlagsLen = proofFlags.length;\n\n        // Check proof validity.\n        if (leavesLen + proof.length != proofFlagsLen + 1) {\n            revert MerkleProofInvalidMultiproof();\n        }\n\n        // The xxxPos values are \"pointers\" to the next value to consume in each array. All accesses are done using\n        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's \"pop\".\n        bytes32[] memory hashes = new bytes32[](proofFlagsLen);\n        uint256 leafPos = 0;\n        uint256 hashPos = 0;\n        uint256 proofPos = 0;\n        // At each step, we compute the next hash using two values:\n        // - a value from the \"main queue\". If not all leaves have been consumed, we get the next leaf, otherwise we\n        //   get the next hash.\n        // - depending on the flag, either another value from the \"main queue\" (merging branches) or an element from the\n        //   `proof` array.\n        for (uint256 i = 0; i < proofFlagsLen; i++) {\n            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];\n            bytes32 b = proofFlags[i]\n                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])\n                : proof[proofPos++];\n            hashes[i] = Hashes.commutativeKeccak256(a, b);\n        }\n\n        if (proofFlagsLen > 0) {\n            if (proofPos != proof.length) {\n                revert MerkleProofInvalidMultiproof();\n            }\n            unchecked {\n                return hashes[proofFlagsLen - 1];\n            }\n        } else if (leavesLen > 0) {\n            return leaves[0];\n        } else {\n            return proof[0];\n        }\n    }\n\n    /**\n     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by\n     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.\n     *\n     * This version handles multiproofs in memory with a custom hashing function.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     *\n     * NOTE: Consider the case where `root == proof[0] && leaves.length == 0` as it will return `true`.\n     * The `leaves` must be validated independently. See {processMultiProof}.\n     */\n    function multiProofVerify(\n        bytes32[] memory proof,\n        bool[] memory proofFlags,\n        bytes32 root,\n        bytes32[] memory leaves,\n        function(bytes32, bytes32) view returns (bytes32) hasher\n    ) internal view returns (bool) {\n        return processMultiProof(proof, proofFlags, leaves, hasher) == root;\n    }\n\n    /**\n     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction\n     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another\n     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false\n     * respectively.\n     *\n     * This version handles multiproofs in memory with a custom hashing function.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree\n     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the\n     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).\n     *\n     * NOTE: The _empty set_ (i.e. the case where `proof.length == 1 && leaves.length == 0`) is considered a no-op,\n     * and therefore a valid multiproof (i.e. it returns `proof[0]`). Consider disallowing this case if you're not\n     * validating the leaves elsewhere.\n     */\n    function processMultiProof(\n        bytes32[] memory proof,\n        bool[] memory proofFlags,\n        bytes32[] memory leaves,\n        function(bytes32, bytes32) view returns (bytes32) hasher\n    ) internal view returns (bytes32 merkleRoot) {\n        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by\n        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the\n        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of\n        // the Merkle tree.\n        uint256 leavesLen = leaves.length;\n        uint256 proofFlagsLen = proofFlags.length;\n\n        // Check proof validity.\n        if (leavesLen + proof.length != proofFlagsLen + 1) {\n            revert MerkleProofInvalidMultiproof();\n        }\n\n        // The xxxPos values are \"pointers\" to the next value to consume in each array. All accesses are done using\n        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's \"pop\".\n        bytes32[] memory hashes = new bytes32[](proofFlagsLen);\n        uint256 leafPos = 0;\n        uint256 hashPos = 0;\n        uint256 proofPos = 0;\n        // At each step, we compute the next hash using two values:\n        // - a value from the \"main queue\". If not all leaves have been consumed, we get the next leaf, otherwise we\n        //   get the next hash.\n        // - depending on the flag, either another value from the \"main queue\" (merging branches) or an element from the\n        //   `proof` array.\n        for (uint256 i = 0; i < proofFlagsLen; i++) {\n            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];\n            bytes32 b = proofFlags[i]\n                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])\n                : proof[proofPos++];\n            hashes[i] = hasher(a, b);\n        }\n\n        if (proofFlagsLen > 0) {\n            if (proofPos != proof.length) {\n                revert MerkleProofInvalidMultiproof();\n            }\n            unchecked {\n                return hashes[proofFlagsLen - 1];\n            }\n        } else if (leavesLen > 0) {\n            return leaves[0];\n        } else {\n            return proof[0];\n        }\n    }\n\n    /**\n     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by\n     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.\n     *\n     * This version handles multiproofs in calldata with the default hashing function.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     *\n     * NOTE: Consider the case where `root == proof[0] && leaves.length == 0` as it will return `true`.\n     * The `leaves` must be validated independently. See {processMultiProofCalldata}.\n     */\n    function multiProofVerifyCalldata(\n        bytes32[] calldata proof,\n        bool[] calldata proofFlags,\n        bytes32 root,\n        bytes32[] memory leaves\n    ) internal pure returns (bool) {\n        return processMultiProofCalldata(proof, proofFlags, leaves) == root;\n    }\n\n    /**\n     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction\n     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another\n     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false\n     * respectively.\n     *\n     * This version handles multiproofs in calldata with the default hashing function.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree\n     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the\n     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).\n     *\n     * NOTE: The _empty set_ (i.e. the case where `proof.length == 1 && leaves.length == 0`) is considered a no-op,\n     * and therefore a valid multiproof (i.e. it returns `proof[0]`). Consider disallowing this case if you're not\n     * validating the leaves elsewhere.\n     */\n    function processMultiProofCalldata(\n        bytes32[] calldata proof,\n        bool[] calldata proofFlags,\n        bytes32[] memory leaves\n    ) internal pure returns (bytes32 merkleRoot) {\n        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by\n        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the\n        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of\n        // the Merkle tree.\n        uint256 leavesLen = leaves.length;\n        uint256 proofFlagsLen = proofFlags.length;\n\n        // Check proof validity.\n        if (leavesLen + proof.length != proofFlagsLen + 1) {\n            revert MerkleProofInvalidMultiproof();\n        }\n\n        // The xxxPos values are \"pointers\" to the next value to consume in each array. All accesses are done using\n        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's \"pop\".\n        bytes32[] memory hashes = new bytes32[](proofFlagsLen);\n        uint256 leafPos = 0;\n        uint256 hashPos = 0;\n        uint256 proofPos = 0;\n        // At each step, we compute the next hash using two values:\n        // - a value from the \"main queue\". If not all leaves have been consumed, we get the next leaf, otherwise we\n        //   get the next hash.\n        // - depending on the flag, either another value from the \"main queue\" (merging branches) or an element from the\n        //   `proof` array.\n        for (uint256 i = 0; i < proofFlagsLen; i++) {\n            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];\n            bytes32 b = proofFlags[i]\n                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])\n                : proof[proofPos++];\n            hashes[i] = Hashes.commutativeKeccak256(a, b);\n        }\n\n        if (proofFlagsLen > 0) {\n            if (proofPos != proof.length) {\n                revert MerkleProofInvalidMultiproof();\n            }\n            unchecked {\n                return hashes[proofFlagsLen - 1];\n            }\n        } else if (leavesLen > 0) {\n            return leaves[0];\n        } else {\n            return proof[0];\n        }\n    }\n\n    /**\n     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by\n     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.\n     *\n     * This version handles multiproofs in calldata with a custom hashing function.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     *\n     * NOTE: Consider the case where `root == proof[0] && leaves.length == 0` as it will return `true`.\n     * The `leaves` must be validated independently. See {processMultiProofCalldata}.\n     */\n    function multiProofVerifyCalldata(\n        bytes32[] calldata proof,\n        bool[] calldata proofFlags,\n        bytes32 root,\n        bytes32[] memory leaves,\n        function(bytes32, bytes32) view returns (bytes32) hasher\n    ) internal view returns (bool) {\n        return processMultiProofCalldata(proof, proofFlags, leaves, hasher) == root;\n    }\n\n    /**\n     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction\n     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another\n     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false\n     * respectively.\n     *\n     * This version handles multiproofs in calldata with a custom hashing function.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree\n     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the\n     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).\n     *\n     * NOTE: The _empty set_ (i.e. the case where `proof.length == 1 && leaves.length == 0`) is considered a no-op,\n     * and therefore a valid multiproof (i.e. it returns `proof[0]`). Consider disallowing this case if you're not\n     * validating the leaves elsewhere.\n     */\n    function processMultiProofCalldata(\n        bytes32[] calldata proof,\n        bool[] calldata proofFlags,\n        bytes32[] memory leaves,\n        function(bytes32, bytes32) view returns (bytes32) hasher\n    ) internal view returns (bytes32 merkleRoot) {\n        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by\n        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the\n        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of\n        // the Merkle tree.\n        uint256 leavesLen = leaves.length;\n        uint256 proofFlagsLen = proofFlags.length;\n\n        // Check proof validity.\n        if (leavesLen + proof.length != proofFlagsLen + 1) {\n            revert MerkleProofInvalidMultiproof();\n        }\n\n        // The xxxPos values are \"pointers\" to the next value to consume in each array. All accesses are done using\n        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's \"pop\".\n        bytes32[] memory hashes = new bytes32[](proofFlagsLen);\n        uint256 leafPos = 0;\n        uint256 hashPos = 0;\n        uint256 proofPos = 0;\n        // At each step, we compute the next hash using two values:\n        // - a value from the \"main queue\". If not all leaves have been consumed, we get the next leaf, otherwise we\n        //   get the next hash.\n        // - depending on the flag, either another value from the \"main queue\" (merging branches) or an element from the\n        //   `proof` array.\n        for (uint256 i = 0; i < proofFlagsLen; i++) {\n            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];\n            bytes32 b = proofFlags[i]\n                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])\n                : proof[proofPos++];\n            hashes[i] = hasher(a, b);\n        }\n\n        if (proofFlagsLen > 0) {\n            if (proofPos != proof.length) {\n                revert MerkleProofInvalidMultiproof();\n            }\n            unchecked {\n                return hashes[proofFlagsLen - 1];\n            }\n        } else if (leavesLen > 0) {\n            return leaves[0];\n        } else {\n            return proof[0];\n        }\n    }\n}\n"
+    },
+    "dependencies/solmate-6.2.0/src/utils/SafeTransferLib.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\nimport {ERC20} from \"../tokens/ERC20.sol\";\n\n/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)\n/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.\n/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.\nlibrary SafeTransferLib {\n    /*//////////////////////////////////////////////////////////////\n                             ETH OPERATIONS\n    //////////////////////////////////////////////////////////////*/\n\n    function safeTransferETH(address to, uint256 amount) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Transfer the ETH and store if it succeeded or not.\n            success := call(gas(), to, amount, 0, 0, 0, 0)\n        }\n\n        require(success, \"ETH_TRANSFER_FAILED\");\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            ERC20 OPERATIONS\n    //////////////////////////////////////////////////////////////*/\n\n    function safeTransferFrom(\n        ERC20 token,\n        address from,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"from\" argument.\n            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 68), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)\n            )\n        }\n\n        require(success, \"TRANSFER_FROM_FAILED\");\n    }\n\n    function safeTransfer(\n        ERC20 token,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 36), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)\n            )\n        }\n\n        require(success, \"TRANSFER_FAILED\");\n    }\n\n    function safeApprove(\n        ERC20 token,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 36), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)\n            )\n        }\n\n        require(success, \"APPROVE_FAILED\");\n    }\n}\n"
+    },
+    "dependencies/solmate-6.2.0/src/tokens/ERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)\n/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)\n/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.\nabstract contract ERC20 {\n    /*//////////////////////////////////////////////////////////////\n                                 EVENTS\n    //////////////////////////////////////////////////////////////*/\n\n    event Transfer(address indexed from, address indexed to, uint256 amount);\n\n    event Approval(address indexed owner, address indexed spender, uint256 amount);\n\n    /*//////////////////////////////////////////////////////////////\n                            METADATA STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    string public name;\n\n    string public symbol;\n\n    uint8 public immutable decimals;\n\n    /*//////////////////////////////////////////////////////////////\n                              ERC20 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 public totalSupply;\n\n    mapping(address => uint256) public balanceOf;\n\n    mapping(address => mapping(address => uint256)) public allowance;\n\n    /*//////////////////////////////////////////////////////////////\n                            EIP-2612 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 internal immutable INITIAL_CHAIN_ID;\n\n    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;\n\n    mapping(address => uint256) public nonces;\n\n    /*//////////////////////////////////////////////////////////////\n                               CONSTRUCTOR\n    //////////////////////////////////////////////////////////////*/\n\n    constructor(\n        string memory _name,\n        string memory _symbol,\n        uint8 _decimals\n    ) {\n        name = _name;\n        symbol = _symbol;\n        decimals = _decimals;\n\n        INITIAL_CHAIN_ID = block.chainid;\n        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                               ERC20 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function approve(address spender, uint256 amount) public virtual returns (bool) {\n        allowance[msg.sender][spender] = amount;\n\n        emit Approval(msg.sender, spender, amount);\n\n        return true;\n    }\n\n    function transfer(address to, uint256 amount) public virtual returns (bool) {\n        balanceOf[msg.sender] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(msg.sender, to, amount);\n\n        return true;\n    }\n\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) public virtual returns (bool) {\n        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.\n\n        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;\n\n        balanceOf[from] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(from, to, amount);\n\n        return true;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                             EIP-2612 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual {\n        require(deadline >= block.timestamp, \"PERMIT_DEADLINE_EXPIRED\");\n\n        // Unchecked because the only math done is incrementing\n        // the owner's nonce which cannot realistically overflow.\n        unchecked {\n            address recoveredAddress = ecrecover(\n                keccak256(\n                    abi.encodePacked(\n                        \"\\x19\\x01\",\n                        DOMAIN_SEPARATOR(),\n                        keccak256(\n                            abi.encode(\n                                keccak256(\n                                    \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n                                ),\n                                owner,\n                                spender,\n                                value,\n                                nonces[owner]++,\n                                deadline\n                            )\n                        )\n                    )\n                ),\n                v,\n                r,\n                s\n            );\n\n            require(recoveredAddress != address(0) && recoveredAddress == owner, \"INVALID_SIGNER\");\n\n            allowance[recoveredAddress][spender] = value;\n        }\n\n        emit Approval(owner, spender, value);\n    }\n\n    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {\n        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();\n    }\n\n    function computeDomainSeparator() internal view virtual returns (bytes32) {\n        return\n            keccak256(\n                abi.encode(\n                    keccak256(\"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"),\n                    keccak256(bytes(name)),\n                    keccak256(\"1\"),\n                    block.chainid,\n                    address(this)\n                )\n            );\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                        INTERNAL MINT/BURN LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function _mint(address to, uint256 amount) internal virtual {\n        totalSupply += amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(address(0), to, amount);\n    }\n\n    function _burn(address from, uint256 amount) internal virtual {\n        balanceOf[from] -= amount;\n\n        // Cannot underflow because a user's balance\n        // will never be larger than the total supply.\n        unchecked {\n            totalSupply -= amount;\n        }\n\n        emit Transfer(from, address(0), amount);\n    }\n}\n"
+    },
+    "src/Kernel.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\n//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████\n//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███\n//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░\n// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████\n// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███\n// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███\n//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████\n//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░\n\n//============================================================================================//\n//                                        GLOBAL TYPES                                        //\n//============================================================================================//\n\n/// @notice Actions to trigger state changes in the kernel. Passed by the executor\nenum Actions {\n    InstallModule,\n    UpgradeModule,\n    ActivatePolicy,\n    DeactivatePolicy,\n    ChangeExecutor,\n    MigrateKernel\n}\n\n/// @notice Used by executor to select an action and a target contract for a kernel action\nstruct Instruction {\n    Actions action;\n    address target;\n}\n\n/// @notice Used to define which module functions a policy needs access to\nstruct Permissions {\n    Keycode keycode;\n    bytes4 funcSelector;\n}\n\ntype Keycode is bytes5;\n\n//============================================================================================//\n//                                       UTIL FUNCTIONS                                       //\n//============================================================================================//\n\nerror TargetNotAContract(address target_);\nerror InvalidKeycode(Keycode keycode_);\n\n// solhint-disable-next-line func-visibility\nfunction toKeycode(bytes5 keycode_) pure returns (Keycode) {\n    return Keycode.wrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction fromKeycode(Keycode keycode_) pure returns (bytes5) {\n    return Keycode.unwrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureContract(address target_) view {\n    if (target_.code.length == 0) revert TargetNotAContract(target_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureValidKeycode(Keycode keycode_) pure {\n    bytes5 unwrapped = Keycode.unwrap(keycode_);\n    for (uint256 i = 0; i < 5; ) {\n        bytes1 char = unwrapped[i];\n        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only\n        unchecked {\n            i++;\n        }\n    }\n}\n\n//============================================================================================//\n//                                        COMPONENTS                                          //\n//============================================================================================//\n\n/// @notice Generic adapter interface for kernel access in modules and policies.\nabstract contract KernelAdapter {\n    error KernelAdapter_OnlyKernel(address caller_);\n\n    Kernel public kernel;\n\n    constructor(Kernel kernel_) {\n        kernel = kernel_;\n    }\n\n    /// @notice Modifier to restrict functions to be called only by kernel.\n    modifier onlyKernel() {\n        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);\n        _;\n    }\n\n    /// @notice Function used by kernel when migrating to a new kernel.\n    function changeKernel(Kernel newKernel_) external onlyKernel {\n        kernel = newKernel_;\n    }\n}\n\n/// @notice Base level extension of the kernel. Modules act as independent state components to be\n///         interacted with and mutated through policies.\n/// @dev    Modules are installed and uninstalled via the executor.\nabstract contract Module is KernelAdapter {\n    error Module_PolicyNotPermitted(address policy_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Modifier to restrict which policies have access to module functions.\n    modifier permissioned() {\n        if (\n            msg.sender == address(kernel) ||\n            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)\n        ) revert Module_PolicyNotPermitted(msg.sender);\n        _;\n    }\n\n    /// @notice 5 byte identifier for a module.\n    function KEYCODE() public pure virtual returns (Keycode) {}\n\n    /// @notice Returns which semantic version of a module is being implemented.\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}\n\n    /// @notice Initialization function for the module\n    /// @dev    This function is called when the module is installed or upgraded by the kernel.\n    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.\n    function INIT() external virtual onlyKernel {}\n}\n\n/// @notice Policies are application logic and external interface for the kernel and installed modules.\n/// @dev    Policies are activated and deactivated in the kernel by the executor.\n/// @dev    Module dependencies and function permissions must be defined in appropriate functions.\nabstract contract Policy is KernelAdapter {\n    error Policy_ModuleDoesNotExist(Keycode keycode_);\n    error Policy_WrongModuleVersion(bytes expected_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Easily accessible indicator for if a policy is activated or not.\n    function isActive() external view returns (bool) {\n        return kernel.isPolicyActive(this);\n    }\n\n    /// @notice Function to grab module address from a given keycode.\n    function getModuleAddress(Keycode keycode_) internal view returns (address) {\n        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));\n        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);\n        return moduleForKeycode;\n    }\n\n    /// @notice Define module dependencies for this policy.\n    /// @return dependencies - Keycode array of module dependencies.\n    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}\n\n    /// @notice Function called by kernel to set module function permissions.\n    /// @return requests - Array of keycodes and function selectors for requested permissions.\n    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}\n}\n\n/// @notice Main contract that acts as a central component registry for the protocol.\n/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,\n/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.\ncontract Kernel {\n    // =========  EVENTS ========= //\n\n    event PermissionsUpdated(\n        Keycode indexed keycode_,\n        Policy indexed policy_,\n        bytes4 funcSelector_,\n        bool granted_\n    );\n    event ActionExecuted(Actions indexed action_, address indexed target_);\n\n    // =========  ERRORS ========= //\n\n    error Kernel_OnlyExecutor(address caller_);\n    error Kernel_ModuleAlreadyInstalled(Keycode module_);\n    error Kernel_InvalidModuleUpgrade(Keycode module_);\n    error Kernel_PolicyAlreadyActivated(address policy_);\n    error Kernel_PolicyNotActivated(address policy_);\n\n    // =========  PRIVILEGED ADDRESSES ========= //\n\n    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.\n    address public executor;\n\n    // =========  MODULE MANAGEMENT ========= //\n\n    /// @notice Array of all modules currently installed.\n    Keycode[] public allKeycodes;\n\n    /// @notice Mapping of module address to keycode.\n    mapping(Keycode => Module) public getModuleForKeycode;\n\n    /// @notice Mapping of keycode to module address.\n    mapping(Module => Keycode) public getKeycodeForModule;\n\n    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.\n    mapping(Keycode => Policy[]) public moduleDependents;\n\n    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.\n    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;\n\n    /// @notice Module <> Policy Permissions.\n    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission\n    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;\n\n    // =========  POLICY MANAGEMENT ========= //\n\n    /// @notice List of all active policies\n    Policy[] public activePolicies;\n\n    /// @notice Helper to get active policy quickly. Prevents need to loop through array.\n    mapping(Policy => uint256) public getPolicyIndex;\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    constructor() {\n        executor = msg.sender;\n    }\n\n    /// @notice Modifier to check if caller is the executor.\n    modifier onlyExecutor() {\n        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);\n        _;\n    }\n\n    function isPolicyActive(Policy policy_) public view returns (bool) {\n        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;\n    }\n\n    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.\n    function executeAction(Actions action_, address target_) external onlyExecutor {\n        if (action_ == Actions.InstallModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _installModule(Module(target_));\n        } else if (action_ == Actions.UpgradeModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _upgradeModule(Module(target_));\n        } else if (action_ == Actions.ActivatePolicy) {\n            ensureContract(target_);\n            _activatePolicy(Policy(target_));\n        } else if (action_ == Actions.DeactivatePolicy) {\n            ensureContract(target_);\n            _deactivatePolicy(Policy(target_));\n        } else if (action_ == Actions.ChangeExecutor) {\n            executor = target_;\n        } else if (action_ == Actions.MigrateKernel) {\n            ensureContract(target_);\n            _migrateKernel(Kernel(target_));\n        }\n\n        emit ActionExecuted(action_, target_);\n    }\n\n    function _installModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n\n        if (address(getModuleForKeycode[keycode]) != address(0))\n            revert Kernel_ModuleAlreadyInstalled(keycode);\n\n        getModuleForKeycode[keycode] = newModule_;\n        getKeycodeForModule[newModule_] = keycode;\n        allKeycodes.push(keycode);\n\n        newModule_.INIT();\n    }\n\n    function _upgradeModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n        Module oldModule = getModuleForKeycode[keycode];\n\n        if (address(oldModule) == address(0) || oldModule == newModule_)\n            revert Kernel_InvalidModuleUpgrade(keycode);\n\n        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));\n        getKeycodeForModule[newModule_] = keycode;\n        getModuleForKeycode[keycode] = newModule_;\n\n        newModule_.INIT();\n\n        _reconfigurePolicies(keycode);\n    }\n\n    function _activatePolicy(Policy policy_) internal {\n        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));\n\n        // Add policy to list of active policies\n        activePolicies.push(policy_);\n        getPolicyIndex[policy_] = activePolicies.length - 1;\n\n        // Record module dependencies\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depLength = dependencies.length;\n\n        for (uint256 i; i < depLength; ) {\n            Keycode keycode = dependencies[i];\n\n            moduleDependents[keycode].push(policy_);\n            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        // Grant permissions for policy to access restricted module functions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, true);\n    }\n\n    function _deactivatePolicy(Policy policy_) internal {\n        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));\n\n        // Revoke permissions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, false);\n\n        // Remove policy from all policy data structures\n        uint256 idx = getPolicyIndex[policy_];\n        Policy lastPolicy = activePolicies[activePolicies.length - 1];\n\n        activePolicies[idx] = lastPolicy;\n        activePolicies.pop();\n        getPolicyIndex[lastPolicy] = idx;\n        delete getPolicyIndex[policy_];\n\n        // Remove policy from module dependents\n        _pruneFromDependents(policy_);\n    }\n\n    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.\n    /// @dev    New kernel must add in all of the modules and policies via executeAction.\n    /// @dev    NOTE: Data does not get cleared from this kernel.\n    function _migrateKernel(Kernel newKernel_) internal {\n        uint256 keycodeLen = allKeycodes.length;\n        for (uint256 i; i < keycodeLen; ) {\n            Module module = Module(getModuleForKeycode[allKeycodes[i]]);\n            module.changeKernel(newKernel_);\n            unchecked {\n                ++i;\n            }\n        }\n\n        uint256 policiesLen = activePolicies.length;\n        for (uint256 j; j < policiesLen; ) {\n            Policy policy = activePolicies[j];\n\n            // Deactivate before changing kernel\n            policy.changeKernel(newKernel_);\n            unchecked {\n                ++j;\n            }\n        }\n    }\n\n    function _reconfigurePolicies(Keycode keycode_) internal {\n        Policy[] memory dependents = moduleDependents[keycode_];\n        uint256 depLength = dependents.length;\n\n        for (uint256 i; i < depLength; ) {\n            dependents[i].configureDependencies();\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _setPolicyPermissions(\n        Policy policy_,\n        Permissions[] memory requests_,\n        bool grant_\n    ) internal {\n        uint256 reqLength = requests_.length;\n        for (uint256 i = 0; i < reqLength; ) {\n            Permissions memory request = requests_[i];\n            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;\n\n            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _pruneFromDependents(Policy policy_) internal {\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depcLength = dependencies.length;\n\n        for (uint256 i; i < depcLength; ) {\n            Keycode keycode = dependencies[i];\n            Policy[] storage dependents = moduleDependents[keycode];\n\n            uint256 origIndex = getDependentIndex[keycode][policy_];\n            Policy lastPolicy = dependents[dependents.length - 1];\n\n            // Swap with last and pop\n            dependents[origIndex] = lastPolicy;\n            dependents.pop();\n\n            // Record new index and delete deactivated policy index\n            getDependentIndex[keycode][lastPolicy] = origIndex;\n            delete getDependentIndex[keycode][policy_];\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n}\n"
+    },
+    "src/modules/ROLES/ROLES.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\nimport \"src/Kernel.sol\";\n\nabstract contract ROLESv1 is Module {\n    // =========  EVENTS ========= //\n\n    event RoleGranted(bytes32 indexed role_, address indexed addr_);\n    event RoleRevoked(bytes32 indexed role_, address indexed addr_);\n\n    // =========  ERRORS ========= //\n\n    error ROLES_InvalidRole(bytes32 role_);\n    error ROLES_RequireRole(bytes32 role_);\n    error ROLES_AddressAlreadyHasRole(address addr_, bytes32 role_);\n    error ROLES_AddressDoesNotHaveRole(address addr_, bytes32 role_);\n    error ROLES_RoleDoesNotExist(bytes32 role_);\n\n    // =========  STATE ========= //\n\n    /// @notice Mapping for if an address has a policy-defined role.\n    mapping(address => mapping(bytes32 => bool)) public hasRole;\n\n    // =========  FUNCTIONS ========= //\n\n    /// @notice Function to grant policy-defined roles to some address. Can only be called by admin.\n    function saveRole(bytes32 role_, address addr_) external virtual;\n\n    /// @notice Function to revoke policy-defined roles from some address. Can only be called by admin.\n    function removeRole(bytes32 role_, address addr_) external virtual;\n\n    /// @notice \"Modifier\" to restrict policy function access to certain addresses with a role.\n    /// @dev    Roles are defined in the policy and granted by the ROLES admin.\n    function requireRole(bytes32 role_, address caller_) external virtual;\n\n    /// @notice Function that checks if role is valid (all lower case)\n    function ensureValidRole(bytes32 role_) external pure virtual;\n}\n"
+    },
+    "src/modules/MINTR/MINTR.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\nimport {OlympusERC20Token as OHM} from \"src/external/OlympusERC20.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Wrapper for minting and burning functions of OHM token.\nabstract contract MINTRv1 is Module {\n    // =========  EVENTS ========= //\n\n    event IncreaseMintApproval(address indexed policy_, uint256 newAmount_);\n    event DecreaseMintApproval(address indexed policy_, uint256 newAmount_);\n    event Mint(address indexed policy_, address indexed to_, uint256 amount_);\n    event Burn(address indexed policy_, address indexed from_, uint256 amount_);\n\n    // ========= ERRORS ========= //\n\n    error MINTR_NotApproved();\n    error MINTR_ZeroAmount();\n    error MINTR_NotActive();\n\n    // =========  STATE ========= //\n\n    OHM public ohm;\n\n    /// @notice Status of the minter. If false, minting and burning OHM is disabled.\n    bool public active;\n\n    /// @notice Mapping of who is approved for minting.\n    /// @dev    minter -> amount. Infinite approval is max(uint256).\n    mapping(address => uint256) public mintApproval;\n\n    // =========  FUNCTIONS ========= //\n\n    modifier onlyWhileActive() {\n        if (!active) revert MINTR_NotActive();\n        _;\n    }\n\n    /// @notice Mint OHM to an address.\n    function mintOhm(address to_, uint256 amount_) external virtual;\n\n    /// @notice Burn OHM from an address. Must have approval.\n    function burnOhm(address from_, uint256 amount_) external virtual;\n\n    /// @notice Increase approval for specific withdrawer addresses\n    /// @dev    Policies must explicity request how much they want approved before withdrawing.\n    function increaseMintApproval(address policy_, uint256 amount_) external virtual;\n\n    /// @notice Decrease approval for specific withdrawer addresses\n    function decreaseMintApproval(address policy_, uint256 amount_) external virtual;\n\n    /// @notice Emergency shutdown of minting and burning.\n    function deactivate() external virtual;\n\n    /// @notice Re-activate minting and burning after shutdown.\n    function activate() external virtual;\n}\n"
+    },
+    "src/policies/utils/PolicyEnabler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\nimport {IEnabler} from \"src/periphery/interfaces/IEnabler.sol\";\nimport {PolicyAdmin} from \"./PolicyAdmin.sol\";\n\n/// @title  PolicyEnabler\n/// @notice This contract is designed to be inherited by contracts that need to be enabled or disabled. It replaces the inconsistent usage of `active` and `locallyActive` state variables across the codebase.\n/// @dev    A contract that inherits from this contract should use the `onlyEnabled` and `onlyDisabled` modifiers to gate access to certain functions.\n///\n///         Inheriting contracts must do the following:\n///         - In `configureDependencies()`, assign the module address to the `ROLES` state variable, e.g. `ROLES = ROLESv1(getModuleAddress(toKeycode(\"ROLES\")));`\n///\n///         The following are optional:\n///         - Override the `_enable()` and `_disable()` functions if custom logic and/or parameters are needed for the enable/disable functions.\n///           - For example, `enable()` could be called with initialisation data that is decoded, validated and assigned in `_enable()`.\nabstract contract PolicyEnabler is IEnabler, PolicyAdmin {\n    // ===== STATE VARIABLES ===== //\n\n    /// @notice Whether the policy functionality is enabled\n    bool public isEnabled;\n\n    // ===== MODIFIERS ===== //\n\n    function _onlyEnabled() internal view {\n        if (!isEnabled) revert NotEnabled();\n    }\n\n    /// @notice Modifier that reverts if the policy is not enabled\n    modifier onlyEnabled() {\n        _onlyEnabled();\n        _;\n    }\n\n    function _onlyDisabled() internal view {\n        if (isEnabled) revert NotDisabled();\n    }\n\n    /// @notice Modifier that reverts if the policy is enabled\n    modifier onlyDisabled() {\n        _onlyDisabled();\n        _;\n    }\n\n    // ===== ENABLEABLE FUNCTIONS ===== //\n\n    /// @notice Enable the contract\n    /// @dev    This function performs the following steps:\n    ///         1. Validates that the caller has the admin role\n    ///         2. Validates that the contract is disabled\n    ///         3. Calls the implementation-specific `_enable()` function\n    ///         4. Changes the state of the contract to enabled\n    ///         5. Emits the `Enabled` event\n    ///\n    /// @param  enableData_ The data to pass to the implementation-specific `_enable()` function\n    function enable(bytes calldata enableData_) public onlyAdminRole onlyDisabled {\n        // Call the implementation-specific enable function\n        _enable(enableData_);\n\n        // Change the state\n        isEnabled = true;\n\n        // Emit the enabled event\n        emit Enabled();\n    }\n\n    /// @notice Implementation-specific enable function\n    /// @dev    This function is called by the `enable()` function\n    ///\n    ///         The implementing contract can override this function and perform the following:\n    ///         1. Validate any parameters (if needed) or revert\n    ///         2. Validate state (if needed) or revert\n    ///         3. Perform any necessary actions, apart from modifying the `isEnabled` state variable\n    ///\n    /// @param  enableData_ Custom data that can be used by the implementation. The format of this data is\n    ///         left to the discretion of the implementation.\n    function _enable(bytes calldata enableData_) internal virtual {}\n\n    /// @notice Disable the contract\n    /// @dev    This function performs the following steps:\n    ///         1. Validates that the caller has the admin or emergency role\n    ///         2. Validates that the contract is enabled\n    ///         3. Calls the implementation-specific `_disable()` function\n    ///         4. Changes the state of the contract to disabled\n    ///         5. Emits the `Disabled` event\n    ///\n    /// @param  disableData_ The data to pass to the implementation-specific `_disable()` function\n    function disable(bytes calldata disableData_) public onlyEmergencyOrAdminRole onlyEnabled {\n        // Call the implementation-specific disable function\n        _disable(disableData_);\n\n        // Change the state\n        isEnabled = false;\n\n        // Emit the disabled event\n        emit Disabled();\n    }\n\n    /// @notice Implementation-specific disable function\n    /// @dev    This function is called by the `disable()` function.\n    ///\n    ///         The implementing contract can override this function and perform the following:\n    ///         1. Validate any parameters (if needed) or revert\n    ///         2. Validate state (if needed) or revert\n    ///         3. Perform any necessary actions, apart from modifying the `isEnabled` state variable\n    ///\n    /// @param  disableData_ Custom data that can be used by the implementation. The format of this data is\n    ///         left to the discretion of the implementation.\n    function _disable(bytes calldata disableData_) internal virtual {}\n\n    // ========== ERC165 ========== //\n\n    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {\n        return\n            interfaceId == bytes4(0x01ffc9a7) || // ERC-165\n            interfaceId == type(IEnabler).interfaceId;\n    }\n}\n"
+    },
+    "dependencies/openzeppelin-new-5.3.0/contracts/utils/introspection/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.1.0) (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Interface of the ERC-165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[ERC].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n    /**\n     * @dev Returns true if this contract implements the interface defined by\n     * `interfaceId`. See the corresponding\n     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[ERC section]\n     * to learn more about how these ids are created.\n     *\n     * This function call must use less than 30 000 gas.\n     */\n    function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    },
+    "src/periphery/interfaces/IEnabler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\n/// @title IEnabler\n/// @notice Interface for contracts that can be enabled and disabled\n/// @dev    This is designed for usage by periphery contracts that cannot inherit from `PolicyEnabler`. Authorization is deliberately left open to the implementing contract.\ninterface IEnabler {\n    // ============ EVENTS ============ //\n\n    /// @notice Emitted when the contract is enabled\n    event Enabled();\n\n    /// @notice Emitted when the contract is disabled\n    event Disabled();\n\n    // ============ ERRORS ============ //\n\n    /// @notice Thrown when the contract is not enabled\n    error NotEnabled();\n\n    /// @notice Thrown when the contract is not disabled\n    error NotDisabled();\n\n    // ============ FUNCTIONS ============ //\n\n    /// @notice         Returns true if the contract is enabled\n    /// @return enabled True if the contract is enabled, false otherwise\n    function isEnabled() external view returns (bool enabled);\n\n    /// @notice             Enables the contract\n    /// @dev                Implementing contracts should implement permissioning logic\n    ///\n    /// @param enableData_  Optional data to pass to a custom enable function\n    function enable(bytes calldata enableData_) external;\n\n    /// @notice             Disables the contract\n    /// @dev                Implementing contracts should implement permissioning logic\n    ///\n    /// @param disableData_ Optional data to pass to a custom disable function\n    function disable(bytes calldata disableData_) external;\n}\n"
+    },
+    "src/external/OlympusERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity >=0.7.5;\n\n/// @notice Olympus OHM token\n/// @dev This contract is the legacy v2 OHM token. Included in the repo for completeness,\n///      since it is not being changed and is imported in some contracts.\n\ninterface IOlympusAuthority {\n    // =========  EVENTS ========= //\n\n    event GovernorPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event GuardianPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event PolicyPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event VaultPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n\n    event GovernorPulled(address indexed from, address indexed to);\n    event GuardianPulled(address indexed from, address indexed to);\n    event PolicyPulled(address indexed from, address indexed to);\n    event VaultPulled(address indexed from, address indexed to);\n\n    // =========  VIEW ========= //\n\n    function governor() external view returns (address);\n\n    function guardian() external view returns (address);\n\n    function policy() external view returns (address);\n\n    function vault() external view returns (address);\n}\n\n// File: types/OlympusAccessControlled.sol\n\nabstract contract OlympusAccessControlled {\n    // =========  EVENTS ========= //\n\n    event AuthorityUpdated(IOlympusAuthority indexed authority);\n\n    string internal UNAUTHORIZED = \"UNAUTHORIZED\"; // save gas\n\n    // =========  STATE VARIABLES ========= //\n\n    IOlympusAuthority public authority;\n\n    // =========  Constructor ========= //\n\n    constructor(IOlympusAuthority _authority) {\n        authority = _authority;\n        emit AuthorityUpdated(_authority);\n    }\n\n    // =========  MODIFIERS ========= //\n\n    modifier onlyGovernor() {\n        require(msg.sender == authority.governor(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyGuardian() {\n        require(msg.sender == authority.guardian(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyPermitted() {\n        require(msg.sender == authority.policy(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyVault() {\n        require(msg.sender == authority.vault(), UNAUTHORIZED);\n        _;\n    }\n\n    // =========  GOV ONLY ========= //\n\n    function setAuthority(IOlympusAuthority _newAuthority) external onlyGovernor {\n        authority = _newAuthority;\n        emit AuthorityUpdated(_newAuthority);\n    }\n}\n\n// File: cryptography/ECDSA.sol\n\n/**\n * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.\n *\n * These functions can be used to verify that a message was signed by the holder\n * of the private keys of a given address.\n */\nlibrary ECDSA {\n    enum RecoverError {\n        NoError,\n        InvalidSignature,\n        InvalidSignatureLength,\n        InvalidSignatureS,\n        InvalidSignatureV\n    }\n\n    function _throwError(RecoverError error) private pure {\n        if (error == RecoverError.NoError) {\n            return; // no error: do nothing\n        } else if (error == RecoverError.InvalidSignature) {\n            revert(\"ECDSA: invalid signature\");\n        } else if (error == RecoverError.InvalidSignatureLength) {\n            revert(\"ECDSA: invalid signature length\");\n        } else if (error == RecoverError.InvalidSignatureS) {\n            revert(\"ECDSA: invalid signature 's' value\");\n        } else if (error == RecoverError.InvalidSignatureV) {\n            revert(\"ECDSA: invalid signature 'v' value\");\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature` or error string. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     *\n     * Documentation for signature generation:\n     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]\n     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes memory signature\n    ) internal pure returns (address, RecoverError) {\n        // Check the signature length\n        // - case 65: r,s,v signature (standard)\n        // - case 64: r,vs signature (cf https://eips.ethereum.org/EIPS/eip-2098) _Available since v4.1._\n        if (signature.length == 65) {\n            bytes32 r;\n            bytes32 s;\n            uint8 v;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                s := mload(add(signature, 0x40))\n                v := byte(0, mload(add(signature, 0x60)))\n            }\n            return tryRecover(hash, v, r, s);\n        } else if (signature.length == 64) {\n            bytes32 r;\n            bytes32 vs;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                vs := mload(add(signature, 0x40))\n            }\n            return tryRecover(hash, r, vs);\n        } else {\n            return (address(0), RecoverError.InvalidSignatureLength);\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature`. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     */\n    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, signature);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.\n     *\n     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address, RecoverError) {\n        bytes32 s;\n        uint8 v;\n        assembly {\n            s := and(vs, 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)\n            v := add(shr(255, vs), 27)\n        }\n        return tryRecover(hash, v, r, s);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.\n     *\n     * _Available since v4.2._\n     */\n    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, r, vs);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address, RecoverError) {\n        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature\n        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most\n        // signatures from current libraries generate a unique signature with an s-value in the lower half order.\n        //\n        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value\n        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or\n        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept\n        // these malleable signatures as well.\n        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {\n            return (address(0), RecoverError.InvalidSignatureS);\n        }\n        if (v != 27 && v != 28) {\n            return (address(0), RecoverError.InvalidSignatureV);\n        }\n\n        // If the signature is valid (and not malleable), return the signer address\n        address signer = ecrecover(hash, v, r, s);\n        if (signer == address(0)) {\n            return (address(0), RecoverError.InvalidSignature);\n        }\n\n        return (signer, RecoverError.NoError);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from a `hash`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {\n        // 32 is the length in bytes of hash,\n        // enforced by the type signature above\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", hash));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Typed Data, created from a\n     * `domainSeparator` and a `structHash`. This produces hash corresponding\n     * to the one signed with the\n     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]\n     * JSON-RPC method as part of EIP-712.\n     *\n     * See {recover}.\n     */\n    function toTypedDataHash(\n        bytes32 domainSeparator,\n        bytes32 structHash\n    ) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19\\x01\", domainSeparator, structHash));\n    }\n}\n\n// File: cryptography/EIP712.sol\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.\n *\n * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,\n * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding\n * they need in their contracts using a combination of `abi.encode` and `keccak256`.\n *\n * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding\n * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA\n * ({_hashTypedDataV4}).\n *\n * The implementation of the domain separator was designed to be as efficient as possible while still properly updating\n * the chain id to protect against replay attacks on an eventual fork of the chain.\n *\n * NOTE: This contract implements the version of the encoding known as \"v4\", as implemented by the JSON RPC method\n * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].\n *\n * _Available since v3.4._\n */\nabstract contract EIP712 {\n    /* solhint-disable var-name-mixedcase */\n    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to\n    // invalidate the cached domain separator if the chain id changes.\n    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;\n    uint256 private immutable _CACHED_CHAIN_ID;\n\n    bytes32 private immutable _HASHED_NAME;\n    bytes32 private immutable _HASHED_VERSION;\n    bytes32 private immutable _TYPE_HASH;\n\n    /* solhint-enable var-name-mixedcase */\n\n    /**\n     * @dev Initializes the domain separator and parameter caches.\n     *\n     * The meaning of `name` and `version` is specified in\n     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:\n     *\n     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.\n     * - `version`: the current major version of the signing domain.\n     *\n     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart\n     * contract upgrade].\n     */\n    constructor(string memory name, string memory version) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        bytes32 hashedName = keccak256(bytes(name));\n        bytes32 hashedVersion = keccak256(bytes(version));\n        bytes32 typeHash = keccak256(\n            \"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"\n        );\n        _HASHED_NAME = hashedName;\n        _HASHED_VERSION = hashedVersion;\n        _CACHED_CHAIN_ID = chainID;\n        _CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator(typeHash, hashedName, hashedVersion);\n        _TYPE_HASH = typeHash;\n    }\n\n    /**\n     * @dev Returns the domain separator for the current chain.\n     */\n    function _domainSeparatorV4() internal view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        if (chainID == _CACHED_CHAIN_ID) {\n            return _CACHED_DOMAIN_SEPARATOR;\n        } else {\n            return _buildDomainSeparator(_TYPE_HASH, _HASHED_NAME, _HASHED_VERSION);\n        }\n    }\n\n    function _buildDomainSeparator(\n        bytes32 typeHash,\n        bytes32 nameHash,\n        bytes32 versionHash\n    ) private view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        return keccak256(abi.encode(typeHash, nameHash, versionHash, chainID, address(this)));\n    }\n\n    /**\n     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this\n     * function returns the hash of the fully encoded EIP712 message for this domain.\n     *\n     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:\n     *\n     * ```solidity\n     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(\n     *     keccak256(\"Mail(address to,string contents)\"),\n     *     mailTo,\n     *     keccak256(bytes(mailContents))\n     * )));\n     * address signer = ECDSA.recover(digest, signature);\n     * ```\n     */\n    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {\n        return ECDSA.toTypedDataHash(_domainSeparatorV4(), structHash);\n    }\n}\n\n// File: interfaces/IERC20Permit.sol\n\n/**\n * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n */\ninterface IERC20Permit {\n    /**\n     * @dev Sets `value` as th xe allowance of `spender` over ``owner``'s tokens,\n     * given ``owner``'s signed approval.\n     *\n     * IMPORTANT: The same issues {IERC20-approve} has related to transaction\n     * ordering also apply here.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `deadline` must be a timestamp in the future.\n     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`\n     * over the EIP712-formatted function arguments.\n     * - the signature must use ``owner``'s current nonce (see {nonces}).\n     *\n     * For more information on the signature format, see the\n     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP\n     * section].\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n\n    /**\n     * @dev Returns the current nonce for `owner`. This value must be\n     * included whenever a signature is generated for {permit}.\n     *\n     * Every successful call to {permit} increases ``owner``'s nonce by one. This\n     * prevents a signature from being used multiple times.\n     */\n    function nonces(address owner) external view returns (uint256);\n\n    /**\n     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n}\n\n// File: interfaces/IERC20.sol\n\ninterface IERC20 {\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `recipient`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address recipient, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `sender` to `recipient` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) external returns (bool);\n\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n\n// File: interfaces/IOHM.sol\n\ninterface IOHM is IERC20 {\n    function mint(address account_, uint256 amount_) external;\n\n    function burn(uint256 amount) external;\n\n    function burnFrom(address account_, uint256 amount_) external;\n}\n\n// File: libraries/SafeMath.sol\n\nlibrary SafeMath {\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        uint256 c = a + b;\n        require(c >= a, \"SafeMath: addition overflow\");\n\n        return c;\n    }\n\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return sub(a, b, \"SafeMath: subtraction overflow\");\n    }\n\n    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b <= a, errorMessage);\n        uint256 c = a - b;\n\n        return c;\n    }\n\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        uint256 c = a * b;\n        require(c / a == b, \"SafeMath: multiplication overflow\");\n\n        return c;\n    }\n\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        return div(a, b, \"SafeMath: division by zero\");\n    }\n\n    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        uint256 c = a / b;\n        assert(a == b * c + (a % b)); // There is no case in which this doesn't hold\n\n        return c;\n    }\n\n    // Only used in the  BondingCalculator.sol\n    function sqrrt(uint256 a) internal pure returns (uint256 c) {\n        if (a > 3) {\n            c = a;\n            uint256 b = add(div(a, 2), 1);\n            while (b < c) {\n                c = b;\n                b = div(add(div(a, b), b), 2);\n            }\n        } else if (a != 0) {\n            c = 1;\n        }\n    }\n}\n\n// File: libraries/Counters.sol\n\nlibrary Counters {\n    using SafeMath for uint256;\n\n    struct Counter {\n        // This variable should never be directly accessed by users of the library: interactions must be restricted to\n        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add\n        // this feature: see https://github.com/ethereum/solidity/issues/4637\n        uint256 _value; // default: 0\n    }\n\n    function current(Counter storage counter) internal view returns (uint256) {\n        return counter._value;\n    }\n\n    function increment(Counter storage counter) internal {\n        // The {SafeMath} overflow check can be skipped here, see the comment at the top\n        counter._value += 1;\n    }\n\n    function decrement(Counter storage counter) internal {\n        counter._value = counter._value.sub(1);\n    }\n}\n\n// File: types/ERC20.sol\n\nabstract contract ERC20 is IERC20 {\n    using SafeMath for uint256;\n\n    // TODO comment actual hash value.\n    bytes32 private constant ERC20TOKEN_ERC1820_INTERFACE_ID = keccak256(\"ERC20Token\");\n\n    mapping(address => uint256) internal _balances;\n\n    mapping(address => mapping(address => uint256)) internal _allowances;\n\n    uint256 internal _totalSupply;\n\n    string internal _name;\n\n    string internal _symbol;\n\n    uint8 internal immutable _decimals;\n\n    constructor(string memory name_, string memory symbol_, uint8 decimals_) {\n        _name = name_;\n        _symbol = symbol_;\n        _decimals = decimals_;\n    }\n\n    function name() public view returns (string memory) {\n        return _name;\n    }\n\n    function symbol() public view returns (string memory) {\n        return _symbol;\n    }\n\n    function decimals() public view virtual returns (uint8) {\n        return _decimals;\n    }\n\n    function totalSupply() public view override returns (uint256) {\n        return _totalSupply;\n    }\n\n    function balanceOf(address account) public view virtual override returns (uint256) {\n        return _balances[account];\n    }\n\n    function transfer(address recipient, uint256 amount) public virtual override returns (bool) {\n        _transfer(msg.sender, recipient, amount);\n        return true;\n    }\n\n    function allowance(\n        address owner,\n        address spender\n    ) public view virtual override returns (uint256) {\n        return _allowances[owner][spender];\n    }\n\n    function approve(address spender, uint256 amount) public virtual override returns (bool) {\n        _approve(msg.sender, spender, amount);\n        return true;\n    }\n\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) public virtual override returns (bool) {\n        _transfer(sender, recipient, amount);\n        _approve(\n            sender,\n            msg.sender,\n            _allowances[sender][msg.sender].sub(amount, \"ERC20: transfer amount exceeds allowance\")\n        );\n        return true;\n    }\n\n    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {\n        _approve(msg.sender, spender, _allowances[msg.sender][spender].add(addedValue));\n        return true;\n    }\n\n    function decreaseAllowance(\n        address spender,\n        uint256 subtractedValue\n    ) public virtual returns (bool) {\n        _approve(\n            msg.sender,\n            spender,\n            _allowances[msg.sender][spender].sub(\n                subtractedValue,\n                \"ERC20: decreased allowance below zero\"\n            )\n        );\n        return true;\n    }\n\n    function _transfer(address sender, address recipient, uint256 amount) internal virtual {\n        require(sender != address(0), \"ERC20: transfer from the zero address\");\n        require(recipient != address(0), \"ERC20: transfer to the zero address\");\n\n        _beforeTokenTransfer(sender, recipient, amount);\n\n        _balances[sender] = _balances[sender].sub(amount, \"ERC20: transfer amount exceeds balance\");\n        _balances[recipient] = _balances[recipient].add(amount);\n        emit Transfer(sender, recipient, amount);\n    }\n\n    function _mint(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: mint to the zero address\");\n        _beforeTokenTransfer(address(0), account, amount);\n        _totalSupply = _totalSupply.add(amount);\n        _balances[account] = _balances[account].add(amount);\n        emit Transfer(address(0), account, amount);\n    }\n\n    function _burn(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: burn from the zero address\");\n\n        _beforeTokenTransfer(account, address(0), amount);\n\n        _balances[account] = _balances[account].sub(amount, \"ERC20: burn amount exceeds balance\");\n        _totalSupply = _totalSupply.sub(amount);\n        emit Transfer(account, address(0), amount);\n    }\n\n    function _approve(address owner, address spender, uint256 amount) internal virtual {\n        require(owner != address(0), \"ERC20: approve from the zero address\");\n        require(spender != address(0), \"ERC20: approve to the zero address\");\n\n        _allowances[owner][spender] = amount;\n        emit Approval(owner, spender, amount);\n    }\n\n    function _beforeTokenTransfer(address from_, address to_, uint256 amount_) internal virtual {}\n}\n\n// File: types/ERC20Permit.sol\n\n/**\n * @dev Implementation of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on `{IERC20-approve}`, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n *\n * _Available since v3.4._\n */\nabstract contract ERC20Permit is ERC20, IERC20Permit, EIP712 {\n    using Counters for Counters.Counter;\n\n    mapping(address => Counters.Counter) private _nonces;\n\n    // solhint-disable-next-line var-name-mixedcase\n    bytes32 private immutable _PERMIT_TYPEHASH =\n        keccak256(\n            \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n        );\n\n    /**\n     * @dev Initializes the {EIP712} domain separator using the `name` parameter, and setting `version` to `\"1\"`.\n     *\n     * It's a good idea to use the same `name` that is defined as the ERC20 token name.\n     */\n    constructor(string memory name) EIP712(name, \"1\") {}\n\n    /**\n     * @dev See {IERC20Permit-permit}.\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual override {\n        require(block.timestamp <= deadline, \"ERC20Permit: expired deadline\");\n\n        bytes32 structHash = keccak256(\n            abi.encode(_PERMIT_TYPEHASH, owner, spender, value, _useNonce(owner), deadline)\n        );\n\n        bytes32 hash = _hashTypedDataV4(structHash);\n\n        address signer = ECDSA.recover(hash, v, r, s);\n        require(signer == owner, \"ERC20Permit: invalid signature\");\n\n        _approve(owner, spender, value);\n    }\n\n    /**\n     * @dev See {IERC20Permit-nonces}.\n     */\n    function nonces(address owner) public view virtual override returns (uint256) {\n        return _nonces[owner].current();\n    }\n\n    /**\n     * @dev See {IERC20Permit-DOMAIN_SEPARATOR}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view override returns (bytes32) {\n        return _domainSeparatorV4();\n    }\n\n    /**\n     * @dev \"Consume a nonce\": return the current value and increment.\n     *\n     * _Available since v4.1._\n     */\n    function _useNonce(address owner) internal virtual returns (uint256 current) {\n        Counters.Counter storage nonce = _nonces[owner];\n        current = nonce.current();\n        nonce.increment();\n    }\n}\n\n// File: OlympusERC20.sol\n\ncontract OlympusERC20Token is ERC20Permit, IOHM, OlympusAccessControlled {\n    using SafeMath for uint256;\n\n    constructor(\n        address _authority\n    )\n        ERC20(\"Olympus\", \"OHM\", 9)\n        ERC20Permit(\"Olympus\")\n        OlympusAccessControlled(IOlympusAuthority(_authority))\n    {}\n\n    function mint(address account_, uint256 amount_) external override onlyVault {\n        _mint(account_, amount_);\n    }\n\n    function burn(uint256 amount) external override {\n        _burn(msg.sender, amount);\n    }\n\n    function burnFrom(address account_, uint256 amount_) external override {\n        _burnFrom(account_, amount_);\n    }\n\n    function _burnFrom(address account_, uint256 amount_) internal {\n        uint256 decreasedAllowance_ = allowance(account_, msg.sender).sub(\n            amount_,\n            \"ERC20: burn amount exceeds allowance\"\n        );\n\n        _approve(account_, msg.sender, decreasedAllowance_);\n        _burn(account_, amount_);\n    }\n}\n"
+    },
+    "dependencies/openzeppelin-new-5.3.0/contracts/utils/cryptography/Hashes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.3.0) (utils/cryptography/Hashes.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Library of standard hash functions.\n *\n * _Available since v5.1._\n */\nlibrary Hashes {\n    /**\n     * @dev Commutative Keccak256 hash of a sorted pair of bytes32. Frequently used when working with merkle proofs.\n     *\n     * NOTE: Equivalent to the `standardNodeHash` in our https://github.com/OpenZeppelin/merkle-tree[JavaScript library].\n     */\n    function commutativeKeccak256(bytes32 a, bytes32 b) internal pure returns (bytes32) {\n        return a < b ? efficientKeccak256(a, b) : efficientKeccak256(b, a);\n    }\n\n    /**\n     * @dev Implementation of keccak256(abi.encode(a, b)) that doesn't allocate or expand memory.\n     */\n    function efficientKeccak256(bytes32 a, bytes32 b) internal pure returns (bytes32 value) {\n        assembly (\"memory-safe\") {\n            mstore(0x00, a)\n            mstore(0x20, b)\n            value := keccak256(0x00, 0x40)\n        }\n    }\n}\n"
+    },
+    "src/policies/utils/PolicyAdmin.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\nimport {ROLESv1} from \"src/modules/ROLES/ROLES.v1.sol\";\nimport {RolesConsumer} from \"src/modules/ROLES/OlympusRoles.sol\";\nimport {ADMIN_ROLE, EMERGENCY_ROLE, MANAGER_ROLE} from \"./RoleDefinitions.sol\";\n\nabstract contract PolicyAdmin is RolesConsumer {\n    error NotAuthorised();\n\n    /// @notice Modifier that reverts if the caller does not have the emergency or admin role\n    modifier onlyEmergencyOrAdminRole() {\n        if (!_isEmergency(msg.sender) && !_isAdmin(msg.sender)) revert NotAuthorised();\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the manager or admin role\n    modifier onlyManagerOrAdminRole() {\n        if (!_isManager(msg.sender) && !_isAdmin(msg.sender)) revert NotAuthorised();\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the admin role\n    modifier onlyAdminRole() {\n        if (!_isAdmin(msg.sender)) revert ROLESv1.ROLES_RequireRole(ADMIN_ROLE);\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the emergency role\n    modifier onlyEmergencyRole() {\n        if (!_isEmergency(msg.sender)) revert ROLESv1.ROLES_RequireRole(EMERGENCY_ROLE);\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the manager role\n    modifier onlyManagerRole() {\n        if (!_isManager(msg.sender)) revert ROLESv1.ROLES_RequireRole(MANAGER_ROLE);\n        _;\n    }\n\n    /// @notice Check if an account has the admin role\n    ///\n    /// @param  account_ The account to check\n    /// @return true if the account has the admin role, false otherwise\n    function _isAdmin(address account_) internal view returns (bool) {\n        return ROLES.hasRole(account_, ADMIN_ROLE);\n    }\n\n    /// @notice Check if an account has the emergency role\n    ///\n    /// @param  account_ The account to check\n    /// @return true if the account has the emergency role, false otherwise\n    function _isEmergency(address account_) internal view returns (bool) {\n        return ROLES.hasRole(account_, EMERGENCY_ROLE);\n    }\n\n    /// @notice Check if an account has the manager role\n    ///\n    /// @param  account_ The account to check\n    /// @return true if the account has the manager role, false otherwise\n    function _isManager(address account_) internal view returns (bool) {\n        return ROLES.hasRole(account_, MANAGER_ROLE);\n    }\n}\n"
+    },
+    "src/modules/ROLES/OlympusRoles.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\nimport {ROLESv1} from \"src/modules/ROLES/ROLES.v1.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Abstract contract to have the `onlyRole` modifier\n/// @dev    Inheriting this automatically makes ROLES module a dependency\nabstract contract RolesConsumer {\n    ROLESv1 public ROLES;\n\n    modifier onlyRole(bytes32 role_) {\n        ROLES.requireRole(role_, msg.sender);\n        _;\n    }\n}\n\n/// @notice Module that holds multisig roles needed by various policies.\ncontract OlympusRoles is ROLESv1 {\n    //============================================================================================//\n    //                                        MODULE SETUP                                        //\n    //============================================================================================//\n\n    constructor(Kernel kernel_) Module(kernel_) {}\n\n    /// @inheritdoc Module\n    function KEYCODE() public pure override returns (Keycode) {\n        return toKeycode(\"ROLES\");\n    }\n\n    /// @inheritdoc Module\n    function VERSION() external pure override returns (uint8 major, uint8 minor) {\n        major = 1;\n        minor = 0;\n    }\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc ROLESv1\n    function saveRole(bytes32 role_, address addr_) external override permissioned {\n        if (hasRole[addr_][role_]) revert ROLES_AddressAlreadyHasRole(addr_, role_);\n\n        ensureValidRole(role_);\n\n        // Grant role to the address\n        hasRole[addr_][role_] = true;\n\n        emit RoleGranted(role_, addr_);\n    }\n\n    /// @inheritdoc ROLESv1\n    function removeRole(bytes32 role_, address addr_) external override permissioned {\n        if (!hasRole[addr_][role_]) revert ROLES_AddressDoesNotHaveRole(addr_, role_);\n\n        hasRole[addr_][role_] = false;\n\n        emit RoleRevoked(role_, addr_);\n    }\n\n    //============================================================================================//\n    //                                       VIEW FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc ROLESv1\n    function requireRole(bytes32 role_, address caller_) external view override {\n        if (!hasRole[caller_][role_]) revert ROLES_RequireRole(role_);\n    }\n\n    /// @inheritdoc ROLESv1\n    function ensureValidRole(bytes32 role_) public pure override {\n        for (uint256 i = 0; i < 32; ) {\n            bytes1 char = role_[i];\n            if ((char < 0x61 || char > 0x7A) && char != 0x5f && char != 0x00) {\n                revert ROLES_InvalidRole(role_); // a-z only\n            }\n            unchecked {\n                i++;\n            }\n        }\n    }\n}\n"
+    },
+    "src/policies/utils/RoleDefinitions.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\n/// @dev Allows enabling/disabling the protocol/policies in an emergency\nbytes32 constant EMERGENCY_ROLE = \"emergency\";\n/// @dev Administrative access, e.g. configuration parameters. Typically assigned to on-chain governance.\nbytes32 constant ADMIN_ROLE = \"admin\";\n/// @dev Managerial access, e.g. managing specific protocol parameters. Typically assigned to a multisig/council.\nbytes32 constant MANAGER_ROLE = \"manager\";\n/// @dev Heart role, e.g. performing periodic tasks.\nbytes32 constant HEART_ROLE = \"heart\";\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.30+commit.73712a01"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "kernel_",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IERC20",
+              "name": "ohmV1_",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IgOHM",
+              "name": "gOHM_",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "merkleRoot_",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "requested",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "allocated",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "migrated",
+              "type": "uint256"
+            }
+          ],
+          "name": "AmountExceedsAllowance",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "remaining",
+              "type": "uint256"
+            }
+          ],
+          "name": "CapExceeded",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidProof",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "caller_",
+              "type": "address"
+            }
+          ],
+          "name": "KernelAdapter_OnlyKernel",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotAuthorised",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotDisabled",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotEnabled",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "Keycode",
+              "name": "keycode_",
+              "type": "bytes5"
+            }
+          ],
+          "name": "Policy_ModuleDoesNotExist",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "expected_",
+              "type": "bytes"
+            }
+          ],
+          "name": "Policy_WrongModuleVersion",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role_",
+              "type": "bytes32"
+            }
+          ],
+          "name": "ROLES_RequireRole",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "SameMerkleRoot",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAmount",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Disabled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Enabled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "newRoot",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "updater",
+              "type": "address"
+            }
+          ],
+          "name": "MerkleRootUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "ohmV1Amount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "ohmV2Amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Migrated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "newApproval",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "oldApproval",
+              "type": "uint256"
+            }
+          ],
+          "name": "RemainingMintApprovalUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Rescued",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "ROLES",
+          "outputs": [
+            {
+              "internalType": "contract ROLESv1",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "VERSION",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "newKernel_",
+              "type": "address"
+            }
+          ],
+          "name": "changeKernel",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "configureDependencies",
+          "outputs": [
+            {
+              "internalType": "Keycode[]",
+              "name": "dependencies",
+              "type": "bytes5[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "disableData_",
+              "type": "bytes"
+            }
+          ],
+          "name": "disable",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "enableData_",
+              "type": "bytes"
+            }
+          ],
+          "name": "enable",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gOHM",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "gOHM_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isActive",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isEnabled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "kernel",
+          "outputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "merkleRoot",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32[]",
+              "name": "proof_",
+              "type": "bytes32[]"
+            },
+            {
+              "internalType": "uint256",
+              "name": "allocatedAmount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "migrate",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account_",
+              "type": "address"
+            }
+          ],
+          "name": "migratedAmounts",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "migratedAmount_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ohmV1",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "ohmV1_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ohmV2",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "ohmV2_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "previewMigrate",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "ohmV2Amount_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "remainingMintApproval",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "remaining_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "requestPermissions",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "Keycode",
+                  "name": "keycode",
+                  "type": "bytes5"
+                },
+                {
+                  "internalType": "bytes4",
+                  "name": "funcSelector",
+                  "type": "bytes4"
+                }
+              ],
+              "internalType": "struct Permissions[]",
+              "name": "requests",
+              "type": "tuple[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "token_",
+              "type": "address"
+            }
+          ],
+          "name": "rescue",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "merkleRoot_",
+              "type": "bytes32"
+            }
+          ],
+          "name": "setMerkleRoot",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "approval_",
+              "type": "uint256"
+            }
+          ],
+          "name": "setRemainingMintApproval",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes4",
+              "name": "interfaceId",
+              "type": "bytes4"
+            }
+          ],
+          "name": "supportsInterface",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "totalMigrated",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "allocatedAmount_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32[]",
+              "name": "proof_",
+              "type": "bytes32[]"
+            }
+          ],
+          "name": "verifyClaim",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "valid_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "details": "Migration flow (partial migrations allowed):         1. User has OHM v1 balance         2. User proves eligibility via merkle proof with their allocated amount         3. User can migrate any amount up to their allocation in multiple transactions         4. Contract calculates OHM v2 amount using gOHM conversion (to match production flow):            - Convert OHM v1 to gOHM via gOHM.balanceTo(ohmV1Amount)            - Convert gOHM back to OHM v2 via gOHM.balanceFrom(gOHMAmount)            - This matches the production flow: OHM v1 -> gOHM -> OHM v2            - When gOHM index is not at base level, the result may be slightly less due to rounding         5. Contract burns OHM v1 and mints calculated OHM v2 amount to user         6. User's migrated amount is tracked by OHM v1 amount (original allocation)         Admin functions:         - setMerkleRoot: Update eligibility tree (resets all migrated amounts)         - setRemainingMintApproval: Update remaining MINTR approval for migration         - enable/disable: Emergency pause/resume",
+        "errors": {
+          "AmountExceedsAllowance(uint256,uint256,uint256)": [
+            {
+              "params": {
+                "allocated": "The user's allocated amount from the merkle tree",
+                "migrated": "The amount already migrated by the user",
+                "requested": "The amount requested to migrate"
+              }
+            }
+          ],
+          "CapExceeded(uint256,uint256)": [
+            {
+              "params": {
+                "amount": "The amount requested to migrate",
+                "remaining": "The remaining MINTR approval for the migrator contract"
+              }
+            }
+          ],
+          "ZeroAmount()": [
+            {
+              "details": "This can happen when the input OHM v1 amount is very small and         gOHM conversion rounds down to zero"
+            }
+          ]
+        },
+        "events": {
+          "MerkleRootUpdated(bytes32,address)": {
+            "params": {
+              "newRoot": "The new merkle root",
+              "updater": "The address that updated the root"
+            }
+          },
+          "Migrated(address,uint256,uint256)": {
+            "params": {
+              "ohmV1Amount": "The amount of OHM v1 burned",
+              "ohmV2Amount": "The amount of OHM v2 minted",
+              "user": "The address of the user migrating"
+            }
+          },
+          "RemainingMintApprovalUpdated(uint256,uint256)": {
+            "params": {
+              "newApproval": "The new remaining mint approval",
+              "oldApproval": "The old remaining mint approval"
+            }
+          },
+          "Rescued(address,address,uint256)": {
+            "params": {
+              "amount": "The amount rescued",
+              "to": "The recipient address",
+              "token": "The rescued token address"
+            }
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "VERSION()": {
+            "returns": {
+              "_0": "- Major version upgrade indicates breaking change to the interface.",
+              "_1": "- Minor version change retains backward-compatible interface."
+            }
+          },
+          "configureDependencies()": {
+            "returns": {
+              "dependencies": "- Keycode array of module dependencies."
+            }
+          },
+          "disable(bytes)": {
+            "details": "This function performs the following steps:         1. Validates that the caller has the admin or emergency role         2. Validates that the contract is enabled         3. Calls the implementation-specific `_disable()` function         4. Changes the state of the contract to disabled         5. Emits the `Disabled` event",
+            "params": {
+              "disableData_": "The data to pass to the implementation-specific `_disable()` function"
+            }
+          },
+          "enable(bytes)": {
+            "details": "This function performs the following steps:         1. Validates that the caller has the admin role         2. Validates that the contract is disabled         3. Calls the implementation-specific `_enable()` function         4. Changes the state of the contract to enabled         5. Emits the `Enabled` event",
+            "params": {
+              "enableData_": "The data to pass to the implementation-specific `_enable()` function"
+            }
+          },
+          "gOHM()": {
+            "details": "Used to calculate OHM v2 amount via balanceTo/balanceFrom to match production flow",
+            "returns": {
+              "gOHM_": "The gOHM token"
+            }
+          },
+          "migrate(uint256,bytes32[],uint256)": {
+            "details": "User must approve this contract to transfer their OHM v1         Users can migrate any amount up to their allocated amount in multiple transactions",
+            "params": {
+              "allocatedAmount_": "The user's allocated amount from the merkle tree",
+              "amount_": "The amount of OHM v1 to migrate (9 decimals)",
+              "proof_": "The merkle proof proving the user is eligible"
+            }
+          },
+          "migratedAmounts(address)": {
+            "details": "Returns the migrated amount for the current merkle root nonce",
+            "params": {
+              "account_": "The account to check"
+            },
+            "returns": {
+              "migratedAmount_": "The amount migrated by the user"
+            }
+          },
+          "ohmV1()": {
+            "returns": {
+              "ohmV1_": "The OHM v1 token"
+            }
+          },
+          "ohmV2()": {
+            "returns": {
+              "ohmV2_": "The OHM v2 token"
+            }
+          },
+          "previewMigrate(uint256)": {
+            "details": "Performs the same gOHM conversion as migrate() without state changes.         Users migrating multiple times will lose dust on each transaction.         Recommended: migrate full allocation in one transaction.",
+            "params": {
+              "amount_": "The amount of OHM v1 to preview (9 decimals)"
+            },
+            "returns": {
+              "ohmV2Amount_": "The amount of OHM v2 that would be received (9 decimals), or 0 if conversion rounds to zero"
+            }
+          },
+          "remainingMintApproval()": {
+            "details": "Returns the actual MINTR mint approval, not a stored value. This is the         remaining amount available for migration and is always in sync with MINTR state.",
+            "returns": {
+              "remaining_": "The remaining OHM that can be minted"
+            }
+          },
+          "requestPermissions()": {
+            "returns": {
+              "requests": "- Array of keycodes and function selectors for requested permissions."
+            }
+          },
+          "rescue(address)": {
+            "details": "Only callable by admin or legacy migration admin. Sweeps entire balance to caller.",
+            "params": {
+              "token_": "The ERC20 token to rescue"
+            }
+          },
+          "setMerkleRoot(bytes32)": {
+            "details": "When the merkle root is updated, the nonce is incremented.         This resets all previous migrations without needing to iterate over users.         The new merkle tree should reflect the amount each user can migrate going         forward (i.e., their current OHM v1 balance).",
+            "params": {
+              "merkleRoot_": "The new merkle root"
+            }
+          },
+          "setRemainingMintApproval(uint256)": {
+            "details": "This sets the remaining amount that can be minted, NOT a lifetime total.         If you want 1000 OHM v2 to be available for migration and 600 has already         been minted, call this with 1000 (not 400). Queries the current MINTR         approval and adjusts it to the target approval.",
+            "params": {
+              "approval_": "The target remaining mint approval (9 decimals)"
+            }
+          },
+          "supportsInterface(bytes4)": {
+            "details": "Supports IERC165, IVersioned, IV1Migrator, and IEnabler (via PolicyEnabler)"
+          },
+          "verifyClaim(address,uint256,bytes32[])": {
+            "params": {
+              "account_": "The account to verify",
+              "allocatedAmount_": "The allocated amount to verify",
+              "proof_": "The merkle proof"
+            },
+            "returns": {
+              "valid_": "True if the claim is valid"
+            }
+          }
+        },
+        "stateVariables": {
+          "_OHMV2": {
+            "details": "Set in configureDependencies via MINTR.ohm()"
+          },
+          "_migratedAmounts": {
+            "details": "Nonce-based invalidation allows O(1) merkle root updates"
+          },
+          "merkleRoot": {
+            "return": "The current merkle root",
+            "returns": {
+              "_0": "The current merkle root"
+            }
+          },
+          "totalMigrated": {
+            "return": "The total migrated amount",
+            "returns": {
+              "_0": "The total migrated amount"
+            }
+          }
+        },
+        "title": "V1Migrator",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "AmountExceedsAllowance(uint256,uint256,uint256)": [
+            {
+              "notice": "Thrown when the amount exceeds the user's allocation"
+            }
+          ],
+          "CapExceeded(uint256,uint256)": [
+            {
+              "notice": "Thrown when the migration cap would be exceeded"
+            }
+          ],
+          "InvalidProof()": [
+            {
+              "notice": "Thrown when the provided merkle proof is invalid"
+            }
+          ],
+          "NotDisabled()": [
+            {
+              "notice": "Thrown when the contract is not disabled"
+            }
+          ],
+          "NotEnabled()": [
+            {
+              "notice": "Thrown when the contract is not enabled"
+            }
+          ],
+          "SameMerkleRoot()": [
+            {
+              "notice": "Thrown when attempting to set the same merkle root that is already set"
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "notice": "Thrown when an address parameter is zero"
+            }
+          ],
+          "ZeroAmount()": [
+            {
+              "notice": "Thrown when the OHM v2 amount after gOHM conversion is zero"
+            }
+          ]
+        },
+        "events": {
+          "Disabled()": {
+            "notice": "Emitted when the contract is disabled"
+          },
+          "Enabled()": {
+            "notice": "Emitted when the contract is enabled"
+          },
+          "MerkleRootUpdated(bytes32,address)": {
+            "notice": "Emitted when the merkle root is updated"
+          },
+          "Migrated(address,uint256,uint256)": {
+            "notice": "Emitted when a user successfully migrates OHM v1 to OHM v2"
+          },
+          "RemainingMintApprovalUpdated(uint256,uint256)": {
+            "notice": "Emitted when the remaining mint approval is updated"
+          },
+          "Rescued(address,address,uint256)": {
+            "notice": "Emitted when tokens are rescued from the contract"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "VERSION()": {
+            "notice": "Returns the version of the contract"
+          },
+          "changeKernel(address)": {
+            "notice": "Function used by kernel when migrating to a new kernel."
+          },
+          "configureDependencies()": {
+            "notice": "Define module dependencies for this policy."
+          },
+          "disable(bytes)": {
+            "notice": "Disable the contract"
+          },
+          "enable(bytes)": {
+            "notice": "Enable the contract"
+          },
+          "gOHM()": {
+            "notice": "The gOHM token contract used for conversion calculations"
+          },
+          "isActive()": {
+            "notice": "Easily accessible indicator for if a policy is activated or not."
+          },
+          "isEnabled()": {
+            "notice": "Whether the policy functionality is enabled"
+          },
+          "merkleRoot()": {
+            "notice": "The current merkle root for verifying eligible claims"
+          },
+          "migrate(uint256,bytes32[],uint256)": {
+            "notice": "Migrate OHM v1 to OHM v2"
+          },
+          "migratedAmounts(address)": {
+            "notice": "The amount a user has migrated under the current root"
+          },
+          "ohmV1()": {
+            "notice": "The OHM v1 token contract"
+          },
+          "ohmV2()": {
+            "notice": "The OHM v2 token contract"
+          },
+          "previewMigrate(uint256)": {
+            "notice": "Preview the OHM v2 amount that will be received for a given OHM v1 amount"
+          },
+          "remainingMintApproval()": {
+            "notice": "The remaining amount of OHM that can be minted by this contract"
+          },
+          "requestPermissions()": {
+            "notice": "Function called by kernel to set module function permissions."
+          },
+          "rescue(address)": {
+            "notice": "Rescue accidentally sent tokens"
+          },
+          "setMerkleRoot(bytes32)": {
+            "notice": "Update the merkle root for eligible claims"
+          },
+          "setRemainingMintApproval(uint256)": {
+            "notice": "Set the remaining MINTR mint approval for migration"
+          },
+          "supportsInterface(bytes4)": {
+            "notice": "ERC165 interface support"
+          },
+          "totalMigrated()": {
+            "notice": "The total amount of OHM v1 migrated so far"
+          },
+          "verifyClaim(address,uint256,bytes32[])": {
+            "notice": "Verify if a claim is valid for a given account and allocated amount"
+          }
+        },
+        "notice": "Policy to allow OHM v1 holders to migrate to OHM v2 via merkle proof verification",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/policies/V1Migrator.sol": "V1Migrator"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10000
+      },
+      "remappings": [
+        ":@addresses/=dependencies/forge-proposal-simulator-1.0.1/addresses/",
+        ":@base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        ":@base64-1.1.0/=dependencies/base64-1.1.0/",
+        ":@chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/",
+        ":@chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        ":@chainlink/contracts-ccip/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/",
+        ":@chainlink/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/",
+        ":@chainlink/local/src/=dependencies/chainlink-local-0.2.5/src/",
+        ":@clones-with-immutable-args-1.1.2/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        ":@examples/=dependencies/forge-proposal-simulator-1.0.1/examples/",
+        ":@forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        ":@layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":@openzeppelin-4.8.0/=dependencies/openzeppelin-4.8.0/contracts/",
+        ":@openzeppelin-5.3.0/=dependencies/openzeppelin-new-5.3.0/contracts/",
+        ":@openzeppelin/contracts/=dependencies/openzeppelin-4.8.0/contracts/",
+        ":@proposals/=dependencies/forge-proposal-simulator-1.0.1/proposals/",
+        ":@safe-utils-0.0.17/=dependencies/safe-utils-0.0.17/src/",
+        ":@script/=dependencies/forge-proposal-simulator-1.0.1/script/",
+        ":@solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        ":@surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":@test/=dependencies/forge-proposal-simulator-1.0.1/test/",
+        ":@utils/=dependencies/forge-proposal-simulator-1.0.1/utils/",
+        ":Governors/=dependencies/forge-proposal-simulator-1.0.1/Governors/",
+        ":base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        ":base64-1.1.0/=dependencies/base64-1.1.0/",
+        ":chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/",
+        ":chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        ":clones-with-immutable-args-1.1.2/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        ":clones/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        ":comp-governance/=dependencies/forge-proposal-simulator-1.0.1/lib/compound-governance/contracts/",
+        ":ds-test/=dependencies/clones-with-immutable-args-1.1.2/lib/ds-test/src/",
+        ":forge-proposal-simulator-1.0.1/=dependencies/forge-proposal-simulator-1.0.1/",
+        ":forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        ":forge-std/=dependencies/forge-std-1.9.6/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":layer-zero/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-4.8.0/=dependencies/openzeppelin-4.8.0/",
+        ":openzeppelin-new-5.3.0/=dependencies/openzeppelin-new-5.3.0/",
+        ":openzeppelin/=dependencies/openzeppelin-4.8.0/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=dependencies/forge-proposal-simulator-1.0.1/",
+        ":safe-smart-account-1.4.1/=dependencies/safe-smart-account-1.4.1/",
+        ":safe-smart-account/=dependencies/safe-smart-account-1.4.1/contracts/",
+        ":safe-utils-0.0.17/=dependencies/safe-utils-0.0.17/src/",
+        ":solidity-http-0.0.7/=dependencies/solidity-http-0.0.7/src/",
+        ":solidity-http/=dependencies/solidity-http-0.0.7/src/",
+        ":solidity-stringutils/=dependencies/solidity-http-0.0.7/lib/solidity-stringutils/",
+        ":solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        ":solmate/=dependencies/solmate-6.2.0/src/",
+        ":surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":test/=src/test/",
+        ":test/lib/=src/test/lib/",
+        ":test/mocks/=src/test/mocks/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@addresses/=dependencies/forge-proposal-simulator-1.0.1/addresses/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@proposals/=dependencies/forge-proposal-simulator-1.0.1/proposals/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@utils/=dependencies/forge-proposal-simulator-1.0.1/utils/"
+      ]
+    },
+    "sources": {
+      "dependencies/openzeppelin-new-5.3.0/contracts/interfaces/IERC165.sol": {
+        "keccak256": "0xde7e9fd9aee8d4f40772f96bb3b58836cbc6dfc0227014a061947f8821ea9724",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://11fea9f8bc98949ac6709f0c1699db7430d2948137aa94d5a9e95a91f61a710a",
+          "dweb:/ipfs/QmQdfRXxQjwP6yn3DVo1GHPpriKNcFghSPi94Z1oKEFUNS"
+        ]
+      },
+      "dependencies/openzeppelin-new-5.3.0/contracts/utils/cryptography/Hashes.sol": {
+        "keccak256": "0x8cbd338f083224b4b6f0ff42cbda641a0a6c31ffcdca197452b97fe4d0918269",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f517dec5ba0c6491395acbf7f1d621f4e89e8f218bf5303c867b1c5ad70c6b11",
+          "dweb:/ipfs/QmWmXHRLEw8W6ckth7NyYTU88YfvuS7xSsfae5ksL8qNUe"
+        ]
+      },
+      "dependencies/openzeppelin-new-5.3.0/contracts/utils/cryptography/MerkleProof.sol": {
+        "keccak256": "0x36a0c409c437a753cac9b92b75f93b0fbe92803bf2c8ff1517e54b247f166134",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0f91ba472de411aa557cdbf6560c40750d87bd11c9060bc04d2ba7119af9d5a6",
+          "dweb:/ipfs/QmQjtYo2i7dDvzCEzZ67bDoNSG4RrwMoxPWuqFmX5Xzpuw"
+        ]
+      },
+      "dependencies/openzeppelin-new-5.3.0/contracts/utils/introspection/IERC165.sol": {
+        "keccak256": "0x79796192ec90263f21b464d5bc90b777a525971d3de8232be80d9c4f9fb353b8",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f6fda447a62815e8064f47eff0dd1cf58d9207ad69b5d32280f8d7ed1d1e4621",
+          "dweb:/ipfs/QmfDRc7pxfaXB2Dh9np5Uf29Na3pQ7tafRS684wd3GLjVL"
+        ]
+      },
+      "dependencies/solmate-6.2.0/src/tokens/ERC20.sol": {
+        "keccak256": "0xcdfd8db76b2a3415620e4d18cc5545f3d50de792dbf2c3dd5adb40cbe6f94b10",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://57b3ab70cde374af1cf2c9888636e8de6cf660f087b1c9abd805e9271e19fa35",
+          "dweb:/ipfs/QmNrLDBAHYFjpjSd12jerm1AdBkDqEYUUaXgnT854BUZ97"
+        ]
+      },
+      "dependencies/solmate-6.2.0/src/utils/SafeTransferLib.sol": {
+        "keccak256": "0x6ab948013c2c7ca6351e593600425b0ec6df9035320280c678e735bce16e996b",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://2ab977d0eeb2bf458f9798250215c646d2f3b1f90b5a7e2b506fdf3335c0f060",
+          "dweb:/ipfs/QmYPRoPhNtBAmCSq7imN1scMVpKNQvMTpoqab3tXUx5Tnv"
+        ]
+      },
+      "src/Kernel.sol": {
+        "keccak256": "0xece14c326a5f22d58cde3d85ad86ea31c8324d836359b0ae46581df2ff25b4db",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://cb0be215fcf96fe0e1a56f2215f100e07fd1432903a88afffc61b5f7575ed4c8",
+          "dweb:/ipfs/QmYcpER8BXi6tA4fBWCY2RsiweShqxo1nXFDJ4ixJZEvid"
+        ]
+      },
+      "src/external/OlympusERC20.sol": {
+        "keccak256": "0x615c2c31c85f680c81bf456550f0dc8da0e45abc6cc7846bb87a067d04772601",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://e5cde097f699ccd42d77e87ca2c7f89cf8e1b1ec40c3da4984489522c1b9b793",
+          "dweb:/ipfs/QmWdb7aBcGG3Fiy1eyfgpsmykeUghZbwx4E53NyGXheraX"
+        ]
+      },
+      "src/interfaces/IERC20.sol": {
+        "keccak256": "0x974a59ee45b2a6107b6dd8cd0f1de0ad878b54f1db47ebf27f697dda6145d9dc",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://da0d8ddb32da028acb692a89cb6a1ab1136c39d029871ee3d3e20b8d51c15dd6",
+          "dweb:/ipfs/QmQ2adrsKG6QyDSznRNSdWD8ceKKXnWohFWk2EjUHTMUyx"
+        ]
+      },
+      "src/interfaces/IERC20BurnableMintable.sol": {
+        "keccak256": "0x041fdbf27a0cd301b57b742cf0c67b9181f4d18e0186110c2a0d76b76df40c58",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d3d615ff6e98c8608c1fd4d55e46b5225b1a7b9afebb94244a487bcf689ceb00",
+          "dweb:/ipfs/QmdCrPi3BgZ7YJgpFhoy3Bx7KBD6PWQYBKWXHfpdjYGRxv"
+        ]
+      },
+      "src/interfaces/IVersioned.sol": {
+        "keccak256": "0xbc2db660e0a39fc14f0cef667bd45195ef33edde2e5b4fa5b00a1693d8a19b9e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://cf2dd6bca639c120982b01e09066c60237239ac537a76a9205ccc54dc01a2719",
+          "dweb:/ipfs/QmV5KqwvqSd71unjdqXKq41mKExkna4eqMkF4rLvBWHK3h"
+        ]
+      },
+      "src/interfaces/IgOHM.sol": {
+        "keccak256": "0xdac2294208a9a842472814d17a034bd45c1f01d1c2bb40c8664faddc78321412",
+        "license": "AGPL-3.0",
+        "urls": [
+          "bzz-raw://5dd8bd17363e54b621159708e69079674a5e9b087575d0e5581a0c587a820d3a",
+          "dweb:/ipfs/QmVKHiNr3RhPnhHzFshWcMfmwTw5bHNKpP7jXWDkSs14dE"
+        ]
+      },
+      "src/modules/MINTR/MINTR.v1.sol": {
+        "keccak256": "0xdef430e901a3900238b525fa6457bfb70b60e660bdef51ed80b5f74581179439",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://86c1ffa8a62354c38e8c8b2ca7a18a0c66aba2beff0982337028d21f33916192",
+          "dweb:/ipfs/QmWV6JsxLmYECE3mVtntrLBffUbvWAbCiQakpfPM1GdMsZ"
+        ]
+      },
+      "src/modules/ROLES/OlympusRoles.sol": {
+        "keccak256": "0xeab9a514b3974cd62487a08e9aaf6f2258fb86792aa61283ac178a0cc18dfd53",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://01411398729a17f86ee4c70658819e723df9ac6824f2d68914744bb3f172ce00",
+          "dweb:/ipfs/QmQvq8oBhVsEui66dXCxjTL2ZbpkveVxFUMGeLLYXtukRo"
+        ]
+      },
+      "src/modules/ROLES/ROLES.v1.sol": {
+        "keccak256": "0xdfde6004b8ac6729dc9907bd965093ce91204b143c78af1165381980090e5e5f",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://dfdbd0c250331d61a875b30da5484ccad7eb9345d106fa67b3ef78add59b5691",
+          "dweb:/ipfs/QmTf1DyFPWTUzoqLohQzAZsdhBcihq9WF9pquqnQ8gM59q"
+        ]
+      },
+      "src/periphery/interfaces/IEnabler.sol": {
+        "keccak256": "0xf3aa4c7fd7237e0cad838a16f58160b2ca7716c2b717a134e5f0ff110d87f278",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://636f3e9a5cfe13a5328a5552c7c0bc2c0d98c585b063361e3aee41837339e3ec",
+          "dweb:/ipfs/QmdCQ8rRWSRJX6uAq9Q5rRC35ScbnfBRm3UdFjsJWmKgtP"
+        ]
+      },
+      "src/policies/V1Migrator.sol": {
+        "keccak256": "0x20c723bf9e714582e7e9a008dd00e0e96ede3e666950ef42d035dfee7ab71067",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://188566f30e61a69e971ae3ebdd88336b1e22715a43b142cb90b668b35495588d",
+          "dweb:/ipfs/QmTQBKy6mgJ6yBUowkUoQJx7L1YN9nsTaNpqGKicYYnDQK"
+        ]
+      },
+      "src/policies/interfaces/IV1Migrator.sol": {
+        "keccak256": "0x86e5f3de0acafa5b00f21bf75bc241a45996484944a4ec08d68df521d14b9f3b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2b85d9250e72c9b436bc628fdaa6737c183c9c8ed1f9dc65b85f14c72ea4a6ca",
+          "dweb:/ipfs/QmWvUTPHfyi4gdNvmo6TPyAVvV3ubTpmsxouugkKYESu9b"
+        ]
+      },
+      "src/policies/utils/PolicyAdmin.sol": {
+        "keccak256": "0x0f654ec5b6a51d1135e3c7e71fe3e51f431a9cadfe469fa1383a0c7e35085b0b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b464a76810ad64bff09f3bdba069cb9849952eddc9fe0daf2f9855e18a8da0ca",
+          "dweb:/ipfs/Qmc13vJgiQM1AcJqUXUyEdkEjZQ9uzuZEqhvvR29uuFBoK"
+        ]
+      },
+      "src/policies/utils/PolicyEnabler.sol": {
+        "keccak256": "0x32e02c75fd4102683464b045bdb84e949634d127c14e8ca348612cd8c2432485",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5cbef0dca176dfc0b46d92f52b409af3d15eaa2bf45e68ff152d58450403f4e4",
+          "dweb:/ipfs/QmTKEQPUkL8GQnzzQkGkyUBQBXG75NaLWD81SveNKEvrXu"
+        ]
+      },
+      "src/policies/utils/RoleDefinitions.sol": {
+        "keccak256": "0xff8923bf8280682bb12f07308cb5d9aece1d52c0604e535027b11905b88fe029",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4c61edc4477c4849e1a6aef4dac8459e6dfc53dcac79487ab83317fb3c3dbd93",
+          "dweb:/ipfs/QmcCmrzTfSvqob6XMz47b7wxKTaGXAyY6SfB5pRnQqQq8u"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.30+commit.73712a01",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 10000,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "interfaces/=src/interfaces/",
+        "modules/=src/modules/",
+        "policies/=src/policies/",
+        "libraries/=src/libraries/",
+        "test/=src/test/",
+        "test/mocks/=src/test/mocks/",
+        "test/lib/=src/test/lib/",
+        "@base64-1.1.0/=dependencies/base64-1.1.0/",
+        "@surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        "@chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/",
+        "@chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        "@chainlink/contracts-ccip/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/",
+        "@chainlink/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/",
+        "@forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        "forge-std/=dependencies/forge-std-1.9.6/src/",
+        "@safe-utils-0.0.17/=dependencies/safe-utils-0.0.17/src/",
+        "@base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        "@clones-with-immutable-args-1.1.2/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        "clones/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        "@layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "layer-zero/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "@solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        "solmate/=dependencies/solmate-6.2.0/src/",
+        "@openzeppelin-4.8.0/=dependencies/openzeppelin-4.8.0/contracts/",
+        "@openzeppelin/contracts/=dependencies/openzeppelin-4.8.0/contracts/",
+        "openzeppelin/=dependencies/openzeppelin-4.8.0/contracts/",
+        "@openzeppelin-5.3.0/=dependencies/openzeppelin-new-5.3.0/contracts/",
+        "proposal-sim/=dependencies/forge-proposal-simulator-1.0.1/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@addresses/=dependencies/forge-proposal-simulator-1.0.1/addresses/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@utils/=dependencies/forge-proposal-simulator-1.0.1/utils/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@proposals/=dependencies/forge-proposal-simulator-1.0.1/proposals/",
+        "Governors/=dependencies/forge-proposal-simulator-1.0.1/Governors/",
+        "safe-smart-account/=dependencies/safe-smart-account-1.4.1/contracts/",
+        "solidity-http/=dependencies/solidity-http-0.0.7/src/",
+        "@addresses/=dependencies/forge-proposal-simulator-1.0.1/addresses/",
+        "@chainlink/local/src/=dependencies/chainlink-local-0.2.5/src/",
+        "@examples/=dependencies/forge-proposal-simulator-1.0.1/examples/",
+        "@proposals/=dependencies/forge-proposal-simulator-1.0.1/proposals/",
+        "@script/=dependencies/forge-proposal-simulator-1.0.1/script/",
+        "@test/=dependencies/forge-proposal-simulator-1.0.1/test/",
+        "@utils/=dependencies/forge-proposal-simulator-1.0.1/utils/",
+        "base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        "base64-1.1.0/=dependencies/base64-1.1.0/",
+        "chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/",
+        "chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        "clones-with-immutable-args-1.1.2/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        "comp-governance/=dependencies/forge-proposal-simulator-1.0.1/lib/compound-governance/contracts/",
+        "ds-test/=dependencies/clones-with-immutable-args-1.1.2/lib/ds-test/src/",
+        "forge-proposal-simulator-1.0.1/=dependencies/forge-proposal-simulator-1.0.1/",
+        "forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        "layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "openzeppelin-4.8.0/=dependencies/openzeppelin-4.8.0/",
+        "openzeppelin-new-5.3.0/=dependencies/openzeppelin-new-5.3.0/",
+        "safe-smart-account-1.4.1/=dependencies/safe-smart-account-1.4.1/",
+        "safe-utils-0.0.17/=dependencies/safe-utils-0.0.17/src/",
+        "solidity-http-0.0.7/=dependencies/solidity-http-0.0.7/src/",
+        "solidity-stringutils/=dependencies/solidity-http-0.0.7/lib/solidity-stringutils/",
+        "solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        "surl-1.0.0/=dependencies/surl-1.0.0/src/"
+      ]
+    },
+    "name": "V1Migrator",
+    "fullyQualifiedName": "src/policies/V1Migrator.sol:V1Migrator"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "21896137",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-03-09T11:32:23Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0x5131654eFCd63f7b797e00118792e0d0dD90B8B0"
+}

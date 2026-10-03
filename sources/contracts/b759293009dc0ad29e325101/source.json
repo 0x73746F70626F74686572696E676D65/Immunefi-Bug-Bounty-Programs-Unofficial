@@ -1,0 +1,948 @@
+{
+  "sources": {
+    "src/modules/DLGTE/OlympusGovDelegation.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {EnumerableMap} from \"openzeppelin/utils/structs/EnumerableMap.sol\";\nimport {SafeTransferLib} from \"solmate/utils/SafeTransferLib.sol\";\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\n\nimport {Kernel, Module, Keycode, toKeycode} from \"src/Kernel.sol\";\nimport {IDLGTEv1} from \"modules/DLGTE/IDLGTE.v1.sol\";\nimport {DLGTEv1} from \"modules/DLGTE/DLGTE.v1.sol\";\nimport {DelegateEscrow} from \"src/external/cooler/DelegateEscrow.sol\";\nimport {DelegateEscrowFactory} from \"src/external/cooler/DelegateEscrowFactory.sol\";\nimport {SafeCast} from \"libraries/SafeCast.sol\";\n\n/**\n * @title  Olympus Governance Delegation\n * @notice Olympus Governance Delegation (Module) Contract\n * @dev    The Olympus Governance Delegation Module enables policies to delegate gOHM on behalf of users.\n *         If the gOHM is undelegated, this module acts as an escrow for the gOHM.\n *         When the gOHM is delegated, new individual escrows are created for those delegates, and that\n *         portion of gOHM is transferred to that escrow.\n *         gOHM balances are tracked per (policy, account) separately such that one policy cannot pull the\n *         gOHM from another policy (eg policy B pulling collateral out of the Cooler policy).\n */\ncontract OlympusGovDelegation is DLGTEv1 {\n    using SafeCast for uint256;\n    using EnumerableMap for EnumerableMap.AddressToUintMap;\n    using SafeTransferLib for ERC20;\n\n    struct AccountState {\n        /// @dev A regular account is allowed to delegate up to 10 different addresses.\n        /// The account may be whitelisted to delegate more than that.\n        EnumerableMap.AddressToUintMap delegatedAmounts;\n        /// @dev The total gOHM undelegated and delegated gOHM for this account across all delegates.\n        uint112 totalGOhm;\n        /// @dev The total gOhm delegated for this account across all delegates\n        uint112 delegatedGOhm;\n        /// @dev By default an account can only delegate to 10 addresses.\n        /// This may be increased on a per account basis by governance.\n        uint32 maxDelegateAddresses;\n    }\n\n    DelegateEscrowFactory public immutable delegateEscrowFactory;\n\n    /// @dev The mapping of a delegate's address to their escrow contract\n    // mapping(address /*delegate*/ => DelegateEscrow /*delegateEscrow*/) private _delegateEscrows;\n\n    /**\n     * @dev An account's current state across all policies\n     * A given account is allowed up to 10 delegates. This is capped because to avoid gas griefing,\n     * eg within Cooler, upon a liquidation, the gOHM needs to be pulled from all delegates.\n     */\n    mapping(address /*account*/ => AccountState /*delegations*/) private _accountState;\n\n    /**\n     * @dev The per policy balances of (delegated and undelegated) gOHM for each end user account\n     * One policy isn't allowed to deposit/withdraw to another policy's tracked balances\n     * Eg policy B cannot withdraw gOHM from the collateral held here by the Cooler policy\n     */\n    mapping(address /*policy*/ => mapping(address /*account*/ => uint256 /*totalGOhm*/))\n        private _policyAccountBalances;\n\n    //============================================================================================//\n    //                                      MODULE SETUP                                          //\n    //============================================================================================//\n\n    constructor(\n        Kernel kernel_,\n        address gohm_,\n        DelegateEscrowFactory delegateEscrowFactory_\n    ) Module(kernel_) DLGTEv1(gohm_) {\n        delegateEscrowFactory = delegateEscrowFactory_;\n    }\n\n    /// @inheritdoc Module\n    function KEYCODE() public pure override returns (Keycode) {\n        return toKeycode(\"DLGTE\");\n    }\n\n    /// @inheritdoc Module\n    function VERSION() external pure override returns (uint8 major, uint8 minor) {\n        major = 1;\n        minor = 0;\n    }\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc DLGTEv1\n    function depositUndelegatedGohm(\n        address onBehalfOf,\n        uint256 amount\n    ) external override permissioned {\n        if (onBehalfOf == address(0)) revert DLGTE_InvalidAddress();\n        if (amount == 0) revert DLGTE_InvalidAmount();\n\n        // Update state\n        mapping(address => uint256) storage policyBalances = _policyAccountBalances[msg.sender];\n        policyBalances[onBehalfOf] += amount;\n\n        AccountState storage aState = _accountState[onBehalfOf];\n        aState.totalGOhm += amount.encodeUInt112();\n\n        // Pull gOHM from the calling policy\n        _gOHM.safeTransferFrom(msg.sender, address(this), amount);\n    }\n\n    /// @inheritdoc DLGTEv1\n    function withdrawUndelegatedGohm(\n        address onBehalfOf,\n        uint256 amount,\n        uint256 autoRescindMaxNumDelegates\n    ) external override permissioned {\n        if (onBehalfOf == address(0)) revert DLGTE_InvalidAddress();\n        if (amount == 0) revert DLGTE_InvalidAmount();\n        AccountState storage aState = _accountState[onBehalfOf];\n        uint256 totalAccountGOhm = aState.totalGOhm;\n\n        if (autoRescindMaxNumDelegates > 0) {\n            // Don't need to handle the case where it didn't rescind enough\n            // As it will just fail with DLGTE_ExceededUndelegatedBalance below.\n            _autoRescindDelegations(\n                onBehalfOf,\n                amount,\n                aState,\n                totalAccountGOhm,\n                autoRescindMaxNumDelegates\n            );\n        }\n\n        mapping(address => uint256) storage policyBalances = _policyAccountBalances[msg.sender];\n        uint256 policyAccountBalance = policyBalances[onBehalfOf];\n        if (amount > policyAccountBalance)\n            revert DLGTE_ExceededPolicyAccountBalance(policyAccountBalance, amount);\n\n        uint256 accountUndelegatedBalance = totalAccountGOhm - aState.delegatedGOhm;\n        if (amount > accountUndelegatedBalance)\n            revert DLGTE_ExceededUndelegatedBalance(accountUndelegatedBalance, amount);\n\n        // Update state\n        policyBalances[onBehalfOf] = policyAccountBalance - amount;\n        aState.totalGOhm = (totalAccountGOhm - amount).encodeUInt112();\n\n        // Send the gOHM\n        _gOHM.safeTransfer(msg.sender, amount);\n    }\n\n    /// @inheritdoc DLGTEv1\n    function rescindDelegations(\n        address onBehalfOf,\n        uint256 requestedUndelegatedBalance,\n        uint256 maxNumDelegates\n    )\n        external\n        override\n        permissioned\n        returns (uint256 totalRescinded, uint256 newUndelegatedBalance)\n    {\n        if (onBehalfOf == address(0)) revert DLGTE_InvalidAddress();\n        if (maxNumDelegates == 0) revert DLGTE_InvalidAmount();\n        AccountState storage aState = _accountState[onBehalfOf];\n        return\n            _autoRescindDelegations(\n                onBehalfOf,\n                requestedUndelegatedBalance,\n                aState,\n                aState.totalGOhm,\n                maxNumDelegates\n            );\n    }\n\n    /// @inheritdoc DLGTEv1\n    function applyDelegations(\n        address onBehalfOf,\n        IDLGTEv1.DelegationRequest[] calldata delegationRequests\n    )\n        external\n        override\n        permissioned\n        returns (\n            uint256 appliedDelegationAmounts,\n            uint256 appliedUndelegationAmounts,\n            uint256 undelegatedBalance\n        )\n    {\n        if (onBehalfOf == address(0)) revert DLGTE_InvalidAddress();\n        if (delegationRequests.length == 0) revert DLGTE_InvalidDelegationRequests();\n\n        AccountState storage aState = _accountState[onBehalfOf];\n        uint256 totalAccountGOhm = aState.totalGOhm;\n        undelegatedBalance = totalAccountGOhm - aState.delegatedGOhm;\n\n        (\n            appliedDelegationAmounts,\n            appliedUndelegationAmounts,\n            undelegatedBalance\n        ) = _applyDelegations(onBehalfOf, aState, undelegatedBalance, delegationRequests);\n\n        // Update state for the delegated amount of gOHM for this account\n        aState.delegatedGOhm = (totalAccountGOhm - undelegatedBalance).encodeUInt112();\n    }\n\n    /// @inheritdoc DLGTEv1\n    function setMaxDelegateAddresses(\n        address account,\n        uint32 maxDelegates\n    ) external override permissioned {\n        emit MaxDelegateAddressesSet(account, maxDelegates);\n        _accountState[account].maxDelegateAddresses = maxDelegates;\n    }\n\n    //============================================================================================//\n    //                                      VIEW FUNCTIONS                                        //\n    //============================================================================================//\n\n    /// @inheritdoc DLGTEv1\n    function policyAccountBalances(\n        address policy,\n        address account\n    ) external view override returns (uint256 gOhmBalance) {\n        return _policyAccountBalances[policy][account];\n    }\n\n    /// @inheritdoc DLGTEv1\n    function accountDelegationsList(\n        address account,\n        uint256 startIndex,\n        uint256 maxItems\n    ) external view override returns (IDLGTEv1.AccountDelegation[] memory delegations) {\n        AccountState storage aState = _accountState[account];\n        EnumerableMap.AddressToUintMap storage acctDelegatedAmounts = aState.delegatedAmounts;\n\n        // No items if either maxItems is zero or there are no delegate addresses.\n        if (maxItems == 0) return new AccountDelegation[](0);\n        uint256 length = acctDelegatedAmounts.length();\n        if (length == 0) return new AccountDelegation[](0);\n\n        // No items if startIndex is greater than the max array index\n        if (startIndex >= length) return new AccountDelegation[](0);\n\n        // end index is the max of the requested items or the length\n        uint256 requestedEndIndex = startIndex + maxItems - 1;\n        uint256 maxPossibleEndIndex = length - 1;\n        if (maxPossibleEndIndex < requestedEndIndex) requestedEndIndex = maxPossibleEndIndex;\n\n        uint256 numDelegations = requestedEndIndex - startIndex + 1;\n        delegations = new AccountDelegation[](numDelegations);\n        DelegateEscrow escrow;\n        AccountDelegation memory delegateInfo;\n        for (uint256 i; i < numDelegations; ++i) {\n            delegateInfo = delegations[i];\n            (delegateInfo.delegate, delegateInfo.amount) = acctDelegatedAmounts.at(i + startIndex);\n            escrow = delegateEscrowFactory.escrowFor(delegateInfo.delegate);\n            delegateInfo.escrow = address(escrow);\n        }\n    }\n\n    /// @inheritdoc DLGTEv1\n    function totalDelegatedTo(address delegate) external view override returns (uint256) {\n        DelegateEscrow escrow = delegateEscrowFactory.escrowFor(delegate);\n        return address(escrow) == address(0) ? 0 : escrow.totalDelegated();\n    }\n\n    /// @inheritdoc DLGTEv1\n    function accountDelegationSummary(\n        address account\n    )\n        external\n        view\n        override\n        returns (\n            uint256 /*totalGOhm*/,\n            uint256 /*delegatedGOhm*/,\n            uint256 /*numDelegateAddresses*/,\n            uint256 /*maxAllowedDelegateAddresses*/\n        )\n    {\n        AccountState storage aState = _accountState[account];\n        uint32 maxDelegates = aState.maxDelegateAddresses;\n        if (maxDelegates == 0) maxDelegates = DEFAULT_MAX_DELEGATE_ADDRESSES;\n        return (\n            aState.totalGOhm,\n            aState.delegatedGOhm,\n            aState.delegatedAmounts.length(),\n            maxDelegates\n        );\n    }\n\n    /// @inheritdoc DLGTEv1\n    function maxDelegateAddresses(address account) external view override returns (uint32 result) {\n        result = _accountState[account].maxDelegateAddresses;\n        if (result == 0) result = DEFAULT_MAX_DELEGATE_ADDRESSES;\n    }\n\n    //============================================================================================//\n    //                                    INTERNAL FUNCTIONS                                      //\n    //============================================================================================//\n\n    function _applyDelegations(\n        address onBehalfOf,\n        AccountState storage aState,\n        uint256 undelegatedBalance,\n        IDLGTEv1.DelegationRequest[] calldata delegationRequests\n    )\n        private\n        returns (\n            uint256 appliedDelegationAmounts,\n            uint256 appliedUndelegationAmounts,\n            uint256 newUndelegatedBalance\n        )\n    {\n        uint32 maxDelegates = _maxDelegateAddresses(aState);\n        EnumerableMap.AddressToUintMap storage acctDelegatedAmounts = aState.delegatedAmounts;\n\n        uint256 length = delegationRequests.length;\n        uint256 currentDelegatedAmount;\n        uint256 currentUndelegatedAmount;\n        newUndelegatedBalance = undelegatedBalance;\n        for (uint256 i; i < length; ++i) {\n            (currentDelegatedAmount, currentUndelegatedAmount) = _applyDelegation(\n                onBehalfOf,\n                newUndelegatedBalance,\n                maxDelegates,\n                acctDelegatedAmounts,\n                delegationRequests[i]\n            );\n\n            appliedDelegationAmounts += currentDelegatedAmount;\n            appliedUndelegationAmounts += currentUndelegatedAmount;\n            newUndelegatedBalance =\n                newUndelegatedBalance +\n                currentUndelegatedAmount -\n                currentDelegatedAmount;\n        }\n    }\n\n    // If this is the first delegation, set to the default.\n    // NB: This means the lowest number of delegate addresses an account can have after\n    // whitelisting is 1 (since if it's set to zero, it will reset to the default)\n    function _maxDelegateAddresses(\n        AccountState storage aState\n    ) private returns (uint32 maxDelegates) {\n        maxDelegates = aState.maxDelegateAddresses;\n        if (maxDelegates == 0) {\n            aState.maxDelegateAddresses = maxDelegates = DEFAULT_MAX_DELEGATE_ADDRESSES;\n        }\n    }\n\n    function _applyDelegation(\n        address onBehalfOf,\n        uint256 undelegatedBalance,\n        uint32 maxDelegates,\n        EnumerableMap.AddressToUintMap storage acctDelegatedAmounts,\n        IDLGTEv1.DelegationRequest calldata delegationRequest\n    ) private returns (uint256 delegatedAmount, uint256 undelegatedAmount) {\n        if (delegationRequest.delegate == address(0)) revert DLGTE_InvalidAddress();\n\n        // If the amount is positive, it is add a delegation\n        // negative will rescind the delegation\n        if (delegationRequest.amount >= 0) {\n            // Special case to delegate all remaining (undelegated) gOhm.\n            delegatedAmount = delegationRequest.amount == type(int256).max\n                ? undelegatedBalance\n                : uint256(delegationRequest.amount);\n            if (delegatedAmount == 0) revert DLGTE_InvalidAmount();\n\n            // Ensure the account isn't delegating more than the undelegated balance\n            if (delegatedAmount > undelegatedBalance) {\n                revert DLGTE_ExceededUndelegatedBalance(undelegatedBalance, delegatedAmount);\n            }\n\n            _addDelegation(\n                onBehalfOf,\n                delegationRequest.delegate,\n                delegatedAmount,\n                acctDelegatedAmounts,\n                maxDelegates\n            );\n        } else {\n            // Revert with a custom error if trying to rescind and there's no record of this delegation.\n            (bool exists, uint256 delegatedBalance) = acctDelegatedAmounts.tryGet(\n                delegationRequest.delegate\n            );\n            if (!exists) revert DLGTE_InvalidDelegateEscrow();\n\n            // Special case to undelegate all remaining (delegated) gOhm.\n            undelegatedAmount = delegationRequest.amount == type(int256).min\n                ? delegatedBalance\n                : uint256(-delegationRequest.amount);\n            if (undelegatedAmount == 0) revert DLGTE_InvalidAmount();\n\n            // Ensure the account isn't trying to undelegate more than the recorded amount\n            if (undelegatedAmount > delegatedBalance) {\n                revert DLGTE_ExceededDelegatedBalance(\n                    delegationRequest.delegate,\n                    delegatedBalance,\n                    undelegatedAmount\n                );\n            }\n\n            _rescindDelegation(\n                onBehalfOf,\n                delegationRequest.delegate,\n                delegatedBalance,\n                undelegatedAmount,\n                acctDelegatedAmounts\n            );\n        }\n    }\n\n    function _addDelegation(\n        address onBehalfOf,\n        address delegate,\n        uint256 delegatedAmount,\n        EnumerableMap.AddressToUintMap storage acctDelegatedAmounts,\n        uint32 maxDelegates\n    ) private {\n        // Check the maxDelegates if this is a new delegation record for the `onBehalfOf`\n        (bool alreadyExisted, uint256 existingAmount) = acctDelegatedAmounts.tryGet(delegate);\n        if (!alreadyExisted && acctDelegatedAmounts.length() >= maxDelegates) {\n            revert DLGTE_TooManyDelegates();\n        }\n\n        // Increase the delegation record amount\n        acctDelegatedAmounts.set(delegate, existingAmount + delegatedAmount);\n\n        // Delegate gOhm to the new escrow.\n        DelegateEscrow delegateEscrow = delegateEscrowFactory.create(delegate);\n        _gOHM.safeApprove(address(delegateEscrow), delegatedAmount);\n        delegateEscrow.delegate(onBehalfOf, delegatedAmount);\n        emit DelegationApplied(onBehalfOf, delegate, int256(delegatedAmount));\n    }\n\n    function _autoRescindDelegations(\n        address onBehalfOf,\n        uint256 requestedUndelegatedBalance,\n        AccountState storage aState,\n        uint256 totalAccountGOhm,\n        uint256 maxNumDelegates\n    ) private returns (uint256 totalRescinded, uint256 newUndelegatedBalance) {\n        newUndelegatedBalance = totalAccountGOhm - aState.delegatedGOhm;\n\n        // Nothing to do if the undelegated balance is already greater than the requested amount\n        if (newUndelegatedBalance >= requestedUndelegatedBalance) {\n            return (totalRescinded, newUndelegatedBalance);\n        }\n\n        uint256 requestedToRescind;\n        unchecked {\n            requestedToRescind = requestedUndelegatedBalance - newUndelegatedBalance;\n        }\n\n        // Using low level functions here, as the OZ version doesn't have a keys() function\n        EnumerableMap.AddressToUintMap storage acctDelegatedAmounts = aState.delegatedAmounts;\n        bytes32[] storage delegateAddrs = acctDelegatedAmounts._inner._keys._inner._values;\n\n        // If no delegates, then nothing to do\n        uint256 index = delegateAddrs.length;\n        if (index == 0) {\n            return (totalRescinded, newUndelegatedBalance);\n        }\n\n        // Iterate over the delegates in reverse, to avoid 'pop and swap' on deleting unused\n        // delegates, changing the array order.\n        // Only iterate over the minimum of number of delegates and the requested max number.\n        uint256 minIndex = index > maxNumDelegates ? index - maxNumDelegates : 0;\n        bytes32 delegateAddr;\n        uint256 delegatedBalance;\n        uint256 rescindAmount;\n        while (index > minIndex) {\n            index--;\n            delegateAddr = delegateAddrs[index];\n            delegatedBalance = uint256(acctDelegatedAmounts._inner._values[delegateAddr]);\n\n            // Cap the amount to rescind for this delegate by the remaining required to get to the\n            // requested undelegated balance\n            rescindAmount = requestedToRescind - totalRescinded;\n            rescindAmount = delegatedBalance < rescindAmount ? delegatedBalance : rescindAmount;\n\n            _rescindDelegation(\n                onBehalfOf,\n                address(uint160(uint256(delegateAddr))),\n                delegatedBalance,\n                rescindAmount,\n                acctDelegatedAmounts\n            );\n\n            // Break if the requested undelegated balance is reached\n            totalRescinded += rescindAmount;\n            if (totalRescinded == requestedToRescind) break;\n        }\n\n        // Update state for the delegated amount of gOHM for this account\n        // Note: May not have undelegated the full requested amount - left up to the calling policy on how to handle this gap\n        newUndelegatedBalance = newUndelegatedBalance + totalRescinded;\n        aState.delegatedGOhm = (totalAccountGOhm - newUndelegatedBalance).encodeUInt112();\n    }\n\n    function _rescindDelegation(\n        address onBehalfOf,\n        address delegate,\n        uint256 delegatedBalance,\n        uint256 rescindAmount,\n        EnumerableMap.AddressToUintMap storage acctDelegatedAmounts\n    ) private {\n        // Rescind the delegation from the escrow\n        DelegateEscrow delegateEscrow = delegateEscrowFactory.create(delegate);\n        delegateEscrow.rescindDelegation(onBehalfOf, rescindAmount);\n        emit DelegationApplied(onBehalfOf, delegate, -int256(rescindAmount));\n\n        // Decrease the delegation record amount.\n        // Remove if that is now zero such that it doesn't count towards the `maxDelegates` cap\n        delegatedBalance -= rescindAmount;\n        if (delegatedBalance == 0) {\n            acctDelegatedAmounts.remove(delegate);\n        } else {\n            acctDelegatedAmounts.set(delegate, delegatedBalance);\n        }\n    }\n}\n"
+    },
+    "lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/utils/structs/EnumerableMap.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.9.0) (utils/structs/EnumerableMap.sol)\n// This file was procedurally generated from scripts/generate/templates/EnumerableMap.js.\n\npragma solidity ^0.8.0;\n\nimport \"./EnumerableSet.sol\";\n\n/**\n * @dev Library for managing an enumerable variant of Solidity's\n * https://solidity.readthedocs.io/en/latest/types.html#mapping-types[`mapping`]\n * type.\n *\n * Maps have the following properties:\n *\n * - Entries are added, removed, and checked for existence in constant time\n * (O(1)).\n * - Entries are enumerated in O(n). No guarantees are made on the ordering.\n *\n * ```solidity\n * contract Example {\n *     // Add the library methods\n *     using EnumerableMap for EnumerableMap.UintToAddressMap;\n *\n *     // Declare a set state variable\n *     EnumerableMap.UintToAddressMap private myMap;\n * }\n * ```\n *\n * The following map types are supported:\n *\n * - `uint256 -> address` (`UintToAddressMap`) since v3.0.0\n * - `address -> uint256` (`AddressToUintMap`) since v4.6.0\n * - `bytes32 -> bytes32` (`Bytes32ToBytes32Map`) since v4.6.0\n * - `uint256 -> uint256` (`UintToUintMap`) since v4.7.0\n * - `bytes32 -> uint256` (`Bytes32ToUintMap`) since v4.7.0\n *\n * [WARNING]\n * ====\n * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure\n * unusable.\n * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.\n *\n * In order to clean an EnumerableMap, you can either remove all elements one by one or create a fresh instance using an\n * array of EnumerableMap.\n * ====\n */\nlibrary EnumerableMap {\n    using EnumerableSet for EnumerableSet.Bytes32Set;\n\n    // To implement this library for multiple types with as little code\n    // repetition as possible, we write it in terms of a generic Map type with\n    // bytes32 keys and values.\n    // The Map implementation uses private functions, and user-facing\n    // implementations (such as Uint256ToAddressMap) are just wrappers around\n    // the underlying Map.\n    // This means that we can only create new EnumerableMaps for types that fit\n    // in bytes32.\n\n    struct Bytes32ToBytes32Map {\n        // Storage of keys\n        EnumerableSet.Bytes32Set _keys;\n        mapping(bytes32 => bytes32) _values;\n    }\n\n    /**\n     * @dev Adds a key-value pair to a map, or updates the value for an existing\n     * key. O(1).\n     *\n     * Returns true if the key was added to the map, that is if it was not\n     * already present.\n     */\n    function set(Bytes32ToBytes32Map storage map, bytes32 key, bytes32 value) internal returns (bool) {\n        map._values[key] = value;\n        return map._keys.add(key);\n    }\n\n    /**\n     * @dev Removes a key-value pair from a map. O(1).\n     *\n     * Returns true if the key was removed from the map, that is if it was present.\n     */\n    function remove(Bytes32ToBytes32Map storage map, bytes32 key) internal returns (bool) {\n        delete map._values[key];\n        return map._keys.remove(key);\n    }\n\n    /**\n     * @dev Returns true if the key is in the map. O(1).\n     */\n    function contains(Bytes32ToBytes32Map storage map, bytes32 key) internal view returns (bool) {\n        return map._keys.contains(key);\n    }\n\n    /**\n     * @dev Returns the number of key-value pairs in the map. O(1).\n     */\n    function length(Bytes32ToBytes32Map storage map) internal view returns (uint256) {\n        return map._keys.length();\n    }\n\n    /**\n     * @dev Returns the key-value pair stored at position `index` in the map. O(1).\n     *\n     * Note that there are no guarantees on the ordering of entries inside the\n     * array, and it may change when more entries are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function at(Bytes32ToBytes32Map storage map, uint256 index) internal view returns (bytes32, bytes32) {\n        bytes32 key = map._keys.at(index);\n        return (key, map._values[key]);\n    }\n\n    /**\n     * @dev Tries to returns the value associated with `key`. O(1).\n     * Does not revert if `key` is not in the map.\n     */\n    function tryGet(Bytes32ToBytes32Map storage map, bytes32 key) internal view returns (bool, bytes32) {\n        bytes32 value = map._values[key];\n        if (value == bytes32(0)) {\n            return (contains(map, key), bytes32(0));\n        } else {\n            return (true, value);\n        }\n    }\n\n    /**\n     * @dev Returns the value associated with `key`. O(1).\n     *\n     * Requirements:\n     *\n     * - `key` must be in the map.\n     */\n    function get(Bytes32ToBytes32Map storage map, bytes32 key) internal view returns (bytes32) {\n        bytes32 value = map._values[key];\n        require(value != 0 || contains(map, key), \"EnumerableMap: nonexistent key\");\n        return value;\n    }\n\n    /**\n     * @dev Same as {get}, with a custom error message when `key` is not in the map.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryGet}.\n     */\n    function get(\n        Bytes32ToBytes32Map storage map,\n        bytes32 key,\n        string memory errorMessage\n    ) internal view returns (bytes32) {\n        bytes32 value = map._values[key];\n        require(value != 0 || contains(map, key), errorMessage);\n        return value;\n    }\n\n    /**\n     * @dev Return the an array containing all the keys\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the map grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function keys(Bytes32ToBytes32Map storage map) internal view returns (bytes32[] memory) {\n        return map._keys.values();\n    }\n\n    // UintToUintMap\n\n    struct UintToUintMap {\n        Bytes32ToBytes32Map _inner;\n    }\n\n    /**\n     * @dev Adds a key-value pair to a map, or updates the value for an existing\n     * key. O(1).\n     *\n     * Returns true if the key was added to the map, that is if it was not\n     * already present.\n     */\n    function set(UintToUintMap storage map, uint256 key, uint256 value) internal returns (bool) {\n        return set(map._inner, bytes32(key), bytes32(value));\n    }\n\n    /**\n     * @dev Removes a value from a map. O(1).\n     *\n     * Returns true if the key was removed from the map, that is if it was present.\n     */\n    function remove(UintToUintMap storage map, uint256 key) internal returns (bool) {\n        return remove(map._inner, bytes32(key));\n    }\n\n    /**\n     * @dev Returns true if the key is in the map. O(1).\n     */\n    function contains(UintToUintMap storage map, uint256 key) internal view returns (bool) {\n        return contains(map._inner, bytes32(key));\n    }\n\n    /**\n     * @dev Returns the number of elements in the map. O(1).\n     */\n    function length(UintToUintMap storage map) internal view returns (uint256) {\n        return length(map._inner);\n    }\n\n    /**\n     * @dev Returns the element stored at position `index` in the map. O(1).\n     * Note that there are no guarantees on the ordering of values inside the\n     * array, and it may change when more values are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function at(UintToUintMap storage map, uint256 index) internal view returns (uint256, uint256) {\n        (bytes32 key, bytes32 value) = at(map._inner, index);\n        return (uint256(key), uint256(value));\n    }\n\n    /**\n     * @dev Tries to returns the value associated with `key`. O(1).\n     * Does not revert if `key` is not in the map.\n     */\n    function tryGet(UintToUintMap storage map, uint256 key) internal view returns (bool, uint256) {\n        (bool success, bytes32 value) = tryGet(map._inner, bytes32(key));\n        return (success, uint256(value));\n    }\n\n    /**\n     * @dev Returns the value associated with `key`. O(1).\n     *\n     * Requirements:\n     *\n     * - `key` must be in the map.\n     */\n    function get(UintToUintMap storage map, uint256 key) internal view returns (uint256) {\n        return uint256(get(map._inner, bytes32(key)));\n    }\n\n    /**\n     * @dev Same as {get}, with a custom error message when `key` is not in the map.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryGet}.\n     */\n    function get(UintToUintMap storage map, uint256 key, string memory errorMessage) internal view returns (uint256) {\n        return uint256(get(map._inner, bytes32(key), errorMessage));\n    }\n\n    /**\n     * @dev Return the an array containing all the keys\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the map grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function keys(UintToUintMap storage map) internal view returns (uint256[] memory) {\n        bytes32[] memory store = keys(map._inner);\n        uint256[] memory result;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            result := store\n        }\n\n        return result;\n    }\n\n    // UintToAddressMap\n\n    struct UintToAddressMap {\n        Bytes32ToBytes32Map _inner;\n    }\n\n    /**\n     * @dev Adds a key-value pair to a map, or updates the value for an existing\n     * key. O(1).\n     *\n     * Returns true if the key was added to the map, that is if it was not\n     * already present.\n     */\n    function set(UintToAddressMap storage map, uint256 key, address value) internal returns (bool) {\n        return set(map._inner, bytes32(key), bytes32(uint256(uint160(value))));\n    }\n\n    /**\n     * @dev Removes a value from a map. O(1).\n     *\n     * Returns true if the key was removed from the map, that is if it was present.\n     */\n    function remove(UintToAddressMap storage map, uint256 key) internal returns (bool) {\n        return remove(map._inner, bytes32(key));\n    }\n\n    /**\n     * @dev Returns true if the key is in the map. O(1).\n     */\n    function contains(UintToAddressMap storage map, uint256 key) internal view returns (bool) {\n        return contains(map._inner, bytes32(key));\n    }\n\n    /**\n     * @dev Returns the number of elements in the map. O(1).\n     */\n    function length(UintToAddressMap storage map) internal view returns (uint256) {\n        return length(map._inner);\n    }\n\n    /**\n     * @dev Returns the element stored at position `index` in the map. O(1).\n     * Note that there are no guarantees on the ordering of values inside the\n     * array, and it may change when more values are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function at(UintToAddressMap storage map, uint256 index) internal view returns (uint256, address) {\n        (bytes32 key, bytes32 value) = at(map._inner, index);\n        return (uint256(key), address(uint160(uint256(value))));\n    }\n\n    /**\n     * @dev Tries to returns the value associated with `key`. O(1).\n     * Does not revert if `key` is not in the map.\n     */\n    function tryGet(UintToAddressMap storage map, uint256 key) internal view returns (bool, address) {\n        (bool success, bytes32 value) = tryGet(map._inner, bytes32(key));\n        return (success, address(uint160(uint256(value))));\n    }\n\n    /**\n     * @dev Returns the value associated with `key`. O(1).\n     *\n     * Requirements:\n     *\n     * - `key` must be in the map.\n     */\n    function get(UintToAddressMap storage map, uint256 key) internal view returns (address) {\n        return address(uint160(uint256(get(map._inner, bytes32(key)))));\n    }\n\n    /**\n     * @dev Same as {get}, with a custom error message when `key` is not in the map.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryGet}.\n     */\n    function get(\n        UintToAddressMap storage map,\n        uint256 key,\n        string memory errorMessage\n    ) internal view returns (address) {\n        return address(uint160(uint256(get(map._inner, bytes32(key), errorMessage))));\n    }\n\n    /**\n     * @dev Return the an array containing all the keys\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the map grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function keys(UintToAddressMap storage map) internal view returns (uint256[] memory) {\n        bytes32[] memory store = keys(map._inner);\n        uint256[] memory result;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            result := store\n        }\n\n        return result;\n    }\n\n    // AddressToUintMap\n\n    struct AddressToUintMap {\n        Bytes32ToBytes32Map _inner;\n    }\n\n    /**\n     * @dev Adds a key-value pair to a map, or updates the value for an existing\n     * key. O(1).\n     *\n     * Returns true if the key was added to the map, that is if it was not\n     * already present.\n     */\n    function set(AddressToUintMap storage map, address key, uint256 value) internal returns (bool) {\n        return set(map._inner, bytes32(uint256(uint160(key))), bytes32(value));\n    }\n\n    /**\n     * @dev Removes a value from a map. O(1).\n     *\n     * Returns true if the key was removed from the map, that is if it was present.\n     */\n    function remove(AddressToUintMap storage map, address key) internal returns (bool) {\n        return remove(map._inner, bytes32(uint256(uint160(key))));\n    }\n\n    /**\n     * @dev Returns true if the key is in the map. O(1).\n     */\n    function contains(AddressToUintMap storage map, address key) internal view returns (bool) {\n        return contains(map._inner, bytes32(uint256(uint160(key))));\n    }\n\n    /**\n     * @dev Returns the number of elements in the map. O(1).\n     */\n    function length(AddressToUintMap storage map) internal view returns (uint256) {\n        return length(map._inner);\n    }\n\n    /**\n     * @dev Returns the element stored at position `index` in the map. O(1).\n     * Note that there are no guarantees on the ordering of values inside the\n     * array, and it may change when more values are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function at(AddressToUintMap storage map, uint256 index) internal view returns (address, uint256) {\n        (bytes32 key, bytes32 value) = at(map._inner, index);\n        return (address(uint160(uint256(key))), uint256(value));\n    }\n\n    /**\n     * @dev Tries to returns the value associated with `key`. O(1).\n     * Does not revert if `key` is not in the map.\n     */\n    function tryGet(AddressToUintMap storage map, address key) internal view returns (bool, uint256) {\n        (bool success, bytes32 value) = tryGet(map._inner, bytes32(uint256(uint160(key))));\n        return (success, uint256(value));\n    }\n\n    /**\n     * @dev Returns the value associated with `key`. O(1).\n     *\n     * Requirements:\n     *\n     * - `key` must be in the map.\n     */\n    function get(AddressToUintMap storage map, address key) internal view returns (uint256) {\n        return uint256(get(map._inner, bytes32(uint256(uint160(key)))));\n    }\n\n    /**\n     * @dev Same as {get}, with a custom error message when `key` is not in the map.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryGet}.\n     */\n    function get(\n        AddressToUintMap storage map,\n        address key,\n        string memory errorMessage\n    ) internal view returns (uint256) {\n        return uint256(get(map._inner, bytes32(uint256(uint160(key))), errorMessage));\n    }\n\n    /**\n     * @dev Return the an array containing all the keys\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the map grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function keys(AddressToUintMap storage map) internal view returns (address[] memory) {\n        bytes32[] memory store = keys(map._inner);\n        address[] memory result;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            result := store\n        }\n\n        return result;\n    }\n\n    // Bytes32ToUintMap\n\n    struct Bytes32ToUintMap {\n        Bytes32ToBytes32Map _inner;\n    }\n\n    /**\n     * @dev Adds a key-value pair to a map, or updates the value for an existing\n     * key. O(1).\n     *\n     * Returns true if the key was added to the map, that is if it was not\n     * already present.\n     */\n    function set(Bytes32ToUintMap storage map, bytes32 key, uint256 value) internal returns (bool) {\n        return set(map._inner, key, bytes32(value));\n    }\n\n    /**\n     * @dev Removes a value from a map. O(1).\n     *\n     * Returns true if the key was removed from the map, that is if it was present.\n     */\n    function remove(Bytes32ToUintMap storage map, bytes32 key) internal returns (bool) {\n        return remove(map._inner, key);\n    }\n\n    /**\n     * @dev Returns true if the key is in the map. O(1).\n     */\n    function contains(Bytes32ToUintMap storage map, bytes32 key) internal view returns (bool) {\n        return contains(map._inner, key);\n    }\n\n    /**\n     * @dev Returns the number of elements in the map. O(1).\n     */\n    function length(Bytes32ToUintMap storage map) internal view returns (uint256) {\n        return length(map._inner);\n    }\n\n    /**\n     * @dev Returns the element stored at position `index` in the map. O(1).\n     * Note that there are no guarantees on the ordering of values inside the\n     * array, and it may change when more values are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function at(Bytes32ToUintMap storage map, uint256 index) internal view returns (bytes32, uint256) {\n        (bytes32 key, bytes32 value) = at(map._inner, index);\n        return (key, uint256(value));\n    }\n\n    /**\n     * @dev Tries to returns the value associated with `key`. O(1).\n     * Does not revert if `key` is not in the map.\n     */\n    function tryGet(Bytes32ToUintMap storage map, bytes32 key) internal view returns (bool, uint256) {\n        (bool success, bytes32 value) = tryGet(map._inner, key);\n        return (success, uint256(value));\n    }\n\n    /**\n     * @dev Returns the value associated with `key`. O(1).\n     *\n     * Requirements:\n     *\n     * - `key` must be in the map.\n     */\n    function get(Bytes32ToUintMap storage map, bytes32 key) internal view returns (uint256) {\n        return uint256(get(map._inner, key));\n    }\n\n    /**\n     * @dev Same as {get}, with a custom error message when `key` is not in the map.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryGet}.\n     */\n    function get(\n        Bytes32ToUintMap storage map,\n        bytes32 key,\n        string memory errorMessage\n    ) internal view returns (uint256) {\n        return uint256(get(map._inner, key, errorMessage));\n    }\n\n    /**\n     * @dev Return the an array containing all the keys\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the map grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function keys(Bytes32ToUintMap storage map) internal view returns (bytes32[] memory) {\n        bytes32[] memory store = keys(map._inner);\n        bytes32[] memory result;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            result := store\n        }\n\n        return result;\n    }\n}\n"
+    },
+    "lib/solmate/src/utils/SafeTransferLib.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\nimport {ERC20} from \"../tokens/ERC20.sol\";\n\n/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)\n/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.\n/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.\nlibrary SafeTransferLib {\n    /*//////////////////////////////////////////////////////////////\n                             ETH OPERATIONS\n    //////////////////////////////////////////////////////////////*/\n\n    function safeTransferETH(address to, uint256 amount) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Transfer the ETH and store if it succeeded or not.\n            success := call(gas(), to, amount, 0, 0, 0, 0)\n        }\n\n        require(success, \"ETH_TRANSFER_FAILED\");\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            ERC20 OPERATIONS\n    //////////////////////////////////////////////////////////////*/\n\n    function safeTransferFrom(\n        ERC20 token,\n        address from,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"from\" argument.\n            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 68), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)\n            )\n        }\n\n        require(success, \"TRANSFER_FROM_FAILED\");\n    }\n\n    function safeTransfer(\n        ERC20 token,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 36), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)\n            )\n        }\n\n        require(success, \"TRANSFER_FAILED\");\n    }\n\n    function safeApprove(\n        ERC20 token,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 36), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)\n            )\n        }\n\n        require(success, \"APPROVE_FAILED\");\n    }\n}\n"
+    },
+    "lib/solmate/src/tokens/ERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)\n/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)\n/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.\nabstract contract ERC20 {\n    /*//////////////////////////////////////////////////////////////\n                                 EVENTS\n    //////////////////////////////////////////////////////////////*/\n\n    event Transfer(address indexed from, address indexed to, uint256 amount);\n\n    event Approval(address indexed owner, address indexed spender, uint256 amount);\n\n    /*//////////////////////////////////////////////////////////////\n                            METADATA STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    string public name;\n\n    string public symbol;\n\n    uint8 public immutable decimals;\n\n    /*//////////////////////////////////////////////////////////////\n                              ERC20 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 public totalSupply;\n\n    mapping(address => uint256) public balanceOf;\n\n    mapping(address => mapping(address => uint256)) public allowance;\n\n    /*//////////////////////////////////////////////////////////////\n                            EIP-2612 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 internal immutable INITIAL_CHAIN_ID;\n\n    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;\n\n    mapping(address => uint256) public nonces;\n\n    /*//////////////////////////////////////////////////////////////\n                               CONSTRUCTOR\n    //////////////////////////////////////////////////////////////*/\n\n    constructor(\n        string memory _name,\n        string memory _symbol,\n        uint8 _decimals\n    ) {\n        name = _name;\n        symbol = _symbol;\n        decimals = _decimals;\n\n        INITIAL_CHAIN_ID = block.chainid;\n        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                               ERC20 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function approve(address spender, uint256 amount) public virtual returns (bool) {\n        allowance[msg.sender][spender] = amount;\n\n        emit Approval(msg.sender, spender, amount);\n\n        return true;\n    }\n\n    function transfer(address to, uint256 amount) public virtual returns (bool) {\n        balanceOf[msg.sender] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(msg.sender, to, amount);\n\n        return true;\n    }\n\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) public virtual returns (bool) {\n        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.\n\n        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;\n\n        balanceOf[from] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(from, to, amount);\n\n        return true;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                             EIP-2612 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual {\n        require(deadline >= block.timestamp, \"PERMIT_DEADLINE_EXPIRED\");\n\n        // Unchecked because the only math done is incrementing\n        // the owner's nonce which cannot realistically overflow.\n        unchecked {\n            address recoveredAddress = ecrecover(\n                keccak256(\n                    abi.encodePacked(\n                        \"\\x19\\x01\",\n                        DOMAIN_SEPARATOR(),\n                        keccak256(\n                            abi.encode(\n                                keccak256(\n                                    \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n                                ),\n                                owner,\n                                spender,\n                                value,\n                                nonces[owner]++,\n                                deadline\n                            )\n                        )\n                    )\n                ),\n                v,\n                r,\n                s\n            );\n\n            require(recoveredAddress != address(0) && recoveredAddress == owner, \"INVALID_SIGNER\");\n\n            allowance[recoveredAddress][spender] = value;\n        }\n\n        emit Approval(owner, spender, value);\n    }\n\n    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {\n        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();\n    }\n\n    function computeDomainSeparator() internal view virtual returns (bytes32) {\n        return\n            keccak256(\n                abi.encode(\n                    keccak256(\"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"),\n                    keccak256(bytes(name)),\n                    keccak256(\"1\"),\n                    block.chainid,\n                    address(this)\n                )\n            );\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                        INTERNAL MINT/BURN LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function _mint(address to, uint256 amount) internal virtual {\n        totalSupply += amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(address(0), to, amount);\n    }\n\n    function _burn(address from, uint256 amount) internal virtual {\n        balanceOf[from] -= amount;\n\n        // Cannot underflow because a user's balance\n        // will never be larger than the total supply.\n        unchecked {\n            totalSupply -= amount;\n        }\n\n        emit Transfer(from, address(0), amount);\n    }\n}\n"
+    },
+    "src/Kernel.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\n//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████\n//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███\n//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░\n// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████\n// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███\n// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███\n//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████\n//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░\n\n//============================================================================================//\n//                                        GLOBAL TYPES                                        //\n//============================================================================================//\n\n/// @notice Actions to trigger state changes in the kernel. Passed by the executor\nenum Actions {\n    InstallModule,\n    UpgradeModule,\n    ActivatePolicy,\n    DeactivatePolicy,\n    ChangeExecutor,\n    MigrateKernel\n}\n\n/// @notice Used by executor to select an action and a target contract for a kernel action\nstruct Instruction {\n    Actions action;\n    address target;\n}\n\n/// @notice Used to define which module functions a policy needs access to\nstruct Permissions {\n    Keycode keycode;\n    bytes4 funcSelector;\n}\n\ntype Keycode is bytes5;\n\n//============================================================================================//\n//                                       UTIL FUNCTIONS                                       //\n//============================================================================================//\n\nerror TargetNotAContract(address target_);\nerror InvalidKeycode(Keycode keycode_);\n\n// solhint-disable-next-line func-visibility\nfunction toKeycode(bytes5 keycode_) pure returns (Keycode) {\n    return Keycode.wrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction fromKeycode(Keycode keycode_) pure returns (bytes5) {\n    return Keycode.unwrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureContract(address target_) view {\n    if (target_.code.length == 0) revert TargetNotAContract(target_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureValidKeycode(Keycode keycode_) pure {\n    bytes5 unwrapped = Keycode.unwrap(keycode_);\n    for (uint256 i = 0; i < 5; ) {\n        bytes1 char = unwrapped[i];\n        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only\n        unchecked {\n            i++;\n        }\n    }\n}\n\n//============================================================================================//\n//                                        COMPONENTS                                          //\n//============================================================================================//\n\n/// @notice Generic adapter interface for kernel access in modules and policies.\nabstract contract KernelAdapter {\n    error KernelAdapter_OnlyKernel(address caller_);\n\n    Kernel public kernel;\n\n    constructor(Kernel kernel_) {\n        kernel = kernel_;\n    }\n\n    /// @notice Modifier to restrict functions to be called only by kernel.\n    modifier onlyKernel() {\n        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);\n        _;\n    }\n\n    /// @notice Function used by kernel when migrating to a new kernel.\n    function changeKernel(Kernel newKernel_) external onlyKernel {\n        kernel = newKernel_;\n    }\n}\n\n/// @notice Base level extension of the kernel. Modules act as independent state components to be\n///         interacted with and mutated through policies.\n/// @dev    Modules are installed and uninstalled via the executor.\nabstract contract Module is KernelAdapter {\n    error Module_PolicyNotPermitted(address policy_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Modifier to restrict which policies have access to module functions.\n    modifier permissioned() {\n        if (\n            msg.sender == address(kernel) ||\n            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)\n        ) revert Module_PolicyNotPermitted(msg.sender);\n        _;\n    }\n\n    /// @notice 5 byte identifier for a module.\n    function KEYCODE() public pure virtual returns (Keycode) {}\n\n    /// @notice Returns which semantic version of a module is being implemented.\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}\n\n    /// @notice Initialization function for the module\n    /// @dev    This function is called when the module is installed or upgraded by the kernel.\n    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.\n    function INIT() external virtual onlyKernel {}\n}\n\n/// @notice Policies are application logic and external interface for the kernel and installed modules.\n/// @dev    Policies are activated and deactivated in the kernel by the executor.\n/// @dev    Module dependencies and function permissions must be defined in appropriate functions.\nabstract contract Policy is KernelAdapter {\n    error Policy_ModuleDoesNotExist(Keycode keycode_);\n    error Policy_WrongModuleVersion(bytes expected_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Easily accessible indicator for if a policy is activated or not.\n    function isActive() external view returns (bool) {\n        return kernel.isPolicyActive(this);\n    }\n\n    /// @notice Function to grab module address from a given keycode.\n    function getModuleAddress(Keycode keycode_) internal view returns (address) {\n        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));\n        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);\n        return moduleForKeycode;\n    }\n\n    /// @notice Define module dependencies for this policy.\n    /// @return dependencies - Keycode array of module dependencies.\n    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}\n\n    /// @notice Function called by kernel to set module function permissions.\n    /// @return requests - Array of keycodes and function selectors for requested permissions.\n    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}\n}\n\n/// @notice Main contract that acts as a central component registry for the protocol.\n/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,\n/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.\ncontract Kernel {\n    // =========  EVENTS ========= //\n\n    event PermissionsUpdated(\n        Keycode indexed keycode_,\n        Policy indexed policy_,\n        bytes4 funcSelector_,\n        bool granted_\n    );\n    event ActionExecuted(Actions indexed action_, address indexed target_);\n\n    // =========  ERRORS ========= //\n\n    error Kernel_OnlyExecutor(address caller_);\n    error Kernel_ModuleAlreadyInstalled(Keycode module_);\n    error Kernel_InvalidModuleUpgrade(Keycode module_);\n    error Kernel_PolicyAlreadyActivated(address policy_);\n    error Kernel_PolicyNotActivated(address policy_);\n\n    // =========  PRIVILEGED ADDRESSES ========= //\n\n    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.\n    address public executor;\n\n    // =========  MODULE MANAGEMENT ========= //\n\n    /// @notice Array of all modules currently installed.\n    Keycode[] public allKeycodes;\n\n    /// @notice Mapping of module address to keycode.\n    mapping(Keycode => Module) public getModuleForKeycode;\n\n    /// @notice Mapping of keycode to module address.\n    mapping(Module => Keycode) public getKeycodeForModule;\n\n    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.\n    mapping(Keycode => Policy[]) public moduleDependents;\n\n    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.\n    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;\n\n    /// @notice Module <> Policy Permissions.\n    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission\n    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;\n\n    // =========  POLICY MANAGEMENT ========= //\n\n    /// @notice List of all active policies\n    Policy[] public activePolicies;\n\n    /// @notice Helper to get active policy quickly. Prevents need to loop through array.\n    mapping(Policy => uint256) public getPolicyIndex;\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    constructor() {\n        executor = msg.sender;\n    }\n\n    /// @notice Modifier to check if caller is the executor.\n    modifier onlyExecutor() {\n        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);\n        _;\n    }\n\n    function isPolicyActive(Policy policy_) public view returns (bool) {\n        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;\n    }\n\n    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.\n    function executeAction(Actions action_, address target_) external onlyExecutor {\n        if (action_ == Actions.InstallModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _installModule(Module(target_));\n        } else if (action_ == Actions.UpgradeModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _upgradeModule(Module(target_));\n        } else if (action_ == Actions.ActivatePolicy) {\n            ensureContract(target_);\n            _activatePolicy(Policy(target_));\n        } else if (action_ == Actions.DeactivatePolicy) {\n            ensureContract(target_);\n            _deactivatePolicy(Policy(target_));\n        } else if (action_ == Actions.ChangeExecutor) {\n            executor = target_;\n        } else if (action_ == Actions.MigrateKernel) {\n            ensureContract(target_);\n            _migrateKernel(Kernel(target_));\n        }\n\n        emit ActionExecuted(action_, target_);\n    }\n\n    function _installModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n\n        if (address(getModuleForKeycode[keycode]) != address(0))\n            revert Kernel_ModuleAlreadyInstalled(keycode);\n\n        getModuleForKeycode[keycode] = newModule_;\n        getKeycodeForModule[newModule_] = keycode;\n        allKeycodes.push(keycode);\n\n        newModule_.INIT();\n    }\n\n    function _upgradeModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n        Module oldModule = getModuleForKeycode[keycode];\n\n        if (address(oldModule) == address(0) || oldModule == newModule_)\n            revert Kernel_InvalidModuleUpgrade(keycode);\n\n        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));\n        getKeycodeForModule[newModule_] = keycode;\n        getModuleForKeycode[keycode] = newModule_;\n\n        newModule_.INIT();\n\n        _reconfigurePolicies(keycode);\n    }\n\n    function _activatePolicy(Policy policy_) internal {\n        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));\n\n        // Add policy to list of active policies\n        activePolicies.push(policy_);\n        getPolicyIndex[policy_] = activePolicies.length - 1;\n\n        // Record module dependencies\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depLength = dependencies.length;\n\n        for (uint256 i; i < depLength; ) {\n            Keycode keycode = dependencies[i];\n\n            moduleDependents[keycode].push(policy_);\n            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        // Grant permissions for policy to access restricted module functions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, true);\n    }\n\n    function _deactivatePolicy(Policy policy_) internal {\n        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));\n\n        // Revoke permissions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, false);\n\n        // Remove policy from all policy data structures\n        uint256 idx = getPolicyIndex[policy_];\n        Policy lastPolicy = activePolicies[activePolicies.length - 1];\n\n        activePolicies[idx] = lastPolicy;\n        activePolicies.pop();\n        getPolicyIndex[lastPolicy] = idx;\n        delete getPolicyIndex[policy_];\n\n        // Remove policy from module dependents\n        _pruneFromDependents(policy_);\n    }\n\n    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.\n    /// @dev    New kernel must add in all of the modules and policies via executeAction.\n    /// @dev    NOTE: Data does not get cleared from this kernel.\n    function _migrateKernel(Kernel newKernel_) internal {\n        uint256 keycodeLen = allKeycodes.length;\n        for (uint256 i; i < keycodeLen; ) {\n            Module module = Module(getModuleForKeycode[allKeycodes[i]]);\n            module.changeKernel(newKernel_);\n            unchecked {\n                ++i;\n            }\n        }\n\n        uint256 policiesLen = activePolicies.length;\n        for (uint256 j; j < policiesLen; ) {\n            Policy policy = activePolicies[j];\n\n            // Deactivate before changing kernel\n            policy.changeKernel(newKernel_);\n            unchecked {\n                ++j;\n            }\n        }\n    }\n\n    function _reconfigurePolicies(Keycode keycode_) internal {\n        Policy[] memory dependents = moduleDependents[keycode_];\n        uint256 depLength = dependents.length;\n\n        for (uint256 i; i < depLength; ) {\n            dependents[i].configureDependencies();\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _setPolicyPermissions(\n        Policy policy_,\n        Permissions[] memory requests_,\n        bool grant_\n    ) internal {\n        uint256 reqLength = requests_.length;\n        for (uint256 i = 0; i < reqLength; ) {\n            Permissions memory request = requests_[i];\n            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;\n\n            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _pruneFromDependents(Policy policy_) internal {\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depcLength = dependencies.length;\n\n        for (uint256 i; i < depcLength; ) {\n            Keycode keycode = dependencies[i];\n            Policy[] storage dependents = moduleDependents[keycode];\n\n            uint256 origIndex = getDependentIndex[keycode][policy_];\n            Policy lastPolicy = dependents[dependents.length - 1];\n\n            // Swap with last and pop\n            dependents[origIndex] = lastPolicy;\n            dependents.pop();\n\n            // Record new index and delete deactivated policy index\n            getDependentIndex[keycode][lastPolicy] = origIndex;\n            delete getDependentIndex[keycode][policy_];\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n}\n"
+    },
+    "src/modules/DLGTE/IDLGTE.v1.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {IERC20} from \"../../interfaces/IERC20.sol\";\n\ninterface IDLGTEv1 {\n    // =========  ERRORS ========= //\n\n    error DLGTE_InvalidAddress();\n    error DLGTE_InvalidDelegationRequests();\n    error DLGTE_TooManyDelegates();\n    error DLGTE_InvalidDelegateEscrow();\n    error DLGTE_InvalidAmount();\n\n    error DLGTE_ExceededUndelegatedBalance(uint256 balance, uint256 requested);\n    error DLGTE_ExceededDelegatedBalance(address delegate, uint256 balance, uint256 requested);\n    error DLGTE_ExceededPolicyAccountBalance(uint256 balance, uint256 requested);\n\n    // ========= EVENTS ========= //\n\n    event DelegationApplied(address indexed account, address indexed delegate, int256 amount);\n\n    event MaxDelegateAddressesSet(address indexed account, uint256 maxDelegateAddresses);\n\n    // ========= STRUCTS ======= //\n\n    struct DelegationRequest {\n        /// @dev The address of the delegate\n        address delegate;\n        /// @dev The amount to (un)delegate.\n        /// positive means delegate, negative undelegate.\n        int256 amount;\n    }\n\n    struct AccountDelegation {\n        /// @dev The delegate address - the receiver account of the gOHM voting power.\n        address delegate;\n        /// @dev The amount of gOHM delegated to `delegate`\n        uint256 amount;\n        /// @dev The DelegateEscrow contract address for this `delegate`\n        address escrow;\n    }\n\n    // ========= FUNCTIONS ========= //\n\n    /**\n     * @notice Set an account to have more or less than the DEFAULT_MAX_DELEGATE_ADDRESSES\n     * number of delegates.\n     */\n    function setMaxDelegateAddresses(address account, uint32 maxDelegateAddresses) external;\n\n    /**\n     * @notice gOHM is pulled from the calling policy and added to the undelegated balance.\n     * @dev\n     *   - This gOHM cannot be used for governance voting until it is delegated.\n     *   - Deposted gOHM balances are tracked per policy. policyA cannot withdraw gOHM that policyB deposited\n     */\n    function depositUndelegatedGohm(address onBehalfOf, uint256 amount) external;\n\n    /**\n     * @notice Undelegated gOHM is transferred to the calling policy.\n     * @dev\n     *   - If `autoRescindMaxNumDelegates` is greater than zero, the delegations will be automatically rescinded if required\n     *     from up to `autoRescindMaxNumDelegates` number of delegate escrows. See `rescindDelegations()` for details\n     *   - Will revert if there is still not enough undelegated gOHM for `onBehalfOf` OR\n     *     if policy is attempting to withdraw more gOHM than it deposited\n     *     Deposted gOHM balances are tracked per policy. policyA cannot withdraw gOHM that policyB deposited\n     */\n    function withdrawUndelegatedGohm(\n        address onBehalfOf,\n        uint256 amount,\n        uint256 autoRescindMaxNumDelegates\n    ) external;\n\n    /**\n     * @notice Apply a set of delegation requests on behalf of a given account.\n     *  - Each delegation request either delegates or undelegates to an address\n     *  - It applies across total gOHM balances for a given account across all calling policies\n     *    So policyA may (un)delegate the account's gOHM set by policyA, B and C\n     */\n    function applyDelegations(\n        address onBehalfOf,\n        DelegationRequest[] calldata delegationRequests\n    )\n        external\n        returns (uint256 totalDelegated, uint256 totalUndelegated, uint256 undelegatedBalance);\n\n    /**\n     * @notice Rescind delegations until the amount undelegated for the `onBehalfOf` account\n     * is greater or equal to `requestedUndelegatedBalance`. No more than `maxNumDelegates`\n     * will be rescinded as part of this\n     * @dev\n     *    - Delegations are rescinded by iterating through the delegate addresses for the\n     *      `onBehalfOf` address.\n     *    - No guarantees on the order of who is rescinded -- it may change as delegations are\n     *      removed\n     *    - A calling policy may be able to rescind more than it added via `depositUndelegatedGohm()`\n     *      however the policy cannot then withdraw an amount higher than what it deposited.\n     *    - If the full `requestedUndelegatedBalance` cannot be fulfilled the `actualUndelegatedBalance`\n     *      return parameter may be less than `requestedUndelegatedBalance`. The caller must decide\n     *      on how to handle that.\n     */\n    function rescindDelegations(\n        address onBehalfOf,\n        uint256 requestedUndelegatedBalance,\n        uint256 maxNumDelegates\n    ) external returns (uint256 totalRescinded, uint256 newUndelegatedBalance);\n\n    /**\n     * @notice Report the total delegated and undelegated gOHM balance for an account\n     * in a given policy\n     */\n    function policyAccountBalances(\n        address policy,\n        address account\n    ) external view returns (uint256 gOhmBalance);\n\n    /**\n     * @notice Paginated view of an account's delegations\n     * @dev This can be called sequentially, increasing the `startIndex` each time by the number of items\n     * returned in the previous call, until number of items returned is less than `maxItems`\n     * The `totalAmount` delegated within the return struct is across all policies for that account delegate\n     */\n    function accountDelegationsList(\n        address account,\n        uint256 startIndex,\n        uint256 maxItems\n    ) external view returns (AccountDelegation[] memory delegations);\n\n    /**\n     * @notice A summary of an account's delegations\n     */\n    function accountDelegationSummary(\n        address account\n    )\n        external\n        view\n        returns (\n            uint256 totalGOhm,\n            uint256 delegatedGOhm,\n            uint256 numDelegateAddresses,\n            uint256 maxAllowedDelegateAddresses\n        );\n\n    /**\n     * @notice The total amount delegated to a particular delegate across all policies,\n     * and externally made delegations (including any permanent donations)\n     */\n    function totalDelegatedTo(address delegate) external view returns (uint256);\n\n    /**\n     * @notice The maximum number of delegates an account can have accross all policies\n     */\n    function maxDelegateAddresses(address account) external view returns (uint32 result);\n\n    /// @notice The gOhm token supplied by accounts\n    function gOHM() external view returns (IERC20);\n\n    /// @notice The default maximum number of addresses an account can delegate to\n    function DEFAULT_MAX_DELEGATE_ADDRESSES() external view returns (uint32);\n}\n"
+    },
+    "src/modules/DLGTE/DLGTE.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\nimport {Module} from \"src/Kernel.sol\";\nimport {IDLGTEv1} from \"modules/DLGTE/IDLGTE.v1.sol\";\nimport {IERC20} from \"../../interfaces/IERC20.sol\";\n\n/**\n * @title  Olympus Governance Delegation\n * @notice Olympus Governance Delegation (Module) Contract\n * @dev    The Olympus Governance Delegation Module enables policies to delegate gOHM on behalf of accounts.\n *         If the gOHM is undelegated, this module acts as an escrow for the gOHM.\n *         When the gOHM is delegated, new individual escrows are created for those delegates, and that\n *         portion of gOHM is transferred to that escrow.\n *         gOHM balances are tracked per (policy, account) separately such that one policy cannot pull the\n *         gOHM from another policy (eg policy B pulling collateral out of the Cooler policy).\n */\nabstract contract DLGTEv1 is Module, IDLGTEv1 {\n    // ========= STATE ========= //\n\n    ERC20 internal immutable _gOHM;\n\n    /// @inheritdoc IDLGTEv1\n    uint32 public constant override DEFAULT_MAX_DELEGATE_ADDRESSES = 10;\n\n    constructor(address gohm_) {\n        _gOHM = ERC20(gohm_);\n    }\n\n    // ========= FUNCTIONS ========= //\n\n    /// @inheritdoc IDLGTEv1\n    function setMaxDelegateAddresses(\n        address account,\n        uint32 maxDelegateAddresses\n    ) external virtual override;\n\n    /// @inheritdoc IDLGTEv1\n    function depositUndelegatedGohm(address onBehalfOf, uint256 amount) external virtual override;\n\n    /// @inheritdoc IDLGTEv1\n    function withdrawUndelegatedGohm(\n        address onBehalfOf,\n        uint256 amount,\n        uint256 autoRescindMaxNumDelegates\n    ) external virtual override;\n\n    /// @inheritdoc IDLGTEv1\n    function applyDelegations(\n        address onBehalfOf,\n        DelegationRequest[] calldata delegationRequests\n    )\n        external\n        virtual\n        override\n        returns (uint256 totalDelegated, uint256 totalUndelegated, uint256 undelegatedBalance);\n\n    /// @inheritdoc IDLGTEv1\n    function rescindDelegations(\n        address onBehalfOf,\n        uint256 requestedUndelegatedBalance,\n        uint256 maxNumDelegates\n    ) external virtual override returns (uint256 totalRescinded, uint256 newUndelegatedBalance);\n\n    /// @inheritdoc IDLGTEv1\n    function policyAccountBalances(\n        address policy,\n        address account\n    ) external view virtual override returns (uint256 gOhmBalance);\n\n    /// @inheritdoc IDLGTEv1\n    function accountDelegationsList(\n        address account,\n        uint256 startIndex,\n        uint256 maxItems\n    ) external view virtual override returns (AccountDelegation[] memory delegations);\n\n    /// @inheritdoc IDLGTEv1\n    function accountDelegationSummary(\n        address account\n    )\n        external\n        view\n        virtual\n        returns (\n            uint256 totalGOhm,\n            uint256 delegatedGOhm,\n            uint256 numDelegateAddresses,\n            uint256 maxAllowedDelegateAddresses\n        );\n\n    /// @inheritdoc IDLGTEv1\n    function totalDelegatedTo(address delegate) external view virtual returns (uint256);\n\n    /// @inheritdoc IDLGTEv1\n    function maxDelegateAddresses(\n        address account\n    ) external view virtual override returns (uint32 result);\n\n    /// @inheritdoc IDLGTEv1\n    function gOHM() external view override returns (IERC20) {\n        return IERC20(address(_gOHM));\n    }\n}\n"
+    },
+    "src/external/cooler/DelegateEscrow.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {IVotes} from \"openzeppelin/governance/utils/IVotes.sol\";\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\nimport {SafeTransferLib} from \"solmate/utils/SafeTransferLib.sol\";\nimport {Clone} from \"clones/Clone.sol\";\nimport {DelegateEscrowFactory} from \"src/external/cooler/DelegateEscrowFactory.sol\";\n\n/**\n * @title Delegate Escrow Account\n * @notice An escrow to hold gOHM and delegate that amount to exactly one account.\n * @dev Any caller (eg MonoCooler) can delegate on behalf of a `delegator` address, but only that same caller\n * can rescind the delegation to pull the gOHM back.\n * This contract uses Clones (https://github.com/wighawag/clones-with-immutable-args)\n * to save gas on deployment.\n * Note: Any donated gOHM (transferred directly rather than using `delegate()`) cannot be recovered.\n */\ncontract DelegateEscrow is Clone {\n    using SafeTransferLib for ERC20;\n\n    /// @notice OHM governance token\n    ERC20 public immutable gohm;\n\n    /// @notice A caller cannot rescind a delegation for more the gOHM which was\n    /// delegated.\n    error ExceededDelegationBalance();\n\n    /// @notice Can only be called from the factory which created this contract\n    error NotFactory();\n\n    /// @notice The mapping of delegation amounts.\n    /// @dev Partitioned by the calling address, and also by\n    /// the address on behalf it is delegating for.\n    mapping(address /* caller */ => mapping(address /* onBehalfOf */ => uint256 /* amount */))\n        public delegations;\n\n    constructor(address gohm_) {\n        gohm = ERC20(gohm_);\n    }\n\n    function initialize() external onlyFactory {\n        IVotes(address(gohm)).delegate(delegateAccount());\n    }\n\n    /// @notice The delegate address of the gOHM collateral in this escrow\n    function delegateAccount() public pure returns (address) {\n        return _getArgAddress(0x0);\n    }\n\n    /// @notice The factory contract which created this escrow\n    function factory() public pure returns (DelegateEscrowFactory _factory) {\n        return DelegateEscrowFactory(_getArgAddress(0x14));\n    }\n\n    /// @notice Delegate an amount of gOHM to the predefined `delegateAccount`\n    /// @dev gOHM is pulled from the caller (which must provide allowance), and only that\n    /// same caller may rescind the delegation to recall the gOHM at a future date.\n    function delegate(\n        address onBehalfOf,\n        uint256 gohmAmount\n    ) external returns (uint256 delegatedAmount) {\n        gohm.safeTransferFrom(msg.sender, address(this), gohmAmount);\n\n        mapping(address => uint256) storage delegatorAmounts = delegations[msg.sender];\n        delegatorAmounts[onBehalfOf] = delegatedAmount = delegatorAmounts[onBehalfOf] + gohmAmount;\n\n        factory().logDelegate(msg.sender, onBehalfOf, int256(gohmAmount));\n    }\n\n    /// @notice Rescind a delegation of gOHM and send back to the caller.\n    function rescindDelegation(\n        address onBehalfOf,\n        uint256 gohmAmount\n    ) external returns (uint256 delegatedAmount) {\n        mapping(address => uint256) storage delegatorAmounts = delegations[msg.sender];\n        uint256 existingDelegatedAmount = delegatorAmounts[onBehalfOf];\n        if (gohmAmount > existingDelegatedAmount) revert ExceededDelegationBalance();\n\n        unchecked {\n            delegatorAmounts[onBehalfOf] = delegatedAmount = existingDelegatedAmount - gohmAmount;\n        }\n        gohm.safeTransfer(msg.sender, gohmAmount);\n\n        factory().logDelegate(msg.sender, onBehalfOf, -int256(gohmAmount));\n    }\n\n    /// @notice The total amount delegated via this escrow across all callers, including donations.\n    function totalDelegated() external view returns (uint256) {\n        return gohm.balanceOf(address(this));\n    }\n\n    /// @notice Ensure that the caller is the factory which created this contract only.\n    modifier onlyFactory() {\n        if (msg.sender != address(factory())) revert NotFactory();\n        _;\n    }\n}\n"
+    },
+    "src/external/cooler/DelegateEscrowFactory.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {ClonesWithImmutableArgs} from \"clones/ClonesWithImmutableArgs.sol\";\nimport {DelegateEscrow} from \"src/external/cooler/DelegateEscrow.sol\";\n\n/// @title  Delegate Escrow Factory.\n/// @notice The Delegate Escrow Factory creates new escrow contracts, each holding the delegated\n///         gOHM from other accounts\n/// @dev    This contract uses Clones (https://github.com/wighawag/clones-with-immutable-args)\n///         to save gas on deployment.\ncontract DelegateEscrowFactory {\n    using ClonesWithImmutableArgs for address;\n\n    error NotFromFactory();\n\n    /// @notice A caller has created a new escrow for a delegate\n    event DelegateEscrowCreated(\n        address indexed caller,\n        address indexed delegate,\n        address indexed escrow\n    );\n\n    /// @notice A `caller` has (un)delegated their gOHM amount from `escrow` on behalf of a user\n    /// @dev\n    ///      delegationAmountDelta > 0: It has been delegated to this escrow\n    ///      delegationAmountDelta < 0: It has been undelegated from this escrow\n    event Delegate(\n        address indexed escrow,\n        address indexed caller,\n        address indexed onBehalfOf,\n        int256 delegationAmountDelta\n    );\n\n    /// @notice Reference implementation (deployed on creation to clone from).\n    DelegateEscrow public immutable escrowImplementation;\n\n    /// @notice Mapping to validate deployed escrows.\n    mapping(address => bool) public created;\n\n    /// @notice Mapping to query escrows for a given delegate.\n    mapping(address => DelegateEscrow) public escrowFor;\n\n    constructor(address gohm_) {\n        escrowImplementation = new DelegateEscrow(gohm_);\n    }\n\n    /// @notice creates a new escrow contract for a delegate.\n    function create(address delegate) external returns (DelegateEscrow escrow) {\n        escrow = escrowFor[delegate];\n\n        // If not found, generate a new escrow\n        if (address(escrow) == address(0)) {\n            // Clone the escrow implementation.\n            bytes memory escrowData = abi.encodePacked(\n                delegate,\n                address(this) // factory\n            );\n            escrow = DelegateEscrow(address(escrowImplementation).clone(escrowData));\n            escrow.initialize();\n            emit DelegateEscrowCreated(msg.sender, delegate, address(escrow));\n\n            // Update storage accordingly.\n            escrowFor[delegate] = escrow;\n            created[address(escrow)] = true;\n        }\n    }\n\n    /// @notice Emit a global event when a new loan request is created.\n    function logDelegate(\n        address caller,\n        address onBehalfOf,\n        int256 delegationAmountDelta\n    ) external onlyFromFactory {\n        emit Delegate(msg.sender, caller, onBehalfOf, delegationAmountDelta);\n    }\n\n    /// @notice Ensure that the called is a Cooler.\n    modifier onlyFromFactory() {\n        if (!created[msg.sender]) revert NotFromFactory();\n        _;\n    }\n}\n"
+    },
+    "src/libraries/SafeCast.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\nlibrary SafeCast {\n    error Overflow(uint256 amount);\n\n    function encodeUInt128(uint256 amount) internal pure returns (uint128) {\n        if (amount > type(uint128).max) {\n            revert Overflow(amount);\n        }\n        return uint128(amount);\n    }\n\n    function encodeUInt112(uint256 amount) internal pure returns (uint112) {\n        if (amount > type(uint112).max) {\n            revert Overflow(amount);\n        }\n        return uint112(amount);\n    }\n\n    function encodeUInt96(uint256 amount) internal pure returns (uint96) {\n        if (amount > type(uint96).max) {\n            revert Overflow(amount);\n        }\n        return uint96(amount);\n    }\n\n    function encodeUInt32(uint256 amount) internal pure returns (uint32) {\n        if (amount > type(uint32).max) {\n            revert Overflow(amount);\n        }\n        return uint32(amount);\n    }\n\n    function encodeUInt16(uint256 amount) internal pure returns (uint16) {\n        if (amount > type(uint16).max) {\n            revert Overflow(amount);\n        }\n        return uint16(amount);\n    }\n}\n"
+    },
+    "lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.9.0) (utils/structs/EnumerableSet.sol)\n// This file was procedurally generated from scripts/generate/templates/EnumerableSet.js.\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Library for managing\n * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive\n * types.\n *\n * Sets have the following properties:\n *\n * - Elements are added, removed, and checked for existence in constant time\n * (O(1)).\n * - Elements are enumerated in O(n). No guarantees are made on the ordering.\n *\n * ```solidity\n * contract Example {\n *     // Add the library methods\n *     using EnumerableSet for EnumerableSet.AddressSet;\n *\n *     // Declare a set state variable\n *     EnumerableSet.AddressSet private mySet;\n * }\n * ```\n *\n * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)\n * and `uint256` (`UintSet`) are supported.\n *\n * [WARNING]\n * ====\n * Trying to delete such a structure from storage will likely result in data corruption, rendering the structure\n * unusable.\n * See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.\n *\n * In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an\n * array of EnumerableSet.\n * ====\n */\nlibrary EnumerableSet {\n    // To implement this library for multiple types with as little code\n    // repetition as possible, we write it in terms of a generic Set type with\n    // bytes32 values.\n    // The Set implementation uses private functions, and user-facing\n    // implementations (such as AddressSet) are just wrappers around the\n    // underlying Set.\n    // This means that we can only create new EnumerableSets for types that fit\n    // in bytes32.\n\n    struct Set {\n        // Storage of set values\n        bytes32[] _values;\n        // Position of the value in the `values` array, plus 1 because index 0\n        // means a value is not in the set.\n        mapping(bytes32 => uint256) _indexes;\n    }\n\n    /**\n     * @dev Add a value to a set. O(1).\n     *\n     * Returns true if the value was added to the set, that is if it was not\n     * already present.\n     */\n    function _add(Set storage set, bytes32 value) private returns (bool) {\n        if (!_contains(set, value)) {\n            set._values.push(value);\n            // The value is stored at length-1, but we add 1 to all indexes\n            // and use 0 as a sentinel value\n            set._indexes[value] = set._values.length;\n            return true;\n        } else {\n            return false;\n        }\n    }\n\n    /**\n     * @dev Removes a value from a set. O(1).\n     *\n     * Returns true if the value was removed from the set, that is if it was\n     * present.\n     */\n    function _remove(Set storage set, bytes32 value) private returns (bool) {\n        // We read and store the value's index to prevent multiple reads from the same storage slot\n        uint256 valueIndex = set._indexes[value];\n\n        if (valueIndex != 0) {\n            // Equivalent to contains(set, value)\n            // To delete an element from the _values array in O(1), we swap the element to delete with the last one in\n            // the array, and then remove the last element (sometimes called as 'swap and pop').\n            // This modifies the order of the array, as noted in {at}.\n\n            uint256 toDeleteIndex = valueIndex - 1;\n            uint256 lastIndex = set._values.length - 1;\n\n            if (lastIndex != toDeleteIndex) {\n                bytes32 lastValue = set._values[lastIndex];\n\n                // Move the last value to the index where the value to delete is\n                set._values[toDeleteIndex] = lastValue;\n                // Update the index for the moved value\n                set._indexes[lastValue] = valueIndex; // Replace lastValue's index to valueIndex\n            }\n\n            // Delete the slot where the moved value was stored\n            set._values.pop();\n\n            // Delete the index for the deleted slot\n            delete set._indexes[value];\n\n            return true;\n        } else {\n            return false;\n        }\n    }\n\n    /**\n     * @dev Returns true if the value is in the set. O(1).\n     */\n    function _contains(Set storage set, bytes32 value) private view returns (bool) {\n        return set._indexes[value] != 0;\n    }\n\n    /**\n     * @dev Returns the number of values on the set. O(1).\n     */\n    function _length(Set storage set) private view returns (uint256) {\n        return set._values.length;\n    }\n\n    /**\n     * @dev Returns the value stored at position `index` in the set. O(1).\n     *\n     * Note that there are no guarantees on the ordering of values inside the\n     * array, and it may change when more values are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function _at(Set storage set, uint256 index) private view returns (bytes32) {\n        return set._values[index];\n    }\n\n    /**\n     * @dev Return the entire set in an array\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function _values(Set storage set) private view returns (bytes32[] memory) {\n        return set._values;\n    }\n\n    // Bytes32Set\n\n    struct Bytes32Set {\n        Set _inner;\n    }\n\n    /**\n     * @dev Add a value to a set. O(1).\n     *\n     * Returns true if the value was added to the set, that is if it was not\n     * already present.\n     */\n    function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {\n        return _add(set._inner, value);\n    }\n\n    /**\n     * @dev Removes a value from a set. O(1).\n     *\n     * Returns true if the value was removed from the set, that is if it was\n     * present.\n     */\n    function remove(Bytes32Set storage set, bytes32 value) internal returns (bool) {\n        return _remove(set._inner, value);\n    }\n\n    /**\n     * @dev Returns true if the value is in the set. O(1).\n     */\n    function contains(Bytes32Set storage set, bytes32 value) internal view returns (bool) {\n        return _contains(set._inner, value);\n    }\n\n    /**\n     * @dev Returns the number of values in the set. O(1).\n     */\n    function length(Bytes32Set storage set) internal view returns (uint256) {\n        return _length(set._inner);\n    }\n\n    /**\n     * @dev Returns the value stored at position `index` in the set. O(1).\n     *\n     * Note that there are no guarantees on the ordering of values inside the\n     * array, and it may change when more values are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function at(Bytes32Set storage set, uint256 index) internal view returns (bytes32) {\n        return _at(set._inner, index);\n    }\n\n    /**\n     * @dev Return the entire set in an array\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function values(Bytes32Set storage set) internal view returns (bytes32[] memory) {\n        bytes32[] memory store = _values(set._inner);\n        bytes32[] memory result;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            result := store\n        }\n\n        return result;\n    }\n\n    // AddressSet\n\n    struct AddressSet {\n        Set _inner;\n    }\n\n    /**\n     * @dev Add a value to a set. O(1).\n     *\n     * Returns true if the value was added to the set, that is if it was not\n     * already present.\n     */\n    function add(AddressSet storage set, address value) internal returns (bool) {\n        return _add(set._inner, bytes32(uint256(uint160(value))));\n    }\n\n    /**\n     * @dev Removes a value from a set. O(1).\n     *\n     * Returns true if the value was removed from the set, that is if it was\n     * present.\n     */\n    function remove(AddressSet storage set, address value) internal returns (bool) {\n        return _remove(set._inner, bytes32(uint256(uint160(value))));\n    }\n\n    /**\n     * @dev Returns true if the value is in the set. O(1).\n     */\n    function contains(AddressSet storage set, address value) internal view returns (bool) {\n        return _contains(set._inner, bytes32(uint256(uint160(value))));\n    }\n\n    /**\n     * @dev Returns the number of values in the set. O(1).\n     */\n    function length(AddressSet storage set) internal view returns (uint256) {\n        return _length(set._inner);\n    }\n\n    /**\n     * @dev Returns the value stored at position `index` in the set. O(1).\n     *\n     * Note that there are no guarantees on the ordering of values inside the\n     * array, and it may change when more values are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function at(AddressSet storage set, uint256 index) internal view returns (address) {\n        return address(uint160(uint256(_at(set._inner, index))));\n    }\n\n    /**\n     * @dev Return the entire set in an array\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function values(AddressSet storage set) internal view returns (address[] memory) {\n        bytes32[] memory store = _values(set._inner);\n        address[] memory result;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            result := store\n        }\n\n        return result;\n    }\n\n    // UintSet\n\n    struct UintSet {\n        Set _inner;\n    }\n\n    /**\n     * @dev Add a value to a set. O(1).\n     *\n     * Returns true if the value was added to the set, that is if it was not\n     * already present.\n     */\n    function add(UintSet storage set, uint256 value) internal returns (bool) {\n        return _add(set._inner, bytes32(value));\n    }\n\n    /**\n     * @dev Removes a value from a set. O(1).\n     *\n     * Returns true if the value was removed from the set, that is if it was\n     * present.\n     */\n    function remove(UintSet storage set, uint256 value) internal returns (bool) {\n        return _remove(set._inner, bytes32(value));\n    }\n\n    /**\n     * @dev Returns true if the value is in the set. O(1).\n     */\n    function contains(UintSet storage set, uint256 value) internal view returns (bool) {\n        return _contains(set._inner, bytes32(value));\n    }\n\n    /**\n     * @dev Returns the number of values in the set. O(1).\n     */\n    function length(UintSet storage set) internal view returns (uint256) {\n        return _length(set._inner);\n    }\n\n    /**\n     * @dev Returns the value stored at position `index` in the set. O(1).\n     *\n     * Note that there are no guarantees on the ordering of values inside the\n     * array, and it may change when more values are added or removed.\n     *\n     * Requirements:\n     *\n     * - `index` must be strictly less than {length}.\n     */\n    function at(UintSet storage set, uint256 index) internal view returns (uint256) {\n        return uint256(_at(set._inner, index));\n    }\n\n    /**\n     * @dev Return the entire set in an array\n     *\n     * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n     * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n     * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n     * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n     */\n    function values(UintSet storage set) internal view returns (uint256[] memory) {\n        bytes32[] memory store = _values(set._inner);\n        uint256[] memory result;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            result := store\n        }\n\n        return result;\n    }\n}\n"
+    },
+    "src/interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\n// Imported from forge-std\n\n/// @dev Interface of the ERC20 standard as defined in the EIP.\n/// @dev This includes the optional name, symbol, and decimals metadata.\ninterface IERC20 {\n    /// @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /// @dev Emitted when the allowance of a `spender` for an `owner` is set, where `value`\n    /// is the new allowance.\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /// @notice Returns the amount of tokens in existence.\n    function totalSupply() external view returns (uint256);\n\n    /// @notice Returns the amount of tokens owned by `account`.\n    function balanceOf(address account) external view returns (uint256);\n\n    /// @notice Moves `amount` tokens from the caller's account to `to`.\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the remaining number of tokens that `spender` is allowed\n    /// to spend on behalf of `owner`\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /// @notice Sets `amount` as the allowance of `spender` over the caller's tokens.\n    /// @dev Be aware of front-running risks: https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /// @notice Moves `amount` tokens from `from` to `to` using the allowance mechanism.\n    /// `amount` is then deducted from the caller's allowance.\n    function transferFrom(address from, address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the name of the token.\n    function name() external view returns (string memory);\n\n    /// @notice Returns the symbol of the token.\n    function symbol() external view returns (string memory);\n\n    /// @notice Returns the decimals places of the token.\n    function decimals() external view returns (uint8);\n}\n"
+    },
+    "lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/governance/utils/IVotes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.9.0) (governance/utils/IVotes.sol)\npragma solidity ^0.8.0;\n\n/**\n * @dev Common interface for {ERC20Votes}, {ERC721Votes}, and other {Votes}-enabled contracts.\n *\n * _Available since v4.5._\n */\ninterface IVotes {\n    /**\n     * @dev Emitted when an account changes their delegate.\n     */\n    event DelegateChanged(address indexed delegator, address indexed fromDelegate, address indexed toDelegate);\n\n    /**\n     * @dev Emitted when a token transfer or delegate change results in changes to a delegate's number of votes.\n     */\n    event DelegateVotesChanged(address indexed delegate, uint256 previousBalance, uint256 newBalance);\n\n    /**\n     * @dev Returns the current amount of votes that `account` has.\n     */\n    function getVotes(address account) external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of votes that `account` had at a specific moment in the past. If the `clock()` is\n     * configured to use block numbers, this will return the value at the end of the corresponding block.\n     */\n    function getPastVotes(address account, uint256 timepoint) external view returns (uint256);\n\n    /**\n     * @dev Returns the total supply of votes available at a specific moment in the past. If the `clock()` is\n     * configured to use block numbers, this will return the value at the end of the corresponding block.\n     *\n     * NOTE: This value is the sum of all available votes, which is not necessarily the sum of all delegated votes.\n     * Votes that have not been delegated are still part of total supply, even though they would not participate in a\n     * vote.\n     */\n    function getPastTotalSupply(uint256 timepoint) external view returns (uint256);\n\n    /**\n     * @dev Returns the delegate that `account` has chosen.\n     */\n    function delegates(address account) external view returns (address);\n\n    /**\n     * @dev Delegates votes from the sender to `delegatee`.\n     */\n    function delegate(address delegatee) external;\n\n    /**\n     * @dev Delegates votes from signer to `delegatee`.\n     */\n    function delegateBySig(address delegatee, uint256 nonce, uint256 expiry, uint8 v, bytes32 r, bytes32 s) external;\n}\n"
+    },
+    "lib/clones-with-immutable-args/src/Clone.sol": {
+      "content": "// SPDX-License-Identifier: BSD\npragma solidity ^0.8.4;\n\n/// @title Clone\n/// @author zefram.eth\n/// @notice Provides helper functions for reading immutable args from calldata\ncontract Clone {\n    /// @notice Reads an immutable arg with type address\n    /// @param argOffset The offset of the arg in the packed data\n    /// @return arg The arg value\n    function _getArgAddress(uint256 argOffset)\n        internal\n        pure\n        returns (address arg)\n    {\n        uint256 offset = _getImmutableArgsOffset();\n        assembly {\n            arg := shr(0x60, calldataload(add(offset, argOffset)))\n        }\n    }\n\n    /// @notice Reads an immutable arg with type uint256\n    /// @param argOffset The offset of the arg in the packed data\n    /// @return arg The arg value\n    function _getArgUint256(uint256 argOffset)\n        internal\n        pure\n        returns (uint256 arg)\n    {\n        uint256 offset = _getImmutableArgsOffset();\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            arg := calldataload(add(offset, argOffset))\n        }\n    }\n\n    /// @notice Reads an immutable arg with type uint64\n    /// @param argOffset The offset of the arg in the packed data\n    /// @return arg The arg value\n    function _getArgUint64(uint256 argOffset)\n        internal\n        pure\n        returns (uint64 arg)\n    {\n        uint256 offset = _getImmutableArgsOffset();\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            arg := shr(0xc0, calldataload(add(offset, argOffset)))\n        }\n    }\n\n    /// @notice Reads an immutable arg with type uint8\n    /// @param argOffset The offset of the arg in the packed data\n    /// @return arg The arg value\n    function _getArgUint8(uint256 argOffset) internal pure returns (uint8 arg) {\n        uint256 offset = _getImmutableArgsOffset();\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            arg := shr(0xf8, calldataload(add(offset, argOffset)))\n        }\n    }\n\n    /// @return offset The offset of the packed immutable args in calldata\n    function _getImmutableArgsOffset() internal pure returns (uint256 offset) {\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            offset := sub(\n                calldatasize(),\n                add(shr(240, calldataload(sub(calldatasize(), 2))), 2)\n            )\n        }\n    }\n}\n"
+    },
+    "lib/clones-with-immutable-args/src/ClonesWithImmutableArgs.sol": {
+      "content": "// SPDX-License-Identifier: BSD\n\npragma solidity ^0.8.4;\n\n/// @title ClonesWithImmutableArgs\n/// @author wighawag, zefram.eth\n/// @notice Enables creating clone contracts with immutable args\nlibrary ClonesWithImmutableArgs {\n    error CreateFail();\n\n    /// @notice Creates a clone proxy of the implementation contract, with immutable args\n    /// @dev data cannot exceed 65535 bytes, since 2 bytes are used to store the data length\n    /// @param implementation The implementation contract to clone\n    /// @param data Encoded immutable args\n    /// @return instance The address of the created clone\n    function clone(address implementation, bytes memory data)\n        internal\n        returns (address instance)\n    {\n        // unrealistic for memory ptr or data length to exceed 256 bits\n        unchecked {\n            uint256 extraLength = data.length + 2; // +2 bytes for telling how much data there is appended to the call\n            uint256 creationSize = 0x43 + extraLength;\n            uint256 runSize = creationSize - 11;\n            uint256 dataPtr;\n            uint256 ptr;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                ptr := mload(0x40)\n\n                // -------------------------------------------------------------------------------------------------------------\n                // CREATION (11 bytes)\n                // -------------------------------------------------------------------------------------------------------------\n\n                // 3d          | RETURNDATASIZE        | 0                       | –\n                // 61 runtime  | PUSH2 runtime (r)     | r 0                     | –\n                mstore(\n                    ptr,\n                    0x3d61000000000000000000000000000000000000000000000000000000000000\n                )\n                mstore(add(ptr, 0x02), shl(240, runSize)) // size of the contract running bytecode (16 bits)\n\n                // creation size = 0b\n                // 80          | DUP1                  | r r 0                   | –\n                // 60 creation | PUSH1 creation (c)    | c r r 0                 | –\n                // 3d          | RETURNDATASIZE        | 0 c r r 0               | –\n                // 39          | CODECOPY              | r 0                     | [0-2d]: runtime code\n                // 81          | DUP2                  | 0 c  0                  | [0-2d]: runtime code\n                // f3          | RETURN                | 0                       | [0-2d]: runtime code\n                mstore(\n                    add(ptr, 0x04),\n                    0x80600b3d3981f300000000000000000000000000000000000000000000000000\n                )\n\n                // -------------------------------------------------------------------------------------------------------------\n                // RUNTIME\n                // -------------------------------------------------------------------------------------------------------------\n\n                // 36          | CALLDATASIZE          | cds                     | –\n                // 3d          | RETURNDATASIZE        | 0 cds                   | –\n                // 3d          | RETURNDATASIZE        | 0 0 cds                 | –\n                // 37          | CALLDATACOPY          | –                       | [0, cds] = calldata\n                // 61          | PUSH2 extra           | extra                   | [0, cds] = calldata\n                mstore(\n                    add(ptr, 0x0b),\n                    0x363d3d3761000000000000000000000000000000000000000000000000000000\n                )\n                mstore(add(ptr, 0x10), shl(240, extraLength))\n\n                // 60 0x38     | PUSH1 0x38            | 0x38 extra              | [0, cds] = calldata // 0x38 (56) is runtime size - data\n                // 36          | CALLDATASIZE          | cds 0x38 extra          | [0, cds] = calldata\n                // 39          | CODECOPY              | _                       | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | 0                       | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | 0 0                     | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | 0 0 0                   | [0, cds] = calldata\n                // 36          | CALLDATASIZE          | cds 0 0 0               | [0, cds] = calldata\n                // 61 extra    | PUSH2 extra           | extra cds 0 0 0         | [0, cds] = calldata\n                mstore(\n                    add(ptr, 0x12),\n                    0x603836393d3d3d36610000000000000000000000000000000000000000000000\n                )\n                mstore(add(ptr, 0x1b), shl(240, extraLength))\n\n                // 01          | ADD                   | cds+extra 0 0 0         | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | 0 cds 0 0 0             | [0, cds] = calldata\n                // 73 addr     | PUSH20 0x123…         | addr 0 cds 0 0 0        | [0, cds] = calldata\n                mstore(\n                    add(ptr, 0x1d),\n                    0x013d730000000000000000000000000000000000000000000000000000000000\n                )\n                mstore(add(ptr, 0x20), shl(0x60, implementation))\n\n                // 5a          | GAS                   | gas addr 0 cds 0 0 0    | [0, cds] = calldata\n                // f4          | DELEGATECALL          | success 0               | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | rds success 0           | [0, cds] = calldata\n                // 82          | DUP3                  | 0 rds success 0         | [0, cds] = calldata\n                // 80          | DUP1                  | 0 0 rds success 0       | [0, cds] = calldata\n                // 3e          | RETURNDATACOPY        | success 0               | [0, rds] = return data (there might be some irrelevant leftovers in memory [rds, cds] when rds < cds)\n                // 90          | SWAP1                 | 0 success               | [0, rds] = return data\n                // 3d          | RETURNDATASIZE        | rds 0 success           | [0, rds] = return data\n                // 91          | SWAP2                 | success 0 rds           | [0, rds] = return data\n                // 60 0x36     | PUSH1 0x36            | 0x36 sucess 0 rds       | [0, rds] = return data\n                // 57          | JUMPI                 | 0 rds                   | [0, rds] = return data\n                // fd          | REVERT                | –                       | [0, rds] = return data\n                // 5b          | JUMPDEST              | 0 rds                   | [0, rds] = return data\n                // f3          | RETURN                | –                       | [0, rds] = return data\n\n                mstore(\n                    add(ptr, 0x34),\n                    0x5af43d82803e903d91603657fd5bf30000000000000000000000000000000000\n                )\n            }\n\n            // -------------------------------------------------------------------------------------------------------------\n            // APPENDED DATA (Accessible from extcodecopy)\n            // (but also send as appended data to the delegatecall)\n            // -------------------------------------------------------------------------------------------------------------\n\n            extraLength -= 2;\n            uint256 counter = extraLength;\n            uint256 copyPtr = ptr + 0x43;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                dataPtr := add(data, 32)\n            }\n            for (; counter >= 32; counter -= 32) {\n                // solhint-disable-next-line no-inline-assembly\n                assembly {\n                    mstore(copyPtr, mload(dataPtr))\n                }\n\n                copyPtr += 32;\n                dataPtr += 32;\n            }\n            uint256 mask = ~(256**(32 - counter) - 1);\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                mstore(copyPtr, and(mload(dataPtr), mask))\n            }\n            copyPtr += counter;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                mstore(copyPtr, shl(240, extraLength))\n            }\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                instance := create(0, ptr, creationSize)\n            }\n            if (instance == address(0)) {\n                revert CreateFail();\n            }\n        }\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.15+commit.e14f2714"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "kernel_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "gohm_",
+              "type": "address"
+            },
+            {
+              "internalType": "contract DelegateEscrowFactory",
+              "name": "delegateEscrowFactory_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "delegate",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "balance",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "requested",
+              "type": "uint256"
+            }
+          ],
+          "name": "DLGTE_ExceededDelegatedBalance",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "balance",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "requested",
+              "type": "uint256"
+            }
+          ],
+          "name": "DLGTE_ExceededPolicyAccountBalance",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "balance",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "requested",
+              "type": "uint256"
+            }
+          ],
+          "name": "DLGTE_ExceededUndelegatedBalance",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DLGTE_InvalidAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DLGTE_InvalidAmount",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DLGTE_InvalidDelegateEscrow",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DLGTE_InvalidDelegationRequests",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DLGTE_TooManyDelegates",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "caller_",
+              "type": "address"
+            }
+          ],
+          "name": "KernelAdapter_OnlyKernel",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "policy_",
+              "type": "address"
+            }
+          ],
+          "name": "Module_PolicyNotPermitted",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Overflow",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "delegate",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "int256",
+              "name": "amount",
+              "type": "int256"
+            }
+          ],
+          "name": "DelegationApplied",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "maxDelegateAddresses",
+              "type": "uint256"
+            }
+          ],
+          "name": "MaxDelegateAddressesSet",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "DEFAULT_MAX_DELEGATE_ADDRESSES",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "INIT",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "KEYCODE",
+          "outputs": [
+            {
+              "internalType": "Keycode",
+              "name": "",
+              "type": "bytes5"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "VERSION",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "major",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint8",
+              "name": "minor",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "accountDelegationSummary",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "startIndex",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxItems",
+              "type": "uint256"
+            }
+          ],
+          "name": "accountDelegationsList",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "delegate",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "address",
+                  "name": "escrow",
+                  "type": "address"
+                }
+              ],
+              "internalType": "struct IDLGTEv1.AccountDelegation[]",
+              "name": "delegations",
+              "type": "tuple[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "onBehalfOf",
+              "type": "address"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "delegate",
+                  "type": "address"
+                },
+                {
+                  "internalType": "int256",
+                  "name": "amount",
+                  "type": "int256"
+                }
+              ],
+              "internalType": "struct IDLGTEv1.DelegationRequest[]",
+              "name": "delegationRequests",
+              "type": "tuple[]"
+            }
+          ],
+          "name": "applyDelegations",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "appliedDelegationAmounts",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "appliedUndelegationAmounts",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "undelegatedBalance",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "newKernel_",
+              "type": "address"
+            }
+          ],
+          "name": "changeKernel",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "delegateEscrowFactory",
+          "outputs": [
+            {
+              "internalType": "contract DelegateEscrowFactory",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "onBehalfOf",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "depositUndelegatedGohm",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gOHM",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "kernel",
+          "outputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "maxDelegateAddresses",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "result",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "policy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "policyAccountBalances",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "gOhmBalance",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "onBehalfOf",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "requestedUndelegatedBalance",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxNumDelegates",
+              "type": "uint256"
+            }
+          ],
+          "name": "rescindDelegations",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "totalRescinded",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "newUndelegatedBalance",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint32",
+              "name": "maxDelegates",
+              "type": "uint32"
+            }
+          ],
+          "name": "setMaxDelegateAddresses",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "delegate",
+              "type": "address"
+            }
+          ],
+          "name": "totalDelegatedTo",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "onBehalfOf",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "autoRescindMaxNumDelegates",
+              "type": "uint256"
+            }
+          ],
+          "name": "withdrawUndelegatedGohm",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "details": "The Olympus Governance Delegation Module enables policies to delegate gOHM on behalf of users.         If the gOHM is undelegated, this module acts as an escrow for the gOHM.         When the gOHM is delegated, new individual escrows are created for those delegates, and that         portion of gOHM is transferred to that escrow.         gOHM balances are tracked per (policy, account) separately such that one policy cannot pull the         gOHM from another policy (eg policy B pulling collateral out of the Cooler policy).",
+        "kind": "dev",
+        "methods": {
+          "INIT()": {
+            "details": "This function is called when the module is installed or upgraded by the kernel.MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic."
+          },
+          "VERSION()": {
+            "returns": {
+              "major": "- Major version upgrade indicates breaking change to the interface.",
+              "minor": "- Minor version change retains backward-compatible interface."
+            }
+          },
+          "accountDelegationsList(address,uint256,uint256)": {
+            "details": "This can be called sequentially, increasing the `startIndex` each time by the number of items returned in the previous call, until number of items returned is less than `maxItems` The `totalAmount` delegated within the return struct is across all policies for that account delegate"
+          },
+          "depositUndelegatedGohm(address,uint256)": {
+            "details": "- This gOHM cannot be used for governance voting until it is delegated.   - Deposted gOHM balances are tracked per policy. policyA cannot withdraw gOHM that policyB deposited"
+          },
+          "rescindDelegations(address,uint256,uint256)": {
+            "details": "- Delegations are rescinded by iterating through the delegate addresses for the      `onBehalfOf` address.    - No guarantees on the order of who is rescinded -- it may change as delegations are      removed    - A calling policy may be able to rescind more than it added via `depositUndelegatedGohm()`      however the policy cannot then withdraw an amount higher than what it deposited.    - If the full `requestedUndelegatedBalance` cannot be fulfilled the `actualUndelegatedBalance`      return parameter may be less than `requestedUndelegatedBalance`. The caller must decide      on how to handle that."
+          },
+          "withdrawUndelegatedGohm(address,uint256,uint256)": {
+            "details": "- If `autoRescindMaxNumDelegates` is greater than zero, the delegations will be automatically rescinded if required     from up to `autoRescindMaxNumDelegates` number of delegate escrows. See `rescindDelegations()` for details   - Will revert if there is still not enough undelegated gOHM for `onBehalfOf` OR     if policy is attempting to withdraw more gOHM than it deposited     Deposted gOHM balances are tracked per policy. policyA cannot withdraw gOHM that policyB deposited"
+          }
+        },
+        "stateVariables": {
+          "_accountState": {
+            "details": "An account's current state across all policies A given account is allowed up to 10 delegates. This is capped because to avoid gas griefing, eg within Cooler, upon a liquidation, the gOHM needs to be pulled from all delegates."
+          },
+          "_policyAccountBalances": {
+            "details": "The per policy balances of (delegated and undelegated) gOHM for each end user account One policy isn't allowed to deposit/withdraw to another policy's tracked balances Eg policy B cannot withdraw gOHM from the collateral held here by the Cooler policy"
+          }
+        },
+        "title": "Olympus Governance Delegation",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "DEFAULT_MAX_DELEGATE_ADDRESSES()": {
+            "notice": "The default maximum number of addresses an account can delegate to"
+          },
+          "INIT()": {
+            "notice": "Initialization function for the module"
+          },
+          "KEYCODE()": {
+            "notice": "5 byte identifier for a module."
+          },
+          "VERSION()": {
+            "notice": "Returns which semantic version of a module is being implemented."
+          },
+          "accountDelegationSummary(address)": {
+            "notice": "A summary of an account's delegations"
+          },
+          "accountDelegationsList(address,uint256,uint256)": {
+            "notice": "Paginated view of an account's delegations"
+          },
+          "applyDelegations(address,(address,int256)[])": {
+            "notice": "Apply a set of delegation requests on behalf of a given account.  - Each delegation request either delegates or undelegates to an address  - It applies across total gOHM balances for a given account across all calling policies    So policyA may (un)delegate the account's gOHM set by policyA, B and C"
+          },
+          "changeKernel(address)": {
+            "notice": "Function used by kernel when migrating to a new kernel."
+          },
+          "depositUndelegatedGohm(address,uint256)": {
+            "notice": "gOHM is pulled from the calling policy and added to the undelegated balance."
+          },
+          "gOHM()": {
+            "notice": "The gOhm token supplied by accounts"
+          },
+          "maxDelegateAddresses(address)": {
+            "notice": "The maximum number of delegates an account can have accross all policies"
+          },
+          "policyAccountBalances(address,address)": {
+            "notice": "Report the total delegated and undelegated gOHM balance for an account in a given policy"
+          },
+          "rescindDelegations(address,uint256,uint256)": {
+            "notice": "Rescind delegations until the amount undelegated for the `onBehalfOf` account is greater or equal to `requestedUndelegatedBalance`. No more than `maxNumDelegates` will be rescinded as part of this"
+          },
+          "setMaxDelegateAddresses(address,uint32)": {
+            "notice": "Set an account to have more or less than the DEFAULT_MAX_DELEGATE_ADDRESSES number of delegates."
+          },
+          "totalDelegatedTo(address)": {
+            "notice": "The total amount delegated to a particular delegate across all policies, and externally made delegations (including any permanent donations)"
+          },
+          "withdrawUndelegatedGohm(address,uint256,uint256)": {
+            "notice": "Undelegated gOHM is transferred to the calling policy."
+          }
+        },
+        "notice": "Olympus Governance Delegation (Module) Contract",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/modules/DLGTE/OlympusGovDelegation.sol": "OlympusGovDelegation"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10000
+      },
+      "remappings": [
+        ":@addresses/=lib/forge-proposal-simulator/addresses/",
+        ":@examples/=lib/forge-proposal-simulator/examples/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@proposals/=lib/forge-proposal-simulator/proposals/",
+        ":@script/=lib/forge-proposal-simulator/script/",
+        ":@test/=lib/forge-proposal-simulator/test/",
+        ":@utils/=lib/forge-proposal-simulator/utils/",
+        ":balancer-v2/=lib/balancer-v2/",
+        ":bonds/=lib/bonds/src/",
+        ":clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        ":clones/=lib/clones-with-immutable-args/src/",
+        ":comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        ":forge-std/=lib/forge-std/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero/=lib/solidity-examples/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=lib/forge-proposal-simulator/",
+        ":solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        ":solidity-examples/=lib/solidity-examples/contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":test/=src/test/",
+        ":test/lib/=src/test/lib/",
+        ":test/mocks/=src/test/mocks/"
+      ]
+    },
+    "sources": {
+      "lib/clones-with-immutable-args/src/Clone.sol": {
+        "keccak256": "0x8f569b077d99ec821c2750c52094b59b3505fb6ca3e6eac9009092bf86c5452d",
+        "license": "BSD",
+        "urls": [
+          "bzz-raw://d0f3966d1f97959f6512ee5bc4b73487bf5ce593880e3c1dbf97ed50d49402a0",
+          "dweb:/ipfs/QmSAtFtA28Mja6f6FfET26B38XEgrLgqRezNLo3AsXyjVB"
+        ]
+      },
+      "lib/clones-with-immutable-args/src/ClonesWithImmutableArgs.sol": {
+        "keccak256": "0x0c6a218a9724ce6d754db22b162600adbdbac41bfe4dd4eecf6b6d77c74eefe7",
+        "license": "BSD",
+        "urls": [
+          "bzz-raw://9b05614d01be2267ebb94ae587deb2588e903c101f9a2106230f551bf27faa98",
+          "dweb:/ipfs/QmQbRMeckjgCiFp5UXCBwoYiE41o63Wv79s2qeGeCvGSYX"
+        ]
+      },
+      "lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/governance/utils/IVotes.sol": {
+        "keccak256": "0x1618ddebe73377660f6da71afcba35d5ac4c4600918b3a381d9c6f37eba613eb",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://666c8d7c62478b55e082f1835275b7acfc1595491998df6d67183ff2c70eab96",
+          "dweb:/ipfs/QmVXmnXfxNaLhoX283dqyKJ8DJbF5thUd9sMuRoFpNMwr7"
+        ]
+      },
+      "lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/utils/structs/EnumerableMap.sol": {
+        "keccak256": "0x7ebfe2422bc571599c2ec20577d7848e1e7a0acf85fa7c2d9636618bbbdf6fca",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://77fb3f64d470c92c3142e3c07d2f18ad78723a1f1e680a251dcde37e865d0636",
+          "dweb:/ipfs/QmXAeNPRRGfNSRxi1d17QjkNTBZFemhiMzJVvEJgMWwqUW"
+        ]
+      },
+      "lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/utils/structs/EnumerableSet.sol": {
+        "keccak256": "0x9f4357008a8f7d8c8bf5d48902e789637538d8c016be5766610901b4bba81514",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://20bf19b2b851f58a4c24543de80ae70b3e08621f9230eb335dc75e2d4f43f5df",
+          "dweb:/ipfs/QmSYuH1AhvJkPK8hNvoPqtExBcgTB42pPRHgTHkS5c5zYW"
+        ]
+      },
+      "lib/solmate/src/tokens/ERC20.sol": {
+        "keccak256": "0xcdfd8db76b2a3415620e4d18cc5545f3d50de792dbf2c3dd5adb40cbe6f94b10",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://57b3ab70cde374af1cf2c9888636e8de6cf660f087b1c9abd805e9271e19fa35",
+          "dweb:/ipfs/QmNrLDBAHYFjpjSd12jerm1AdBkDqEYUUaXgnT854BUZ97"
+        ]
+      },
+      "lib/solmate/src/utils/SafeTransferLib.sol": {
+        "keccak256": "0x6ab948013c2c7ca6351e593600425b0ec6df9035320280c678e735bce16e996b",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://2ab977d0eeb2bf458f9798250215c646d2f3b1f90b5a7e2b506fdf3335c0f060",
+          "dweb:/ipfs/QmYPRoPhNtBAmCSq7imN1scMVpKNQvMTpoqab3tXUx5Tnv"
+        ]
+      },
+      "src/Kernel.sol": {
+        "keccak256": "0x5798deae5f5ce704f699ef3b5022e16825a4470972212a9b55ec66746fcd5fc2",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://67b6284b459b3d3e8781975a85b08778d14850a09dc51aff80de76de54f12129",
+          "dweb:/ipfs/QmarPSzUc6TckbSd2sGovhstAiNTbWBDTbQB9mwPXeX1A5"
+        ]
+      },
+      "src/external/cooler/DelegateEscrow.sol": {
+        "keccak256": "0x2ace99423514c77b4d490251ea74ca18131885923132e708af0b495ac223c206",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://3024ebaf7858720f114f9e1073a86d42e12d7d2ec6863acc5fabdd38d1ed976a",
+          "dweb:/ipfs/QmZSQzrqjxuBWUy8PbaxNUrLt3qMAqHMrnT665QCSXXNf7"
+        ]
+      },
+      "src/external/cooler/DelegateEscrowFactory.sol": {
+        "keccak256": "0x4bd5c89128691c47e445bf8755ec51a3204566cd97088c6184aa11d12e0e1370",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f928a8495c575a4bffb0d048299a99200236ec2bba493495241ce80089f10ca2",
+          "dweb:/ipfs/QmYqtio2PoqeNYEDXAycAcK4gW6SVbD5RHWgQYxAnKkRh5"
+        ]
+      },
+      "src/interfaces/IERC20.sol": {
+        "keccak256": "0x974a59ee45b2a6107b6dd8cd0f1de0ad878b54f1db47ebf27f697dda6145d9dc",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://da0d8ddb32da028acb692a89cb6a1ab1136c39d029871ee3d3e20b8d51c15dd6",
+          "dweb:/ipfs/QmQ2adrsKG6QyDSznRNSdWD8ceKKXnWohFWk2EjUHTMUyx"
+        ]
+      },
+      "src/libraries/SafeCast.sol": {
+        "keccak256": "0x01224a32ebd5bb849ccd9fcd65d10738ef60a8248eb68d8368f5924d78d8cd02",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c9fa48a2ef57c121c239ba33956491a72560321677fb083a7031ab7d947cf2a0",
+          "dweb:/ipfs/QmSj284A6YDUXpuZumpznHj3jQSrbBrmceabCvEVJeDNhM"
+        ]
+      },
+      "src/modules/DLGTE/DLGTE.v1.sol": {
+        "keccak256": "0x2efcd2983f70097de91904321e5319fe1dab11cfa696f4510bd4a291b956ff91",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://452d6f755a5f2c5560047ef7f1d1deb87157e84ec428b2f35bd3a61f2321add9",
+          "dweb:/ipfs/QmWiFq94anWG97jFGafv1u4Qai6vqULRhq1p4g9eJNev8v"
+        ]
+      },
+      "src/modules/DLGTE/IDLGTE.v1.sol": {
+        "keccak256": "0x9691327526a3f666297fbd44be17b0ccf976aa7355e68f54997913782fc51fb1",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7bcc8ce57ca0b06fc1eb2f6b707b8235919ecec93dff3a84d164a4b870413eab",
+          "dweb:/ipfs/QmZx3uWa48h2hrn3wZGYJ5Sy4p9saLi2Y6uBwA848GGKsG"
+        ]
+      },
+      "src/modules/DLGTE/OlympusGovDelegation.sol": {
+        "keccak256": "0x87490f855bc88a21e88bc53f8c95a7264dfe02817dd725cee5c7ae1cd5969605",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://1fd559ed8dcf80b857e6df5c398fdaa8b54d0609d2640c2ed6d102146b5777d1",
+          "dweb:/ipfs/QmPT6ayPGn1KzoKiDdU1J7E7CJxC2KTQGzf8WniYUKeHeV"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.15+commit.e14f2714",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 10000,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": [
+        "ds-test/=lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "interfaces/=src/interfaces/",
+        "modules/=src/modules/",
+        "policies/=src/policies/",
+        "libraries/=src/libraries/",
+        "solmate/=lib/solmate/src/",
+        "balancer-v2/=lib/balancer-v2/",
+        "layer-zero/=lib/solidity-examples/contracts/",
+        "@openzeppelin/=lib/openzeppelin-contracts/",
+        "bonds/=lib/bonds/src/",
+        "test/=src/test/",
+        "test/mocks/=src/test/mocks/",
+        "test/lib/=src/test/lib/",
+        "clones/=lib/clones-with-immutable-args/src/",
+        "proposal-sim/=lib/forge-proposal-simulator/",
+        "@addresses/=lib/forge-proposal-simulator/addresses/",
+        "@examples/=lib/forge-proposal-simulator/examples/",
+        "@proposals/=lib/forge-proposal-simulator/proposals/",
+        "@script/=lib/forge-proposal-simulator/script/",
+        "@test/=lib/forge-proposal-simulator/test/",
+        "@utils/=lib/forge-proposal-simulator/utils/",
+        "clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        "comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        "compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        "erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        "forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        "openzeppelin/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/",
+        "solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        "solidity-examples/=lib/solidity-examples/contracts/",
+        "surl-1.0.0/=dependencies/surl-1.0.0/src/"
+      ]
+    },
+    "name": "OlympusGovDelegation",
+    "fullyQualifiedName": "src/modules/DLGTE/OlympusGovDelegation.sol:OlympusGovDelegation"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "6397822",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2025-05-27T19:46:40Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0xD3204Ae00d6599Ba6e182c6D640A79d76CdAad74"
+}

@@ -1,0 +1,1148 @@
+{
+  "sources": {
+    "src/periphery/CoolerV2Migrator.sol": {
+      "content": "// SPDX-License-Identifier: GLP-3.0\npragma solidity ^0.8.15;\n\n// Interfaces\nimport {IERC3156FlashBorrower} from \"src/interfaces/maker-dao/IERC3156FlashBorrower.sol\";\nimport {IERC3156FlashLender} from \"src/interfaces/maker-dao/IERC3156FlashLender.sol\";\nimport {IDaiUsdsMigrator} from \"src/interfaces/maker-dao/IDaiUsdsMigrator.sol\";\nimport {ICoolerV2Migrator} from \"./interfaces/ICoolerV2Migrator.sol\";\nimport {IEnabler} from \"./interfaces/IEnabler.sol\";\n\n// Libraries\nimport {ReentrancyGuard} from \"solmate/utils/ReentrancyGuard.sol\";\nimport {SafeCast} from \"src/libraries/SafeCast.sol\";\nimport {SafeTransferLib} from \"solmate/utils/SafeTransferLib.sol\";\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\nimport {Owned} from \"solmate/auth/Owned.sol\";\n\n// Bophades\nimport {Cooler} from \"src/external/cooler/Cooler.sol\";\nimport {CHREGv1} from \"src/modules/CHREG/CHREG.v1.sol\";\nimport {IMonoCooler} from \"src/policies/interfaces/cooler/IMonoCooler.sol\";\nimport {ICoolerFactory} from \"src/external/cooler/interfaces/ICoolerFactory.sol\";\nimport {IDLGTEv1} from \"src/modules/DLGTE/IDLGTE.v1.sol\";\n\n/// @title  CoolerV2Migrator\n/// @notice A contract that migrates debt from Olympus Cooler V1 facilities to Cooler V2.\n///         This is compatible with all three versions of Cooler V1.\n/// @dev    This contract uses the `IERC3156FlashBorrower` interface to interact with Maker flashloans.\n///         The debt token of MonoCooler is assumed to be USDS. If that is changed in the future, this contract will need to be re-deployed.\ncontract CoolerV2Migrator is\n    IERC3156FlashBorrower,\n    ICoolerV2Migrator,\n    ReentrancyGuard,\n    Owned,\n    IEnabler\n{\n    using SafeCast for uint256;\n    using SafeTransferLib for ERC20;\n\n    // ========= DATA STRUCTURES ========= //\n\n    /// @notice Data structure used to store data about a Cooler\n    struct CoolerData {\n        Cooler cooler;\n        ERC20 debtToken;\n        uint8 numLoans;\n    }\n\n    /// @dev    Temporary storage for the principal and interest for each debt token\n    struct CoolerTotal {\n        uint256 daiPrincipal;\n        uint256 daiInterest;\n        uint256 usdsPrincipal;\n        uint256 usdsInterest;\n    }\n\n    /// @notice Data structure used for flashloan parameters\n    struct FlashLoanData {\n        CoolerData[] coolers;\n        address currentOwner;\n        address newOwner;\n        uint256 usdsRequired;\n        IDLGTEv1.DelegationRequest[] delegationRequests;\n    }\n\n    // ========= STATE ========= //\n\n    /// @notice Whether the contract is enabled\n    bool public isEnabled;\n\n    /// @notice The Clearinghouse registry module\n    CHREGv1 public immutable CHREG;\n\n    /// @notice The DAI token\n    ERC20 public immutable DAI;\n\n    /// @notice The USDS token\n    ERC20 public immutable USDS;\n\n    /// @notice The gOHM token\n    ERC20 public immutable GOHM;\n\n    /// @notice The DAI <> USDS Migrator\n    IDaiUsdsMigrator public immutable MIGRATOR;\n\n    /// @notice The ERC3156 flash loan provider\n    IERC3156FlashLender public immutable FLASH;\n\n    /// @notice The Cooler V2 contract\n    IMonoCooler public immutable COOLERV2;\n\n    /// @notice The list of CoolerFactories\n    address[] internal _COOLER_FACTORIES;\n\n    /// @notice This constant is used when iterating through the loans of a Cooler\n    /// @dev    This is used to prevent infinite loops, and is an appropriate upper bound\n    ///         as the maximum number of loans seen per Cooler is less than 50.\n    uint8 internal constant MAX_LOANS = type(uint8).max;\n\n    // ========= CONSTRUCTOR ========= //\n\n    constructor(\n        address owner_,\n        address coolerV2_,\n        address dai_,\n        address usds_,\n        address gohm_,\n        address migrator_,\n        address flash_,\n        address chreg_,\n        address[] memory coolerFactories_\n    ) Owned(owner_) {\n        // Validate\n        if (coolerV2_ == address(0)) revert Params_InvalidAddress(\"coolerV2\");\n        if (dai_ == address(0)) revert Params_InvalidAddress(\"dai\");\n        if (usds_ == address(0)) revert Params_InvalidAddress(\"usds\");\n        if (gohm_ == address(0)) revert Params_InvalidAddress(\"gohm\");\n        if (migrator_ == address(0)) revert Params_InvalidAddress(\"migrator\");\n        if (flash_ == address(0)) revert Params_InvalidAddress(\"flash\");\n        if (chreg_ == address(0)) revert Params_InvalidAddress(\"chreg\");\n\n        COOLERV2 = IMonoCooler(coolerV2_);\n\n        // Validate tokens\n        if (address(COOLERV2.collateralToken()) != gohm_) revert Params_InvalidAddress(\"gohm\");\n        if (address(COOLERV2.debtToken()) != usds_) revert Params_InvalidAddress(\"usds\");\n\n        DAI = ERC20(dai_);\n        USDS = ERC20(usds_);\n        GOHM = ERC20(gohm_);\n        MIGRATOR = IDaiUsdsMigrator(migrator_);\n        FLASH = IERC3156FlashLender(flash_);\n        CHREG = CHREGv1(chreg_);\n\n        // Validate the cooler factories for duplicates\n        for (uint256 i; i < coolerFactories_.length; i++) {\n            if (coolerFactories_[i] == address(0)) revert Params_InvalidAddress(\"zero\");\n\n            // Check for duplicates\n            for (uint256 j; j < i; j++) {\n                if (coolerFactories_[j] == coolerFactories_[i])\n                    revert Params_InvalidAddress(\"duplicate\");\n            }\n\n            _COOLER_FACTORIES.push(coolerFactories_[i]);\n\n            // Emit the event\n            emit CoolerFactoryAdded(coolerFactories_[i]);\n        }\n    }\n\n    // ========= OPERATION ========= //\n\n    /// @inheritdoc ICoolerV2Migrator\n    function previewConsolidate(\n        address[] memory coolers_\n    ) external view onlyEnabled returns (uint256 collateralAmount, uint256 borrowAmount) {\n        address[] memory clearinghouses = _getClearinghouses();\n        address[] memory coolers = new address[](coolers_.length);\n\n        // Determine the totals\n        for (uint256 i; i < coolers_.length; i++) {\n            // Check that the CoolerFactory created the Cooler\n            if (!_isValidCooler(coolers_[i])) revert Params_InvalidCooler();\n\n            // Check that the Cooler is not already in the array\n            for (uint256 j; j < coolers.length; j++) {\n                if (coolers[j] == coolers_[i]) revert Params_DuplicateCooler();\n            }\n\n            // Add the Cooler to the array\n            coolers[i] = coolers_[i];\n\n            Cooler cooler = Cooler(coolers_[i]);\n\n            (\n                uint256 principal,\n                uint256 interest,\n                uint256 collateral,\n                address debtToken,\n\n            ) = _getDebtForCooler(cooler, clearinghouses);\n\n            // Check that the debt token is DAI or USDS\n            if (debtToken != address(DAI) && debtToken != address(USDS))\n                revert Params_InvalidCooler();\n\n            collateralAmount += collateral;\n            borrowAmount += principal + interest;\n        }\n\n        // Lender contract is immutable and the fee is also hard-coded to 0. No need to calculate.\n\n        return (collateralAmount, borrowAmount);\n    }\n\n    /// @inheritdoc ICoolerV2Migrator\n    /// @dev    This function will revert if:\n    ///         - Any of the Coolers are not owned by the caller.\n    ///         - Any of the Coolers have not been created by the CoolerFactory.\n    ///         - Any of the Coolers have a different lender than an Olympus Clearinghouse.\n    ///         - A duplicate Cooler is provided.\n    ///         - The owner of the destination Cooler V2 has not provided authorization for this contract to manage their Cooler V2 position.\n    ///         - The caller has not approved this contract to spend the collateral token, gOHM.\n    ///         - The contract is not active.\n    ///         - Re-entrancy is detected.\n    function consolidate(\n        address[] memory coolers_,\n        address newOwner_,\n        IMonoCooler.Authorization memory authorization_,\n        IMonoCooler.Signature calldata signature_,\n        IDLGTEv1.DelegationRequest[] calldata delegationRequests_\n    ) external onlyEnabled nonReentrant {\n        // Validate that the Clearinghouses and Coolers are protocol-owned\n        // Also calculate the principal and interest for each cooler\n        CoolerData[] memory coolerData = new CoolerData[](coolers_.length);\n\n        // Keep track of the total principal and interest for each debt token\n        CoolerTotal memory totals;\n        {\n            address[] memory clearinghouses = _getClearinghouses();\n\n            for (uint256 i; i < coolers_.length; i++) {\n                // Check that the CoolerFactory created the Cooler\n                if (!_isValidCooler(coolers_[i])) revert Params_InvalidCooler();\n\n                // Check that the Cooler is owned by the caller\n                Cooler cooler = Cooler(coolers_[i]);\n                if (cooler.owner() != msg.sender) revert Only_CoolerOwner();\n\n                // Check that the Cooler is not already in the array\n                for (uint256 j; j < coolerData.length; j++) {\n                    if (address(coolerData[j].cooler) == coolers_[i])\n                        revert Params_DuplicateCooler();\n                }\n\n                // Determine the total principal and interest for the cooler\n                (\n                    uint256 coolerPrincipal,\n                    uint256 coolerInterest,\n                    ,\n                    address debtToken,\n                    uint8 numLoans\n                ) = _getDebtForCooler(cooler, clearinghouses);\n                coolerData[i] = CoolerData({\n                    cooler: cooler,\n                    debtToken: ERC20(debtToken),\n                    numLoans: numLoans\n                });\n\n                if (debtToken == address(DAI)) {\n                    totals.daiPrincipal += coolerPrincipal;\n                    totals.daiInterest += coolerInterest;\n                } else if (debtToken == address(USDS)) {\n                    totals.usdsPrincipal += coolerPrincipal;\n                    totals.usdsInterest += coolerInterest;\n                } else {\n                    // Unsupported debt token\n                    revert Params_InvalidCooler();\n                }\n            }\n        }\n\n        // Set the Cooler V2 authorization signature, if provided\n        // If the new owner cannot provide a signature (e.g. multisig), they can call `IMonoCooler.setAuthorization()` instead\n        if (authorization_.account != address(0)) {\n            // Validate that authorization provider and new owner matches\n            if (authorization_.account != newOwner_) revert Params_InvalidNewOwner();\n\n            // Authorize this contract to manage user Cooler V2 position\n            COOLERV2.setAuthorizationWithSig(authorization_, signature_);\n        }\n\n        // Take flashloan\n        // This will trigger the `onFlashLoan` function after the flashloan amount has been transferred to this contract\n        {\n            // Calculate the flashloan amount\n            uint256 flashloanAmount = totals.daiPrincipal +\n                totals.usdsPrincipal +\n                totals.daiInterest +\n                totals.usdsInterest;\n\n            FLASH.flashLoan(\n                this,\n                address(DAI),\n                flashloanAmount,\n                abi.encode(\n                    FlashLoanData(\n                        coolerData,\n                        msg.sender,\n                        newOwner_,\n                        totals.usdsPrincipal + totals.usdsInterest, // The amount of DAI that will be migrated to USDS\n                        delegationRequests_\n                    )\n                )\n            );\n        }\n\n        // This shouldn't happen, but transfer any leftover funds back to the sender\n        uint256 usdsBalanceAfter = USDS.balanceOf(address(this));\n        if (usdsBalanceAfter > 0) {\n            USDS.safeTransfer(msg.sender, usdsBalanceAfter);\n            emit TokenRefunded(address(USDS), msg.sender, usdsBalanceAfter);\n        }\n        uint256 daiBalanceAfter = DAI.balanceOf(address(this));\n        if (daiBalanceAfter > 0) {\n            DAI.safeTransfer(msg.sender, daiBalanceAfter);\n            emit TokenRefunded(address(DAI), msg.sender, daiBalanceAfter);\n        }\n    }\n\n    /// @inheritdoc IERC3156FlashBorrower\n    /// @dev        This function reverts if:\n    ///             - The caller is not the flash loan provider\n    ///             - The initiator is not this contract\n    function onFlashLoan(\n        address initiator_,\n        address, // flashloan token is only DAI\n        uint256 amount_,\n        uint256, // lender fee is 0\n        bytes calldata params_\n    ) external override returns (bytes32) {\n        // perform sanity checks\n        if (msg.sender != address(FLASH)) revert OnlyLender();\n        if (initiator_ != address(this)) revert OnlyThis();\n\n        // Unpack param data\n        FlashLoanData memory flashLoanData = abi.decode(params_, (FlashLoanData));\n        CoolerData[] memory coolers = flashLoanData.coolers;\n\n        // If there are loans in USDS, convert the required amount from DAI\n        // The DAI can come from the flash loan or the caller\n        if (flashLoanData.usdsRequired > 0) {\n            DAI.safeApprove(address(MIGRATOR), flashLoanData.usdsRequired);\n            MIGRATOR.daiToUsds(address(this), flashLoanData.usdsRequired);\n        }\n\n        // Keep track of debt tokens out and collateral in\n        uint256 totalPrincipal;\n        uint256 totalInterest;\n        uint256 totalCollateral;\n\n        // Validate and repay loans for each cooler\n        for (uint256 i; i < coolers.length; ++i) {\n            CoolerData memory coolerData = coolers[i];\n\n            (uint256 principal, uint256 interest, uint256 collateral) = _handleRepayments(\n                coolerData.cooler,\n                coolerData.debtToken,\n                coolerData.numLoans\n            );\n            totalPrincipal += principal;\n            totalInterest += interest;\n            totalCollateral += collateral;\n        }\n\n        // Transfer the collateral from the cooler owner to this contract\n        GOHM.safeTransferFrom(flashLoanData.currentOwner, address(this), totalCollateral);\n\n        // Approve the Cooler V2 to spend the collateral\n        GOHM.safeApprove(address(COOLERV2), totalCollateral);\n\n        // Calculate the amount to borrow from Cooler V2\n        // The LTC of Cooler V1 is fixed, and the LTC of Cooler V2 is higher at the outset\n        // Lender fee will be 0\n        uint256 borrowAmount = totalPrincipal + totalInterest;\n\n        // Add collateral and borrow spent flash loan from Cooler V2\n        COOLERV2.addCollateral(\n            totalCollateral.encodeUInt128(),\n            flashLoanData.newOwner,\n            flashLoanData.delegationRequests\n        );\n        COOLERV2.borrow(borrowAmount.encodeUInt128(), flashLoanData.newOwner, address(this));\n\n        // Convert the USDS to DAI\n        uint256 usdsBalance = USDS.balanceOf(address(this));\n        if (usdsBalance > 0) {\n            USDS.safeApprove(address(MIGRATOR), usdsBalance);\n            MIGRATOR.usdsToDai(address(this), usdsBalance);\n        }\n\n        // Approve the flash loan provider to collect the flashloan amount and fee (0)\n        // The initiator will transfer any remaining DAI and USDS back to the caller\n        DAI.safeApprove(address(FLASH), amount_);\n\n        return keccak256(\"ERC3156FlashBorrower.onFlashLoan\");\n    }\n\n    function _handleRepayments(\n        Cooler cooler_,\n        ERC20 debtToken_,\n        uint256 numLoans_\n    ) internal returns (uint256 principal, uint256 interest, uint256 collateral) {\n        // Provide upfront infinite approval to cooler\n        // The consolidate() function is gated by a nonReentrant modifier, so there cannot be a reentrancy attack during the approval and revocation\n        debtToken_.safeApprove(address(cooler_), type(uint256).max);\n\n        // Iterate through and repay loans\n        for (uint256 i; i < numLoans_; i++) {\n            Cooler.Loan memory loan = cooler_.getLoan(i);\n\n            // Only repay outstanding loans\n            if (loan.principal > 0) {\n                principal += loan.principal;\n                interest += loan.interestDue;\n                collateral += loan.collateral;\n\n                cooler_.repayLoan(i, loan.principal + loan.interestDue);\n            }\n        }\n\n        // Revoke approval\n        debtToken_.safeApprove(address(cooler_), 0);\n\n        return (principal, interest, collateral);\n    }\n\n    // ========= HELPER FUNCTIONS ========= //\n\n    function _getDebtForCooler(\n        Cooler cooler_,\n        address[] memory clearinghouses_\n    )\n        internal\n        view\n        returns (\n            uint256 coolerPrincipal,\n            uint256 coolerInterest,\n            uint256 coolerCollateral,\n            address debtToken,\n            uint8 numLoans\n        )\n    {\n        // Determine the debt token\n        debtToken = address(cooler_.debt());\n\n        // The Cooler contract does not expose the number of loans, so we iterate until the call reverts\n        uint8 i;\n        for (i; i < MAX_LOANS; i++) {\n            try cooler_.getLoan(i) returns (Cooler.Loan memory loan) {\n                // Each loan is issued by a Clearinghouse, so we need to check that the Clearinghouse is valid\n                if (!_inArray(clearinghouses_, loan.lender)) revert Params_InvalidCooler();\n\n                // Interest is paid down first, so if the principal is 0, the loan has been paid off\n                if (loan.principal > 0) {\n                    coolerPrincipal += loan.principal;\n                    coolerInterest += loan.interestDue;\n                    coolerCollateral += loan.collateral;\n                }\n            } catch Panic(uint256 /*errorCode*/) {\n                break;\n            }\n        }\n\n        return (coolerPrincipal, coolerInterest, coolerCollateral, debtToken, i);\n    }\n\n    /// @notice Check if a given cooler was created by the CoolerFactory\n    ///\n    /// @param  cooler_       Cooler contract\n    /// @return bool          Whether the cooler was created by the CoolerFactory\n    function _isValidCooler(address cooler_) internal view returns (bool) {\n        for (uint256 i; i < _COOLER_FACTORIES.length; i++) {\n            if (ICoolerFactory(_COOLER_FACTORIES[i]).created(cooler_)) {\n                return true;\n            }\n        }\n\n        return false;\n    }\n\n    function _inArray(address[] memory array_, address item_) internal pure returns (bool) {\n        // Check that the item is in the list\n        for (uint256 i; i < array_.length; i++) {\n            if (array_[i] == item_) {\n                return true;\n            }\n        }\n\n        return false;\n    }\n\n    /// @notice Get all of the clearinghouses in the registry\n    ///\n    /// @return clearinghouses The list of clearinghouses\n    function _getClearinghouses() internal view returns (address[] memory clearinghouses) {\n        uint256 registryCount = CHREG.registryCount();\n        clearinghouses = new address[](registryCount);\n        for (uint256 i; i < registryCount; i++) {\n            clearinghouses[i] = CHREG.registry(i);\n        }\n        return clearinghouses;\n    }\n\n    // ============ ADMIN FUNCTIONS ============ //\n\n    /// @notice Add a CoolerFactory to the migrator\n    ///\n    /// @param  coolerFactory_ The CoolerFactory to add\n    function addCoolerFactory(address coolerFactory_) external onlyOwner {\n        // Validate that the CoolerFactory is not the zero address\n        if (coolerFactory_ == address(0)) revert Params_InvalidAddress(\"zero\");\n\n        // Validate that the CoolerFactory is not already in the array\n        for (uint256 i; i < _COOLER_FACTORIES.length; i++) {\n            if (_COOLER_FACTORIES[i] == coolerFactory_) revert Params_InvalidAddress(\"duplicate\");\n        }\n\n        // Add the CoolerFactory to the array\n        _COOLER_FACTORIES.push(coolerFactory_);\n\n        // Emit the event\n        emit CoolerFactoryAdded(coolerFactory_);\n    }\n\n    /// @notice Remove a CoolerFactory from the migrator\n    ///\n    /// @param  coolerFactory_ The CoolerFactory to remove\n    function removeCoolerFactory(address coolerFactory_) external onlyOwner {\n        // Remove the CoolerFactory from the array\n        bool found;\n        for (uint256 i; i < _COOLER_FACTORIES.length; i++) {\n            if (_COOLER_FACTORIES[i] == coolerFactory_) {\n                _COOLER_FACTORIES[i] = _COOLER_FACTORIES[_COOLER_FACTORIES.length - 1];\n                _COOLER_FACTORIES.pop();\n                found = true;\n                break;\n            }\n        }\n        if (!found) revert Params_InvalidAddress(\"not found\");\n\n        // Emit the event\n        emit CoolerFactoryRemoved(coolerFactory_);\n    }\n\n    /// @notice Get the list of CoolerFactories\n    ///\n    /// @return coolerFactories The list of CoolerFactories\n    function getCoolerFactories() external view returns (address[] memory coolerFactories) {\n        return _COOLER_FACTORIES;\n    }\n\n    // ============ ENABLER FUNCTIONS ============ //\n\n    modifier onlyEnabled() {\n        if (!isEnabled) revert NotEnabled();\n        _;\n    }\n\n    /// @inheritdoc IEnabler\n    function enable(bytes calldata) external onlyOwner {\n        // Validate that the contract is disabled\n        if (isEnabled) revert NotDisabled();\n\n        // Enable the contract\n        isEnabled = true;\n\n        // Emit the enabled event\n        emit Enabled();\n    }\n\n    /// @inheritdoc IEnabler\n    function disable(bytes calldata) external onlyEnabled onlyOwner {\n        // Disable the contract\n        isEnabled = false;\n\n        // Emit the disabled event\n        emit Disabled();\n    }\n}\n"
+    },
+    "src/interfaces/maker-dao/IERC3156FlashBorrower.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\n// Copyright (C) 2021 Dai Foundation\n//\n// This program is free software: you can redistribute it and/or modify\n// it under the terms of the GNU Affero General Public License as published by\n// the Free Software Foundation, either version 3 of the License, or\n// (at your option) any later version.\n//\n// This program is distributed in the hope that it will be useful,\n// but WITHOUT ANY WARRANTY; without even the implied warranty of\n// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n// GNU Affero General Public License for more details.\n//\n// You should have received a copy of the GNU Affero General Public License\n// along with this program.  If not, see <https://www.gnu.org/licenses/>.\n\npragma solidity >=0.7.0;\n\ninterface IERC3156FlashBorrower {\n    /**\n     * @dev Receive a flash loan.\n     * @param initiator The initiator of the loan.\n     * @param token The loan currency.\n     * @param amount The amount of tokens lent.\n     * @param fee The additional amount of tokens to repay.\n     * @param data Arbitrary data structure, intended to contain user-defined parameters.\n     * @return The keccak256 hash of \"ERC3156FlashBorrower.onFlashLoan\"\n     */\n    function onFlashLoan(\n        address initiator,\n        address token,\n        uint256 amount,\n        uint256 fee,\n        bytes calldata data\n    ) external returns (bytes32);\n}\n"
+    },
+    "src/interfaces/maker-dao/IERC3156FlashLender.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\n// Copyright (C) 2021 Dai Foundation\n//\n// This program is free software: you can redistribute it and/or modify\n// it under the terms of the GNU Affero General Public License as published by\n// the Free Software Foundation, either version 3 of the License, or\n// (at your option) any later version.\n//\n// This program is distributed in the hope that it will be useful,\n// but WITHOUT ANY WARRANTY; without even the implied warranty of\n// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n// GNU Affero General Public License for more details.\n//\n// You should have received a copy of the GNU Affero General Public License\n// along with this program.  If not, see <https://www.gnu.org/licenses/>.\n\npragma solidity >=0.7.0;\n\nimport \"./IERC3156FlashBorrower.sol\";\n\ninterface IERC3156FlashLender {\n    /**\n     * @dev The amount of currency available to be lent.\n     * @param token The loan currency.\n     * @return The amount of `token` that can be borrowed.\n     */\n    function maxFlashLoan(address token) external view returns (uint256);\n\n    /**\n     * @dev The fee to be charged for a given loan.\n     * @param token The loan currency.\n     * @param amount The amount of tokens lent.\n     * @return The amount of `token` to be charged for the loan, on top of the returned principal.\n     */\n    function flashFee(address token, uint256 amount) external view returns (uint256);\n\n    /**\n     * @dev Initiate a flash loan.\n     * @param receiver The receiver of the tokens in the loan, and the receiver of the callback.\n     * @param token The loan currency.\n     * @param amount The amount of tokens lent.\n     * @param data Arbitrary data structure, intended to contain user-defined parameters.\n     */\n    function flashLoan(\n        IERC3156FlashBorrower receiver,\n        address token,\n        uint256 amount,\n        bytes calldata data\n    ) external returns (bool);\n}\n"
+    },
+    "src/interfaces/maker-dao/IDaiUsdsMigrator.sol": {
+      "content": "// SPDX-License-Identifier: UNLICENSED\npragma solidity ^0.8.4;\n\ninterface IDaiUsdsMigrator {\n    event DaiToUsds(address indexed caller, address indexed usr, uint256 wad);\n    event UsdsToDai(address indexed caller, address indexed usr, uint256 wad);\n\n    function dai() external view returns (address);\n\n    function daiJoin() external view returns (address);\n\n    function daiToUsds(address usr, uint256 wad) external;\n\n    function usds() external view returns (address);\n\n    function usdsJoin() external view returns (address);\n\n    function usdsToDai(address usr, uint256 wad) external;\n}\n"
+    },
+    "src/periphery/interfaces/ICoolerV2Migrator.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {IMonoCooler} from \"src/policies/interfaces/cooler/IMonoCooler.sol\";\nimport {IDLGTEv1} from \"src/modules/DLGTE/IDLGTE.v1.sol\";\n\n/// @title  Cooler V2 Migrator\n/// @notice Interface for contracts that migrate Cooler V1 loans to Cooler V2\ninterface ICoolerV2Migrator {\n    // ========= ERRORS ========= //\n\n    /// @notice Thrown when the caller is not the contract itself.\n    error OnlyThis();\n\n    /// @notice Thrown when the caller is not the flash lender.\n    error OnlyLender();\n\n    /// @notice Thrown when the Cooler is not owned by the caller\n    error Only_CoolerOwner();\n\n    /// @notice Thrown when the Clearinghouse is not valid\n    error Params_InvalidClearinghouse();\n\n    /// @notice Thrown when the Cooler is not valid\n    error Params_InvalidCooler();\n\n    /// @notice Thrown when the new owner address provided does not match the authorization\n    error Params_InvalidNewOwner();\n\n    /// @notice Thrown when the Cooler is duplicated\n    error Params_DuplicateCooler();\n\n    /// @notice Thrown when the address is invalid\n    error Params_InvalidAddress(string reason_);\n\n    // ========= EVENTS ========= //\n\n    /// @notice Emitted when a CoolerFactory is added to the migrator\n    event CoolerFactoryAdded(address indexed coolerFactory);\n\n    /// @notice Emitted when a CoolerFactory is removed from the migrator\n    event CoolerFactoryRemoved(address indexed coolerFactory);\n\n    /// @notice Emitted when a token is refunded to the recipient\n    event TokenRefunded(address indexed token, address indexed recipient, uint256 amount);\n\n    // ========= FUNCTIONS ========= //\n\n    /// @notice Preview the consolidation of a set of loans.\n    ///\n    /// @param  coolers_            The Coolers to consolidate the loans from.\n    /// @return collateralAmount    The amount of collateral that will be migrated into Cooler V2.\n    /// @return borrowAmount        The amount of debt that will be borrowed from Cooler V2.\n    function previewConsolidate(\n        address[] calldata coolers_\n    ) external view returns (uint256 collateralAmount, uint256 borrowAmount);\n\n    /// @notice Consolidate Cooler V1 loans into Cooler V2\n    ///\n    ///         This function supports consolidation of loans from multiple Clearinghouses and Coolers, provided that the caller is the owner.\n    ///\n    ///         The funds for paying interest owed and fees will be borrowed from Cooler V2.\n    ///\n    ///         It is expected that the caller will have already provided approval for this contract to spend the required tokens. See `previewConsolidate()` for more details.\n    ///\n    /// @dev    The implementing function is expected to handle the following:\n    ///         - Ensure that `coolers_` are valid\n    ///         - Ensure that the caller is the owner of the Coolers\n    ///         - Repay all loans in the Coolers\n    ///         - Deposit the collateral into Cooler V2\n    ///         - Borrow the required amount from Cooler V2 to repay the Cooler V1 loans\n    ///\n    /// @param  coolers_            The Coolers from which the loans will be migrated.\n    /// @param  newOwner_           Address of the owner of the Cooler V2 position. This can be the same as the caller, or a different address.\n    /// @param  authorization_      Authorization parameters for the new owner. Set the `account` field to the zero address to indicate that authorization has already been provided through `IMonoCooler.setAuthorization()`.\n    /// @param  signature_          Authorization signature for the new owner. Ignored if `authorization_.account` is the zero address.\n    /// @param  delegationRequests_ Delegation requests for the new owner.\n    function consolidate(\n        address[] memory coolers_,\n        address newOwner_,\n        IMonoCooler.Authorization memory authorization_,\n        IMonoCooler.Signature calldata signature_,\n        IDLGTEv1.DelegationRequest[] calldata delegationRequests_\n    ) external;\n\n    // ===== ADMIN FUNCTIONS ===== //\n\n    /// @notice Add a CoolerFactory to the migrator\n    ///\n    /// @param  coolerFactory_ The CoolerFactory to add\n    function addCoolerFactory(address coolerFactory_) external;\n\n    /// @notice Remove a CoolerFactory from the migrator\n    ///\n    /// @param  coolerFactory_ The CoolerFactory to remove\n    function removeCoolerFactory(address coolerFactory_) external;\n\n    /// @notice Get the list of CoolerFactories\n    ///\n    /// @return coolerFactories The list of CoolerFactories\n    function getCoolerFactories() external view returns (address[] memory coolerFactories);\n}\n"
+    },
+    "src/periphery/interfaces/IEnabler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\n/// @title IEnabler\n/// @notice Interface for contracts that can be enabled and disabled\n/// @dev    This is designed for usage by periphery contracts that cannot inherit from `PolicyEnabler`. Authorization is deliberately left open to the implementing contract.\ninterface IEnabler {\n    // ============ EVENTS ============ //\n\n    /// @notice Emitted when the contract is enabled\n    event Enabled();\n\n    /// @notice Emitted when the contract is disabled\n    event Disabled();\n\n    // ============ ERRORS ============ //\n\n    /// @notice Thrown when the contract is not enabled\n    error NotEnabled();\n\n    /// @notice Thrown when the contract is not disabled\n    error NotDisabled();\n\n    // ============ FUNCTIONS ============ //\n\n    /// @notice         Returns true if the contract is enabled\n    /// @return enabled True if the contract is enabled, false otherwise\n    function isEnabled() external view returns (bool enabled);\n\n    /// @notice             Enables the contract\n    /// @dev                Implementing contracts should implement permissioning logic\n    ///\n    /// @param enableData_  Optional data to pass to a custom enable function\n    function enable(bytes calldata enableData_) external;\n\n    /// @notice             Disables the contract\n    /// @dev                Implementing contracts should implement permissioning logic\n    ///\n    /// @param disableData_ Optional data to pass to a custom disable function\n    function disable(bytes calldata disableData_) external;\n}\n"
+    },
+    "lib/solmate/src/utils/ReentrancyGuard.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Gas optimized reentrancy protection for smart contracts.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/ReentrancyGuard.sol)\n/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/security/ReentrancyGuard.sol)\nabstract contract ReentrancyGuard {\n    uint256 private locked = 1;\n\n    modifier nonReentrant() virtual {\n        require(locked == 1, \"REENTRANCY\");\n\n        locked = 2;\n\n        _;\n\n        locked = 1;\n    }\n}\n"
+    },
+    "src/libraries/SafeCast.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\nlibrary SafeCast {\n    error Overflow(uint256 amount);\n\n    function encodeUInt128(uint256 amount) internal pure returns (uint128) {\n        if (amount > type(uint128).max) {\n            revert Overflow(amount);\n        }\n        return uint128(amount);\n    }\n\n    function encodeUInt112(uint256 amount) internal pure returns (uint112) {\n        if (amount > type(uint112).max) {\n            revert Overflow(amount);\n        }\n        return uint112(amount);\n    }\n\n    function encodeUInt96(uint256 amount) internal pure returns (uint96) {\n        if (amount > type(uint96).max) {\n            revert Overflow(amount);\n        }\n        return uint96(amount);\n    }\n\n    function encodeUInt32(uint256 amount) internal pure returns (uint32) {\n        if (amount > type(uint32).max) {\n            revert Overflow(amount);\n        }\n        return uint32(amount);\n    }\n\n    function encodeUInt16(uint256 amount) internal pure returns (uint16) {\n        if (amount > type(uint16).max) {\n            revert Overflow(amount);\n        }\n        return uint16(amount);\n    }\n}\n"
+    },
+    "lib/solmate/src/utils/SafeTransferLib.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\nimport {ERC20} from \"../tokens/ERC20.sol\";\n\n/// @notice Safe ETH and ERC20 transfer library that gracefully handles missing return values.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/SafeTransferLib.sol)\n/// @dev Use with caution! Some functions in this library knowingly create dirty bits at the destination of the free memory pointer.\n/// @dev Note that none of the functions in this library check that a token has code at all! That responsibility is delegated to the caller.\nlibrary SafeTransferLib {\n    /*//////////////////////////////////////////////////////////////\n                             ETH OPERATIONS\n    //////////////////////////////////////////////////////////////*/\n\n    function safeTransferETH(address to, uint256 amount) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Transfer the ETH and store if it succeeded or not.\n            success := call(gas(), to, amount, 0, 0, 0, 0)\n        }\n\n        require(success, \"ETH_TRANSFER_FAILED\");\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                            ERC20 OPERATIONS\n    //////////////////////////////////////////////////////////////*/\n\n    function safeTransferFrom(\n        ERC20 token,\n        address from,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0x23b872dd00000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(from, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"from\" argument.\n            mstore(add(freeMemoryPointer, 36), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 68), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 100 because the length of our calldata totals up like so: 4 + 32 * 3.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 100, 0, 32)\n            )\n        }\n\n        require(success, \"TRANSFER_FROM_FAILED\");\n    }\n\n    function safeTransfer(\n        ERC20 token,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0xa9059cbb00000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 36), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)\n            )\n        }\n\n        require(success, \"TRANSFER_FAILED\");\n    }\n\n    function safeApprove(\n        ERC20 token,\n        address to,\n        uint256 amount\n    ) internal {\n        bool success;\n\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Get a pointer to some free memory.\n            let freeMemoryPointer := mload(0x40)\n\n            // Write the abi-encoded calldata into memory, beginning with the function selector.\n            mstore(freeMemoryPointer, 0x095ea7b300000000000000000000000000000000000000000000000000000000)\n            mstore(add(freeMemoryPointer, 4), and(to, 0xffffffffffffffffffffffffffffffffffffffff)) // Append and mask the \"to\" argument.\n            mstore(add(freeMemoryPointer, 36), amount) // Append the \"amount\" argument. Masking not required as it's a full 32 byte type.\n\n            success := and(\n                // Set success to whether the call reverted, if not we check it either\n                // returned exactly 1 (can't just be non-zero data), or had no return data.\n                or(and(eq(mload(0), 1), gt(returndatasize(), 31)), iszero(returndatasize())),\n                // We use 68 because the length of our calldata totals up like so: 4 + 32 * 2.\n                // We use 0 and 32 to copy up to 32 bytes of return data into the scratch space.\n                // Counterintuitively, this call must be positioned second to the or() call in the\n                // surrounding and() call or else returndatasize() will be zero during the computation.\n                call(gas(), token, 0, freeMemoryPointer, 68, 0, 32)\n            )\n        }\n\n        require(success, \"APPROVE_FAILED\");\n    }\n}\n"
+    },
+    "lib/solmate/src/tokens/ERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)\n/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)\n/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.\nabstract contract ERC20 {\n    /*//////////////////////////////////////////////////////////////\n                                 EVENTS\n    //////////////////////////////////////////////////////////////*/\n\n    event Transfer(address indexed from, address indexed to, uint256 amount);\n\n    event Approval(address indexed owner, address indexed spender, uint256 amount);\n\n    /*//////////////////////////////////////////////////////////////\n                            METADATA STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    string public name;\n\n    string public symbol;\n\n    uint8 public immutable decimals;\n\n    /*//////////////////////////////////////////////////////////////\n                              ERC20 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 public totalSupply;\n\n    mapping(address => uint256) public balanceOf;\n\n    mapping(address => mapping(address => uint256)) public allowance;\n\n    /*//////////////////////////////////////////////////////////////\n                            EIP-2612 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 internal immutable INITIAL_CHAIN_ID;\n\n    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;\n\n    mapping(address => uint256) public nonces;\n\n    /*//////////////////////////////////////////////////////////////\n                               CONSTRUCTOR\n    //////////////////////////////////////////////////////////////*/\n\n    constructor(\n        string memory _name,\n        string memory _symbol,\n        uint8 _decimals\n    ) {\n        name = _name;\n        symbol = _symbol;\n        decimals = _decimals;\n\n        INITIAL_CHAIN_ID = block.chainid;\n        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                               ERC20 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function approve(address spender, uint256 amount) public virtual returns (bool) {\n        allowance[msg.sender][spender] = amount;\n\n        emit Approval(msg.sender, spender, amount);\n\n        return true;\n    }\n\n    function transfer(address to, uint256 amount) public virtual returns (bool) {\n        balanceOf[msg.sender] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(msg.sender, to, amount);\n\n        return true;\n    }\n\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) public virtual returns (bool) {\n        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.\n\n        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;\n\n        balanceOf[from] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(from, to, amount);\n\n        return true;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                             EIP-2612 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual {\n        require(deadline >= block.timestamp, \"PERMIT_DEADLINE_EXPIRED\");\n\n        // Unchecked because the only math done is incrementing\n        // the owner's nonce which cannot realistically overflow.\n        unchecked {\n            address recoveredAddress = ecrecover(\n                keccak256(\n                    abi.encodePacked(\n                        \"\\x19\\x01\",\n                        DOMAIN_SEPARATOR(),\n                        keccak256(\n                            abi.encode(\n                                keccak256(\n                                    \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n                                ),\n                                owner,\n                                spender,\n                                value,\n                                nonces[owner]++,\n                                deadline\n                            )\n                        )\n                    )\n                ),\n                v,\n                r,\n                s\n            );\n\n            require(recoveredAddress != address(0) && recoveredAddress == owner, \"INVALID_SIGNER\");\n\n            allowance[recoveredAddress][spender] = value;\n        }\n\n        emit Approval(owner, spender, value);\n    }\n\n    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {\n        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();\n    }\n\n    function computeDomainSeparator() internal view virtual returns (bytes32) {\n        return\n            keccak256(\n                abi.encode(\n                    keccak256(\"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"),\n                    keccak256(bytes(name)),\n                    keccak256(\"1\"),\n                    block.chainid,\n                    address(this)\n                )\n            );\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                        INTERNAL MINT/BURN LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function _mint(address to, uint256 amount) internal virtual {\n        totalSupply += amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(address(0), to, amount);\n    }\n\n    function _burn(address from, uint256 amount) internal virtual {\n        balanceOf[from] -= amount;\n\n        // Cannot underflow because a user's balance\n        // will never be larger than the total supply.\n        unchecked {\n            totalSupply -= amount;\n        }\n\n        emit Transfer(from, address(0), amount);\n    }\n}\n"
+    },
+    "lib/solmate/src/auth/Owned.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Simple single owner authorization mixin.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/auth/Owned.sol)\nabstract contract Owned {\n    /*//////////////////////////////////////////////////////////////\n                                 EVENTS\n    //////////////////////////////////////////////////////////////*/\n\n    event OwnershipTransferred(address indexed user, address indexed newOwner);\n\n    /*//////////////////////////////////////////////////////////////\n                            OWNERSHIP STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    address public owner;\n\n    modifier onlyOwner() virtual {\n        require(msg.sender == owner, \"UNAUTHORIZED\");\n\n        _;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                               CONSTRUCTOR\n    //////////////////////////////////////////////////////////////*/\n\n    constructor(address _owner) {\n        owner = _owner;\n\n        emit OwnershipTransferred(address(0), _owner);\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                             OWNERSHIP LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function transferOwnership(address newOwner) public virtual onlyOwner {\n        owner = newOwner;\n\n        emit OwnershipTransferred(msg.sender, newOwner);\n    }\n}\n"
+    },
+    "src/external/cooler/Cooler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {SafeTransferLib} from \"solmate/utils/SafeTransferLib.sol\";\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\nimport {Clone} from \"clones/Clone.sol\";\n\nimport {CoolerFactory} from \"./CoolerFactory.sol\";\nimport {CoolerCallback} from \"./CoolerCallback.sol\";\n\n// Function sig taken from gOHM contract\ninterface IDelegate {\n    function delegate(address to_) external;\n}\n\n/// @title  Cooler Loans.\n/// @notice A Cooler is a smart contract escrow that facilitates fixed-duration, peer-to-peer\n///         loans for a user-defined debt-collateral pair.\n/// @dev    This contract uses Clones (https://github.com/wighawag/clones-with-immutable-args)\n///         to save gas on deployment.\ncontract Cooler is Clone {\n    using SafeTransferLib for ERC20;\n\n    // --- ERRORS ----------------------------------------------------\n\n    error OnlyApproved();\n    error Deactivated();\n    error Default();\n    error NotExpired();\n    error NotCoolerCallback();\n\n    // --- DATA STRUCTURES -------------------------------------------\n\n    /// @notice A loan begins with a borrow request.\n    struct Request {\n        uint256 amount; // Amount to be borrowed.\n        uint256 interest; // Annualized percentage to be paid as interest.\n        uint256 loanToCollateral; // Requested loan-to-collateral ratio.\n        uint256 duration; // Time to repay the loan before it defaults.\n        bool active; // Any lender can clear an active loan request.\n        address requester; // The address that created the request.\n    }\n\n    /// @notice A request is converted to a loan when a lender clears it.\n    struct Loan {\n        Request request; // Loan terms specified in the request.\n        uint256 principal; // Amount of principal debt owed to the lender.\n        uint256 interestDue; // Interest owed to the lender.\n        uint256 collateral; // Amount of collateral pledged.\n        uint256 expiry; // Time when the loan defaults.\n        address lender; // Lender's address.\n        address recipient; // Recipient of repayments.\n        bool callback; // If this is true, the lender must inherit CoolerCallback.\n    }\n\n    // --- IMMUTABLES ------------------------------------------------\n\n    // This makes the code look prettier.\n    uint256 private constant DECIMALS_INTEREST = 1e18;\n\n    /// @notice This address owns the collateral in escrow.\n    function owner() public pure returns (address _owner) {\n        return _getArgAddress(0x0);\n    }\n\n    /// @notice This token is borrowed against.\n    function collateral() public pure returns (ERC20 _collateral) {\n        return ERC20(_getArgAddress(0x14));\n    }\n\n    /// @notice This token is lent.\n    function debt() public pure returns (ERC20 _debt) {\n        return ERC20(_getArgAddress(0x28));\n    }\n\n    /// @notice This contract created the Cooler\n    function factory() public pure returns (CoolerFactory _factory) {\n        return CoolerFactory(_getArgAddress(0x3c));\n    }\n\n    // --- STATE VARIABLES -------------------------------------------\n\n    /// @notice Arrays stores all the loan requests.\n    Request[] public requests;\n\n    /// @notice Arrays stores all the granted loans.\n    Loan[] public loans;\n\n    /// @notice Facilitates transfer of lender ownership to new addresses\n    mapping(uint256 => address) public approvals;\n\n    // --- BORROWER --------------------------------------------------\n\n    /// @notice Request a loan with given parameters.\n    ///         Collateral is taken at time of request.\n    /// @param  amount_ of debt tokens to borrow.\n    /// @param  interest_ to pay (annualized % of 'amount_'). Expressed in DECIMALS_INTEREST.\n    /// @param  loanToCollateral_ debt tokens per collateral token pledged. Expressed in 10**collateral().decimals().\n    /// @param  duration_ of loan tenure in seconds.\n    /// @return reqID of the created request. Equivalent to the index of request in requests[].\n    function requestLoan(\n        uint256 amount_,\n        uint256 interest_,\n        uint256 loanToCollateral_,\n        uint256 duration_\n    ) external returns (uint256 reqID) {\n        reqID = requests.length;\n        requests.push(\n            Request({\n                amount: amount_,\n                interest: interest_,\n                loanToCollateral: loanToCollateral_,\n                duration: duration_,\n                active: true,\n                requester: msg.sender\n            })\n        );\n\n        // The collateral is taken upfront. Will be escrowed\n        // until the loan is repaid or defaulted.\n        collateral().safeTransferFrom(\n            msg.sender,\n            address(this),\n            collateralFor(amount_, loanToCollateral_)\n        );\n\n        // Log the event.\n        factory().logRequestLoan(reqID);\n    }\n\n    /// @notice Cancel a loan request and get the collateral back.\n    /// @param  reqID_ index of request in requests[].\n    function rescindRequest(uint256 reqID_) external {\n        if (msg.sender != owner()) revert OnlyApproved();\n\n        Request storage req = requests[reqID_];\n\n        if (!req.active) revert Deactivated();\n\n        // Update storage and send collateral back to the owner.\n        req.active = false;\n        collateral().safeTransfer(owner(), collateralFor(req.amount, req.loanToCollateral));\n\n        // Log the event.\n        factory().logRescindRequest(reqID_);\n    }\n\n    /// @notice Repay a loan to get the collateral back.\n    /// @dev    Despite a malicious lender could reenter with the callback, the\n    ///         usage of `msg.sender` prevents any economical benefit to the\n    ///         attacker, since they would be repaying the loan themselves.\n    /// @param  loanID_ index of loan in loans[].\n    /// @param  repayment_ debt tokens to be repaid.\n    /// @return collateral given back to the borrower.\n    function repayLoan(uint256 loanID_, uint256 repayment_) external returns (uint256) {\n        Loan memory loan = loans[loanID_];\n\n        if (block.timestamp > loan.expiry) revert Default();\n\n        // Cap the repayment to the total debt of the loan\n        uint256 totalDebt = loan.principal + loan.interestDue;\n        if (repayment_ > totalDebt) repayment_ = totalDebt;\n\n        // Need to repay interest first, then any extra goes to paying down principal.\n        uint256 interestPaid;\n        uint256 remainder;\n        if (repayment_ >= loan.interestDue) {\n            remainder = repayment_ - loan.interestDue;\n            interestPaid = loan.interestDue;\n            loan.interestDue = 0;\n        } else {\n            loan.interestDue -= repayment_;\n            interestPaid = repayment_;\n        }\n\n        // We pay back only if user has paid back principal. This can be 0.\n        uint256 decollateralized;\n        if (remainder > 0) {\n            decollateralized = (loan.collateral * remainder) / loan.principal;\n\n            loan.principal -= remainder;\n            loan.collateral -= decollateralized;\n        }\n\n        // Save updated loan info in storage.\n        loans[loanID_] = loan;\n\n        // Transfer repaid debt back to the lender and collateral back to the owner if applicable\n        debt().safeTransferFrom(msg.sender, loan.recipient, repayment_);\n        if (decollateralized > 0) collateral().safeTransfer(owner(), decollateralized);\n\n        // Log the event.\n        factory().logRepayLoan(loanID_, repayment_);\n\n        // If necessary, trigger lender callback.\n        if (loan.callback) {\n            CoolerCallback(loan.lender).onRepay(loanID_, remainder, interestPaid);\n        }\n\n        return decollateralized;\n    }\n\n    /// @notice Delegate voting power on collateral.\n    /// @param  to_ address to delegate.\n    function delegateVoting(address to_) external {\n        if (msg.sender != owner()) revert OnlyApproved();\n        IDelegate(address(collateral())).delegate(to_);\n    }\n\n    // --- LENDER ----------------------------------------------------\n\n    /// @notice Fill a requested loan as a lender.\n    /// @param  reqID_ index of request in requests[].\n    /// @param  recipient_ address to repay the loan to.\n    /// @param  isCallback_ true if the lender implements the CoolerCallback abstract. False otherwise.\n    /// @return loanID of the granted loan. Equivalent to the index of loan in loans[].\n    function clearRequest(\n        uint256 reqID_,\n        address recipient_,\n        bool isCallback_\n    ) external returns (uint256 loanID) {\n        Request memory req = requests[reqID_];\n\n        // Loan callbacks are only allowed if:\n        //  1. The loan request has been created via a trusted lender.\n        //  2. The lender signals that it implements the CoolerCallback Abstract.\n        bool callback = (isCallback_ && msg.sender == req.requester);\n\n        // If necessary, ensure lender implements the CoolerCallback abstract.\n        if (callback && !CoolerCallback(msg.sender).isCoolerCallback()) revert NotCoolerCallback();\n        // Ensure loan request is active.\n        if (!req.active) revert Deactivated();\n\n        // Clear the loan request in memory.\n        req.active = false;\n\n        // Calculate and store loan terms.\n        uint256 interest = interestFor(req.amount, req.interest, req.duration);\n        uint256 collat = collateralFor(req.amount, req.loanToCollateral);\n        loanID = loans.length;\n\n        loans.push(\n            Loan({\n                request: req,\n                principal: req.amount,\n                interestDue: interest,\n                collateral: collat,\n                expiry: block.timestamp + req.duration,\n                lender: msg.sender,\n                recipient: recipient_,\n                callback: callback\n            })\n        );\n\n        // Clear the loan request storage.\n        requests[reqID_].active = false;\n\n        // Transfer debt tokens to the owner of the request.\n        debt().safeTransferFrom(msg.sender, owner(), req.amount);\n\n        // Log the event.\n        factory().logClearRequest(reqID_, loanID);\n    }\n\n    /// @notice Allow lender to extend a loan for the borrower. Doesn't require\n    ///         borrower permission because it doesn't have a negative impact for them.\n    /// @dev    Since this function solely impacts the expiration day, the lender\n    ///         should ensure that extension interest payments are done beforehand.\n    /// @param  loanID_ index of loan in loans[].\n    /// @param  times_ that the fixed-term loan duration is extended.\n    function extendLoanTerms(uint256 loanID_, uint8 times_) external {\n        Loan memory loan = loans[loanID_];\n\n        if (msg.sender != loan.lender) revert OnlyApproved();\n        if (block.timestamp > loan.expiry) revert Default();\n\n        // Update loan terms to reflect the extension.\n        loan.expiry += loan.request.duration * times_;\n\n        // Save updated loan info in storage.\n        loans[loanID_] = loan;\n\n        // Log the event.\n        factory().logExtendLoan(loanID_, times_);\n    }\n\n    /// @notice Claim collateral upon loan default.\n    /// @param  loanID_ index of loan in loans[].\n    /// @return defaulted debt by the borrower, collateral kept by the lender, elapsed time since expiry.\n    function claimDefaulted(uint256 loanID_) external returns (uint256, uint256, uint256, uint256) {\n        Loan memory loan = loans[loanID_];\n\n        if (block.timestamp <= loan.expiry) revert NotExpired();\n\n        loans[loanID_].principal = 0;\n        loans[loanID_].interestDue = 0;\n        loans[loanID_].collateral = 0;\n\n        // Transfer defaulted collateral to the lender.\n        collateral().safeTransfer(loan.lender, loan.collateral);\n\n        // Log the event.\n        factory().logDefaultLoan(loanID_, loan.collateral);\n\n        // If necessary, trigger lender callback.\n        if (loan.callback) {\n            CoolerCallback(loan.lender).onDefault(\n                loanID_,\n                loan.principal,\n                loan.interestDue,\n                loan.collateral\n            );\n        }\n\n        return (loan.principal, loan.interestDue, loan.collateral, block.timestamp - loan.expiry);\n    }\n\n    /// @notice Approve transfer of loan ownership rights to a new address.\n    /// @param  to_ address to be approved.\n    /// @param  loanID_ index of loan in loans[].\n    function approveTransfer(address to_, uint256 loanID_) external {\n        if (msg.sender != loans[loanID_].lender) revert OnlyApproved();\n\n        // Update transfer approvals.\n        approvals[loanID_] = to_;\n    }\n\n    /// @notice Execute loan ownership transfer. Must be previously approved by the lender.\n    /// @param  loanID_ index of loan in loans[].\n    function transferOwnership(uint256 loanID_) external {\n        if (msg.sender != approvals[loanID_]) revert OnlyApproved();\n\n        // Update the load lender and the recipient.\n        loans[loanID_].lender = msg.sender;\n        loans[loanID_].recipient = msg.sender;\n        // Callbacks are disabled when transferring ownership.\n        loans[loanID_].callback = false;\n        // Clear transfer approvals.\n        approvals[loanID_] = address(0);\n    }\n\n    /// @notice Allow lender to set repayment recipient of a given loan.\n    /// @param  loanID_ of lender's loan.\n    /// @param  recipient_ reciever of repayments\n    function setRepaymentAddress(uint256 loanID_, address recipient_) external {\n        if (msg.sender != loans[loanID_].lender) revert OnlyApproved();\n\n        // Update the repayment method.\n        loans[loanID_].recipient = recipient_;\n    }\n\n    // --- AUX FUNCTIONS ---------------------------------------------\n\n    /// @notice Compute collateral needed for a desired loan amount at given loan to collateral ratio.\n    /// @param  principal_ amount of debt tokens.\n    /// @param  loanToCollateral_ ratio for loan. Expressed in 10**collateral().decimals().\n    function collateralFor(\n        uint256 principal_,\n        uint256 loanToCollateral_\n    ) public view returns (uint256) {\n        return (principal_ * (10 ** collateral().decimals())) / loanToCollateral_;\n    }\n\n    /// @notice Compute interest cost on amount for duration at given annualized rate.\n    /// @param  principal_ amount of debt tokens.\n    /// @param  rate_ of interest (annualized).\n    /// @param  duration_ of the loan in seconds.\n    /// @return Interest in debt token terms.\n    function interestFor(\n        uint256 principal_,\n        uint256 rate_,\n        uint256 duration_\n    ) public pure returns (uint256) {\n        uint256 interest = (rate_ * duration_) / 365 days;\n        return (principal_ * interest) / DECIMALS_INTEREST;\n    }\n\n    /// @notice Check if given loan has expired.\n    /// @param  loanID_ index of loan in loans[].\n    /// @return Expiration status.\n    function hasExpired(uint256 loanID_) external view returns (bool) {\n        return block.timestamp > loans[loanID_].expiry;\n    }\n\n    /// @notice Check if a given request is active.\n    /// @param  reqID_ index of request in requests[].\n    /// @return Active status.\n    function isActive(uint256 reqID_) external view returns (bool) {\n        return requests[reqID_].active;\n    }\n\n    /// @notice Getter for Request data as a struct.\n    /// @param  reqID_ index of request in requests[].\n    /// @return Request struct.\n    function getRequest(uint256 reqID_) external view returns (Request memory) {\n        return requests[reqID_];\n    }\n\n    /// @notice Getter for Loan data as a struct.\n    /// @param loanID_ index of loan in loans[].\n    /// @return Loan struct.\n    function getLoan(uint256 loanID_) external view returns (Loan memory) {\n        return loans[loanID_];\n    }\n}\n"
+    },
+    "src/modules/CHREG/CHREG.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {Module} from \"src/Kernel.sol\";\n\n/// @title  Olympus Clearinghouse Registry\n/// @notice Olympus Clearinghouse Registry (Module) Contract\n/// @dev    The Olympus Clearinghouse Registry Module tracks the lending facilities that the Olympus\n///         protocol deploys to satisfy the Cooler Loan demand. This allows for a single-source of truth\n///         for reporting purposes around the total Treasury holdings as well as its projected receivables.\nabstract contract CHREGv1 is Module {\n    // =========  ERRORS ========= //\n\n    error CHREG_InvalidConstructor();\n    error CHREG_NotActivated(address clearinghouse_);\n    error CHREG_AlreadyActivated(address clearinghouse_);\n\n    // ========= EVENTS ========= //\n\n    /// @notice Logs whenever a Clearinghouse is activated.\n    ///         If it is the first time, it is also added to the registry.\n    event ClearinghouseActivated(address indexed clearinghouse);\n\n    /// @notice Logs whenever an active Clearinghouse is deactivated.\n    event ClearinghouseDeactivated(address indexed clearinghouse);\n\n    // ========= STATE ========= //\n\n    /// @notice Count of active and historical clearinghouses.\n    /// @dev    These are useless variables in contracts, but useful for any frontends\n    ///         or off-chain requests where the array is not easily accessible.\n    uint256 public activeCount;\n    uint256 public registryCount;\n\n    /// @notice Tracks the addresses of all the active Clearinghouses.\n    address[] public active;\n\n    /// @notice Historical record of all the Clearinghouse addresses.\n    address[] public registry;\n\n    // ========= FUNCTIONS ========= //\n\n    /// @notice Adds a Clearinghouse to the registry.\n    ///         Only callable by permissioned policies.\n    ///\n    /// @param  clearinghouse_ The address of the clearinghouse.\n    function activateClearinghouse(address clearinghouse_) external virtual;\n\n    /// @notice Deactivates a clearinghouse from the registry.\n    ///         Only callable by permissioned policies.\n    ///\n    /// @param  clearinghouse_ The address of the clearinghouse.\n    function deactivateClearinghouse(address clearinghouse_) external virtual;\n}\n"
+    },
+    "src/policies/interfaces/cooler/IMonoCooler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {IERC20} from \"../../../interfaces/IERC20.sol\";\nimport {IDLGTEv1} from \"../../../modules/DLGTE/IDLGTE.v1.sol\";\nimport {ICoolerLtvOracle} from \"./ICoolerLtvOracle.sol\";\nimport {ICoolerTreasuryBorrower} from \"./ICoolerTreasuryBorrower.sol\";\nimport {IStaking} from \"../../../interfaces/IStaking.sol\";\n\n/**\n * @title Mono Cooler\n * @notice A borrow/lend market where users can deposit their gOHM as collateral and then\n * borrow a stablecoin debt token up to a certain LTV\n *  - The debt token may change over time - eg DAI to USDS (or USDC), determined by the\n *    `CoolerTreasuryBorrower`\n *  - The collateral and debt amounts tracked on this contract are always reported in wad,\n *    ie 18 decimal places\n *  - gOHM collateral can be delegated to accounts for voting, via the DLGTE module\n *  - Positions can be liquidated if the LTV breaches the 'liquidation LTV' as determined by the\n *    `LTV Oracle`\n *  - Users may set an authorization for one other address to act on its behalf.\n */\ninterface IMonoCooler {\n    error ExceededMaxOriginationLtv(uint256 newLtv, uint256 maxOriginationLtv);\n    error ExceededCollateralBalance();\n    error MinDebtNotMet(uint256 minRequired, uint256 current);\n    error InvalidAddress();\n    error InvalidParam();\n    error ExpectedNonZero();\n    error Paused();\n    error CannotLiquidate();\n    error InvalidDelegationRequests();\n    error ExceededPreviousLtv(uint256 oldLtv, uint256 newLtv);\n    error InvalidCollateralDelta();\n    error ExpiredSignature(uint256 deadline);\n    error InvalidNonce(uint256 deadline);\n    error InvalidSigner(address signer, address owner);\n    error UnauthorizedOnBehalfOf();\n\n    event BorrowPausedSet(bool isPaused);\n    event LiquidationsPausedSet(bool isPaused);\n    event InterestRateSet(uint96 interestRateWad);\n    event LtvOracleSet(address indexed oracle);\n    event TreasuryBorrowerSet(address indexed treasuryBorrower);\n    event CollateralAdded(\n        address indexed caller,\n        address indexed onBehalfOf,\n        uint128 collateralAmount\n    );\n    event CollateralWithdrawn(\n        address indexed caller,\n        address indexed onBehalfOf,\n        address indexed recipient,\n        uint128 collateralAmount\n    );\n    event Borrow(\n        address indexed caller,\n        address indexed onBehalfOf,\n        address indexed recipient,\n        uint128 amount\n    );\n    event Repay(address indexed caller, address indexed onBehalfOf, uint128 repayAmount);\n    event Liquidated(\n        address indexed caller,\n        address indexed account,\n        uint128 collateralSeized,\n        uint128 debtWiped,\n        uint128 incentives\n    );\n    event AuthorizationSet(\n        address indexed caller,\n        address indexed account,\n        address indexed authorized,\n        uint96 authorizationDeadline\n    );\n\n    /// @notice The record of an individual account's collateral and debt data\n    struct AccountState {\n        /// @notice The amount of gOHM collateral the account has posted\n        uint128 collateral;\n        /**\n         * @notice A checkpoint of user debt, updated after a borrow/repay/liquidation\n         * @dev Debt as of now =  (\n         *    `account.debtCheckpoint` *\n         *    `debtTokenData.interestAccumulator` /\n         *    `account.interestAccumulator`\n         * )\n         */\n        uint128 debtCheckpoint;\n        /// @notice The account's last interest accumulator checkpoint\n        uint256 interestAccumulatorRay;\n    }\n\n    struct Authorization {\n        /// @notice The address of the account granting authorization\n        address account;\n        /// @notice The address of who is authorized to act on the the accounts behalf\n        address authorized;\n        /// @notice The unix timestamp that the access is automatically revoked\n        uint96 authorizationDeadline;\n        /// @notice For replay protection\n        uint256 nonce;\n        /// @notice A unix timestamp for when the signature is valid until\n        uint256 signatureDeadline;\n    }\n\n    struct Signature {\n        uint8 v;\n        bytes32 r;\n        bytes32 s;\n    }\n\n    /// @notice The status for whether an account can be liquidated or not\n    struct LiquidationStatus {\n        /// @notice The amount [in gOHM collateral terms] of collateral which has been provided by the user\n        uint128 collateral;\n        /// @notice The up to date amount of debt [in debtToken terms]\n        uint128 currentDebt;\n        /// @notice The current LTV of this account [in debtTokens per gOHM collateral terms]\n        uint128 currentLtv;\n        /// @notice Has this account exceeded the liquidation LTV\n        bool exceededLiquidationLtv;\n        /// @notice Has this account exceeded the max origination LTV\n        bool exceededMaxOriginationLtv;\n        /// @notice A liquidator will receive this amount [in gOHM collateral terms] if\n        /// this account is liquidated as of this block\n        uint128 currentIncentive;\n    }\n\n    /// @notice An account's collateral and debt position details\n    /// Provided for UX\n    struct AccountPosition {\n        /// @notice The amount [in gOHM collateral terms] of collateral which has been provided by the user\n        /// @dev To 18 decimal places\n        uint256 collateral;\n        /// @notice The up to date amount of debt\n        /// @dev To 18 decimal places\n        uint256 currentDebt;\n        /// @notice The maximum amount of debtToken's this account can borrow given the\n        /// collateral posted, up to `maxOriginationLtv`\n        /// @dev To 18 decimal places\n        uint256 maxOriginationDebtAmount;\n        /// @notice The maximum amount of debtToken's this account can accrue before being\n        /// eligable to be liquidated, up to `liquidationLtv`\n        /// @dev To 18 decimal places\n        uint256 liquidationDebtAmount;\n        /// @notice The health factor of this accounts position.\n        /// Anything less than 1 can be liquidated, relative to `liquidationLtv`\n        /// @dev To 18 decimal places\n        uint256 healthFactor;\n        /// @notice The current LTV of this account [in debtTokens per gOHM collateral terms]\n        /// @dev To 18 decimal places\n        uint256 currentLtv;\n        /// @notice The total collateral delegated for this user across all delegates\n        /// @dev To 18 decimal places\n        uint256 totalDelegated;\n        /// @notice The current number of addresses this account has delegated to\n        uint256 numDelegateAddresses;\n        /// @notice The max number of delegates this account is allowed to delegate to\n        uint256 maxDelegateAddresses;\n    }\n\n    /// @notice The collateral token supplied by users/accounts, eg gOHM\n    function collateralToken() external view returns (IERC20);\n\n    /// @notice The debt token which can be borrowed, eg DAI or USDS\n    function debtToken() external view returns (IERC20);\n\n    /// @notice Unwrapped gOHM\n    function ohm() external view returns (IERC20);\n\n    /// @notice staking contract to unstake (and burn) OHM from liquidations\n    function staking() external view returns (IStaking);\n\n    /// @notice The minimum debt a user needs to maintain\n    /// @dev It costs gas to liquidate users, so we don't want dust amounts.\n    /// To 18 decimal places\n    function minDebtRequired() external view returns (uint256);\n\n    /// @notice The total amount of collateral posted across all accounts.\n    /// @dev To 18 decimal places\n    function totalCollateral() external view returns (uint128);\n\n    /// @notice The total amount of debt which has been borrowed across all users\n    /// as of the latest checkpoint\n    /// @dev To 18 decimal places\n    function totalDebt() external view returns (uint128);\n\n    /// @notice Liquidations may be paused in order for users to recover/repay debt after\n    /// emergency actions or interest rate changes\n    function liquidationsPaused() external view returns (bool);\n\n    /// @notice Borrows may be paused for emergency actions or deprecating the facility\n    function borrowsPaused() external view returns (bool);\n\n    /// @notice The flat interest rate (APR).\n    /// @dev Interest (approximately) continuously compounds at this rate.\n    /// @dev To 18 decimal places\n    function interestRateWad() external view returns (uint96);\n\n    /// @notice The oracle serving both the Max Origination LTV and the Liquidation LTV\n    function ltvOracle() external view returns (ICoolerLtvOracle);\n\n    /// @notice The policy which borrows/repays from Treasury on behalf of Cooler\n    function treasuryBorrower() external view returns (ICoolerTreasuryBorrower);\n\n    /// @notice The current Max Origination LTV and Liquidation LTV from the `ltvOracle()`\n    /// @dev Both to 18 decimal places\n    function loanToValues() external view returns (uint96 maxOriginationLtv, uint96 liquidationLtv);\n\n    /// @notice The last time the global debt accumulator was updated\n    function interestAccumulatorUpdatedAt() external view returns (uint40);\n\n    /// @notice The accumulator index used to track the compounding of debt, starting at 1e27 at genesis\n    /// @dev To RAY (1e27) precision\n    function interestAccumulatorRay() external view returns (uint256);\n\n    /// @notice Whether `authorized` is authorized to act on `authorizer`'s behalf for all user actions\n    /// up until the `authorizationDeadline` unix timestamp.\n    /// @dev Anyone is authorized to modify their own positions, regardless of this variable.\n    function authorizations(\n        address authorizer,\n        address authorized\n    ) external view returns (uint96 authorizationDeadline);\n\n    /// @notice The `authorizer`'s current nonce. Used to prevent replay attacks with EIP-712 signatures.\n    function authorizationNonces(address authorizer) external view returns (uint256);\n\n    /// @dev Returns the domain separator used in the encoding of the signature for `setAuthorizationWithSig()`, as defined by {EIP712}.\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n\n    /// @notice Sets the authorization for `authorized` to manage `msg.sender`'s positions until `authorizationDeadline`\n    /// @param authorized The authorized address.\n    /// @param authorizationDeadline The unix timestamp that they the authorization is valid until.\n    /// @dev Authorization can be revoked by setting the `authorizationDeadline` into the past\n    function setAuthorization(address authorized, uint96 authorizationDeadline) external;\n\n    /// @notice Sets the authorization for `authorization.authorized` to manage `authorization.authorizer`'s positions\n    /// until `authorization.authorizationDeadline`.\n    /// @dev Warning: Reverts if the signature has already been submitted.\n    /// @dev The signature is malleable, but it has no impact on the security here.\n    /// @dev The nonce is passed as argument to be able to revert with a different error message.\n    /// @param authorization The `Authorization` struct.\n    /// @param signature The signature.\n    /// @dev Authorization can be revoked by calling `setAuthorization()` and setting the `authorizationDeadline` into the past\n    function setAuthorizationWithSig(\n        Authorization calldata authorization,\n        Signature calldata signature\n    ) external;\n\n    /// @dev Returns whether the `sender` is authorized to manage `onBehalf`'s positions.\n    function isSenderAuthorized(address sender, address onBehalf) external view returns (bool);\n\n    //============================================================================================//\n    //                                        COLLATERAL                                          //\n    //============================================================================================//\n\n    /**\n     * @notice Deposit gOHM as collateral\n     * @param collateralAmount The amount to deposit to 18 decimal places\n     *    - MUST be greater than zero\n     * @param onBehalfOf A caller can add collateral on behalf of themselves or another address.\n     *    - MUST NOT be address(0)\n     * @param delegationRequests The set of delegations to apply after adding collateral.\n     *    - MAY be empty, meaning no delegations are applied.\n     *    - MUST ONLY be requests to add delegations, and that total MUST BE less than the `collateralAmount` argument\n     *    - If `onBehalfOf` does not equal the caller, the caller must be authorized via\n     *      `setAuthorization()` or `setAuthorizationWithSig()`\n     */\n    function addCollateral(\n        uint128 collateralAmount,\n        address onBehalfOf,\n        IDLGTEv1.DelegationRequest[] calldata delegationRequests\n    ) external;\n\n    /**\n     * @notice Withdraw gOHM collateral.\n     *    - Account LTV MUST be less than or equal to `maxOriginationLtv` after the withdraw is applied\n     *    - At least `collateralAmount` collateral MUST be undelegated for this account.\n     *      Use the `delegationRequests` to rescind enough as part of this request.\n     * @param collateralAmount The amount of collateral to remove to 18 decimal places\n     *    - MUST be greater than zero\n     *    - If set to type(uint128).max then withdraw the max amount up to maxOriginationLtv\n     * @param onBehalfOf A caller can withdraw collateral on behalf of themselves or another address if\n     *      authorized via `setAuthorization()` or `setAuthorizationWithSig()`\n     * @param recipient Send the gOHM collateral to a specified recipient address.\n     *    - MUST NOT be address(0)\n     * @param delegationRequests The set of delegations to apply before removing collateral.\n     *    - MAY be empty, meaning no delegations are applied.\n     *    - MUST ONLY be requests to undelegate, and that total undelegated MUST BE less than the `collateralAmount` argument\n     */\n    function withdrawCollateral(\n        uint128 collateralAmount,\n        address onBehalfOf,\n        address recipient,\n        IDLGTEv1.DelegationRequest[] calldata delegationRequests\n    ) external returns (uint128 collateralWithdrawn);\n\n    /**\n     * @notice Apply a set of delegation requests on behalf of a given user.\n     * @param delegationRequests The set of delegations to apply.\n     *    - MAY be empty, meaning no delegations are applied.\n     *    - Total collateral delegated as part of these requests MUST BE less than the account collateral.\n     *    - MUST NOT apply delegations that results in more collateral being undelegated than\n     *      the account has collateral for.\n     *    - It applies across total gOHM balances for a given account across all calling policies\n     *      So this may (un)delegate the account's gOHM set by another policy\n     * @param onBehalfOf A caller can apply delegations on behalf of themselves or another address if\n     *      authorized via `setAuthorization()` or `setAuthorizationWithSig()`\n     */\n    function applyDelegations(\n        IDLGTEv1.DelegationRequest[] calldata delegationRequests,\n        address onBehalfOf\n    )\n        external\n        returns (uint256 totalDelegated, uint256 totalUndelegated, uint256 undelegatedBalance);\n\n    //============================================================================================//\n    //                                       BORROW/REPAY                                         //\n    //============================================================================================//\n\n    /**\n     * @notice Borrow `debtToken`\n     *    - Account LTV MUST be less than or equal to `maxOriginationLtv` after the borrow is applied\n     *    - Total debt for this account MUST be greater than or equal to the `minDebtRequired`\n     *      after the borrow is applied\n     * @param borrowAmountInWad The amount of `debtToken` to borrow, to 18 decimals regardless of the debt token\n     *    - MUST be greater than zero\n     *    - If set to type(uint128).max then borrow the max amount up to maxOriginationLtv\n     * @param onBehalfOf A caller can borrow on behalf of themselves or another address if\n     *      authorized via `setAuthorization()` or `setAuthorizationWithSig()`\n     * @param recipient Send the borrowed token to a specified recipient address.\n     *    - MUST NOT be address(0)\n     * @return amountBorrowedInWad The amount actually borrowed.\n     */\n    function borrow(\n        uint128 borrowAmountInWad,\n        address onBehalfOf,\n        address recipient\n    ) external returns (uint128 amountBorrowedInWad);\n\n    /**\n     * @notice Repay a portion, or all of the debt\n     *    - MUST NOT be called for an account which has no debt\n     *    - If the entire debt isn't paid off, then the total debt for this account\n     *      MUST be greater than or equal to the `minDebtRequired` after the borrow is applied\n     * @param repayAmountInWad The amount to repay, to 18 decimals regardless of the debt token\n     *    - MUST be greater than zero\n     *    - MAY be greater than the latest debt as of this block. In which case it will be capped\n     *      to that latest debt\n     * @param onBehalfOf A caller can repay the debt on behalf of themselves or another address\n     * @return amountRepaidInWad The amount actually repaid.\n     */\n    function repay(\n        uint128 repayAmountInWad,\n        address onBehalfOf\n    ) external returns (uint128 amountRepaidInWad);\n\n    //============================================================================================//\n    //                                       LIQUIDATIONS                                         //\n    //============================================================================================//\n\n    /**\n     * @notice Liquidate one or more accounts which have exceeded the `liquidationLtv`\n     * The gOHM collateral is seized (unstaked to OHM and burned), and the accounts debt is wiped.\n     * @dev\n     *    - If one of the provided accounts in the batch hasn't exceeded the max LTV then it is skipped.\n     *    - Delegations are auto-rescinded if required. Ordering of this is not guaranteed.\n     */\n    function batchLiquidate(\n        address[] calldata accounts\n    )\n        external\n        returns (\n            uint128 totalCollateralClaimed,\n            uint128 totalDebtWiped,\n            uint128 totalLiquidationIncentive\n        );\n\n    /**\n     * @notice If an account becomes unhealthy and has many delegations such that liquidation can't be\n     * performed in one transaction, then delegations can be rescinded over multiple transactions\n     * in order to get this account into a state where it can then be liquidated.\n     */\n    function applyUnhealthyDelegations(\n        address account,\n        uint256 autoRescindMaxNumDelegates\n    ) external returns (uint256 totalUndelegated, uint256 undelegatedBalance);\n\n    //============================================================================================//\n    //                                           ADMIN                                            //\n    //============================================================================================//\n\n    /// @notice Set the oracle which serves the max Origination LTV and the Liquidation LTV\n    function setLtvOracle(address newOracle) external;\n\n    /// @notice Set the policy which borrows/repays from Treasury on behalf of Cooler\n    function setTreasuryBorrower(address newTreasuryBorrower) external;\n\n    /// @notice Liquidation may be paused in order for users to recover/repay debt after emergency actions\n    /// @dev Can only be called by emergency or admin roles\n    function setLiquidationsPaused(bool isPaused) external;\n\n    /// @notice Pause any new borrows of `debtToken`\n    /// @dev Can only be called by emergency or admin roles\n    function setBorrowPaused(bool isPaused) external;\n\n    /// @notice Update the interest rate (APR), specified in Wad (18 decimals)\n    /// @dev\n    ///     - Cannot be set higher than 10% APR\n    ///     - Interest (approximately) continuously compounds at this rate.\n    function setInterestRateWad(uint96 newInterestRateWad) external;\n\n    /// @notice Allow an account to have more or less than the DEFAULT_MAX_DELEGATE_ADDRESSES\n    /// number of delegates.\n    function setMaxDelegateAddresses(address account, uint32 maxDelegateAddresses) external;\n\n    /// @notice Update and checkpoint the total debt up until now\n    /// @dev May be useful in case there are no new user actions for some time.\n    function checkpointDebt()\n        external\n        returns (uint128 totalDebtInWad, uint256 interestAccumulatorRay);\n\n    //============================================================================================//\n    //                                      AUX FUNCTIONS                                         //\n    //============================================================================================//\n\n    /**\n     * @notice Calculate the difference in debt required in order to be at or just under\n     * the maxOriginationLTV if `collateralDelta` was added/removed\n     * from the current position.\n     * A positive `debtDeltaInWad` means the account can borrow that amount after adding that `collateralDelta` collateral\n     * A negative `debtDeltaInWad` means it needs to repay that amount in order to withdraw that `collateralDelta` collateral\n     * @dev debtDeltaInWad is always to 18 decimal places\n     */\n    function debtDeltaForMaxOriginationLtv(\n        address account,\n        int128 collateralDelta\n    ) external view returns (int128 debtDeltaInWad);\n\n    /**\n     * @notice An view of an accounts current and up to date position as of this block\n     * @param account The account to get a position for\n     */\n    function accountPosition(\n        address account\n    ) external view returns (AccountPosition memory position);\n\n    /**\n     * @notice Compute the liquidity status for a set of accounts.\n     * @dev This can be used to verify if accounts can be liquidated or not.\n     * @param accounts The accounts to get the status for.\n     */\n    function computeLiquidity(\n        address[] calldata accounts\n    ) external view returns (LiquidationStatus[] memory status);\n\n    /**\n     * @notice Paginated view of an account's delegations\n     * @dev Can call sequentially increasing the `startIndex` each time by the number of items returned in the previous call,\n     * until number of items returned is less than `maxItems`\n     */\n    function accountDelegationsList(\n        address account,\n        uint256 startIndex,\n        uint256 maxItems\n    ) external view returns (IDLGTEv1.AccountDelegation[] memory delegations);\n\n    /// @notice A view of the last checkpoint of account data (not as of this block)\n    function accountState(address account) external view returns (AccountState memory);\n\n    /// @notice An account's current collateral\n    /// @dev to 18 decimal places\n    function accountCollateral(address account) external view returns (uint128 collateralInWad);\n\n    /// @notice An account's current debt as of this block\n    //  @notice to 18 decimal places regardless of the debt token\n    function accountDebt(address account) external view returns (uint128 debtInWad);\n\n    /// @notice A view of the derived/internal cache data.\n    function globalState()\n        external\n        view\n        returns (uint128 totalDebt, uint256 interestAccumulatorRay);\n}\n"
+    },
+    "src/external/cooler/interfaces/ICoolerFactory.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\nimport {IERC20} from \"src/interfaces/IERC20.sol\";\n\ninterface ICoolerFactory {\n    // ===== ERRORS ===== //\n\n    error NotFromFactory();\n    error DecimalsNot18();\n\n    // ===== EVENTS ===== //\n\n    /// @notice A global event when a new loan request is created.\n    event RequestLoan(address indexed cooler, address collateral, address debt, uint256 reqID);\n    /// @notice A global event when a loan request is rescinded.\n    event RescindRequest(address indexed cooler, uint256 reqID);\n    /// @notice A global event when a loan request is fulfilled.\n    event ClearRequest(address indexed cooler, uint256 reqID, uint256 loanID);\n    /// @notice A global event when a loan is repaid.\n    event RepayLoan(address indexed cooler, uint256 loanID, uint256 amount);\n    /// @notice A global event when a loan is extended.\n    event ExtendLoan(address indexed cooler, uint256 loanID, uint8 times);\n    /// @notice A global event when the collateral of defaulted loan is claimed.\n    event DefaultLoan(address indexed cooler, uint256 loanID, uint256 amount);\n\n    // ===== COOLER FUNCTIONS ===== //\n\n    /// @notice Generate a new cooler.\n    ///\n    /// @param  collateral_ The collateral token.\n    /// @param  debt_       The debt token.\n    /// @return cooler      The address of the new cooler.\n    function generateCooler(IERC20 collateral_, IERC20 debt_) external returns (address cooler);\n\n    // ===== AUX FUNCTIONS ===== //\n\n    /// @notice Get the cooler for a given user <> collateral <> debt combination.\n    ///\n    /// @param  user_       The user address.\n    /// @param  collateral_ The collateral token.\n    /// @param  debt_       The debt token.\n    /// @return cooler      The address of the cooler.\n    function getCoolerFor(\n        address user_,\n        address collateral_,\n        address debt_\n    ) external view returns (address cooler);\n\n    /// @notice Check if a cooler was created by the factory.\n    ///\n    /// @param  cooler_ The cooler address.\n    /// @return bool    Whether the cooler was created by the factory.\n    function created(address cooler_) external view returns (bool);\n}\n"
+    },
+    "src/modules/DLGTE/IDLGTE.v1.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {IERC20} from \"../../interfaces/IERC20.sol\";\n\ninterface IDLGTEv1 {\n    // =========  ERRORS ========= //\n\n    error DLGTE_InvalidAddress();\n    error DLGTE_InvalidDelegationRequests();\n    error DLGTE_TooManyDelegates();\n    error DLGTE_InvalidDelegateEscrow();\n    error DLGTE_InvalidAmount();\n\n    error DLGTE_ExceededUndelegatedBalance(uint256 balance, uint256 requested);\n    error DLGTE_ExceededDelegatedBalance(address delegate, uint256 balance, uint256 requested);\n    error DLGTE_ExceededPolicyAccountBalance(uint256 balance, uint256 requested);\n\n    // ========= EVENTS ========= //\n\n    event DelegationApplied(address indexed account, address indexed delegate, int256 amount);\n\n    event MaxDelegateAddressesSet(address indexed account, uint256 maxDelegateAddresses);\n\n    // ========= STRUCTS ======= //\n\n    struct DelegationRequest {\n        /// @dev The address of the delegate\n        address delegate;\n        /// @dev The amount to (un)delegate.\n        /// positive means delegate, negative undelegate.\n        int256 amount;\n    }\n\n    struct AccountDelegation {\n        /// @dev The delegate address - the receiver account of the gOHM voting power.\n        address delegate;\n        /// @dev The amount of gOHM delegated to `delegate`\n        uint256 amount;\n        /// @dev The DelegateEscrow contract address for this `delegate`\n        address escrow;\n    }\n\n    // ========= FUNCTIONS ========= //\n\n    /**\n     * @notice Set an account to have more or less than the DEFAULT_MAX_DELEGATE_ADDRESSES\n     * number of delegates.\n     */\n    function setMaxDelegateAddresses(address account, uint32 maxDelegateAddresses) external;\n\n    /**\n     * @notice gOHM is pulled from the calling policy and added to the undelegated balance.\n     * @dev\n     *   - This gOHM cannot be used for governance voting until it is delegated.\n     *   - Deposted gOHM balances are tracked per policy. policyA cannot withdraw gOHM that policyB deposited\n     */\n    function depositUndelegatedGohm(address onBehalfOf, uint256 amount) external;\n\n    /**\n     * @notice Undelegated gOHM is transferred to the calling policy.\n     * @dev\n     *   - If `autoRescindMaxNumDelegates` is greater than zero, the delegations will be automatically rescinded if required\n     *     from up to `autoRescindMaxNumDelegates` number of delegate escrows. See `rescindDelegations()` for details\n     *   - Will revert if there is still not enough undelegated gOHM for `onBehalfOf` OR\n     *     if policy is attempting to withdraw more gOHM than it deposited\n     *     Deposted gOHM balances are tracked per policy. policyA cannot withdraw gOHM that policyB deposited\n     */\n    function withdrawUndelegatedGohm(\n        address onBehalfOf,\n        uint256 amount,\n        uint256 autoRescindMaxNumDelegates\n    ) external;\n\n    /**\n     * @notice Apply a set of delegation requests on behalf of a given account.\n     *  - Each delegation request either delegates or undelegates to an address\n     *  - It applies across total gOHM balances for a given account across all calling policies\n     *    So policyA may (un)delegate the account's gOHM set by policyA, B and C\n     */\n    function applyDelegations(\n        address onBehalfOf,\n        DelegationRequest[] calldata delegationRequests\n    )\n        external\n        returns (uint256 totalDelegated, uint256 totalUndelegated, uint256 undelegatedBalance);\n\n    /**\n     * @notice Rescind delegations until the amount undelegated for the `onBehalfOf` account\n     * is greater or equal to `requestedUndelegatedBalance`. No more than `maxNumDelegates`\n     * will be rescinded as part of this\n     * @dev\n     *    - Delegations are rescinded by iterating through the delegate addresses for the\n     *      `onBehalfOf` address.\n     *    - No guarantees on the order of who is rescinded -- it may change as delegations are\n     *      removed\n     *    - A calling policy may be able to rescind more than it added via `depositUndelegatedGohm()`\n     *      however the policy cannot then withdraw an amount higher than what it deposited.\n     *    - If the full `requestedUndelegatedBalance` cannot be fulfilled the `actualUndelegatedBalance`\n     *      return parameter may be less than `requestedUndelegatedBalance`. The caller must decide\n     *      on how to handle that.\n     */\n    function rescindDelegations(\n        address onBehalfOf,\n        uint256 requestedUndelegatedBalance,\n        uint256 maxNumDelegates\n    ) external returns (uint256 totalRescinded, uint256 newUndelegatedBalance);\n\n    /**\n     * @notice Report the total delegated and undelegated gOHM balance for an account\n     * in a given policy\n     */\n    function policyAccountBalances(\n        address policy,\n        address account\n    ) external view returns (uint256 gOhmBalance);\n\n    /**\n     * @notice Paginated view of an account's delegations\n     * @dev This can be called sequentially, increasing the `startIndex` each time by the number of items\n     * returned in the previous call, until number of items returned is less than `maxItems`\n     * The `totalAmount` delegated within the return struct is across all policies for that account delegate\n     */\n    function accountDelegationsList(\n        address account,\n        uint256 startIndex,\n        uint256 maxItems\n    ) external view returns (AccountDelegation[] memory delegations);\n\n    /**\n     * @notice A summary of an account's delegations\n     */\n    function accountDelegationSummary(\n        address account\n    )\n        external\n        view\n        returns (\n            uint256 totalGOhm,\n            uint256 delegatedGOhm,\n            uint256 numDelegateAddresses,\n            uint256 maxAllowedDelegateAddresses\n        );\n\n    /**\n     * @notice The total amount delegated to a particular delegate across all policies,\n     * and externally made delegations (including any permanent donations)\n     */\n    function totalDelegatedTo(address delegate) external view returns (uint256);\n\n    /**\n     * @notice The maximum number of delegates an account can have accross all policies\n     */\n    function maxDelegateAddresses(address account) external view returns (uint32 result);\n\n    /// @notice The gOhm token supplied by accounts\n    function gOHM() external view returns (IERC20);\n\n    /// @notice The default maximum number of addresses an account can delegate to\n    function DEFAULT_MAX_DELEGATE_ADDRESSES() external view returns (uint32);\n}\n"
+    },
+    "lib/clones-with-immutable-args/src/Clone.sol": {
+      "content": "// SPDX-License-Identifier: BSD\npragma solidity ^0.8.4;\n\n/// @title Clone\n/// @author zefram.eth\n/// @notice Provides helper functions for reading immutable args from calldata\ncontract Clone {\n    /// @notice Reads an immutable arg with type address\n    /// @param argOffset The offset of the arg in the packed data\n    /// @return arg The arg value\n    function _getArgAddress(uint256 argOffset)\n        internal\n        pure\n        returns (address arg)\n    {\n        uint256 offset = _getImmutableArgsOffset();\n        assembly {\n            arg := shr(0x60, calldataload(add(offset, argOffset)))\n        }\n    }\n\n    /// @notice Reads an immutable arg with type uint256\n    /// @param argOffset The offset of the arg in the packed data\n    /// @return arg The arg value\n    function _getArgUint256(uint256 argOffset)\n        internal\n        pure\n        returns (uint256 arg)\n    {\n        uint256 offset = _getImmutableArgsOffset();\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            arg := calldataload(add(offset, argOffset))\n        }\n    }\n\n    /// @notice Reads an immutable arg with type uint64\n    /// @param argOffset The offset of the arg in the packed data\n    /// @return arg The arg value\n    function _getArgUint64(uint256 argOffset)\n        internal\n        pure\n        returns (uint64 arg)\n    {\n        uint256 offset = _getImmutableArgsOffset();\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            arg := shr(0xc0, calldataload(add(offset, argOffset)))\n        }\n    }\n\n    /// @notice Reads an immutable arg with type uint8\n    /// @param argOffset The offset of the arg in the packed data\n    /// @return arg The arg value\n    function _getArgUint8(uint256 argOffset) internal pure returns (uint8 arg) {\n        uint256 offset = _getImmutableArgsOffset();\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            arg := shr(0xf8, calldataload(add(offset, argOffset)))\n        }\n    }\n\n    /// @return offset The offset of the packed immutable args in calldata\n    function _getImmutableArgsOffset() internal pure returns (uint256 offset) {\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            offset := sub(\n                calldatasize(),\n                add(shr(240, calldataload(sub(calldatasize(), 2))), 2)\n            )\n        }\n    }\n}\n"
+    },
+    "src/external/cooler/CoolerFactory.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\nimport {ClonesWithImmutableArgs} from \"clones/ClonesWithImmutableArgs.sol\";\n\nimport {Cooler} from \"./Cooler.sol\";\n\n/// @title  Cooler Loans Factory.\n/// @notice The Cooler Factory creates new Cooler escrow contracts.\n/// @dev    This contract uses Clones (https://github.com/wighawag/clones-with-immutable-args)\n///         to save gas on deployment.\ncontract CoolerFactory {\n    using ClonesWithImmutableArgs for address;\n\n    // --- ERRORS ----------------------------------------------------\n\n    error NotFromFactory();\n    error DecimalsNot18();\n\n    // --- EVENTS ----------------------------------------------------\n\n    /// @notice A global event when a new loan request is created.\n    event RequestLoan(address indexed cooler, address collateral, address debt, uint256 reqID);\n    /// @notice A global event when a loan request is rescinded.\n    event RescindRequest(address indexed cooler, uint256 reqID);\n    /// @notice A global event when a loan request is fulfilled.\n    event ClearRequest(address indexed cooler, uint256 reqID, uint256 loanID);\n    /// @notice A global event when a loan is repaid.\n    event RepayLoan(address indexed cooler, uint256 loanID, uint256 amount);\n    /// @notice A global event when a loan is extended.\n    event ExtendLoan(address indexed cooler, uint256 loanID, uint8 times);\n    /// @notice A global event when the collateral of defaulted loan is claimed.\n    event DefaultLoan(address indexed cooler, uint256 loanID, uint256 amount);\n\n    // -- STATE VARIABLES --------------------------------------------\n\n    /// @notice Cooler reference implementation (deployed on creation to clone from).\n    Cooler public immutable coolerImplementation;\n\n    /// @notice Mapping to validate deployed coolers.\n    mapping(address => bool) public created;\n\n    /// @notice Mapping to prevent duplicate coolers.\n    mapping(address => mapping(ERC20 => mapping(ERC20 => address))) private coolerFor;\n\n    /// @notice Mapping to query Coolers for Collateral-Debt pair.\n    mapping(ERC20 => mapping(ERC20 => address[])) public coolersFor;\n\n    // --- INITIALIZATION --------------------------------------------\n\n    constructor() {\n        coolerImplementation = new Cooler();\n    }\n\n    // --- DEPLOY NEW COOLERS ----------------------------------------\n\n    /// @notice creates a new Escrow contract for collateral and debt tokens.\n    /// @param  collateral_ the token given as collateral.\n    /// @param  debt_ the token to be lent. Interest is denominated in debt tokens.\n    /// @return cooler address of the contract.\n    function generateCooler(ERC20 collateral_, ERC20 debt_) external returns (address cooler) {\n        // Return address if cooler exists.\n        cooler = coolerFor[msg.sender][collateral_][debt_];\n\n        // Otherwise generate new cooler.\n        if (cooler == address(0)) {\n            if (collateral_.decimals() != 18 || debt_.decimals() != 18) revert DecimalsNot18();\n            // Clone the cooler implementation.\n            bytes memory coolerData = abi.encodePacked(\n                msg.sender, // owner\n                address(collateral_), // collateral\n                address(debt_), // debt\n                address(this) // factory\n            );\n            cooler = address(coolerImplementation).clone(coolerData);\n\n            // Update storage accordingly.\n            coolerFor[msg.sender][collateral_][debt_] = cooler;\n            coolersFor[collateral_][debt_].push(cooler);\n            created[cooler] = true;\n        }\n    }\n\n    // --- EMIT EVENTS -----------------------------------------------\n\n    /// @notice Ensure that the called is a Cooler.\n    modifier onlyFromFactory() {\n        if (!created[msg.sender]) revert NotFromFactory();\n        _;\n    }\n\n    /// @notice Emit a global event when a new loan request is created.\n    function logRequestLoan(uint256 reqID_) external onlyFromFactory {\n        emit RequestLoan(\n            msg.sender,\n            address(Cooler(msg.sender).collateral()),\n            address(Cooler(msg.sender).debt()),\n            reqID_\n        );\n    }\n\n    /// @notice Emit a global event when a loan request is rescinded.\n    function logRescindRequest(uint256 reqID_) external onlyFromFactory {\n        emit RescindRequest(msg.sender, reqID_);\n    }\n\n    /// @notice Emit a global event when a loan request is fulfilled.\n    function logClearRequest(uint256 reqID_, uint256 loanID_) external onlyFromFactory {\n        emit ClearRequest(msg.sender, reqID_, loanID_);\n    }\n\n    /// @notice Emit a global event when a loan is repaid.\n    function logRepayLoan(uint256 loanID_, uint256 repayment_) external onlyFromFactory {\n        emit RepayLoan(msg.sender, loanID_, repayment_);\n    }\n\n    /// @notice Emit a global event when a loan is extended.\n    function logExtendLoan(uint256 loanID_, uint8 times_) external onlyFromFactory {\n        emit ExtendLoan(msg.sender, loanID_, times_);\n    }\n\n    /// @notice Emit a global event when the collateral of defaulted loan is claimed.\n    function logDefaultLoan(uint256 loanID_, uint256 collateral_) external onlyFromFactory {\n        emit DefaultLoan(msg.sender, loanID_, collateral_);\n    }\n\n    // --- AUX FUNCTIONS ---------------------------------------------\n\n    /// @notice Getter function to get an existing cooler for a given user <> collateral <> debt combination.\n    function getCoolerFor(\n        address user_,\n        address collateral_,\n        address debt_\n    ) public view returns (address) {\n        return coolerFor[user_][ERC20(collateral_)][ERC20(debt_)];\n    }\n}\n"
+    },
+    "src/external/cooler/CoolerCallback.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\nimport {CoolerFactory} from \"./CoolerFactory.sol\";\n\n/// @notice Allows for debt issuers to execute logic when a loan is repaid, rolled, or defaulted.\n/// @dev    The three callback functions must be implemented if `isCoolerCallback()` is set to true.\nabstract contract CoolerCallback {\n    // --- ERRORS ----------------------------------------------------\n\n    error OnlyFromFactory();\n\n    // --- INITIALIZATION --------------------------------------------\n\n    CoolerFactory public immutable factory;\n\n    constructor(address coolerFactory_) {\n        factory = CoolerFactory(coolerFactory_);\n    }\n\n    // --- EXTERNAL FUNCTIONS ------------------------------------------------\n\n    /// @notice Informs to Cooler that this contract can handle its callbacks.\n    function isCoolerCallback() external pure returns (bool) {\n        return true;\n    }\n\n    /// @notice Callback function that handles repayments.\n    function onRepay(uint256 loanID_, uint256 principlePaid_, uint256 interestPaid_) external {\n        if (!factory.created(msg.sender)) revert OnlyFromFactory();\n        _onRepay(loanID_, principlePaid_, interestPaid_);\n    }\n\n    /// @notice Callback function that handles defaults.\n    function onDefault(\n        uint256 loanID_,\n        uint256 principle,\n        uint256 interest,\n        uint256 collateral\n    ) external {\n        if (!factory.created(msg.sender)) revert OnlyFromFactory();\n        _onDefault(loanID_, principle, interest, collateral);\n    }\n\n    // --- INTERNAL FUNCTIONS ------------------------------------------------\n\n    /// @notice Callback function that handles repayments. Override for custom logic.\n    function _onRepay(\n        uint256 loanID_,\n        uint256 principlePaid_,\n        uint256 interestPaid_\n    ) internal virtual;\n\n    /// @notice Callback function that handles defaults.\n    function _onDefault(\n        uint256 loanID_,\n        uint256 principle_,\n        uint256 interestDue_,\n        uint256 collateral\n    ) internal virtual;\n}\n"
+    },
+    "src/Kernel.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\n//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████\n//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███\n//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░\n// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████\n// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███\n// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███\n//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████\n//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░\n\n//============================================================================================//\n//                                        GLOBAL TYPES                                        //\n//============================================================================================//\n\n/// @notice Actions to trigger state changes in the kernel. Passed by the executor\nenum Actions {\n    InstallModule,\n    UpgradeModule,\n    ActivatePolicy,\n    DeactivatePolicy,\n    ChangeExecutor,\n    MigrateKernel\n}\n\n/// @notice Used by executor to select an action and a target contract for a kernel action\nstruct Instruction {\n    Actions action;\n    address target;\n}\n\n/// @notice Used to define which module functions a policy needs access to\nstruct Permissions {\n    Keycode keycode;\n    bytes4 funcSelector;\n}\n\ntype Keycode is bytes5;\n\n//============================================================================================//\n//                                       UTIL FUNCTIONS                                       //\n//============================================================================================//\n\nerror TargetNotAContract(address target_);\nerror InvalidKeycode(Keycode keycode_);\n\n// solhint-disable-next-line func-visibility\nfunction toKeycode(bytes5 keycode_) pure returns (Keycode) {\n    return Keycode.wrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction fromKeycode(Keycode keycode_) pure returns (bytes5) {\n    return Keycode.unwrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureContract(address target_) view {\n    if (target_.code.length == 0) revert TargetNotAContract(target_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureValidKeycode(Keycode keycode_) pure {\n    bytes5 unwrapped = Keycode.unwrap(keycode_);\n    for (uint256 i = 0; i < 5; ) {\n        bytes1 char = unwrapped[i];\n        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only\n        unchecked {\n            i++;\n        }\n    }\n}\n\n//============================================================================================//\n//                                        COMPONENTS                                          //\n//============================================================================================//\n\n/// @notice Generic adapter interface for kernel access in modules and policies.\nabstract contract KernelAdapter {\n    error KernelAdapter_OnlyKernel(address caller_);\n\n    Kernel public kernel;\n\n    constructor(Kernel kernel_) {\n        kernel = kernel_;\n    }\n\n    /// @notice Modifier to restrict functions to be called only by kernel.\n    modifier onlyKernel() {\n        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);\n        _;\n    }\n\n    /// @notice Function used by kernel when migrating to a new kernel.\n    function changeKernel(Kernel newKernel_) external onlyKernel {\n        kernel = newKernel_;\n    }\n}\n\n/// @notice Base level extension of the kernel. Modules act as independent state components to be\n///         interacted with and mutated through policies.\n/// @dev    Modules are installed and uninstalled via the executor.\nabstract contract Module is KernelAdapter {\n    error Module_PolicyNotPermitted(address policy_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Modifier to restrict which policies have access to module functions.\n    modifier permissioned() {\n        if (\n            msg.sender == address(kernel) ||\n            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)\n        ) revert Module_PolicyNotPermitted(msg.sender);\n        _;\n    }\n\n    /// @notice 5 byte identifier for a module.\n    function KEYCODE() public pure virtual returns (Keycode) {}\n\n    /// @notice Returns which semantic version of a module is being implemented.\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}\n\n    /// @notice Initialization function for the module\n    /// @dev    This function is called when the module is installed or upgraded by the kernel.\n    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.\n    function INIT() external virtual onlyKernel {}\n}\n\n/// @notice Policies are application logic and external interface for the kernel and installed modules.\n/// @dev    Policies are activated and deactivated in the kernel by the executor.\n/// @dev    Module dependencies and function permissions must be defined in appropriate functions.\nabstract contract Policy is KernelAdapter {\n    error Policy_ModuleDoesNotExist(Keycode keycode_);\n    error Policy_WrongModuleVersion(bytes expected_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Easily accessible indicator for if a policy is activated or not.\n    function isActive() external view returns (bool) {\n        return kernel.isPolicyActive(this);\n    }\n\n    /// @notice Function to grab module address from a given keycode.\n    function getModuleAddress(Keycode keycode_) internal view returns (address) {\n        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));\n        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);\n        return moduleForKeycode;\n    }\n\n    /// @notice Define module dependencies for this policy.\n    /// @return dependencies - Keycode array of module dependencies.\n    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}\n\n    /// @notice Function called by kernel to set module function permissions.\n    /// @return requests - Array of keycodes and function selectors for requested permissions.\n    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}\n}\n\n/// @notice Main contract that acts as a central component registry for the protocol.\n/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,\n/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.\ncontract Kernel {\n    // =========  EVENTS ========= //\n\n    event PermissionsUpdated(\n        Keycode indexed keycode_,\n        Policy indexed policy_,\n        bytes4 funcSelector_,\n        bool granted_\n    );\n    event ActionExecuted(Actions indexed action_, address indexed target_);\n\n    // =========  ERRORS ========= //\n\n    error Kernel_OnlyExecutor(address caller_);\n    error Kernel_ModuleAlreadyInstalled(Keycode module_);\n    error Kernel_InvalidModuleUpgrade(Keycode module_);\n    error Kernel_PolicyAlreadyActivated(address policy_);\n    error Kernel_PolicyNotActivated(address policy_);\n\n    // =========  PRIVILEGED ADDRESSES ========= //\n\n    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.\n    address public executor;\n\n    // =========  MODULE MANAGEMENT ========= //\n\n    /// @notice Array of all modules currently installed.\n    Keycode[] public allKeycodes;\n\n    /// @notice Mapping of module address to keycode.\n    mapping(Keycode => Module) public getModuleForKeycode;\n\n    /// @notice Mapping of keycode to module address.\n    mapping(Module => Keycode) public getKeycodeForModule;\n\n    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.\n    mapping(Keycode => Policy[]) public moduleDependents;\n\n    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.\n    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;\n\n    /// @notice Module <> Policy Permissions.\n    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission\n    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;\n\n    // =========  POLICY MANAGEMENT ========= //\n\n    /// @notice List of all active policies\n    Policy[] public activePolicies;\n\n    /// @notice Helper to get active policy quickly. Prevents need to loop through array.\n    mapping(Policy => uint256) public getPolicyIndex;\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    constructor() {\n        executor = msg.sender;\n    }\n\n    /// @notice Modifier to check if caller is the executor.\n    modifier onlyExecutor() {\n        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);\n        _;\n    }\n\n    function isPolicyActive(Policy policy_) public view returns (bool) {\n        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;\n    }\n\n    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.\n    function executeAction(Actions action_, address target_) external onlyExecutor {\n        if (action_ == Actions.InstallModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _installModule(Module(target_));\n        } else if (action_ == Actions.UpgradeModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _upgradeModule(Module(target_));\n        } else if (action_ == Actions.ActivatePolicy) {\n            ensureContract(target_);\n            _activatePolicy(Policy(target_));\n        } else if (action_ == Actions.DeactivatePolicy) {\n            ensureContract(target_);\n            _deactivatePolicy(Policy(target_));\n        } else if (action_ == Actions.ChangeExecutor) {\n            executor = target_;\n        } else if (action_ == Actions.MigrateKernel) {\n            ensureContract(target_);\n            _migrateKernel(Kernel(target_));\n        }\n\n        emit ActionExecuted(action_, target_);\n    }\n\n    function _installModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n\n        if (address(getModuleForKeycode[keycode]) != address(0))\n            revert Kernel_ModuleAlreadyInstalled(keycode);\n\n        getModuleForKeycode[keycode] = newModule_;\n        getKeycodeForModule[newModule_] = keycode;\n        allKeycodes.push(keycode);\n\n        newModule_.INIT();\n    }\n\n    function _upgradeModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n        Module oldModule = getModuleForKeycode[keycode];\n\n        if (address(oldModule) == address(0) || oldModule == newModule_)\n            revert Kernel_InvalidModuleUpgrade(keycode);\n\n        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));\n        getKeycodeForModule[newModule_] = keycode;\n        getModuleForKeycode[keycode] = newModule_;\n\n        newModule_.INIT();\n\n        _reconfigurePolicies(keycode);\n    }\n\n    function _activatePolicy(Policy policy_) internal {\n        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));\n\n        // Add policy to list of active policies\n        activePolicies.push(policy_);\n        getPolicyIndex[policy_] = activePolicies.length - 1;\n\n        // Record module dependencies\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depLength = dependencies.length;\n\n        for (uint256 i; i < depLength; ) {\n            Keycode keycode = dependencies[i];\n\n            moduleDependents[keycode].push(policy_);\n            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        // Grant permissions for policy to access restricted module functions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, true);\n    }\n\n    function _deactivatePolicy(Policy policy_) internal {\n        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));\n\n        // Revoke permissions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, false);\n\n        // Remove policy from all policy data structures\n        uint256 idx = getPolicyIndex[policy_];\n        Policy lastPolicy = activePolicies[activePolicies.length - 1];\n\n        activePolicies[idx] = lastPolicy;\n        activePolicies.pop();\n        getPolicyIndex[lastPolicy] = idx;\n        delete getPolicyIndex[policy_];\n\n        // Remove policy from module dependents\n        _pruneFromDependents(policy_);\n    }\n\n    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.\n    /// @dev    New kernel must add in all of the modules and policies via executeAction.\n    /// @dev    NOTE: Data does not get cleared from this kernel.\n    function _migrateKernel(Kernel newKernel_) internal {\n        uint256 keycodeLen = allKeycodes.length;\n        for (uint256 i; i < keycodeLen; ) {\n            Module module = Module(getModuleForKeycode[allKeycodes[i]]);\n            module.changeKernel(newKernel_);\n            unchecked {\n                ++i;\n            }\n        }\n\n        uint256 policiesLen = activePolicies.length;\n        for (uint256 j; j < policiesLen; ) {\n            Policy policy = activePolicies[j];\n\n            // Deactivate before changing kernel\n            policy.changeKernel(newKernel_);\n            unchecked {\n                ++j;\n            }\n        }\n    }\n\n    function _reconfigurePolicies(Keycode keycode_) internal {\n        Policy[] memory dependents = moduleDependents[keycode_];\n        uint256 depLength = dependents.length;\n\n        for (uint256 i; i < depLength; ) {\n            dependents[i].configureDependencies();\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _setPolicyPermissions(\n        Policy policy_,\n        Permissions[] memory requests_,\n        bool grant_\n    ) internal {\n        uint256 reqLength = requests_.length;\n        for (uint256 i = 0; i < reqLength; ) {\n            Permissions memory request = requests_[i];\n            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;\n\n            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _pruneFromDependents(Policy policy_) internal {\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depcLength = dependencies.length;\n\n        for (uint256 i; i < depcLength; ) {\n            Keycode keycode = dependencies[i];\n            Policy[] storage dependents = moduleDependents[keycode];\n\n            uint256 origIndex = getDependentIndex[keycode][policy_];\n            Policy lastPolicy = dependents[dependents.length - 1];\n\n            // Swap with last and pop\n            dependents[origIndex] = lastPolicy;\n            dependents.pop();\n\n            // Record new index and delete deactivated policy index\n            getDependentIndex[keycode][lastPolicy] = origIndex;\n            delete getDependentIndex[keycode][policy_];\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n}\n"
+    },
+    "src/interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\n// Imported from forge-std\n\n/// @dev Interface of the ERC20 standard as defined in the EIP.\n/// @dev This includes the optional name, symbol, and decimals metadata.\ninterface IERC20 {\n    /// @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /// @dev Emitted when the allowance of a `spender` for an `owner` is set, where `value`\n    /// is the new allowance.\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /// @notice Returns the amount of tokens in existence.\n    function totalSupply() external view returns (uint256);\n\n    /// @notice Returns the amount of tokens owned by `account`.\n    function balanceOf(address account) external view returns (uint256);\n\n    /// @notice Moves `amount` tokens from the caller's account to `to`.\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the remaining number of tokens that `spender` is allowed\n    /// to spend on behalf of `owner`\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /// @notice Sets `amount` as the allowance of `spender` over the caller's tokens.\n    /// @dev Be aware of front-running risks: https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /// @notice Moves `amount` tokens from `from` to `to` using the allowance mechanism.\n    /// `amount` is then deducted from the caller's allowance.\n    function transferFrom(address from, address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the name of the token.\n    function name() external view returns (string memory);\n\n    /// @notice Returns the symbol of the token.\n    function symbol() external view returns (string memory);\n\n    /// @notice Returns the decimals places of the token.\n    function decimals() external view returns (uint8);\n}\n"
+    },
+    "src/policies/interfaces/cooler/ICoolerLtvOracle.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {IERC20} from \"../../../interfaces/IERC20.sol\";\n\n/**\n * @title Cooler LTV Oracle\n * @notice It is a custom oracle (not dependant on external markets/AMMs/dependencies) to give the\n * serve both the Origination LTV and Liquidation LTV\n *  - They are both quoted in [debtToken / collateralToken] units\n *  - It is a fixed 18dp price\n *  - Origination LTV updates on a per second basis according to a policy set rate of change (and is up only or flat)\n *  - Liquidation LTV is a policy set percentage above the Origination LTV\n */\ninterface ICoolerLtvOracle {\n    event OriginationLtvSetAt(\n        uint96 oldOriginationLtv,\n        uint96 newOriginationLtvTarget,\n        uint256 targetTime\n    );\n    event MaxOriginationLtvDeltaSet(uint256 maxDelta);\n    event MinOriginationLtvTargetTimeDeltaSet(uint32 maxTargetTimeDelta);\n    event MaxOriginationLtvRateOfChangeSet(uint96 maxRateOfChange);\n    event MaxLiquidationLtvPremiumBpsSet(uint96 maxPremiumBps);\n    event LiquidationLtvPremiumBpsSet(uint96 premiumBps);\n\n    error BreachedMaxOriginationLtvDelta(\n        uint96 oldOriginationLtv,\n        uint96 newOriginationLtv,\n        uint256 maxDelta\n    );\n    error BreachedMinDateDelta(uint40 targetTime, uint40 currentDate, uint32 maxTargetTimeDelta);\n    error BreachedMaxOriginationLtvRateOfChange(uint96 targetRateOfChange, uint96 maxRateOfChange);\n    error CannotDecreaseLtv();\n    error InvalidParam();\n\n    /// @notice The collateral asset of the LTV [debtToken / collateralToken]\n    function collateralToken() external view returns (IERC20);\n\n    /// @notice The debt asset of the LTV [debtToken / collateralToken]\n    function debtToken() external view returns (IERC20);\n\n    /// @notice The current Origination LTV and Liquidation LTV\n    function currentLtvs() external view returns (uint96 originationLtv, uint96 liquidationLtv);\n\n    /// @notice The current Origination LTV\n    function currentOriginationLtv() external view returns (uint96);\n\n    /// @notice The current Liquidation LTV\n    function currentLiquidationLtv() external view returns (uint96);\n\n    /// @notice The maximum allowed Origination LTV change on any single `setOriginationLtvAt()`, in absolute terms\n    /// between the Origination LTV as of now and the targetOriginationLtv\n    /// @dev 18 decimal places, 0.20e18 == $0.20.\n    /// Used as a bound to avoid unintended/fat fingering when updating Origination LTV\n    function maxOriginationLtvDelta() external view returns (uint96);\n\n    /// @notice The minimum time delta required for Origination LTV to reach it's target value when\n    /// `setOriginationLtvAt()` is called.\n    /// @dev In seconds.\n    /// Used as a bound to avoid unintended/fat fingering when updating Origination LTV\n    function minOriginationLtvTargetTimeDelta() external view returns (uint32);\n\n    /// @notice The maximum (positive) rate of change of Origination LTV allowed, when\n    /// `setOriginationLtvAt()` is called.\n    /// @dev Units: [Origination LTV / second]\n    function maxOriginationLtvRateOfChange() external view returns (uint96);\n\n    /// @notice The current Origination LTV state data\n    function originationLtvData()\n        external\n        view\n        returns (\n            uint96 startingValue,\n            uint40 startTime,\n            uint96 targetValue,\n            uint40 targetTime,\n            uint96 slope\n        );\n\n    /// @notice The maximum Liquidation LTV premium (in basis points) which is allowed to be set when calling\n    /// `setLiquidationLtvPremiumBps()`\n    function maxLiquidationLtvPremiumBps() external view returns (uint16);\n\n    /// @notice The premium (in basis points) of the Liquidation LTV above the Origination LTV\n    function liquidationLtvPremiumBps() external view returns (uint16);\n\n    /// @notice Set maximum Liquidation LTV premium (in basis points) which is allowed to be set when calling\n    /// `setLiquidationLtvPremiumBps()`.\n    function setLiquidationLtvPremiumBps(uint16 premiumBps) external;\n\n    /// @notice Set Liquidation LTV premium (in basis points) of the Liquidation LTV above the Origination LTV\n    function setMaxLiquidationLtvPremiumBps(uint16 premiumBps) external;\n\n    /// @notice Set the maximum allowed Origination LTV change on any single `setOriginationLtvAt()`, in absolute terms\n    /// between the Origination LTV as of now and the targetOriginationLtv\n    /// @dev 18 decimal places, 0.20e18 == $0.20\n    function setMaxOriginationLtvDelta(uint96 maxDelta) external;\n\n    /// @notice Set the minimum time delta required for Origination LTV to reach it's target value when\n    /// `setOriginationLtvAt()` is called.\n    /// @dev In seconds.\n    function setMinOriginationLtvTargetTimeDelta(uint32 minTargetTimeDelta) external;\n\n    /// @notice Set the maximum (positive) rate of change of Origination LTV allowed, when\n    /// `setOriginationLtvAt()` is called.\n    /// @dev Units: [Origination LTV / second]\n    function setMaxOriginationLtvRateOfChange(\n        uint96 originationLtvDelta,\n        uint32 timeDelta\n    ) external;\n\n    /// @notice Set the target Origination LTV which will incrementally increase from it's current value to `targetOriginationLtv`\n    /// between now and `targetTime`.\n    /// @dev targetTime is unixtime, targetOriginationLtv is 18 decimal places, 1.05e18 == $1.05\n    function setOriginationLtvAt(uint96 targetOriginationLtv, uint40 targetTime) external;\n\n    /// @notice The decimal precision of both the Origination LTV and Liquidation LTV\n    function DECIMALS() external view returns (uint8);\n}\n"
+    },
+    "src/policies/interfaces/cooler/ICoolerTreasuryBorrower.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {IERC20} from \"../../../interfaces/IERC20.sol\";\n\n/**\n * @title Cooler Treasury Borrower\n * @notice Policy which can borrow from Treasury on behalf of Cooler\n *  - Cooler will always represent the debt amount in 18 decimal places.\n *  - This logic is split out into a separate policy (rather than using `TreasuryCustodian`):\n *      1/ So the Cooler debt token can be updated if required in future to another stablecoin without a redeploy of Cooler.\n *      2/ In this case, debt is denominated in USDS but stored 'at rest' in Treasury into sUSDS for extra yield.\n *  - Upon an upgreade, if the actual debt token is changed (with a new deployment of this contract) to a non 18dp asset\n *    eg USDC, then borrow() and repay() will need to do the conversion.\n */\ninterface ICoolerTreasuryBorrower {\n    error OnlyCooler();\n    error InvalidParam();\n    error InvalidAddress();\n    error ExpectedNonZero();\n\n    /// @notice Cooler borrows `amount` of `debtToken` from treasury, sent to `recipient`\n    /// @param amountInWad The amount to borrow. Always 18 decimal places\n    ///               regardless of the `debtToken.decimals()`\n    /// @dev If the debtToken is 6dp (eg USDC) then this contract needs to handle the conversion internally\n    function borrow(uint256 amountInWad, address recipient) external;\n\n    /// @notice Repay any `debtToken` in this contract back to treasury.\n    /// @dev Cooler is expected to transfer the amount to this contract prior to calling\n    function repay() external;\n\n    /// @notice Cooler may write off debt in the case of liquidations.\n    /// @dev This reduces the policies debt to TRSRY\n    function writeOffDebt(uint256 debtTokenAmount) external;\n\n    /// @notice In the case of a Cooler debt token change (eg USDS => USDC), the\n    /// debt may be manually net settled from the old debt token (in the old cooler treasury borrower)\n    /// to the new debt token (in the new cooler treasury borrower)\n    /// @param debtTokenAmount The amount of debt to set in Treasury, in the debtToken.decimals() precision\n    function setDebt(uint256 debtTokenAmount) external;\n\n    /// @notice The token (USD based stablecoin) which Cooler users borrow and repay\n    function debtToken() external view returns (IERC20);\n\n    /// @notice Convert a debt amount in wad (18dp) into the decimals of the `debtToken`\n    function convertToDebtTokenAmount(\n        uint256 amountInWad\n    ) external view returns (IERC20 dToken, uint256 dTokenAmount);\n\n    /// @notice The decimal precision of the `amountInWad` used in borrow and repay functions.\n    /// @dev A constant of 18\n    function DECIMALS() external view returns (uint8);\n}\n"
+    },
+    "src/interfaces/IStaking.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\ninterface IStaking {\n    /* ========== DATA STRUCTURES ========== */\n\n    struct Epoch {\n        uint256 length; // in seconds\n        uint256 number; // since inception\n        uint256 end; // timestamp\n        uint256 distribute; // amount\n    }\n\n    /* ========== MUTATIVE FUNCTIONS ========== */\n\n    function rebase() external returns (uint256);\n\n    function unstake(address, uint256, bool _trigger, bool) external returns (uint256);\n\n    /* ========== ADMIN FUNCTIONS ========== */\n\n    function setDistributor(address _distributor) external;\n\n    /* ========== VIEW FUNCTIONS ========== */\n\n    function secondsToNextEpoch() external view returns (uint256);\n\n    function epoch() external view returns (uint256, uint256, uint256, uint256);\n}\n"
+    },
+    "lib/clones-with-immutable-args/src/ClonesWithImmutableArgs.sol": {
+      "content": "// SPDX-License-Identifier: BSD\n\npragma solidity ^0.8.4;\n\n/// @title ClonesWithImmutableArgs\n/// @author wighawag, zefram.eth\n/// @notice Enables creating clone contracts with immutable args\nlibrary ClonesWithImmutableArgs {\n    error CreateFail();\n\n    /// @notice Creates a clone proxy of the implementation contract, with immutable args\n    /// @dev data cannot exceed 65535 bytes, since 2 bytes are used to store the data length\n    /// @param implementation The implementation contract to clone\n    /// @param data Encoded immutable args\n    /// @return instance The address of the created clone\n    function clone(address implementation, bytes memory data)\n        internal\n        returns (address instance)\n    {\n        // unrealistic for memory ptr or data length to exceed 256 bits\n        unchecked {\n            uint256 extraLength = data.length + 2; // +2 bytes for telling how much data there is appended to the call\n            uint256 creationSize = 0x43 + extraLength;\n            uint256 runSize = creationSize - 11;\n            uint256 dataPtr;\n            uint256 ptr;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                ptr := mload(0x40)\n\n                // -------------------------------------------------------------------------------------------------------------\n                // CREATION (11 bytes)\n                // -------------------------------------------------------------------------------------------------------------\n\n                // 3d          | RETURNDATASIZE        | 0                       | –\n                // 61 runtime  | PUSH2 runtime (r)     | r 0                     | –\n                mstore(\n                    ptr,\n                    0x3d61000000000000000000000000000000000000000000000000000000000000\n                )\n                mstore(add(ptr, 0x02), shl(240, runSize)) // size of the contract running bytecode (16 bits)\n\n                // creation size = 0b\n                // 80          | DUP1                  | r r 0                   | –\n                // 60 creation | PUSH1 creation (c)    | c r r 0                 | –\n                // 3d          | RETURNDATASIZE        | 0 c r r 0               | –\n                // 39          | CODECOPY              | r 0                     | [0-2d]: runtime code\n                // 81          | DUP2                  | 0 c  0                  | [0-2d]: runtime code\n                // f3          | RETURN                | 0                       | [0-2d]: runtime code\n                mstore(\n                    add(ptr, 0x04),\n                    0x80600b3d3981f300000000000000000000000000000000000000000000000000\n                )\n\n                // -------------------------------------------------------------------------------------------------------------\n                // RUNTIME\n                // -------------------------------------------------------------------------------------------------------------\n\n                // 36          | CALLDATASIZE          | cds                     | –\n                // 3d          | RETURNDATASIZE        | 0 cds                   | –\n                // 3d          | RETURNDATASIZE        | 0 0 cds                 | –\n                // 37          | CALLDATACOPY          | –                       | [0, cds] = calldata\n                // 61          | PUSH2 extra           | extra                   | [0, cds] = calldata\n                mstore(\n                    add(ptr, 0x0b),\n                    0x363d3d3761000000000000000000000000000000000000000000000000000000\n                )\n                mstore(add(ptr, 0x10), shl(240, extraLength))\n\n                // 60 0x38     | PUSH1 0x38            | 0x38 extra              | [0, cds] = calldata // 0x38 (56) is runtime size - data\n                // 36          | CALLDATASIZE          | cds 0x38 extra          | [0, cds] = calldata\n                // 39          | CODECOPY              | _                       | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | 0                       | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | 0 0                     | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | 0 0 0                   | [0, cds] = calldata\n                // 36          | CALLDATASIZE          | cds 0 0 0               | [0, cds] = calldata\n                // 61 extra    | PUSH2 extra           | extra cds 0 0 0         | [0, cds] = calldata\n                mstore(\n                    add(ptr, 0x12),\n                    0x603836393d3d3d36610000000000000000000000000000000000000000000000\n                )\n                mstore(add(ptr, 0x1b), shl(240, extraLength))\n\n                // 01          | ADD                   | cds+extra 0 0 0         | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | 0 cds 0 0 0             | [0, cds] = calldata\n                // 73 addr     | PUSH20 0x123…         | addr 0 cds 0 0 0        | [0, cds] = calldata\n                mstore(\n                    add(ptr, 0x1d),\n                    0x013d730000000000000000000000000000000000000000000000000000000000\n                )\n                mstore(add(ptr, 0x20), shl(0x60, implementation))\n\n                // 5a          | GAS                   | gas addr 0 cds 0 0 0    | [0, cds] = calldata\n                // f4          | DELEGATECALL          | success 0               | [0, cds] = calldata\n                // 3d          | RETURNDATASIZE        | rds success 0           | [0, cds] = calldata\n                // 82          | DUP3                  | 0 rds success 0         | [0, cds] = calldata\n                // 80          | DUP1                  | 0 0 rds success 0       | [0, cds] = calldata\n                // 3e          | RETURNDATACOPY        | success 0               | [0, rds] = return data (there might be some irrelevant leftovers in memory [rds, cds] when rds < cds)\n                // 90          | SWAP1                 | 0 success               | [0, rds] = return data\n                // 3d          | RETURNDATASIZE        | rds 0 success           | [0, rds] = return data\n                // 91          | SWAP2                 | success 0 rds           | [0, rds] = return data\n                // 60 0x36     | PUSH1 0x36            | 0x36 sucess 0 rds       | [0, rds] = return data\n                // 57          | JUMPI                 | 0 rds                   | [0, rds] = return data\n                // fd          | REVERT                | –                       | [0, rds] = return data\n                // 5b          | JUMPDEST              | 0 rds                   | [0, rds] = return data\n                // f3          | RETURN                | –                       | [0, rds] = return data\n\n                mstore(\n                    add(ptr, 0x34),\n                    0x5af43d82803e903d91603657fd5bf30000000000000000000000000000000000\n                )\n            }\n\n            // -------------------------------------------------------------------------------------------------------------\n            // APPENDED DATA (Accessible from extcodecopy)\n            // (but also send as appended data to the delegatecall)\n            // -------------------------------------------------------------------------------------------------------------\n\n            extraLength -= 2;\n            uint256 counter = extraLength;\n            uint256 copyPtr = ptr + 0x43;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                dataPtr := add(data, 32)\n            }\n            for (; counter >= 32; counter -= 32) {\n                // solhint-disable-next-line no-inline-assembly\n                assembly {\n                    mstore(copyPtr, mload(dataPtr))\n                }\n\n                copyPtr += 32;\n                dataPtr += 32;\n            }\n            uint256 mask = ~(256**(32 - counter) - 1);\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                mstore(copyPtr, and(mload(dataPtr), mask))\n            }\n            copyPtr += counter;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                mstore(copyPtr, shl(240, extraLength))\n            }\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                instance := create(0, ptr, creationSize)\n            }\n            if (instance == address(0)) {\n                revert CreateFail();\n            }\n        }\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.15+commit.e14f2714"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "owner_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "coolerV2_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "dai_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "usds_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "gohm_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "migrator_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "flash_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "chreg_",
+              "type": "address"
+            },
+            {
+              "internalType": "address[]",
+              "name": "coolerFactories_",
+              "type": "address[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "NotDisabled",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotEnabled",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "OnlyLender",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "OnlyThis",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Only_CoolerOwner",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Overflow",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Params_DuplicateCooler",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "string",
+              "name": "reason_",
+              "type": "string"
+            }
+          ],
+          "name": "Params_InvalidAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Params_InvalidClearinghouse",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Params_InvalidCooler",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Params_InvalidNewOwner",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "coolerFactory",
+              "type": "address"
+            }
+          ],
+          "name": "CoolerFactoryAdded",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "coolerFactory",
+              "type": "address"
+            }
+          ],
+          "name": "CoolerFactoryRemoved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Disabled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Enabled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipTransferred",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokenRefunded",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "CHREG",
+          "outputs": [
+            {
+              "internalType": "contract CHREGv1",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "COOLERV2",
+          "outputs": [
+            {
+              "internalType": "contract IMonoCooler",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DAI",
+          "outputs": [
+            {
+              "internalType": "contract ERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "FLASH",
+          "outputs": [
+            {
+              "internalType": "contract IERC3156FlashLender",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "GOHM",
+          "outputs": [
+            {
+              "internalType": "contract ERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MIGRATOR",
+          "outputs": [
+            {
+              "internalType": "contract IDaiUsdsMigrator",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "USDS",
+          "outputs": [
+            {
+              "internalType": "contract ERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "coolerFactory_",
+              "type": "address"
+            }
+          ],
+          "name": "addCoolerFactory",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "coolers_",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "newOwner_",
+              "type": "address"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "account",
+                  "type": "address"
+                },
+                {
+                  "internalType": "address",
+                  "name": "authorized",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint96",
+                  "name": "authorizationDeadline",
+                  "type": "uint96"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "nonce",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "signatureDeadline",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct IMonoCooler.Authorization",
+              "name": "authorization_",
+              "type": "tuple"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "uint8",
+                  "name": "v",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "r",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "s",
+                  "type": "bytes32"
+                }
+              ],
+              "internalType": "struct IMonoCooler.Signature",
+              "name": "signature_",
+              "type": "tuple"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "delegate",
+                  "type": "address"
+                },
+                {
+                  "internalType": "int256",
+                  "name": "amount",
+                  "type": "int256"
+                }
+              ],
+              "internalType": "struct IDLGTEv1.DelegationRequest[]",
+              "name": "delegationRequests_",
+              "type": "tuple[]"
+            }
+          ],
+          "name": "consolidate",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "disable",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            }
+          ],
+          "name": "enable",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getCoolerFactories",
+          "outputs": [
+            {
+              "internalType": "address[]",
+              "name": "coolerFactories",
+              "type": "address[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isEnabled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "initiator_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "params_",
+              "type": "bytes"
+            }
+          ],
+          "name": "onFlashLoan",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "coolers_",
+              "type": "address[]"
+            }
+          ],
+          "name": "previewConsolidate",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "collateralAmount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "borrowAmount",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "coolerFactory_",
+              "type": "address"
+            }
+          ],
+          "name": "removeCoolerFactory",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "transferOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "details": "This contract uses the `IERC3156FlashBorrower` interface to interact with Maker flashloans.         The debt token of MonoCooler is assumed to be USDS. If that is changed in the future, this contract will need to be re-deployed.",
+        "kind": "dev",
+        "methods": {
+          "addCoolerFactory(address)": {
+            "params": {
+              "coolerFactory_": "The CoolerFactory to add"
+            }
+          },
+          "consolidate(address[],address,(address,address,uint96,uint256,uint256),(uint8,bytes32,bytes32),(address,int256)[])": {
+            "details": "This function will revert if:         - Any of the Coolers are not owned by the caller.         - Any of the Coolers have not been created by the CoolerFactory.         - Any of the Coolers have a different lender than an Olympus Clearinghouse.         - A duplicate Cooler is provided.         - The owner of the destination Cooler V2 has not provided authorization for this contract to manage their Cooler V2 position.         - The caller has not approved this contract to spend the collateral token, gOHM.         - The contract is not active.         - Re-entrancy is detected.",
+            "params": {
+              "authorization_": "Authorization parameters for the new owner. Set the `account` field to the zero address to indicate that authorization has already been provided through `IMonoCooler.setAuthorization()`.",
+              "coolers_": "The Coolers from which the loans will be migrated.",
+              "delegationRequests_": "Delegation requests for the new owner.",
+              "newOwner_": "Address of the owner of the Cooler V2 position. This can be the same as the caller, or a different address.",
+              "signature_": "Authorization signature for the new owner. Ignored if `authorization_.account` is the zero address."
+            }
+          },
+          "disable(bytes)": {
+            "details": "Implementing contracts should implement permissioning logic",
+            "params": {
+              "disableData_": "Optional data to pass to a custom disable function"
+            }
+          },
+          "enable(bytes)": {
+            "details": "Implementing contracts should implement permissioning logic",
+            "params": {
+              "enableData_": "Optional data to pass to a custom enable function"
+            }
+          },
+          "getCoolerFactories()": {
+            "returns": {
+              "coolerFactories": "The list of CoolerFactories"
+            }
+          },
+          "onFlashLoan(address,address,uint256,uint256,bytes)": {
+            "details": "This function reverts if:             - The caller is not the flash loan provider             - The initiator is not this contract",
+            "params": {
+              "amount": "The amount of tokens lent.",
+              "data": "Arbitrary data structure, intended to contain user-defined parameters.",
+              "fee": "The additional amount of tokens to repay.",
+              "initiator": "The initiator of the loan.",
+              "token": "The loan currency."
+            },
+            "returns": {
+              "_0": "The keccak256 hash of \"ERC3156FlashBorrower.onFlashLoan\""
+            }
+          },
+          "previewConsolidate(address[])": {
+            "params": {
+              "coolers_": "The Coolers to consolidate the loans from."
+            },
+            "returns": {
+              "borrowAmount": "       The amount of debt that will be borrowed from Cooler V2.",
+              "collateralAmount": "   The amount of collateral that will be migrated into Cooler V2."
+            }
+          },
+          "removeCoolerFactory(address)": {
+            "params": {
+              "coolerFactory_": "The CoolerFactory to remove"
+            }
+          }
+        },
+        "stateVariables": {
+          "MAX_LOANS": {
+            "details": "This is used to prevent infinite loops, and is an appropriate upper bound         as the maximum number of loans seen per Cooler is less than 50."
+          }
+        },
+        "title": "CoolerV2Migrator",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "NotDisabled()": [
+            {
+              "notice": "Thrown when the contract is not disabled"
+            }
+          ],
+          "NotEnabled()": [
+            {
+              "notice": "Thrown when the contract is not enabled"
+            }
+          ],
+          "OnlyLender()": [
+            {
+              "notice": "Thrown when the caller is not the flash lender."
+            }
+          ],
+          "OnlyThis()": [
+            {
+              "notice": "Thrown when the caller is not the contract itself."
+            }
+          ],
+          "Only_CoolerOwner()": [
+            {
+              "notice": "Thrown when the Cooler is not owned by the caller"
+            }
+          ],
+          "Params_DuplicateCooler()": [
+            {
+              "notice": "Thrown when the Cooler is duplicated"
+            }
+          ],
+          "Params_InvalidAddress(string)": [
+            {
+              "notice": "Thrown when the address is invalid"
+            }
+          ],
+          "Params_InvalidClearinghouse()": [
+            {
+              "notice": "Thrown when the Clearinghouse is not valid"
+            }
+          ],
+          "Params_InvalidCooler()": [
+            {
+              "notice": "Thrown when the Cooler is not valid"
+            }
+          ],
+          "Params_InvalidNewOwner()": [
+            {
+              "notice": "Thrown when the new owner address provided does not match the authorization"
+            }
+          ]
+        },
+        "events": {
+          "CoolerFactoryAdded(address)": {
+            "notice": "Emitted when a CoolerFactory is added to the migrator"
+          },
+          "CoolerFactoryRemoved(address)": {
+            "notice": "Emitted when a CoolerFactory is removed from the migrator"
+          },
+          "Disabled()": {
+            "notice": "Emitted when the contract is disabled"
+          },
+          "Enabled()": {
+            "notice": "Emitted when the contract is enabled"
+          },
+          "TokenRefunded(address,address,uint256)": {
+            "notice": "Emitted when a token is refunded to the recipient"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "CHREG()": {
+            "notice": "The Clearinghouse registry module"
+          },
+          "COOLERV2()": {
+            "notice": "The Cooler V2 contract"
+          },
+          "DAI()": {
+            "notice": "The DAI token"
+          },
+          "FLASH()": {
+            "notice": "The ERC3156 flash loan provider"
+          },
+          "GOHM()": {
+            "notice": "The gOHM token"
+          },
+          "MIGRATOR()": {
+            "notice": "The DAI <> USDS Migrator"
+          },
+          "USDS()": {
+            "notice": "The USDS token"
+          },
+          "addCoolerFactory(address)": {
+            "notice": "Add a CoolerFactory to the migrator"
+          },
+          "consolidate(address[],address,(address,address,uint96,uint256,uint256),(uint8,bytes32,bytes32),(address,int256)[])": {
+            "notice": "Consolidate Cooler V1 loans into Cooler V2         This function supports consolidation of loans from multiple Clearinghouses and Coolers, provided that the caller is the owner.         The funds for paying interest owed and fees will be borrowed from Cooler V2.         It is expected that the caller will have already provided approval for this contract to spend the required tokens. See `previewConsolidate()` for more details."
+          },
+          "disable(bytes)": {
+            "notice": "Disables the contract"
+          },
+          "enable(bytes)": {
+            "notice": "Enables the contract"
+          },
+          "getCoolerFactories()": {
+            "notice": "Get the list of CoolerFactories"
+          },
+          "isEnabled()": {
+            "notice": "Whether the contract is enabled"
+          },
+          "previewConsolidate(address[])": {
+            "notice": "Preview the consolidation of a set of loans."
+          },
+          "removeCoolerFactory(address)": {
+            "notice": "Remove a CoolerFactory from the migrator"
+          }
+        },
+        "notice": "A contract that migrates debt from Olympus Cooler V1 facilities to Cooler V2.         This is compatible with all three versions of Cooler V1.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/periphery/CoolerV2Migrator.sol": "CoolerV2Migrator"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10000
+      },
+      "remappings": [
+        ":@addresses/=lib/forge-proposal-simulator/addresses/",
+        ":@examples/=lib/forge-proposal-simulator/examples/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@proposals/=lib/forge-proposal-simulator/proposals/",
+        ":@script/=lib/forge-proposal-simulator/script/",
+        ":@test/=lib/forge-proposal-simulator/test/",
+        ":@utils/=lib/forge-proposal-simulator/utils/",
+        ":balancer-v2/=lib/balancer-v2/",
+        ":bonds/=lib/bonds/src/",
+        ":clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        ":clones/=lib/clones-with-immutable-args/src/",
+        ":comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        ":forge-std/=lib/forge-std/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero/=lib/solidity-examples/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=lib/forge-proposal-simulator/",
+        ":solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        ":solidity-examples/=lib/solidity-examples/contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":test/=src/test/",
+        ":test/lib/=src/test/lib/",
+        ":test/mocks/=src/test/mocks/",
+        "lib/forge-proposal-simulator:Governors/=lib/forge-proposal-simulator/Governors/"
+      ]
+    },
+    "sources": {
+      "lib/clones-with-immutable-args/src/Clone.sol": {
+        "keccak256": "0x8f569b077d99ec821c2750c52094b59b3505fb6ca3e6eac9009092bf86c5452d",
+        "license": "BSD",
+        "urls": [
+          "bzz-raw://d0f3966d1f97959f6512ee5bc4b73487bf5ce593880e3c1dbf97ed50d49402a0",
+          "dweb:/ipfs/QmSAtFtA28Mja6f6FfET26B38XEgrLgqRezNLo3AsXyjVB"
+        ]
+      },
+      "lib/clones-with-immutable-args/src/ClonesWithImmutableArgs.sol": {
+        "keccak256": "0x0c6a218a9724ce6d754db22b162600adbdbac41bfe4dd4eecf6b6d77c74eefe7",
+        "license": "BSD",
+        "urls": [
+          "bzz-raw://9b05614d01be2267ebb94ae587deb2588e903c101f9a2106230f551bf27faa98",
+          "dweb:/ipfs/QmQbRMeckjgCiFp5UXCBwoYiE41o63Wv79s2qeGeCvGSYX"
+        ]
+      },
+      "lib/solmate/src/auth/Owned.sol": {
+        "keccak256": "0xfedb27d14c508342c33eb067c9a02eabcdb0f9dcf93b04ded1001f580d12d0ea",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://1ff52bbee698b9cf9e4574615e6550be0887ccf355f6571e23d6f25b332e79b4",
+          "dweb:/ipfs/QmVorA2apojVRStzS7h8aFccR3Uv32G6HVtBtFHZrE7YXx"
+        ]
+      },
+      "lib/solmate/src/tokens/ERC20.sol": {
+        "keccak256": "0xcdfd8db76b2a3415620e4d18cc5545f3d50de792dbf2c3dd5adb40cbe6f94b10",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://57b3ab70cde374af1cf2c9888636e8de6cf660f087b1c9abd805e9271e19fa35",
+          "dweb:/ipfs/QmNrLDBAHYFjpjSd12jerm1AdBkDqEYUUaXgnT854BUZ97"
+        ]
+      },
+      "lib/solmate/src/utils/ReentrancyGuard.sol": {
+        "keccak256": "0xb282dd78aa7375d6b200b9a5d8dd214b2e5df1004f8217a4b4c2b07f0c5bfd01",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://5fca62eb8d3dbd2b3b7e4bb051f6da16f4d0ff9cee61c39cebb80f031f6a8800",
+          "dweb:/ipfs/QmbrsXPK91iBFwHKwJs2HLRud2KzMoBDRiWYMUtyV5H57j"
+        ]
+      },
+      "lib/solmate/src/utils/SafeTransferLib.sol": {
+        "keccak256": "0x6ab948013c2c7ca6351e593600425b0ec6df9035320280c678e735bce16e996b",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://2ab977d0eeb2bf458f9798250215c646d2f3b1f90b5a7e2b506fdf3335c0f060",
+          "dweb:/ipfs/QmYPRoPhNtBAmCSq7imN1scMVpKNQvMTpoqab3tXUx5Tnv"
+        ]
+      },
+      "src/Kernel.sol": {
+        "keccak256": "0x5798deae5f5ce704f699ef3b5022e16825a4470972212a9b55ec66746fcd5fc2",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://67b6284b459b3d3e8781975a85b08778d14850a09dc51aff80de76de54f12129",
+          "dweb:/ipfs/QmarPSzUc6TckbSd2sGovhstAiNTbWBDTbQB9mwPXeX1A5"
+        ]
+      },
+      "src/external/cooler/Cooler.sol": {
+        "keccak256": "0x3d3807d631528e36d26685459c8de430d6c0476eb8a9ac2258956710d005c563",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f1c0c7f5414f32975f8d55dd9719a455d0f2df6a8a040ebf89c653ffdd082204",
+          "dweb:/ipfs/QmTuxAxZ4tKSoy4SrtNxFcXsaw9iUtsQ72brnykbfiMjns"
+        ]
+      },
+      "src/external/cooler/CoolerCallback.sol": {
+        "keccak256": "0xb6f2c31937e4737b160f06d3687b8a463052987c04df5665c30656dfd44aee61",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d2786fd88fc580c9db14a8220a359e1e09545fc5f715736fd6ad6726a4d3aabc",
+          "dweb:/ipfs/QmV8DGHpHGJue5vd4obzUydnvNwniuCzDaovkAHSMbqAP6"
+        ]
+      },
+      "src/external/cooler/CoolerFactory.sol": {
+        "keccak256": "0x2b62ec66777d28dc03486f8d1d330fbca2b44c6e140a22ba338d1a4966311506",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://00c1e8f1ec73ef1f0f60c0a55d6878f7ee61b3255ee9856a37d71d851bc7ea1b",
+          "dweb:/ipfs/QmVw6BoV6hyrMYD13MnJEPRu57UaS4G1DvBuQE1wZxck7S"
+        ]
+      },
+      "src/external/cooler/interfaces/ICoolerFactory.sol": {
+        "keccak256": "0x2e2b96ef4b5690e25fd49b4f214388dceca3e6bb51226d0c14c43bd1a14cd756",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://1193922696d3b2f694f04e2a6d45b51fb179da25a1f44996dc11d401a09bd354",
+          "dweb:/ipfs/QmNfWeTgVhLzbmSGpyo1ZqGzaG5iRHg99Q5yn1rWeuCYxU"
+        ]
+      },
+      "src/interfaces/IERC20.sol": {
+        "keccak256": "0x974a59ee45b2a6107b6dd8cd0f1de0ad878b54f1db47ebf27f697dda6145d9dc",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://da0d8ddb32da028acb692a89cb6a1ab1136c39d029871ee3d3e20b8d51c15dd6",
+          "dweb:/ipfs/QmQ2adrsKG6QyDSznRNSdWD8ceKKXnWohFWk2EjUHTMUyx"
+        ]
+      },
+      "src/interfaces/IStaking.sol": {
+        "keccak256": "0x5b7df3db742582d39fb557c58067f8320c2d46d7094ae7152809b311fc610d37",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://706f6a94958f1201345689e328d4a79c9dc532d180ce33968a0a9f0036f89556",
+          "dweb:/ipfs/QmWLj7iMK7aHAwNe5fhJKdB7n7rJ586s6VYdrzvcC8Pvxj"
+        ]
+      },
+      "src/interfaces/maker-dao/IDaiUsdsMigrator.sol": {
+        "keccak256": "0xe7d58497c13c1f49e11b8a6674ebad78fb36b3536b2662f2066cd0598eda51cb",
+        "license": "UNLICENSED",
+        "urls": [
+          "bzz-raw://e129e446ea4d41f9b5960f998adbcc0111fd56dda2a01a5f0bdc32701ebfbcb6",
+          "dweb:/ipfs/Qmc4Fg7vpDsvMUj13A3DzrvHQwjcYJuEEzZ8qgPH3SvcJU"
+        ]
+      },
+      "src/interfaces/maker-dao/IERC3156FlashBorrower.sol": {
+        "keccak256": "0xb4f7084c961ff06481f4327429c761ef79be20e16c996bdb0d0d0224666c2c4f",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://9698d00873d28180aa53b3a0fdca656c3a834189a8fd102ff55f3cfa21758ebe",
+          "dweb:/ipfs/QmUCkQjnMG72HBvcsUVKfNUUVDGc6rvd7mkeAMkjnS8n8N"
+        ]
+      },
+      "src/interfaces/maker-dao/IERC3156FlashLender.sol": {
+        "keccak256": "0x064a09ac321cac7c42ffd6b1656d5f53f59ed0d50013cfcd3594870add124e90",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://4c488eceb12fd46d960c5b606c8639a30b19b533e78fdfdd2c3966eb2fbb99b6",
+          "dweb:/ipfs/QmXzqT9RHYuPivvJBivqJp3pMtasuhZQg5fcpAqwhDSJz1"
+        ]
+      },
+      "src/libraries/SafeCast.sol": {
+        "keccak256": "0x01224a32ebd5bb849ccd9fcd65d10738ef60a8248eb68d8368f5924d78d8cd02",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c9fa48a2ef57c121c239ba33956491a72560321677fb083a7031ab7d947cf2a0",
+          "dweb:/ipfs/QmSj284A6YDUXpuZumpznHj3jQSrbBrmceabCvEVJeDNhM"
+        ]
+      },
+      "src/modules/CHREG/CHREG.v1.sol": {
+        "keccak256": "0x6961ed13b143ec508f9ebc5834ff6505bf7f8b2de8539c62f85d76a47a7d4384",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://5961986579dcd56193a3baf455b63afc97cf28538b8d808f018cc27a90f171a0",
+          "dweb:/ipfs/QmR4wnpC6pSv3stgHUdWfaEtk2BkbimXR3YCxmywoBPpNg"
+        ]
+      },
+      "src/modules/DLGTE/IDLGTE.v1.sol": {
+        "keccak256": "0x9691327526a3f666297fbd44be17b0ccf976aa7355e68f54997913782fc51fb1",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7bcc8ce57ca0b06fc1eb2f6b707b8235919ecec93dff3a84d164a4b870413eab",
+          "dweb:/ipfs/QmZx3uWa48h2hrn3wZGYJ5Sy4p9saLi2Y6uBwA848GGKsG"
+        ]
+      },
+      "src/periphery/CoolerV2Migrator.sol": {
+        "keccak256": "0x705ec064f7997f2c175645e60fad3666d68827f58d25bb410a6698465dd62b91",
+        "license": "GLP-3.0",
+        "urls": [
+          "bzz-raw://1adf37d7d42b21352f5c62c3e7db360f4d90c71190798a7c85f9ff09d24a9fdf",
+          "dweb:/ipfs/QmVBzv9cniSQz8CZ6v4gcXL9pFtAUL6jcMxFP4jbFometF"
+        ]
+      },
+      "src/periphery/interfaces/ICoolerV2Migrator.sol": {
+        "keccak256": "0x64d300c3ceb7a8e2c3f25e9e93db5309bf020eec5305fb8d594245c0b156ab93",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://20c664afcb4cba1c66826a674882b5608778e9cec3fdab72f7c4c6e8b3d464a4",
+          "dweb:/ipfs/QmbG3hqUTfm6sQQrDWSHeupe1FhBFM2KfHHDiFkQYWethM"
+        ]
+      },
+      "src/periphery/interfaces/IEnabler.sol": {
+        "keccak256": "0xf3aa4c7fd7237e0cad838a16f58160b2ca7716c2b717a134e5f0ff110d87f278",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://636f3e9a5cfe13a5328a5552c7c0bc2c0d98c585b063361e3aee41837339e3ec",
+          "dweb:/ipfs/QmdCQ8rRWSRJX6uAq9Q5rRC35ScbnfBRm3UdFjsJWmKgtP"
+        ]
+      },
+      "src/policies/interfaces/cooler/ICoolerLtvOracle.sol": {
+        "keccak256": "0xab5264ba6146fe32d455840c2403733f872d5703a1be5ffcdd40c05247ac7ac7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5d5da80c2c71f2a4a2afa34731ff507edc47d730538e049229765dd57361a8b3",
+          "dweb:/ipfs/QmRsfrzvfNXTgBPwxoKzPFSLqcoHQTJMbo368TtJe6tE1k"
+        ]
+      },
+      "src/policies/interfaces/cooler/ICoolerTreasuryBorrower.sol": {
+        "keccak256": "0x516792b157e7b2009548b6b883e0daef1f1071da94212f2e21dd67806d82cebc",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://141090456788ef5a824bc489bf329fff5a9fe5c5277e98bdc5fdbedf9f2f6399",
+          "dweb:/ipfs/Qmej9xCq3MnAo4YE5mf4LsnyxdVH6VD5hUY3GWLN9tPiRf"
+        ]
+      },
+      "src/policies/interfaces/cooler/IMonoCooler.sol": {
+        "keccak256": "0x841eb6e050ca5ae6b636d0aa3aca724b054b03c41a2491f8477a9503eb9cea6e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://16d9c5fc92765df134ece69492113caa42dc4eb682c7cee22356705f426c7b55",
+          "dweb:/ipfs/QmR6mhDY3isUZsbZQXccwMuzun5ZuHQhiEAmdT87pbtn9n"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.15+commit.e14f2714",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 10000,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": [
+        "ds-test/=lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "interfaces/=src/interfaces/",
+        "modules/=src/modules/",
+        "policies/=src/policies/",
+        "libraries/=src/libraries/",
+        "solmate/=lib/solmate/src/",
+        "balancer-v2/=lib/balancer-v2/",
+        "layer-zero/=lib/solidity-examples/contracts/",
+        "@openzeppelin/=lib/openzeppelin-contracts/",
+        "bonds/=lib/bonds/src/",
+        "test/=src/test/",
+        "test/mocks/=src/test/mocks/",
+        "test/lib/=src/test/lib/",
+        "clones/=lib/clones-with-immutable-args/src/",
+        "proposal-sim/=lib/forge-proposal-simulator/",
+        "@addresses/=lib/forge-proposal-simulator/addresses/",
+        "@examples/=lib/forge-proposal-simulator/examples/",
+        "@proposals/=lib/forge-proposal-simulator/proposals/",
+        "@script/=lib/forge-proposal-simulator/script/",
+        "@test/=lib/forge-proposal-simulator/test/",
+        "@utils/=lib/forge-proposal-simulator/utils/",
+        "clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        "comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        "compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        "erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        "forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        "openzeppelin/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/",
+        "solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        "solidity-examples/=lib/solidity-examples/contracts/",
+        "surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        "lib/forge-proposal-simulator:Governors/=lib/forge-proposal-simulator/Governors/"
+      ]
+    },
+    "name": "CoolerV2Migrator",
+    "fullyQualifiedName": "src/periphery/CoolerV2Migrator.sol:CoolerV2Migrator"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "6417345",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2025-06-03T19:43:12Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0xE045BD0A0d85E980AA152064C06EAe6B6aE358D2"
+}

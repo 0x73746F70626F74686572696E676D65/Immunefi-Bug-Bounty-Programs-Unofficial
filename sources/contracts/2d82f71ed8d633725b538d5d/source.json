@@ -1,0 +1,990 @@
+{
+  "sources": {
+    "src/policies/cooler/CoolerLtvOracle.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {Kernel, Policy, Keycode, toKeycode} from \"src/Kernel.sol\";\nimport {ROLESv1} from \"modules/ROLES/OlympusRoles.sol\";\nimport {PolicyAdmin} from \"src/policies/utils/PolicyAdmin.sol\";\nimport {ICoolerLtvOracle} from \"policies/interfaces/cooler/ICoolerLtvOracle.sol\";\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\nimport {IERC20} from \"src/interfaces/IERC20.sol\";\nimport {SafeCast} from \"libraries/SafeCast.sol\";\n\n/**\n * @title Cooler LTV Oracle\n * @notice It is a custom oracle (not dependant on external markets/AMMs/dependencies) to give the\n * serve both the Origination LTV and Liquidation LTV\n *  - They are both quoted in [debtToken / collateralToken] units\n *  - It is a fixed 18dp price\n *  - Origination LTV updates on a per second basis according to a policy set rate of change (and is up only or flat)\n *  - Liquidation LTV is a policy set percentage above the Origination LTV\n */\ncontract CoolerLtvOracle is ICoolerLtvOracle, Policy, PolicyAdmin {\n    using SafeCast for uint256;\n\n    /// @dev The debt token\n    ERC20 private immutable _DEBT_TOKEN;\n\n    /// @dev The collateral token\n    ERC20 private immutable _COLLATERAL_TOKEN;\n\n    struct OriginationLtvData {\n        /// @notice The Origination LTV at the time `setOriginationLtvAt()` was last called\n        uint96 startingValue;\n        /// @notice The time at which Origination LTV was last updated via `setOriginationLtvAt()`\n        uint40 startTime;\n        /// @notice The target Origination LTV at the `targetTime`\n        uint96 targetValue;\n        /// @notice The date which the `targetValue` will be reached.\n        uint40 targetTime;\n        /// @notice The rate at which the `startingValue` will change over time from `startTime` until `targetTime`.\n        uint96 slope;\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    OriginationLtvData public override originationLtvData;\n\n    /// @inheritdoc ICoolerLtvOracle\n    uint96 public override maxOriginationLtvDelta;\n\n    /// @inheritdoc ICoolerLtvOracle\n    uint32 public override minOriginationLtvTargetTimeDelta;\n\n    /// @inheritdoc ICoolerLtvOracle\n    uint96 public override maxOriginationLtvRateOfChange;\n\n    /// @inheritdoc ICoolerLtvOracle\n    uint16 public override maxLiquidationLtvPremiumBps;\n\n    /// @inheritdoc ICoolerLtvOracle\n    uint16 public override liquidationLtvPremiumBps;\n\n    /// @inheritdoc ICoolerLtvOracle\n    uint8 public constant override DECIMALS = 18;\n\n    uint96 public constant BASIS_POINTS_DIVISOR = 10_000;\n\n    constructor(\n        address kernel_,\n        address collateralToken_,\n        address debtToken_,\n        uint96 initialOriginationLtv_,\n        uint96 maxOriginationLtvDelta_,\n        uint32 minOriginationLtvTargetTimeDelta_,\n        uint96 maxOriginationLtvRateOfChange_,\n        uint16 maxLiquidationLtvPremiumBps_,\n        uint16 liquidationLtvPremiumBps_\n    ) Policy(Kernel(kernel_)) {\n        _COLLATERAL_TOKEN = ERC20(collateralToken_);\n        _DEBT_TOKEN = ERC20(debtToken_);\n\n        // Only handle 18dp collateral and debt tokens\n        if (_COLLATERAL_TOKEN.decimals() != 18) revert InvalidParam();\n        if (_DEBT_TOKEN.decimals() != 18) revert InvalidParam();\n\n        originationLtvData = OriginationLtvData({\n            startingValue: initialOriginationLtv_,\n            startTime: uint40(block.timestamp),\n            targetValue: initialOriginationLtv_,\n            targetTime: uint40(block.timestamp),\n            slope: 0\n        });\n        maxOriginationLtvDelta = maxOriginationLtvDelta_;\n        minOriginationLtvTargetTimeDelta = minOriginationLtvTargetTimeDelta_;\n        maxOriginationLtvRateOfChange = maxOriginationLtvRateOfChange_;\n\n        if (maxLiquidationLtvPremiumBps_ > BASIS_POINTS_DIVISOR) revert InvalidParam();\n        if (liquidationLtvPremiumBps_ > maxLiquidationLtvPremiumBps_) revert InvalidParam();\n        maxLiquidationLtvPremiumBps = maxLiquidationLtvPremiumBps_;\n        liquidationLtvPremiumBps = liquidationLtvPremiumBps_;\n    }\n\n    //============================================================================================//\n    //                                          ADMIN                                             //\n    //============================================================================================//\n\n    /// @inheritdoc Policy\n    function configureDependencies() external override returns (Keycode[] memory dependencies) {\n        dependencies = new Keycode[](1);\n        dependencies[0] = toKeycode(\"ROLES\");\n        ROLES = ROLESv1(getModuleAddress(dependencies[0]));\n        (uint8 ROLES_MAJOR, ) = ROLES.VERSION();\n\n        // Ensure Modules are using the expected major version.\n        // Modules should be sorted in alphabetical order.\n        bytes memory expected = abi.encode([1]);\n        if (ROLES_MAJOR != 1) revert Policy_WrongModuleVersion(expected);\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function setMaxOriginationLtvDelta(uint96 maxDelta) external override onlyAdminRole {\n        emit MaxOriginationLtvDeltaSet(maxDelta);\n        maxOriginationLtvDelta = maxDelta;\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function setMinOriginationLtvTargetTimeDelta(\n        uint32 minTargetTimeDelta\n    ) external override onlyAdminRole {\n        emit MinOriginationLtvTargetTimeDeltaSet(minTargetTimeDelta);\n        minOriginationLtvTargetTimeDelta = minTargetTimeDelta;\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function setMaxOriginationLtvRateOfChange(\n        uint96 originationLtvDelta,\n        uint32 timeDelta\n    ) external override onlyAdminRole {\n        // Calculate the rate of change, rounding down.\n        uint96 maxRateOfChange = originationLtvDelta / timeDelta;\n        emit MaxOriginationLtvRateOfChangeSet(maxRateOfChange);\n        maxOriginationLtvRateOfChange = maxRateOfChange;\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function setOriginationLtvAt(\n        uint96 targetValue,\n        uint40 targetTime\n    ) external override onlyAdminRole {\n        uint96 _currentOriginationLtv = currentOriginationLtv();\n        uint40 _now = uint40(block.timestamp);\n\n        // Cannot decrease the OLTV\n        if (targetValue < _currentOriginationLtv) revert CannotDecreaseLtv();\n        uint96 _originationLtvDelta = targetValue - _currentOriginationLtv;\n\n        // targetTime must be at or after (now + minOriginationLtvTargetTimeDelta)\n        if (targetTime < _now + minOriginationLtvTargetTimeDelta)\n            revert BreachedMinDateDelta(targetTime, _now, minOriginationLtvTargetTimeDelta);\n        uint40 _timeDelta = targetTime - _now;\n\n        // Check that the delta is within tolerance\n        if (_originationLtvDelta > maxOriginationLtvDelta)\n            revert BreachedMaxOriginationLtvDelta(\n                _currentOriginationLtv,\n                targetValue,\n                maxOriginationLtvDelta\n            );\n        uint96 _rateOfChange = _originationLtvDelta / _timeDelta;\n        if (_rateOfChange > maxOriginationLtvRateOfChange)\n            revert BreachedMaxOriginationLtvRateOfChange(\n                _rateOfChange,\n                maxOriginationLtvRateOfChange\n            );\n\n        originationLtvData = OriginationLtvData({\n            startingValue: _currentOriginationLtv,\n            startTime: _now,\n            targetValue: targetValue,\n            targetTime: targetTime,\n            slope: _rateOfChange\n        });\n\n        emit OriginationLtvSetAt(_currentOriginationLtv, targetValue, targetTime);\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function setMaxLiquidationLtvPremiumBps(uint16 maxPremiumBps) external override onlyAdminRole {\n        if (maxPremiumBps > BASIS_POINTS_DIVISOR) revert InvalidParam();\n        emit MaxLiquidationLtvPremiumBpsSet(maxPremiumBps);\n        maxLiquidationLtvPremiumBps = maxPremiumBps;\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function setLiquidationLtvPremiumBps(uint16 premiumBps) external override onlyAdminRole {\n        // Cannot set LLTV higher than the max\n        if (premiumBps > maxLiquidationLtvPremiumBps) revert InvalidParam();\n\n        // Cannot lower the LLTV\n        if (premiumBps < liquidationLtvPremiumBps) revert CannotDecreaseLtv();\n        emit LiquidationLtvPremiumBpsSet(premiumBps);\n        liquidationLtvPremiumBps = premiumBps;\n    }\n\n    //============================================================================================//\n    //                                          VIEWS                                             //\n    //============================================================================================//\n\n    /// @inheritdoc ICoolerLtvOracle\n    function collateralToken() external view override returns (IERC20) {\n        return IERC20(address(_COLLATERAL_TOKEN));\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function debtToken() external view override returns (IERC20) {\n        return IERC20(address(_DEBT_TOKEN));\n    }\n\n    function currentLtvs()\n        public\n        view\n        override\n        returns (uint96 originationLtv, uint96 liquidationLtv)\n    {\n        originationLtv = currentOriginationLtv();\n        liquidationLtv = _currentLiquidationLtv(originationLtv);\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function currentLiquidationLtv() external view override returns (uint96) {\n        return _currentLiquidationLtv(currentOriginationLtv());\n    }\n\n    /// @inheritdoc ICoolerLtvOracle\n    function currentOriginationLtv() public view override returns (uint96) {\n        uint40 _now = uint40(block.timestamp);\n        if (_now >= originationLtvData.targetTime) {\n            // Target date reached, no calculation required just return the target Origination LTV\n            return originationLtvData.targetValue;\n        } else {\n            unchecked {\n                uint96 delta = originationLtvData.slope * (_now - originationLtvData.startTime);\n                return delta + originationLtvData.startingValue;\n            }\n        }\n    }\n\n    //============================================================================================//\n    //                                         INTERNAL                                           //\n    //============================================================================================//\n\n    function _currentLiquidationLtv(uint96 oltv) private view returns (uint96) {\n        return (oltv * (BASIS_POINTS_DIVISOR + liquidationLtvPremiumBps)) / BASIS_POINTS_DIVISOR;\n    }\n}\n"
+    },
+    "src/Kernel.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\n//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████\n//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███\n//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░\n// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████\n// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███\n// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███\n//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████\n//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░\n\n//============================================================================================//\n//                                        GLOBAL TYPES                                        //\n//============================================================================================//\n\n/// @notice Actions to trigger state changes in the kernel. Passed by the executor\nenum Actions {\n    InstallModule,\n    UpgradeModule,\n    ActivatePolicy,\n    DeactivatePolicy,\n    ChangeExecutor,\n    MigrateKernel\n}\n\n/// @notice Used by executor to select an action and a target contract for a kernel action\nstruct Instruction {\n    Actions action;\n    address target;\n}\n\n/// @notice Used to define which module functions a policy needs access to\nstruct Permissions {\n    Keycode keycode;\n    bytes4 funcSelector;\n}\n\ntype Keycode is bytes5;\n\n//============================================================================================//\n//                                       UTIL FUNCTIONS                                       //\n//============================================================================================//\n\nerror TargetNotAContract(address target_);\nerror InvalidKeycode(Keycode keycode_);\n\n// solhint-disable-next-line func-visibility\nfunction toKeycode(bytes5 keycode_) pure returns (Keycode) {\n    return Keycode.wrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction fromKeycode(Keycode keycode_) pure returns (bytes5) {\n    return Keycode.unwrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureContract(address target_) view {\n    if (target_.code.length == 0) revert TargetNotAContract(target_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureValidKeycode(Keycode keycode_) pure {\n    bytes5 unwrapped = Keycode.unwrap(keycode_);\n    for (uint256 i = 0; i < 5; ) {\n        bytes1 char = unwrapped[i];\n        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only\n        unchecked {\n            i++;\n        }\n    }\n}\n\n//============================================================================================//\n//                                        COMPONENTS                                          //\n//============================================================================================//\n\n/// @notice Generic adapter interface for kernel access in modules and policies.\nabstract contract KernelAdapter {\n    error KernelAdapter_OnlyKernel(address caller_);\n\n    Kernel public kernel;\n\n    constructor(Kernel kernel_) {\n        kernel = kernel_;\n    }\n\n    /// @notice Modifier to restrict functions to be called only by kernel.\n    modifier onlyKernel() {\n        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);\n        _;\n    }\n\n    /// @notice Function used by kernel when migrating to a new kernel.\n    function changeKernel(Kernel newKernel_) external onlyKernel {\n        kernel = newKernel_;\n    }\n}\n\n/// @notice Base level extension of the kernel. Modules act as independent state components to be\n///         interacted with and mutated through policies.\n/// @dev    Modules are installed and uninstalled via the executor.\nabstract contract Module is KernelAdapter {\n    error Module_PolicyNotPermitted(address policy_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Modifier to restrict which policies have access to module functions.\n    modifier permissioned() {\n        if (\n            msg.sender == address(kernel) ||\n            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)\n        ) revert Module_PolicyNotPermitted(msg.sender);\n        _;\n    }\n\n    /// @notice 5 byte identifier for a module.\n    function KEYCODE() public pure virtual returns (Keycode) {}\n\n    /// @notice Returns which semantic version of a module is being implemented.\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}\n\n    /// @notice Initialization function for the module\n    /// @dev    This function is called when the module is installed or upgraded by the kernel.\n    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.\n    function INIT() external virtual onlyKernel {}\n}\n\n/// @notice Policies are application logic and external interface for the kernel and installed modules.\n/// @dev    Policies are activated and deactivated in the kernel by the executor.\n/// @dev    Module dependencies and function permissions must be defined in appropriate functions.\nabstract contract Policy is KernelAdapter {\n    error Policy_ModuleDoesNotExist(Keycode keycode_);\n    error Policy_WrongModuleVersion(bytes expected_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Easily accessible indicator for if a policy is activated or not.\n    function isActive() external view returns (bool) {\n        return kernel.isPolicyActive(this);\n    }\n\n    /// @notice Function to grab module address from a given keycode.\n    function getModuleAddress(Keycode keycode_) internal view returns (address) {\n        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));\n        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);\n        return moduleForKeycode;\n    }\n\n    /// @notice Define module dependencies for this policy.\n    /// @return dependencies - Keycode array of module dependencies.\n    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}\n\n    /// @notice Function called by kernel to set module function permissions.\n    /// @return requests - Array of keycodes and function selectors for requested permissions.\n    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}\n}\n\n/// @notice Main contract that acts as a central component registry for the protocol.\n/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,\n/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.\ncontract Kernel {\n    // =========  EVENTS ========= //\n\n    event PermissionsUpdated(\n        Keycode indexed keycode_,\n        Policy indexed policy_,\n        bytes4 funcSelector_,\n        bool granted_\n    );\n    event ActionExecuted(Actions indexed action_, address indexed target_);\n\n    // =========  ERRORS ========= //\n\n    error Kernel_OnlyExecutor(address caller_);\n    error Kernel_ModuleAlreadyInstalled(Keycode module_);\n    error Kernel_InvalidModuleUpgrade(Keycode module_);\n    error Kernel_PolicyAlreadyActivated(address policy_);\n    error Kernel_PolicyNotActivated(address policy_);\n\n    // =========  PRIVILEGED ADDRESSES ========= //\n\n    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.\n    address public executor;\n\n    // =========  MODULE MANAGEMENT ========= //\n\n    /// @notice Array of all modules currently installed.\n    Keycode[] public allKeycodes;\n\n    /// @notice Mapping of module address to keycode.\n    mapping(Keycode => Module) public getModuleForKeycode;\n\n    /// @notice Mapping of keycode to module address.\n    mapping(Module => Keycode) public getKeycodeForModule;\n\n    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.\n    mapping(Keycode => Policy[]) public moduleDependents;\n\n    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.\n    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;\n\n    /// @notice Module <> Policy Permissions.\n    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission\n    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;\n\n    // =========  POLICY MANAGEMENT ========= //\n\n    /// @notice List of all active policies\n    Policy[] public activePolicies;\n\n    /// @notice Helper to get active policy quickly. Prevents need to loop through array.\n    mapping(Policy => uint256) public getPolicyIndex;\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    constructor() {\n        executor = msg.sender;\n    }\n\n    /// @notice Modifier to check if caller is the executor.\n    modifier onlyExecutor() {\n        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);\n        _;\n    }\n\n    function isPolicyActive(Policy policy_) public view returns (bool) {\n        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;\n    }\n\n    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.\n    function executeAction(Actions action_, address target_) external onlyExecutor {\n        if (action_ == Actions.InstallModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _installModule(Module(target_));\n        } else if (action_ == Actions.UpgradeModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _upgradeModule(Module(target_));\n        } else if (action_ == Actions.ActivatePolicy) {\n            ensureContract(target_);\n            _activatePolicy(Policy(target_));\n        } else if (action_ == Actions.DeactivatePolicy) {\n            ensureContract(target_);\n            _deactivatePolicy(Policy(target_));\n        } else if (action_ == Actions.ChangeExecutor) {\n            executor = target_;\n        } else if (action_ == Actions.MigrateKernel) {\n            ensureContract(target_);\n            _migrateKernel(Kernel(target_));\n        }\n\n        emit ActionExecuted(action_, target_);\n    }\n\n    function _installModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n\n        if (address(getModuleForKeycode[keycode]) != address(0))\n            revert Kernel_ModuleAlreadyInstalled(keycode);\n\n        getModuleForKeycode[keycode] = newModule_;\n        getKeycodeForModule[newModule_] = keycode;\n        allKeycodes.push(keycode);\n\n        newModule_.INIT();\n    }\n\n    function _upgradeModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n        Module oldModule = getModuleForKeycode[keycode];\n\n        if (address(oldModule) == address(0) || oldModule == newModule_)\n            revert Kernel_InvalidModuleUpgrade(keycode);\n\n        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));\n        getKeycodeForModule[newModule_] = keycode;\n        getModuleForKeycode[keycode] = newModule_;\n\n        newModule_.INIT();\n\n        _reconfigurePolicies(keycode);\n    }\n\n    function _activatePolicy(Policy policy_) internal {\n        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));\n\n        // Add policy to list of active policies\n        activePolicies.push(policy_);\n        getPolicyIndex[policy_] = activePolicies.length - 1;\n\n        // Record module dependencies\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depLength = dependencies.length;\n\n        for (uint256 i; i < depLength; ) {\n            Keycode keycode = dependencies[i];\n\n            moduleDependents[keycode].push(policy_);\n            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        // Grant permissions for policy to access restricted module functions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, true);\n    }\n\n    function _deactivatePolicy(Policy policy_) internal {\n        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));\n\n        // Revoke permissions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, false);\n\n        // Remove policy from all policy data structures\n        uint256 idx = getPolicyIndex[policy_];\n        Policy lastPolicy = activePolicies[activePolicies.length - 1];\n\n        activePolicies[idx] = lastPolicy;\n        activePolicies.pop();\n        getPolicyIndex[lastPolicy] = idx;\n        delete getPolicyIndex[policy_];\n\n        // Remove policy from module dependents\n        _pruneFromDependents(policy_);\n    }\n\n    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.\n    /// @dev    New kernel must add in all of the modules and policies via executeAction.\n    /// @dev    NOTE: Data does not get cleared from this kernel.\n    function _migrateKernel(Kernel newKernel_) internal {\n        uint256 keycodeLen = allKeycodes.length;\n        for (uint256 i; i < keycodeLen; ) {\n            Module module = Module(getModuleForKeycode[allKeycodes[i]]);\n            module.changeKernel(newKernel_);\n            unchecked {\n                ++i;\n            }\n        }\n\n        uint256 policiesLen = activePolicies.length;\n        for (uint256 j; j < policiesLen; ) {\n            Policy policy = activePolicies[j];\n\n            // Deactivate before changing kernel\n            policy.changeKernel(newKernel_);\n            unchecked {\n                ++j;\n            }\n        }\n    }\n\n    function _reconfigurePolicies(Keycode keycode_) internal {\n        Policy[] memory dependents = moduleDependents[keycode_];\n        uint256 depLength = dependents.length;\n\n        for (uint256 i; i < depLength; ) {\n            dependents[i].configureDependencies();\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _setPolicyPermissions(\n        Policy policy_,\n        Permissions[] memory requests_,\n        bool grant_\n    ) internal {\n        uint256 reqLength = requests_.length;\n        for (uint256 i = 0; i < reqLength; ) {\n            Permissions memory request = requests_[i];\n            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;\n\n            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _pruneFromDependents(Policy policy_) internal {\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depcLength = dependencies.length;\n\n        for (uint256 i; i < depcLength; ) {\n            Keycode keycode = dependencies[i];\n            Policy[] storage dependents = moduleDependents[keycode];\n\n            uint256 origIndex = getDependentIndex[keycode][policy_];\n            Policy lastPolicy = dependents[dependents.length - 1];\n\n            // Swap with last and pop\n            dependents[origIndex] = lastPolicy;\n            dependents.pop();\n\n            // Record new index and delete deactivated policy index\n            getDependentIndex[keycode][lastPolicy] = origIndex;\n            delete getDependentIndex[keycode][policy_];\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n}\n"
+    },
+    "src/modules/ROLES/OlympusRoles.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport {ROLESv1} from \"src/modules/ROLES/ROLES.v1.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Abstract contract to have the `onlyRole` modifier\n/// @dev    Inheriting this automatically makes ROLES module a dependency\nabstract contract RolesConsumer {\n    ROLESv1 public ROLES;\n\n    modifier onlyRole(bytes32 role_) {\n        ROLES.requireRole(role_, msg.sender);\n        _;\n    }\n}\n\n/// @notice Module that holds multisig roles needed by various policies.\ncontract OlympusRoles is ROLESv1 {\n    //============================================================================================//\n    //                                        MODULE SETUP                                        //\n    //============================================================================================//\n\n    constructor(Kernel kernel_) Module(kernel_) {}\n\n    /// @inheritdoc Module\n    function KEYCODE() public pure override returns (Keycode) {\n        return toKeycode(\"ROLES\");\n    }\n\n    /// @inheritdoc Module\n    function VERSION() external pure override returns (uint8 major, uint8 minor) {\n        major = 1;\n        minor = 0;\n    }\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc ROLESv1\n    function saveRole(bytes32 role_, address addr_) external override permissioned {\n        if (hasRole[addr_][role_]) revert ROLES_AddressAlreadyHasRole(addr_, role_);\n\n        ensureValidRole(role_);\n\n        // Grant role to the address\n        hasRole[addr_][role_] = true;\n\n        emit RoleGranted(role_, addr_);\n    }\n\n    /// @inheritdoc ROLESv1\n    function removeRole(bytes32 role_, address addr_) external override permissioned {\n        if (!hasRole[addr_][role_]) revert ROLES_AddressDoesNotHaveRole(addr_, role_);\n\n        hasRole[addr_][role_] = false;\n\n        emit RoleRevoked(role_, addr_);\n    }\n\n    //============================================================================================//\n    //                                       VIEW FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc ROLESv1\n    function requireRole(bytes32 role_, address caller_) external view override {\n        if (!hasRole[caller_][role_]) revert ROLES_RequireRole(role_);\n    }\n\n    /// @inheritdoc ROLESv1\n    function ensureValidRole(bytes32 role_) public pure override {\n        for (uint256 i = 0; i < 32; ) {\n            bytes1 char = role_[i];\n            if ((char < 0x61 || char > 0x7A) && char != 0x5f && char != 0x00) {\n                revert ROLES_InvalidRole(role_); // a-z only\n            }\n            unchecked {\n                i++;\n            }\n        }\n    }\n}\n"
+    },
+    "src/policies/utils/PolicyAdmin.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.15;\n\nimport {ROLESv1} from \"src/modules/ROLES/ROLES.v1.sol\";\nimport {RolesConsumer} from \"src/modules/ROLES/OlympusRoles.sol\";\nimport {ADMIN_ROLE, EMERGENCY_ROLE} from \"./RoleDefinitions.sol\";\n\nabstract contract PolicyAdmin is RolesConsumer {\n    error NotAuthorised();\n\n    /// @notice Modifier that reverts if the caller does not have the emergency or admin role\n    modifier onlyEmergencyOrAdminRole() {\n        if (!_isEmergency(msg.sender) && !_isAdmin(msg.sender)) revert NotAuthorised();\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the admin role\n    modifier onlyAdminRole() {\n        if (!_isAdmin(msg.sender)) revert ROLESv1.ROLES_RequireRole(ADMIN_ROLE);\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the emergency role\n    modifier onlyEmergencyRole() {\n        if (!_isEmergency(msg.sender)) revert ROLESv1.ROLES_RequireRole(EMERGENCY_ROLE);\n        _;\n    }\n\n    /// @notice Check if an account has the admin role\n    ///\n    /// @param  account_ The account to check\n    /// @return true if the account has the admin role, false otherwise\n    function _isAdmin(address account_) internal view returns (bool) {\n        return ROLES.hasRole(account_, ADMIN_ROLE);\n    }\n\n    /// @notice Check if an account has the emergency role\n    ///\n    /// @param  account_ The account to check\n    /// @return true if the account has the emergency role, false otherwise\n    function _isEmergency(address account_) internal view returns (bool) {\n        return ROLES.hasRole(account_, EMERGENCY_ROLE);\n    }\n}\n"
+    },
+    "src/policies/interfaces/cooler/ICoolerLtvOracle.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport {IERC20} from \"../../../interfaces/IERC20.sol\";\n\n/**\n * @title Cooler LTV Oracle\n * @notice It is a custom oracle (not dependant on external markets/AMMs/dependencies) to give the\n * serve both the Origination LTV and Liquidation LTV\n *  - They are both quoted in [debtToken / collateralToken] units\n *  - It is a fixed 18dp price\n *  - Origination LTV updates on a per second basis according to a policy set rate of change (and is up only or flat)\n *  - Liquidation LTV is a policy set percentage above the Origination LTV\n */\ninterface ICoolerLtvOracle {\n    event OriginationLtvSetAt(\n        uint96 oldOriginationLtv,\n        uint96 newOriginationLtvTarget,\n        uint256 targetTime\n    );\n    event MaxOriginationLtvDeltaSet(uint256 maxDelta);\n    event MinOriginationLtvTargetTimeDeltaSet(uint32 maxTargetTimeDelta);\n    event MaxOriginationLtvRateOfChangeSet(uint96 maxRateOfChange);\n    event MaxLiquidationLtvPremiumBpsSet(uint96 maxPremiumBps);\n    event LiquidationLtvPremiumBpsSet(uint96 premiumBps);\n\n    error BreachedMaxOriginationLtvDelta(\n        uint96 oldOriginationLtv,\n        uint96 newOriginationLtv,\n        uint256 maxDelta\n    );\n    error BreachedMinDateDelta(uint40 targetTime, uint40 currentDate, uint32 maxTargetTimeDelta);\n    error BreachedMaxOriginationLtvRateOfChange(uint96 targetRateOfChange, uint96 maxRateOfChange);\n    error CannotDecreaseLtv();\n    error InvalidParam();\n\n    /// @notice The collateral asset of the LTV [debtToken / collateralToken]\n    function collateralToken() external view returns (IERC20);\n\n    /// @notice The debt asset of the LTV [debtToken / collateralToken]\n    function debtToken() external view returns (IERC20);\n\n    /// @notice The current Origination LTV and Liquidation LTV\n    function currentLtvs() external view returns (uint96 originationLtv, uint96 liquidationLtv);\n\n    /// @notice The current Origination LTV\n    function currentOriginationLtv() external view returns (uint96);\n\n    /// @notice The current Liquidation LTV\n    function currentLiquidationLtv() external view returns (uint96);\n\n    /// @notice The maximum allowed Origination LTV change on any single `setOriginationLtvAt()`, in absolute terms\n    /// between the Origination LTV as of now and the targetOriginationLtv\n    /// @dev 18 decimal places, 0.20e18 == $0.20.\n    /// Used as a bound to avoid unintended/fat fingering when updating Origination LTV\n    function maxOriginationLtvDelta() external view returns (uint96);\n\n    /// @notice The minimum time delta required for Origination LTV to reach it's target value when\n    /// `setOriginationLtvAt()` is called.\n    /// @dev In seconds.\n    /// Used as a bound to avoid unintended/fat fingering when updating Origination LTV\n    function minOriginationLtvTargetTimeDelta() external view returns (uint32);\n\n    /// @notice The maximum (positive) rate of change of Origination LTV allowed, when\n    /// `setOriginationLtvAt()` is called.\n    /// @dev Units: [Origination LTV / second]\n    function maxOriginationLtvRateOfChange() external view returns (uint96);\n\n    /// @notice The current Origination LTV state data\n    function originationLtvData()\n        external\n        view\n        returns (\n            uint96 startingValue,\n            uint40 startTime,\n            uint96 targetValue,\n            uint40 targetTime,\n            uint96 slope\n        );\n\n    /// @notice The maximum Liquidation LTV premium (in basis points) which is allowed to be set when calling\n    /// `setLiquidationLtvPremiumBps()`\n    function maxLiquidationLtvPremiumBps() external view returns (uint16);\n\n    /// @notice The premium (in basis points) of the Liquidation LTV above the Origination LTV\n    function liquidationLtvPremiumBps() external view returns (uint16);\n\n    /// @notice Set maximum Liquidation LTV premium (in basis points) which is allowed to be set when calling\n    /// `setLiquidationLtvPremiumBps()`.\n    function setLiquidationLtvPremiumBps(uint16 premiumBps) external;\n\n    /// @notice Set Liquidation LTV premium (in basis points) of the Liquidation LTV above the Origination LTV\n    function setMaxLiquidationLtvPremiumBps(uint16 premiumBps) external;\n\n    /// @notice Set the maximum allowed Origination LTV change on any single `setOriginationLtvAt()`, in absolute terms\n    /// between the Origination LTV as of now and the targetOriginationLtv\n    /// @dev 18 decimal places, 0.20e18 == $0.20\n    function setMaxOriginationLtvDelta(uint96 maxDelta) external;\n\n    /// @notice Set the minimum time delta required for Origination LTV to reach it's target value when\n    /// `setOriginationLtvAt()` is called.\n    /// @dev In seconds.\n    function setMinOriginationLtvTargetTimeDelta(uint32 minTargetTimeDelta) external;\n\n    /// @notice Set the maximum (positive) rate of change of Origination LTV allowed, when\n    /// `setOriginationLtvAt()` is called.\n    /// @dev Units: [Origination LTV / second]\n    function setMaxOriginationLtvRateOfChange(\n        uint96 originationLtvDelta,\n        uint32 timeDelta\n    ) external;\n\n    /// @notice Set the target Origination LTV which will incrementally increase from it's current value to `targetOriginationLtv`\n    /// between now and `targetTime`.\n    /// @dev targetTime is unixtime, targetOriginationLtv is 18 decimal places, 1.05e18 == $1.05\n    function setOriginationLtvAt(uint96 targetOriginationLtv, uint40 targetTime) external;\n\n    /// @notice The decimal precision of both the Origination LTV and Liquidation LTV\n    function DECIMALS() external view returns (uint8);\n}\n"
+    },
+    "lib/solmate/src/tokens/ERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)\n/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)\n/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.\nabstract contract ERC20 {\n    /*//////////////////////////////////////////////////////////////\n                                 EVENTS\n    //////////////////////////////////////////////////////////////*/\n\n    event Transfer(address indexed from, address indexed to, uint256 amount);\n\n    event Approval(address indexed owner, address indexed spender, uint256 amount);\n\n    /*//////////////////////////////////////////////////////////////\n                            METADATA STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    string public name;\n\n    string public symbol;\n\n    uint8 public immutable decimals;\n\n    /*//////////////////////////////////////////////////////////////\n                              ERC20 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 public totalSupply;\n\n    mapping(address => uint256) public balanceOf;\n\n    mapping(address => mapping(address => uint256)) public allowance;\n\n    /*//////////////////////////////////////////////////////////////\n                            EIP-2612 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 internal immutable INITIAL_CHAIN_ID;\n\n    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;\n\n    mapping(address => uint256) public nonces;\n\n    /*//////////////////////////////////////////////////////////////\n                               CONSTRUCTOR\n    //////////////////////////////////////////////////////////////*/\n\n    constructor(\n        string memory _name,\n        string memory _symbol,\n        uint8 _decimals\n    ) {\n        name = _name;\n        symbol = _symbol;\n        decimals = _decimals;\n\n        INITIAL_CHAIN_ID = block.chainid;\n        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                               ERC20 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function approve(address spender, uint256 amount) public virtual returns (bool) {\n        allowance[msg.sender][spender] = amount;\n\n        emit Approval(msg.sender, spender, amount);\n\n        return true;\n    }\n\n    function transfer(address to, uint256 amount) public virtual returns (bool) {\n        balanceOf[msg.sender] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(msg.sender, to, amount);\n\n        return true;\n    }\n\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) public virtual returns (bool) {\n        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.\n\n        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;\n\n        balanceOf[from] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(from, to, amount);\n\n        return true;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                             EIP-2612 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual {\n        require(deadline >= block.timestamp, \"PERMIT_DEADLINE_EXPIRED\");\n\n        // Unchecked because the only math done is incrementing\n        // the owner's nonce which cannot realistically overflow.\n        unchecked {\n            address recoveredAddress = ecrecover(\n                keccak256(\n                    abi.encodePacked(\n                        \"\\x19\\x01\",\n                        DOMAIN_SEPARATOR(),\n                        keccak256(\n                            abi.encode(\n                                keccak256(\n                                    \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n                                ),\n                                owner,\n                                spender,\n                                value,\n                                nonces[owner]++,\n                                deadline\n                            )\n                        )\n                    )\n                ),\n                v,\n                r,\n                s\n            );\n\n            require(recoveredAddress != address(0) && recoveredAddress == owner, \"INVALID_SIGNER\");\n\n            allowance[recoveredAddress][spender] = value;\n        }\n\n        emit Approval(owner, spender, value);\n    }\n\n    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {\n        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();\n    }\n\n    function computeDomainSeparator() internal view virtual returns (bytes32) {\n        return\n            keccak256(\n                abi.encode(\n                    keccak256(\"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"),\n                    keccak256(bytes(name)),\n                    keccak256(\"1\"),\n                    block.chainid,\n                    address(this)\n                )\n            );\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                        INTERNAL MINT/BURN LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function _mint(address to, uint256 amount) internal virtual {\n        totalSupply += amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(address(0), to, amount);\n    }\n\n    function _burn(address from, uint256 amount) internal virtual {\n        balanceOf[from] -= amount;\n\n        // Cannot underflow because a user's balance\n        // will never be larger than the total supply.\n        unchecked {\n            totalSupply -= amount;\n        }\n\n        emit Transfer(from, address(0), amount);\n    }\n}\n"
+    },
+    "src/interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\n// Imported from forge-std\n\n/// @dev Interface of the ERC20 standard as defined in the EIP.\n/// @dev This includes the optional name, symbol, and decimals metadata.\ninterface IERC20 {\n    /// @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /// @dev Emitted when the allowance of a `spender` for an `owner` is set, where `value`\n    /// is the new allowance.\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /// @notice Returns the amount of tokens in existence.\n    function totalSupply() external view returns (uint256);\n\n    /// @notice Returns the amount of tokens owned by `account`.\n    function balanceOf(address account) external view returns (uint256);\n\n    /// @notice Moves `amount` tokens from the caller's account to `to`.\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the remaining number of tokens that `spender` is allowed\n    /// to spend on behalf of `owner`\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /// @notice Sets `amount` as the allowance of `spender` over the caller's tokens.\n    /// @dev Be aware of front-running risks: https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /// @notice Moves `amount` tokens from `from` to `to` using the allowance mechanism.\n    /// `amount` is then deducted from the caller's allowance.\n    function transferFrom(address from, address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the name of the token.\n    function name() external view returns (string memory);\n\n    /// @notice Returns the symbol of the token.\n    function symbol() external view returns (string memory);\n\n    /// @notice Returns the decimals places of the token.\n    function decimals() external view returns (uint8);\n}\n"
+    },
+    "src/libraries/SafeCast.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\nlibrary SafeCast {\n    error Overflow(uint256 amount);\n\n    function encodeUInt128(uint256 amount) internal pure returns (uint128) {\n        if (amount > type(uint128).max) {\n            revert Overflow(amount);\n        }\n        return uint128(amount);\n    }\n\n    function encodeUInt112(uint256 amount) internal pure returns (uint112) {\n        if (amount > type(uint112).max) {\n            revert Overflow(amount);\n        }\n        return uint112(amount);\n    }\n\n    function encodeUInt96(uint256 amount) internal pure returns (uint96) {\n        if (amount > type(uint96).max) {\n            revert Overflow(amount);\n        }\n        return uint96(amount);\n    }\n\n    function encodeUInt32(uint256 amount) internal pure returns (uint32) {\n        if (amount > type(uint32).max) {\n            revert Overflow(amount);\n        }\n        return uint32(amount);\n    }\n\n    function encodeUInt16(uint256 amount) internal pure returns (uint16) {\n        if (amount > type(uint16).max) {\n            revert Overflow(amount);\n        }\n        return uint16(amount);\n    }\n}\n"
+    },
+    "src/modules/ROLES/ROLES.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity 0.8.15;\n\nimport \"src/Kernel.sol\";\n\nabstract contract ROLESv1 is Module {\n    // =========  EVENTS ========= //\n\n    event RoleGranted(bytes32 indexed role_, address indexed addr_);\n    event RoleRevoked(bytes32 indexed role_, address indexed addr_);\n\n    // =========  ERRORS ========= //\n\n    error ROLES_InvalidRole(bytes32 role_);\n    error ROLES_RequireRole(bytes32 role_);\n    error ROLES_AddressAlreadyHasRole(address addr_, bytes32 role_);\n    error ROLES_AddressDoesNotHaveRole(address addr_, bytes32 role_);\n    error ROLES_RoleDoesNotExist(bytes32 role_);\n\n    // =========  STATE ========= //\n\n    /// @notice Mapping for if an address has a policy-defined role.\n    mapping(address => mapping(bytes32 => bool)) public hasRole;\n\n    // =========  FUNCTIONS ========= //\n\n    /// @notice Function to grant policy-defined roles to some address. Can only be called by admin.\n    function saveRole(bytes32 role_, address addr_) external virtual;\n\n    /// @notice Function to revoke policy-defined roles from some address. Can only be called by admin.\n    function removeRole(bytes32 role_, address addr_) external virtual;\n\n    /// @notice \"Modifier\" to restrict policy function access to certain addresses with a role.\n    /// @dev    Roles are defined in the policy and granted by the ROLES admin.\n    function requireRole(bytes32 role_, address caller_) external virtual;\n\n    /// @notice Function that checks if role is valid (all lower case)\n    function ensureValidRole(bytes32 role_) external pure virtual;\n}\n"
+    },
+    "src/policies/utils/RoleDefinitions.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\n/// @dev Allows enabling/disabling the protocol/policies in an emergency\nbytes32 constant EMERGENCY_ROLE = \"emergency\";\n/// @dev Administrative access, e.g. configuration parameters. Typically assigned to on-chain governance.\nbytes32 constant ADMIN_ROLE = \"admin\";\n/// @dev Managerial access, e.g. managing specific protocol parameters. Typically assigned to a multisig/council.\nbytes32 constant MANAGER_ROLE = \"manager\";\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.15+commit.e14f2714"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "kernel_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "collateralToken_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "debtToken_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint96",
+              "name": "initialOriginationLtv_",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint96",
+              "name": "maxOriginationLtvDelta_",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint32",
+              "name": "minOriginationLtvTargetTimeDelta_",
+              "type": "uint32"
+            },
+            {
+              "internalType": "uint96",
+              "name": "maxOriginationLtvRateOfChange_",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint16",
+              "name": "maxLiquidationLtvPremiumBps_",
+              "type": "uint16"
+            },
+            {
+              "internalType": "uint16",
+              "name": "liquidationLtvPremiumBps_",
+              "type": "uint16"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint96",
+              "name": "oldOriginationLtv",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint96",
+              "name": "newOriginationLtv",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxDelta",
+              "type": "uint256"
+            }
+          ],
+          "name": "BreachedMaxOriginationLtvDelta",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint96",
+              "name": "targetRateOfChange",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint96",
+              "name": "maxRateOfChange",
+              "type": "uint96"
+            }
+          ],
+          "name": "BreachedMaxOriginationLtvRateOfChange",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint40",
+              "name": "targetTime",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "currentDate",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint32",
+              "name": "maxTargetTimeDelta",
+              "type": "uint32"
+            }
+          ],
+          "name": "BreachedMinDateDelta",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "CannotDecreaseLtv",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidParam",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "caller_",
+              "type": "address"
+            }
+          ],
+          "name": "KernelAdapter_OnlyKernel",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotAuthorised",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "Keycode",
+              "name": "keycode_",
+              "type": "bytes5"
+            }
+          ],
+          "name": "Policy_ModuleDoesNotExist",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "expected_",
+              "type": "bytes"
+            }
+          ],
+          "name": "Policy_WrongModuleVersion",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role_",
+              "type": "bytes32"
+            }
+          ],
+          "name": "ROLES_RequireRole",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint96",
+              "name": "premiumBps",
+              "type": "uint96"
+            }
+          ],
+          "name": "LiquidationLtvPremiumBpsSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint96",
+              "name": "maxPremiumBps",
+              "type": "uint96"
+            }
+          ],
+          "name": "MaxLiquidationLtvPremiumBpsSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "maxDelta",
+              "type": "uint256"
+            }
+          ],
+          "name": "MaxOriginationLtvDeltaSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint96",
+              "name": "maxRateOfChange",
+              "type": "uint96"
+            }
+          ],
+          "name": "MaxOriginationLtvRateOfChangeSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint32",
+              "name": "maxTargetTimeDelta",
+              "type": "uint32"
+            }
+          ],
+          "name": "MinOriginationLtvTargetTimeDeltaSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint96",
+              "name": "oldOriginationLtv",
+              "type": "uint96"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint96",
+              "name": "newOriginationLtvTarget",
+              "type": "uint96"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "targetTime",
+              "type": "uint256"
+            }
+          ],
+          "name": "OriginationLtvSetAt",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "BASIS_POINTS_DIVISOR",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DECIMALS",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ROLES",
+          "outputs": [
+            {
+              "internalType": "contract ROLESv1",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "newKernel_",
+              "type": "address"
+            }
+          ],
+          "name": "changeKernel",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "collateralToken",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "configureDependencies",
+          "outputs": [
+            {
+              "internalType": "Keycode[]",
+              "name": "dependencies",
+              "type": "bytes5[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "currentLiquidationLtv",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "currentLtvs",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "originationLtv",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint96",
+              "name": "liquidationLtv",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "currentOriginationLtv",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "debtToken",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isActive",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "kernel",
+          "outputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "liquidationLtvPremiumBps",
+          "outputs": [
+            {
+              "internalType": "uint16",
+              "name": "",
+              "type": "uint16"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxLiquidationLtvPremiumBps",
+          "outputs": [
+            {
+              "internalType": "uint16",
+              "name": "",
+              "type": "uint16"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxOriginationLtvDelta",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxOriginationLtvRateOfChange",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "minOriginationLtvTargetTimeDelta",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "originationLtvData",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "startingValue",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint40",
+              "name": "startTime",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint96",
+              "name": "targetValue",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint40",
+              "name": "targetTime",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint96",
+              "name": "slope",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "requestPermissions",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "Keycode",
+                  "name": "keycode",
+                  "type": "bytes5"
+                },
+                {
+                  "internalType": "bytes4",
+                  "name": "funcSelector",
+                  "type": "bytes4"
+                }
+              ],
+              "internalType": "struct Permissions[]",
+              "name": "requests",
+              "type": "tuple[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "premiumBps",
+              "type": "uint16"
+            }
+          ],
+          "name": "setLiquidationLtvPremiumBps",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "maxPremiumBps",
+              "type": "uint16"
+            }
+          ],
+          "name": "setMaxLiquidationLtvPremiumBps",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint96",
+              "name": "maxDelta",
+              "type": "uint96"
+            }
+          ],
+          "name": "setMaxOriginationLtvDelta",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint96",
+              "name": "originationLtvDelta",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint32",
+              "name": "timeDelta",
+              "type": "uint32"
+            }
+          ],
+          "name": "setMaxOriginationLtvRateOfChange",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint32",
+              "name": "minTargetTimeDelta",
+              "type": "uint32"
+            }
+          ],
+          "name": "setMinOriginationLtvTargetTimeDelta",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint96",
+              "name": "targetValue",
+              "type": "uint96"
+            },
+            {
+              "internalType": "uint40",
+              "name": "targetTime",
+              "type": "uint40"
+            }
+          ],
+          "name": "setOriginationLtvAt",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "configureDependencies()": {
+            "returns": {
+              "dependencies": "- Keycode array of module dependencies."
+            }
+          },
+          "requestPermissions()": {
+            "returns": {
+              "requests": "- Array of keycodes and function selectors for requested permissions."
+            }
+          },
+          "setMaxOriginationLtvDelta(uint96)": {
+            "details": "18 decimal places, 0.20e18 == $0.20"
+          },
+          "setMaxOriginationLtvRateOfChange(uint96,uint32)": {
+            "details": "Units: [Origination LTV / second]"
+          },
+          "setMinOriginationLtvTargetTimeDelta(uint32)": {
+            "details": "In seconds."
+          },
+          "setOriginationLtvAt(uint96,uint40)": {
+            "details": "targetTime is unixtime, targetOriginationLtv is 18 decimal places, 1.05e18 == $1.05"
+          }
+        },
+        "stateVariables": {
+          "_COLLATERAL_TOKEN": {
+            "details": "The collateral token"
+          },
+          "_DEBT_TOKEN": {
+            "details": "The debt token"
+          },
+          "maxOriginationLtvDelta": {
+            "details": "18 decimal places, 0.20e18 == $0.20. Used as a bound to avoid unintended/fat fingering when updating Origination LTV"
+          },
+          "maxOriginationLtvRateOfChange": {
+            "details": "Units: [Origination LTV / second]"
+          },
+          "minOriginationLtvTargetTimeDelta": {
+            "details": "In seconds. Used as a bound to avoid unintended/fat fingering when updating Origination LTV"
+          }
+        },
+        "title": "Cooler LTV Oracle",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "DECIMALS()": {
+            "notice": "The decimal precision of both the Origination LTV and Liquidation LTV"
+          },
+          "changeKernel(address)": {
+            "notice": "Function used by kernel when migrating to a new kernel."
+          },
+          "collateralToken()": {
+            "notice": "The collateral asset of the LTV [debtToken / collateralToken]"
+          },
+          "configureDependencies()": {
+            "notice": "Define module dependencies for this policy."
+          },
+          "currentLiquidationLtv()": {
+            "notice": "The current Liquidation LTV"
+          },
+          "currentLtvs()": {
+            "notice": "The current Origination LTV and Liquidation LTV"
+          },
+          "currentOriginationLtv()": {
+            "notice": "The current Origination LTV"
+          },
+          "debtToken()": {
+            "notice": "The debt asset of the LTV [debtToken / collateralToken]"
+          },
+          "isActive()": {
+            "notice": "Easily accessible indicator for if a policy is activated or not."
+          },
+          "liquidationLtvPremiumBps()": {
+            "notice": "The premium (in basis points) of the Liquidation LTV above the Origination LTV"
+          },
+          "maxLiquidationLtvPremiumBps()": {
+            "notice": "The maximum Liquidation LTV premium (in basis points) which is allowed to be set when calling `setLiquidationLtvPremiumBps()`"
+          },
+          "maxOriginationLtvDelta()": {
+            "notice": "The maximum allowed Origination LTV change on any single `setOriginationLtvAt()`, in absolute terms between the Origination LTV as of now and the targetOriginationLtv"
+          },
+          "maxOriginationLtvRateOfChange()": {
+            "notice": "The maximum (positive) rate of change of Origination LTV allowed, when `setOriginationLtvAt()` is called."
+          },
+          "minOriginationLtvTargetTimeDelta()": {
+            "notice": "The minimum time delta required for Origination LTV to reach it's target value when `setOriginationLtvAt()` is called."
+          },
+          "originationLtvData()": {
+            "notice": "The current Origination LTV state data"
+          },
+          "requestPermissions()": {
+            "notice": "Function called by kernel to set module function permissions."
+          },
+          "setLiquidationLtvPremiumBps(uint16)": {
+            "notice": "Set maximum Liquidation LTV premium (in basis points) which is allowed to be set when calling `setLiquidationLtvPremiumBps()`."
+          },
+          "setMaxLiquidationLtvPremiumBps(uint16)": {
+            "notice": "Set Liquidation LTV premium (in basis points) of the Liquidation LTV above the Origination LTV"
+          },
+          "setMaxOriginationLtvDelta(uint96)": {
+            "notice": "Set the maximum allowed Origination LTV change on any single `setOriginationLtvAt()`, in absolute terms between the Origination LTV as of now and the targetOriginationLtv"
+          },
+          "setMaxOriginationLtvRateOfChange(uint96,uint32)": {
+            "notice": "Set the maximum (positive) rate of change of Origination LTV allowed, when `setOriginationLtvAt()` is called."
+          },
+          "setMinOriginationLtvTargetTimeDelta(uint32)": {
+            "notice": "Set the minimum time delta required for Origination LTV to reach it's target value when `setOriginationLtvAt()` is called."
+          },
+          "setOriginationLtvAt(uint96,uint40)": {
+            "notice": "Set the target Origination LTV which will incrementally increase from it's current value to `targetOriginationLtv` between now and `targetTime`."
+          }
+        },
+        "notice": "It is a custom oracle (not dependant on external markets/AMMs/dependencies) to give the serve both the Origination LTV and Liquidation LTV  - They are both quoted in [debtToken / collateralToken] units  - It is a fixed 18dp price  - Origination LTV updates on a per second basis according to a policy set rate of change (and is up only or flat)  - Liquidation LTV is a policy set percentage above the Origination LTV",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/policies/cooler/CoolerLtvOracle.sol": "CoolerLtvOracle"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10000
+      },
+      "remappings": [
+        ":@addresses/=lib/forge-proposal-simulator/addresses/",
+        ":@examples/=lib/forge-proposal-simulator/examples/",
+        ":@openzeppelin/=lib/openzeppelin-contracts/",
+        ":@proposals/=lib/forge-proposal-simulator/proposals/",
+        ":@script/=lib/forge-proposal-simulator/script/",
+        ":@test/=lib/forge-proposal-simulator/test/",
+        ":@utils/=lib/forge-proposal-simulator/utils/",
+        ":balancer-v2/=lib/balancer-v2/",
+        ":bonds/=lib/bonds/src/",
+        ":clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        ":clones/=lib/clones-with-immutable-args/src/",
+        ":comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        ":ds-test/=lib/ds-test/src/",
+        ":erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        ":forge-std/=lib/forge-std/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero/=lib/solidity-examples/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        ":openzeppelin/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=lib/forge-proposal-simulator/",
+        ":solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        ":solidity-examples/=lib/solidity-examples/contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":test/=src/test/",
+        ":test/lib/=src/test/lib/",
+        ":test/mocks/=src/test/mocks/"
+      ]
+    },
+    "sources": {
+      "lib/solmate/src/tokens/ERC20.sol": {
+        "keccak256": "0xcdfd8db76b2a3415620e4d18cc5545f3d50de792dbf2c3dd5adb40cbe6f94b10",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://57b3ab70cde374af1cf2c9888636e8de6cf660f087b1c9abd805e9271e19fa35",
+          "dweb:/ipfs/QmNrLDBAHYFjpjSd12jerm1AdBkDqEYUUaXgnT854BUZ97"
+        ]
+      },
+      "src/Kernel.sol": {
+        "keccak256": "0x5798deae5f5ce704f699ef3b5022e16825a4470972212a9b55ec66746fcd5fc2",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://67b6284b459b3d3e8781975a85b08778d14850a09dc51aff80de76de54f12129",
+          "dweb:/ipfs/QmarPSzUc6TckbSd2sGovhstAiNTbWBDTbQB9mwPXeX1A5"
+        ]
+      },
+      "src/interfaces/IERC20.sol": {
+        "keccak256": "0x974a59ee45b2a6107b6dd8cd0f1de0ad878b54f1db47ebf27f697dda6145d9dc",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://da0d8ddb32da028acb692a89cb6a1ab1136c39d029871ee3d3e20b8d51c15dd6",
+          "dweb:/ipfs/QmQ2adrsKG6QyDSznRNSdWD8ceKKXnWohFWk2EjUHTMUyx"
+        ]
+      },
+      "src/libraries/SafeCast.sol": {
+        "keccak256": "0x01224a32ebd5bb849ccd9fcd65d10738ef60a8248eb68d8368f5924d78d8cd02",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c9fa48a2ef57c121c239ba33956491a72560321677fb083a7031ab7d947cf2a0",
+          "dweb:/ipfs/QmSj284A6YDUXpuZumpznHj3jQSrbBrmceabCvEVJeDNhM"
+        ]
+      },
+      "src/modules/ROLES/OlympusRoles.sol": {
+        "keccak256": "0xaa6d6bd245d7fb437ff39fa8a6d7f7a4c246e5284a65ddece396238f0011b1a7",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://d321c286098da23a1ddaa1fb51a1351b71357859f7568b38f733971bc4b5ddae",
+          "dweb:/ipfs/QmdPasx52MrHtGoNRWMUPCTPkBceyZijaqfkAGSoSQJxAR"
+        ]
+      },
+      "src/modules/ROLES/ROLES.v1.sol": {
+        "keccak256": "0x9adeb15569648e1dc977b5ae44d48ce79a63790625510a616b37df9d9e093985",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://d16866adf6987025ea2f89c1e20613a5df351eaeb46d6b0fc5caf88d41734300",
+          "dweb:/ipfs/QmZbRoJcUhe4eUzYriPpGFx5NEbmh7Q2DZzrgYLanvqYKd"
+        ]
+      },
+      "src/policies/cooler/CoolerLtvOracle.sol": {
+        "keccak256": "0x260ff516c73f39ba36033f82abcb95e22b98b58ab3f4ab471c19282ad9b36479",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b81e88df363b21cedfd4f49430d86c01a7666eb3aeda4478d650f7de9c84c723",
+          "dweb:/ipfs/QmbUj3frSXUy7PrTkpdvzpGQHB7EmfRvMvYiBxzxcTTLiY"
+        ]
+      },
+      "src/policies/interfaces/cooler/ICoolerLtvOracle.sol": {
+        "keccak256": "0xab5264ba6146fe32d455840c2403733f872d5703a1be5ffcdd40c05247ac7ac7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5d5da80c2c71f2a4a2afa34731ff507edc47d730538e049229765dd57361a8b3",
+          "dweb:/ipfs/QmRsfrzvfNXTgBPwxoKzPFSLqcoHQTJMbo368TtJe6tE1k"
+        ]
+      },
+      "src/policies/utils/PolicyAdmin.sol": {
+        "keccak256": "0x940893c73c59a4096e6b560656578a38668a9c4957e94432ddbb4e97f63be690",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8a41dc4dc042868ed461a2b970776875ee424fc4c43a2a0c0ad63c9e087cacd1",
+          "dweb:/ipfs/QmT1BLv9G9SWgGE229216WRFZ5ffg4efVv2v7HYZXRMk6W"
+        ]
+      },
+      "src/policies/utils/RoleDefinitions.sol": {
+        "keccak256": "0xf400bf4ce007f3fb215df3dd4a7207a007395df7ce46a1693b51db5755afa92a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://99dbbae6f37f1011c6f4b98cc57dd767da5ca263430c0122df03b4f75735f64c",
+          "dweb:/ipfs/QmRaLpJjwC2pcqAWpNtKoPdFRGm63K3ZyZbnJBxbjVsxjC"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.15+commit.e14f2714",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 10000,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": [
+        "ds-test/=lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "interfaces/=src/interfaces/",
+        "modules/=src/modules/",
+        "policies/=src/policies/",
+        "libraries/=src/libraries/",
+        "solmate/=lib/solmate/src/",
+        "balancer-v2/=lib/balancer-v2/",
+        "layer-zero/=lib/solidity-examples/contracts/",
+        "@openzeppelin/=lib/openzeppelin-contracts/",
+        "bonds/=lib/bonds/src/",
+        "test/=src/test/",
+        "test/mocks/=src/test/mocks/",
+        "test/lib/=src/test/lib/",
+        "clones/=lib/clones-with-immutable-args/src/",
+        "proposal-sim/=lib/forge-proposal-simulator/",
+        "@addresses/=lib/forge-proposal-simulator/addresses/",
+        "@examples/=lib/forge-proposal-simulator/examples/",
+        "@proposals/=lib/forge-proposal-simulator/proposals/",
+        "@script/=lib/forge-proposal-simulator/script/",
+        "@test/=lib/forge-proposal-simulator/test/",
+        "@utils/=lib/forge-proposal-simulator/utils/",
+        "clones-with-immutable-args/=lib/clones-with-immutable-args/src/",
+        "comp-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        "compound-governance/=lib/forge-proposal-simulator/lib/compound-governance/contracts/",
+        "erc4626-tests/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/lib/erc4626-tests/",
+        "forge-proposal-simulator/=lib/forge-proposal-simulator/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/",
+        "openzeppelin/=lib/forge-proposal-simulator/lib/openzeppelin-contracts/contracts/",
+        "solidity-code-metrics/=node_modules/solidity-code-metrics/",
+        "solidity-examples/=lib/solidity-examples/contracts/",
+        "surl-1.0.0/=dependencies/surl-1.0.0/src/"
+      ]
+    },
+    "name": "CoolerLtvOracle",
+    "fullyQualifiedName": "src/policies/cooler/CoolerLtvOracle.sol:CoolerLtvOracle"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "6883629",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2025-07-09T12:46:26Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0x9ee9f0c2e91E4f6B195B988a9e6e19efcf91e8dc"
+}

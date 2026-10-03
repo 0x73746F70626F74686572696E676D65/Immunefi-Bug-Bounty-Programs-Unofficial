@@ -1,0 +1,1455 @@
+{
+  "sources": {
+    "src/policies/Heart.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0\n/// forge-lint: disable-start(mixed-case-variable)\npragma solidity >=0.8.15;\n\n// External libraries\nimport {ReentrancyGuard} from \"@solmate-6.2.0/utils/ReentrancyGuard.sol\";\nimport {ERC20} from \"@solmate-6.2.0/tokens/ERC20.sol\";\n\n// Internal libraries\nimport {TransferHelper} from \"src/libraries/TransferHelper.sol\";\n\n// Interfaces\nimport {IDistributor} from \"src/policies/interfaces/IDistributor.sol\";\nimport {IHeart} from \"src/policies/interfaces/IHeart.sol\";\n\n// Modules\nimport {ROLESv1} from \"src/modules/ROLES/ROLES.v1.sol\";\nimport {PRICEv1} from \"src/modules/PRICE/PRICE.v1.sol\";\nimport {MINTRv1} from \"src/modules/MINTR/MINTR.v1.sol\";\n\n// Base Contracts\nimport {BasePeriodicTaskManager} from \"src/bases/BasePeriodicTaskManager.sol\";\nimport {PolicyEnabler} from \"src/policies/utils/PolicyEnabler.sol\";\n\n// Kernel\nimport {Kernel, Policy, Keycode, Permissions, toKeycode} from \"src/Kernel.sol\";\n\n/// @title  Olympus Heart\n/// @notice Olympus Heart (Policy) Contract\n/// @dev    The Olympus Heart contract provides keeper rewards to call the heart beat function which fuels\n///         Olympus market operations. The Heart orchestrates state updates in the correct order to ensure\n///         market operations use up to date information.\n///         This version implements an auction style reward system where the reward is linearly increasing up to a max reward.\n///         Rewards are issued in OHM.\ncontract OlympusHeart is IHeart, Policy, PolicyEnabler, ReentrancyGuard, BasePeriodicTaskManager {\n    using TransferHelper for ERC20;\n\n    // =========  STATE ========= //\n\n    /// @notice Timestamp of the last beat (UTC, in seconds)\n    uint48 public lastBeat;\n\n    /// @notice Duration of the reward auction (in seconds)\n    uint48 public auctionDuration;\n\n    /// @notice Max reward for beating the Heart (in reward token decimals)\n    uint256 public maxReward;\n\n    // Modules\n    PRICEv1 internal PRICE;\n    MINTRv1 internal MINTR;\n\n    // Policies\n    IDistributor public distributor;\n\n    //============================================================================================//\n    //                                      POLICY SETUP                                          //\n    //============================================================================================//\n\n    /// @dev Auction duration must be less than or equal to frequency, but we cannot validate that in the constructor because PRICE is not yet set.\n    ///      Therefore, manually ensure that the value is valid when deploying the contract.\n    constructor(\n        Kernel kernel_,\n        IDistributor distributor_,\n        uint256 maxReward_,\n        uint48 auctionDuration_\n    ) Policy(kernel_) {\n        distributor = distributor_;\n\n        auctionDuration = auctionDuration_;\n        maxReward = maxReward_;\n\n        emit RewardUpdated(maxReward_, auctionDuration_);\n\n        // Disabled by default by PolicyEnabler\n    }\n\n    /// @inheritdoc Policy\n    function configureDependencies() external override returns (Keycode[] memory dependencies) {\n        dependencies = new Keycode[](3);\n        dependencies[0] = toKeycode(\"PRICE\");\n        dependencies[1] = toKeycode(\"ROLES\");\n        dependencies[2] = toKeycode(\"MINTR\");\n\n        PRICE = PRICEv1(getModuleAddress(dependencies[0]));\n        ROLES = ROLESv1(getModuleAddress(dependencies[1]));\n        MINTR = MINTRv1(getModuleAddress(dependencies[2]));\n\n        (uint8 MINTR_MAJOR, ) = MINTR.VERSION();\n        (uint8 PRICE_MAJOR, ) = PRICE.VERSION();\n        (uint8 ROLES_MAJOR, ) = ROLES.VERSION();\n\n        // Ensure Modules are using the expected major version.\n        // Modules should be sorted in alphabetical order.\n        bytes memory expected = abi.encode([1, 1, 1]);\n        if (MINTR_MAJOR != 1 || PRICE_MAJOR != 1 || ROLES_MAJOR != 1)\n            revert Policy_WrongModuleVersion(expected);\n\n        // Sync beat with distributor if called from kernel\n        if (msg.sender == address(kernel)) {\n            _syncBeatWithDistributor();\n        }\n    }\n\n    /// @inheritdoc Policy\n    function requestPermissions()\n        external\n        view\n        override\n        returns (Permissions[] memory permissions)\n    {\n        Keycode MINTR_KEYCODE = MINTR.KEYCODE();\n\n        permissions = new Permissions[](3);\n        permissions[0] = Permissions({\n            keycode: PRICE.KEYCODE(),\n            funcSelector: PRICE.updateMovingAverage.selector\n        });\n        permissions[1] = Permissions({\n            keycode: MINTR_KEYCODE,\n            funcSelector: MINTR.mintOhm.selector\n        });\n        permissions[2] = Permissions({\n            keycode: MINTR_KEYCODE,\n            funcSelector: MINTR.increaseMintApproval.selector\n        });\n    }\n\n    /// @notice Returns the version of the policy.\n    ///\n    /// @return major The major version of the policy.\n    /// @return minor The minor version of the policy.\n    function VERSION() external pure returns (uint8 major, uint8 minor) {\n        return (1, 7);\n    }\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc IHeart\n    function beat() external nonReentrant {\n        if (!isEnabled) revert Heart_BeatStopped();\n        uint48 currentTime = uint48(block.timestamp);\n        if (currentTime < lastBeat + frequency()) revert Heart_OutOfCycle();\n\n        // Update the moving average on the Price module\n        // This cannot be a periodic task, because it requires a policy with permission to call the updateMovingAverage function\n        PRICE.updateMovingAverage();\n\n        // Trigger the rebase\n        distributor.triggerRebase();\n\n        // Execute periodic tasks\n        _executePeriodicTasks();\n\n        // Calculate the reward (0 <= reward <= maxReward) for the keeper\n        uint256 reward = currentReward();\n\n        // Update the last beat timestamp\n        // Ensure that update frequency doesn't change, but do not allow multiple beats if one is skipped\n        lastBeat = currentTime - ((currentTime - lastBeat) % frequency());\n\n        // Issue the reward\n        if (reward > 0) {\n            MINTR.increaseMintApproval(address(this), reward);\n            MINTR.mintOhm(msg.sender, reward);\n            emit RewardIssued(msg.sender, reward);\n        }\n\n        emit Beat(block.timestamp);\n    }\n\n    //============================================================================================//\n    //                                      ADMIN FUNCTIONS                                       //\n    //============================================================================================//\n\n    function _syncBeatWithDistributor() internal {\n        (uint256 epochLength, , uint256 epochEnd, ) = distributor.staking().epoch();\n        if (frequency() != epochLength) revert Heart_InvalidFrequency();\n        lastBeat = uint48(epochEnd - epochLength);\n    }\n\n    function _resetBeat() internal {\n        lastBeat = uint48(block.timestamp) - frequency();\n    }\n\n    /// @inheritdoc IHeart\n    /// @dev        This function is gated to the ADMIN or MANAGER roles\n    function resetBeat() external onlyManagerOrAdminRole {\n        _resetBeat();\n    }\n\n    /// @inheritdoc PolicyEnabler\n    function _enable(bytes calldata) internal override {\n        _resetBeat();\n    }\n\n    /// @inheritdoc IHeart\n    /// @dev        This function is gated to the ADMIN role\n    function setDistributor(address distributor_) external onlyAdminRole {\n        distributor = IDistributor(distributor_);\n        _syncBeatWithDistributor();\n    }\n\n    modifier notWhileBeatAvailable() {\n        // Prevent calling if a beat is available to avoid front-running a keeper\n        if (uint48(block.timestamp) >= lastBeat + frequency()) revert Heart_BeatAvailable();\n        _;\n    }\n\n    /// @inheritdoc IHeart\n    /// @dev        This function is gated to the ADMIN role\n    function setRewardAuctionParams(\n        uint256 maxReward_,\n        uint48 auctionDuration_\n    ) external onlyAdminRole notWhileBeatAvailable {\n        // auction duration should be less than or equal to frequency, otherwise frequency will be used\n        if (auctionDuration_ > frequency()) revert Heart_InvalidParams();\n\n        maxReward = maxReward_;\n        auctionDuration = auctionDuration_;\n        emit RewardUpdated(maxReward_, auctionDuration_);\n    }\n\n    //============================================================================================//\n    //                                       VIEW FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc IHeart\n    function frequency() public view returns (uint48) {\n        return uint48(PRICE.observationFrequency());\n    }\n\n    /// @inheritdoc IHeart\n    function currentReward() public view returns (uint256) {\n        // If beat not available, return 0\n        // Otherwise, calculate reward from linearly increasing auction bounded by maxReward and heart balance\n        uint48 beatFrequency = frequency();\n        uint48 nextBeat = lastBeat + beatFrequency;\n        uint48 currentTime = uint48(block.timestamp);\n        uint48 duration = auctionDuration > beatFrequency ? beatFrequency : auctionDuration;\n        if (currentTime <= nextBeat) {\n            return 0;\n        } else {\n            return\n                currentTime - nextBeat >= duration\n                    ? maxReward\n                    : (uint256(currentTime - nextBeat) * maxReward) / duration;\n        }\n    }\n}\n/// forge-lint: disable-end(mixed-case-variable)\n"
+    },
+    "dependencies/solmate-6.2.0/src/utils/ReentrancyGuard.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Gas optimized reentrancy protection for smart contracts.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/utils/ReentrancyGuard.sol)\n/// @author Modified from OpenZeppelin (https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/security/ReentrancyGuard.sol)\nabstract contract ReentrancyGuard {\n    uint256 private locked = 1;\n\n    modifier nonReentrant() virtual {\n        require(locked == 1, \"REENTRANCY\");\n\n        locked = 2;\n\n        _;\n\n        locked = 1;\n    }\n}\n"
+    },
+    "dependencies/solmate-6.2.0/src/tokens/ERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Modern and gas efficient ERC20 + EIP-2612 implementation.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC20.sol)\n/// @author Modified from Uniswap (https://github.com/Uniswap/uniswap-v2-core/blob/master/contracts/UniswapV2ERC20.sol)\n/// @dev Do not manually set balances without updating totalSupply, as the sum of all user balances must not exceed it.\nabstract contract ERC20 {\n    /*//////////////////////////////////////////////////////////////\n                                 EVENTS\n    //////////////////////////////////////////////////////////////*/\n\n    event Transfer(address indexed from, address indexed to, uint256 amount);\n\n    event Approval(address indexed owner, address indexed spender, uint256 amount);\n\n    /*//////////////////////////////////////////////////////////////\n                            METADATA STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    string public name;\n\n    string public symbol;\n\n    uint8 public immutable decimals;\n\n    /*//////////////////////////////////////////////////////////////\n                              ERC20 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 public totalSupply;\n\n    mapping(address => uint256) public balanceOf;\n\n    mapping(address => mapping(address => uint256)) public allowance;\n\n    /*//////////////////////////////////////////////////////////////\n                            EIP-2612 STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    uint256 internal immutable INITIAL_CHAIN_ID;\n\n    bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;\n\n    mapping(address => uint256) public nonces;\n\n    /*//////////////////////////////////////////////////////////////\n                               CONSTRUCTOR\n    //////////////////////////////////////////////////////////////*/\n\n    constructor(\n        string memory _name,\n        string memory _symbol,\n        uint8 _decimals\n    ) {\n        name = _name;\n        symbol = _symbol;\n        decimals = _decimals;\n\n        INITIAL_CHAIN_ID = block.chainid;\n        INITIAL_DOMAIN_SEPARATOR = computeDomainSeparator();\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                               ERC20 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function approve(address spender, uint256 amount) public virtual returns (bool) {\n        allowance[msg.sender][spender] = amount;\n\n        emit Approval(msg.sender, spender, amount);\n\n        return true;\n    }\n\n    function transfer(address to, uint256 amount) public virtual returns (bool) {\n        balanceOf[msg.sender] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(msg.sender, to, amount);\n\n        return true;\n    }\n\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) public virtual returns (bool) {\n        uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.\n\n        if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;\n\n        balanceOf[from] -= amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(from, to, amount);\n\n        return true;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                             EIP-2612 LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual {\n        require(deadline >= block.timestamp, \"PERMIT_DEADLINE_EXPIRED\");\n\n        // Unchecked because the only math done is incrementing\n        // the owner's nonce which cannot realistically overflow.\n        unchecked {\n            address recoveredAddress = ecrecover(\n                keccak256(\n                    abi.encodePacked(\n                        \"\\x19\\x01\",\n                        DOMAIN_SEPARATOR(),\n                        keccak256(\n                            abi.encode(\n                                keccak256(\n                                    \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n                                ),\n                                owner,\n                                spender,\n                                value,\n                                nonces[owner]++,\n                                deadline\n                            )\n                        )\n                    )\n                ),\n                v,\n                r,\n                s\n            );\n\n            require(recoveredAddress != address(0) && recoveredAddress == owner, \"INVALID_SIGNER\");\n\n            allowance[recoveredAddress][spender] = value;\n        }\n\n        emit Approval(owner, spender, value);\n    }\n\n    function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {\n        return block.chainid == INITIAL_CHAIN_ID ? INITIAL_DOMAIN_SEPARATOR : computeDomainSeparator();\n    }\n\n    function computeDomainSeparator() internal view virtual returns (bytes32) {\n        return\n            keccak256(\n                abi.encode(\n                    keccak256(\"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"),\n                    keccak256(bytes(name)),\n                    keccak256(\"1\"),\n                    block.chainid,\n                    address(this)\n                )\n            );\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                        INTERNAL MINT/BURN LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function _mint(address to, uint256 amount) internal virtual {\n        totalSupply += amount;\n\n        // Cannot overflow because the sum of all user\n        // balances can't exceed the max uint256 value.\n        unchecked {\n            balanceOf[to] += amount;\n        }\n\n        emit Transfer(address(0), to, amount);\n    }\n\n    function _burn(address from, uint256 amount) internal virtual {\n        balanceOf[from] -= amount;\n\n        // Cannot underflow because a user's balance\n        // will never be larger than the total supply.\n        unchecked {\n            totalSupply -= amount;\n        }\n\n        emit Transfer(from, address(0), amount);\n    }\n}\n"
+    },
+    "src/libraries/TransferHelper.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\nimport {ERC20} from \"solmate/tokens/ERC20.sol\";\n\n/// @notice Safe ERC20 and ETH transfer library that safely handles missing return values.\n/// @author Modified from Uniswap & old Solmate (https://github.com/Uniswap/uniswap-v3-periphery/blob/main/contracts/libraries/TransferHelper.sol)\nlibrary TransferHelper {\n    function safeTransferFrom(ERC20 token, address from, address to, uint256 amount) internal {\n        (bool success, bytes memory data) = address(token).call(\n            abi.encodeWithSelector(ERC20.transferFrom.selector, from, to, amount)\n        );\n\n        require(success && (data.length == 0 || abi.decode(data, (bool))), \"TRANSFER_FROM_FAILED\");\n    }\n\n    function safeTransfer(ERC20 token, address to, uint256 amount) internal {\n        (bool success, bytes memory data) = address(token).call(\n            abi.encodeWithSelector(ERC20.transfer.selector, to, amount)\n        );\n\n        require(success && (data.length == 0 || abi.decode(data, (bool))), \"TRANSFER_FAILED\");\n    }\n\n    function safeApprove(ERC20 token, address to, uint256 amount) internal {\n        (bool success, bytes memory data) = address(token).call(\n            abi.encodeWithSelector(ERC20.approve.selector, to, amount)\n        );\n\n        require(success && (data.length == 0 || abi.decode(data, (bool))), \"APPROVE_FAILED\");\n    }\n}\n"
+    },
+    "src/policies/interfaces/IDistributor.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0\npragma solidity ^0.8.0;\n\nimport {IStaking} from \"interfaces/IStaking.sol\";\n\ninterface IDistributor {\n    // =========  ERRORS ========= //\n\n    error Distributor_NoRebaseOccurred();\n    error Distributor_OnlyStaking();\n    error Distributor_NotUnlocked();\n\n    // =========  CORE FUNCTIONS ========= //\n\n    /// @notice Trigger rebases via distributor. There is an error in Staking's `stake` function\n    ///         which pulls forward part of the rebase for the next epoch. This path triggers a\n    ///         rebase by calling `unstake` (which does not have the issue). The patch also\n    ///         restricts `distribute` to only be able to be called from a tx originating in this\n    ///         function.\n    function triggerRebase() external;\n\n    /// @notice Send the epoch's reward to the staking contract, and mint rewards to Uniswap V2 pools.\n    ///         This removes opportunity cost for liquidity providers by sending rebase rewards\n    ///         directly into the liquidity pool.\n    ///\n    ///         NOTE: This does not add additional emissions (user could be staked instead and get the\n    ///         same tokens).\n    function distribute() external;\n\n    /// @notice Mints the bounty (if > 0) to the staking contract for distribution.\n    /// @return uint256 The amount of OHM minted as a bounty.\n    function retrieveBounty() external returns (uint256);\n\n    /// @notice Getter function for the staking contract address.\n    /// @return address The staking contract address.\n    function staking() external view returns (IStaking);\n}\n"
+    },
+    "src/policies/interfaces/IHeart.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0\npragma solidity >=0.8.0;\n\n/// @dev Interface for the Heart policy as of v1.7\ninterface IHeart {\n    // =========  EVENTS ========= //\n\n    event Beat(uint256 timestamp_);\n    event RewardIssued(address to_, uint256 rewardAmount_);\n    event RewardUpdated(uint256 maxRewardAmount_, uint48 auctionDuration_);\n\n    // =========  ERRORS ========= //\n\n    error Heart_OutOfCycle();\n    error Heart_BeatStopped();\n    error Heart_InvalidParams();\n    error Heart_BeatAvailable();\n    error Heart_InvalidFrequency();\n\n    // =========  CORE FUNCTIONS ========= //\n\n    /// @notice Beats the heart\n    /// @notice Only callable when enough time has passed since last beat (determined by frequency variable)\n    /// @notice This function is incentivized with a token reward (see rewardToken and reward variables).\n    /// @dev    Triggers price oracle update and market operations\n    function beat() external;\n\n    // =========  ADMIN FUNCTIONS ========= //\n\n    /// @notice Unlocks the cycle if stuck on one side, eject function\n    /// @notice Access restricted\n    function resetBeat() external;\n\n    /// @notice Updates the Distributor contract address that the Heart calls on a beat\n    /// @notice Access restricted\n    /// @param  distributor_ The address of the new Distributor contract\n    function setDistributor(address distributor_) external;\n\n    /// @notice Sets the max reward amount, and auction duration for the beat function\n    /// @notice Access restricted\n    /// @param  maxReward_ - New max reward amount, in units of the reward token\n    /// @param  auctionDuration_ - New auction duration, in seconds\n    function setRewardAuctionParams(uint256 maxReward_, uint48 auctionDuration_) external;\n\n    // =========  VIEW FUNCTIONS ========= //\n\n    /// @notice Heart beat frequency, in seconds\n    function frequency() external view returns (uint48);\n\n    /// @notice Current reward amount based on linear auction\n    function currentReward() external view returns (uint256);\n}\n"
+    },
+    "src/modules/ROLES/ROLES.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\nimport \"src/Kernel.sol\";\n\nabstract contract ROLESv1 is Module {\n    // =========  EVENTS ========= //\n\n    event RoleGranted(bytes32 indexed role_, address indexed addr_);\n    event RoleRevoked(bytes32 indexed role_, address indexed addr_);\n\n    // =========  ERRORS ========= //\n\n    error ROLES_InvalidRole(bytes32 role_);\n    error ROLES_RequireRole(bytes32 role_);\n    error ROLES_AddressAlreadyHasRole(address addr_, bytes32 role_);\n    error ROLES_AddressDoesNotHaveRole(address addr_, bytes32 role_);\n    error ROLES_RoleDoesNotExist(bytes32 role_);\n\n    // =========  STATE ========= //\n\n    /// @notice Mapping for if an address has a policy-defined role.\n    mapping(address => mapping(bytes32 => bool)) public hasRole;\n\n    // =========  FUNCTIONS ========= //\n\n    /// @notice Function to grant policy-defined roles to some address. Can only be called by admin.\n    function saveRole(bytes32 role_, address addr_) external virtual;\n\n    /// @notice Function to revoke policy-defined roles from some address. Can only be called by admin.\n    function removeRole(bytes32 role_, address addr_) external virtual;\n\n    /// @notice \"Modifier\" to restrict policy function access to certain addresses with a role.\n    /// @dev    Roles are defined in the policy and granted by the ROLES admin.\n    function requireRole(bytes32 role_, address caller_) external virtual;\n\n    /// @notice Function that checks if role is valid (all lower case)\n    function ensureValidRole(bytes32 role_) external pure virtual;\n}\n"
+    },
+    "src/modules/PRICE/PRICE.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0\npragma solidity >=0.8.15;\n\nimport {AggregatorV2V3Interface} from \"interfaces/AggregatorV2V3Interface.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Price oracle data storage\n/// @dev    The Olympus Price Oracle contract provides a standard interface for OHM price data against a reserve asset.\n///         It also implements a moving average price calculation (same as a TWAP) on the price feed data over a configured\n///         duration and observation frequency. The data provided by this contract is used by the Olympus Range Operator to\n///         perform market operations. The Olympus Price Oracle is updated each epoch by the Olympus Heart contract.\nabstract contract PRICEv1 is Module {\n    // =========  EVENTS ========= //\n\n    event NewObservation(uint256 timestamp_, uint256 price_, uint256 movingAverage_);\n    event MovingAverageDurationChanged(uint48 movingAverageDuration_);\n    event ObservationFrequencyChanged(uint48 observationFrequency_);\n    event UpdateThresholdsChanged(uint48 ohmEthUpdateThreshold_, uint48 reserveEthUpdateThreshold_);\n    event MinimumTargetPriceChanged(uint256 minimumTargetPrice_);\n\n    // =========  ERRORS ========= //\n\n    error Price_InvalidParams();\n    error Price_NotInitialized();\n    error Price_AlreadyInitialized();\n    error Price_BadFeed(address priceFeed);\n\n    // =========  STATE ========= //\n\n    /// @dev    Price feeds. Chainlink typically provides price feeds for an asset in ETH. Therefore, we use two price feeds against ETH, one for OHM and one for the Reserve asset, to calculate the relative price of OHM in the Reserve asset.\n    /// @dev    Update thresholds are the maximum amount of time that can pass between price feed updates before the price oracle is considered stale. These should be set based on the parameters of the price feed.\n\n    /// @notice OHM/ETH price feed\n    AggregatorV2V3Interface public ohmEthPriceFeed;\n\n    /// @notice Maximum expected time between OHM/ETH price feed updates\n    uint48 public ohmEthUpdateThreshold;\n\n    /// @notice Reserve/ETH price feed\n    AggregatorV2V3Interface public reserveEthPriceFeed;\n\n    /// @notice Maximum expected time between OHM/ETH price feed updates\n    uint48 public reserveEthUpdateThreshold;\n\n    /// @notice    Running sum of observations to calculate the moving average price from\n    /// @dev       See getMovingAverage()\n    uint256 public cumulativeObs;\n\n    /// @notice Array of price observations. Check nextObsIndex to determine latest data point.\n    /// @dev    Observations are stored in a ring buffer where the moving average is the sum of all observations divided by the number of observations.\n    ///         Observations can be cleared by changing the movingAverageDuration or observationFrequency and must be re-initialized.\n    uint256[] public observations;\n\n    /// @notice Index of the next observation to make. The current value at this index is the oldest observation.\n    uint32 public nextObsIndex;\n\n    /// @notice Number of observations used in the moving average calculation. Computed from movingAverageDuration / observationFrequency.\n    uint32 public numObservations;\n\n    /// @notice Frequency (in seconds) that observations should be stored.\n    uint48 public observationFrequency;\n\n    /// @notice Duration (in seconds) over which the moving average is calculated.\n    uint48 public movingAverageDuration;\n\n    /// @notice Unix timestamp of last observation (in seconds).\n    uint48 public lastObservationTime;\n\n    /// @notice Whether the price module is initialized (and therefore active).\n    bool public initialized;\n\n    /// @notice Number of decimals in the price values provided by the contract.\n    uint8 public constant decimals = 18;\n\n    /// @notice Minimum target price for RBS system. Set manually to correspond to the liquid backing of OHM.\n    uint256 public minimumTargetPrice;\n\n    // =========  FUNCTIONS ========= //\n\n    /// @notice Trigger an update of the moving average. Permissioned.\n    /// @dev    This function does not have a time-gating on the observationFrequency on this contract. It is set on the Heart policy contract.\n    ///         The Heart beat frequency should be set to the same value as the observationFrequency.\n    function updateMovingAverage() external virtual;\n\n    /// @notice Initialize the price module\n    /// @notice Access restricted to activated policies\n    /// @param  startObservations_ - Array of observations to initialize the moving average with. Must be of length numObservations.\n    /// @param  lastObservationTime_ - Unix timestamp of last observation being provided (in seconds).\n    /// @dev    This function must be called after the Price module is deployed to activate it and after updating the observationFrequency\n    ///         or movingAverageDuration (in certain cases) in order for the Price module to function properly.\n    function initialize(\n        uint256[] memory startObservations_,\n        uint48 lastObservationTime_\n    ) external virtual;\n\n    /// @notice Change the moving average window (duration)\n    /// @param  movingAverageDuration_ - Moving average duration in seconds, must be a multiple of observation frequency\n    /// @dev    Changing the moving average duration will erase the current observations array\n    ///         and require the initialize function to be called again. Ensure that you have saved\n    ///         the existing data and can re-populate before calling this function.\n    function changeMovingAverageDuration(uint48 movingAverageDuration_) external virtual;\n\n    /// @notice   Change the observation frequency of the moving average (i.e. how often a new observation is taken)\n    /// @param    observationFrequency_ - Observation frequency in seconds, must be a divisor of the moving average duration\n    /// @dev      Changing the observation frequency clears existing observation data since it will not be taken at the right time intervals.\n    ///           Ensure that you have saved the existing data and/or can re-populate before calling this function.\n    function changeObservationFrequency(uint48 observationFrequency_) external virtual;\n\n    /// @notice   Change the update thresholds for the price feeds\n    /// @param    ohmEthUpdateThreshold_ - Maximum allowed time between OHM/ETH price feed updates\n    /// @param    reserveEthUpdateThreshold_ - Maximum allowed time between Reserve/ETH price feed updates\n    /// @dev      The update thresholds should be set based on the update threshold of the chainlink oracles.\n    function changeUpdateThresholds(\n        uint48 ohmEthUpdateThreshold_,\n        uint48 reserveEthUpdateThreshold_\n    ) external virtual;\n\n    /// @notice   Change the minimum target price\n    /// @param    minimumTargetPrice_ - Minimum target price for RBS system with 18 decimals, expressed as number of Reserve per OHM\n    /// @dev      The minimum target price should be set based on the liquid backing of OHM.\n    function changeMinimumTargetPrice(uint256 minimumTargetPrice_) external virtual;\n\n    /// @notice Get the current price of OHM in the Reserve asset from the price feeds\n    function getCurrentPrice() external view virtual returns (uint256);\n\n    /// @notice Get the last stored price observation of OHM in the Reserve asset\n    function getLastPrice() external view virtual returns (uint256);\n\n    /// @notice Get the moving average of OHM in the Reserve asset over the defined window (see movingAverageDuration and observationFrequency).\n    function getMovingAverage() external view virtual returns (uint256);\n\n    /// @notice Get target price of OHM in the Reserve asset for the RBS system\n    /// @dev    Returns the maximum of the moving average and the minimum target price\n    function getTargetPrice() external view virtual returns (uint256);\n}\n"
+    },
+    "src/modules/MINTR/MINTR.v1.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\nimport {OlympusERC20Token as OHM} from \"src/external/OlympusERC20.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Wrapper for minting and burning functions of OHM token.\nabstract contract MINTRv1 is Module {\n    // =========  EVENTS ========= //\n\n    event IncreaseMintApproval(address indexed policy_, uint256 newAmount_);\n    event DecreaseMintApproval(address indexed policy_, uint256 newAmount_);\n    event Mint(address indexed policy_, address indexed to_, uint256 amount_);\n    event Burn(address indexed policy_, address indexed from_, uint256 amount_);\n\n    // ========= ERRORS ========= //\n\n    error MINTR_NotApproved();\n    error MINTR_ZeroAmount();\n    error MINTR_NotActive();\n\n    // =========  STATE ========= //\n\n    OHM public ohm;\n\n    /// @notice Status of the minter. If false, minting and burning OHM is disabled.\n    bool public active;\n\n    /// @notice Mapping of who is approved for minting.\n    /// @dev    minter -> amount. Infinite approval is max(uint256).\n    mapping(address => uint256) public mintApproval;\n\n    // =========  FUNCTIONS ========= //\n\n    modifier onlyWhileActive() {\n        if (!active) revert MINTR_NotActive();\n        _;\n    }\n\n    /// @notice Mint OHM to an address.\n    function mintOhm(address to_, uint256 amount_) external virtual;\n\n    /// @notice Burn OHM from an address. Must have approval.\n    function burnOhm(address from_, uint256 amount_) external virtual;\n\n    /// @notice Increase approval for specific withdrawer addresses\n    /// @dev    Policies must explicity request how much they want approved before withdrawing.\n    function increaseMintApproval(address policy_, uint256 amount_) external virtual;\n\n    /// @notice Decrease approval for specific withdrawer addresses\n    function decreaseMintApproval(address policy_, uint256 amount_) external virtual;\n\n    /// @notice Emergency shutdown of minting and burning.\n    function deactivate() external virtual;\n\n    /// @notice Re-activate minting and burning after shutdown.\n    function activate() external virtual;\n}\n"
+    },
+    "src/bases/BasePeriodicTaskManager.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\n// Interfaces\nimport {IPeriodicTask} from \"src/interfaces/IPeriodicTask.sol\";\nimport {IPeriodicTaskManager} from \"src/bases/interfaces/IPeriodicTaskManager.sol\";\nimport {IERC165} from \"@openzeppelin-4.8.0/interfaces/IERC165.sol\";\n\n// Libraries\nimport {AddressStorageArray} from \"src/libraries/AddressStorageArray.sol\";\n\n// Bophades\nimport {PolicyEnabler} from \"src/policies/utils/PolicyEnabler.sol\";\n\nabstract contract BasePeriodicTaskManager is IPeriodicTaskManager, PolicyEnabler {\n    using AddressStorageArray for address[];\n\n    // ========== STATE VARIABLES ========== //\n\n    /// @notice The periodic tasks\n    address[] internal _periodicTaskAddresses;\n\n    /// @notice An optional custom selector for each periodic task\n    /// @dev    If the selector is set (non-zero), the task will be executed using the custom selector\n    ///         instead of the `IPeriodicTask.execute` function\n    mapping(address => bytes4) internal _periodicTaskCustomSelectors;\n\n    // ========== TASK CONFIGURATION ========== //\n\n    function _addPeriodicTask(address task_, bytes4 customSelector_, uint256 index_) internal {\n        // Validate that the task is not already added\n        if (hasPeriodicTask(task_)) revert PeriodicTaskManager_TaskAlreadyExists(task_);\n\n        // Validate that the task is not a zero address\n        if (task_ == address(0)) revert PeriodicTaskManager_ZeroAddress();\n\n        // Validate that the task is a contract\n        if (task_.code.length == 0) revert PeriodicTaskManager_NotPeriodicTask(task_);\n\n        // If there is no custom selector, validate that the task implements the IPeriodicTask interface\n        if (customSelector_ == bytes4(0)) {\n            // Validate that the task implements the IPeriodicTask interface\n            (bool success, bytes memory data) = task_.staticcall(\n                abi.encodeWithSelector(\n                    IERC165.supportsInterface.selector,\n                    type(IPeriodicTask).interfaceId\n                )\n            );\n            if (!success || abi.decode(data, (bool)) == false)\n                revert PeriodicTaskManager_NotPeriodicTask(task_);\n        } else {\n            // Validation of the selector happens at the time of execution, as there is no way to validate it here\n            _periodicTaskCustomSelectors[task_] = customSelector_;\n        }\n\n        // Insert the task at the index\n        // This will also validate that the index is within bounds\n        _periodicTaskAddresses.insert(task_, index_);\n\n        // Emit the event\n        emit PeriodicTaskAdded(task_, customSelector_, index_);\n    }\n\n    /// @inheritdoc IPeriodicTaskManager\n    /// @dev        This function reverts if:\n    ///             - The caller is not the admin\n    ///             - The task is already added\n    ///             - The task is not a valid periodic task\n    ///\n    function addPeriodicTask(address task_) external override onlyAdminRole {\n        _addPeriodicTask(task_, bytes4(0), _periodicTaskAddresses.length);\n    }\n\n    /// @inheritdoc IPeriodicTaskManager\n    /// @dev        This function reverts if:\n    ///             - The caller is not the admin\n    ///             - The task is already added\n    ///             - The task is not a valid periodic task\n    ///             - The index is out of bounds\n    ///\n    ///             If a custom selector is provided, care must be taken to ensure that the selector exists on {task_}.\n    ///             If the selector does not exist, all of the periodic tasks will revert.\n    function addPeriodicTaskAtIndex(\n        address task_,\n        bytes4 customSelector_,\n        uint256 index_\n    ) external override onlyAdminRole {\n        _addPeriodicTask(task_, customSelector_, index_);\n    }\n\n    function _removePeriodicTask(uint256 index_) internal {\n        // Remove the task at the index\n        address removedTask = _periodicTaskAddresses.remove(index_);\n\n        // Clear the custom selector for the task\n        delete _periodicTaskCustomSelectors[removedTask];\n\n        // Emit the event\n        emit PeriodicTaskRemoved(removedTask, index_);\n    }\n\n    /// @inheritdoc IPeriodicTaskManager\n    /// @dev        This function reverts if:\n    ///             - The caller is not the admin\n    ///             - The task is not added\n    function removePeriodicTask(address task_) external override onlyAdminRole {\n        // Get the index of the task\n        uint256 index = getPeriodicTaskIndex(task_);\n\n        // Validate that the task exists\n        if (index == type(uint256).max) revert PeriodicTaskManager_TaskNotFound(task_);\n\n        // Remove the task at the index\n        _removePeriodicTask(index);\n    }\n\n    /// @inheritdoc IPeriodicTaskManager\n    /// @dev        This function reverts if:\n    ///             - The caller is not the admin\n    ///             - The index is out of bounds\n    function removePeriodicTaskAtIndex(uint256 index_) external override onlyAdminRole {\n        // Remove the task at the index\n        _removePeriodicTask(index_);\n    }\n\n    // ========== TASK EXECUTION ========== //\n\n    /// @dev This function does not implement any logic to catch errors from the periodic tasks.\n    /// @dev The logic is that if a periodic task fails, it should fail loudly and revert.\n    /// @dev Any tasks that are non-essential can include a try-catch block to handle the error internally.\n    function _executePeriodicTasks() internal {\n        for (uint256 i = 0; i < _periodicTaskAddresses.length; i++) {\n            // Get the custom selector for the task\n            bytes4 customSelector = _periodicTaskCustomSelectors[_periodicTaskAddresses[i]];\n\n            // If there is no custom selector, execute the task using the `IPeriodicTask.execute` function\n            if (customSelector == bytes4(0)) {\n                IPeriodicTask(_periodicTaskAddresses[i]).execute();\n            }\n            // Otherwise, execute the task using the custom selector\n            else {\n                // Call the custom selector\n                (bool success, bytes memory data) = _periodicTaskAddresses[i].call(\n                    abi.encodeWithSelector(customSelector)\n                );\n\n                // If the call fails, revert\n                if (!success)\n                    revert PeriodicTaskManager_CustomSelectorFailed(\n                        _periodicTaskAddresses[i],\n                        customSelector,\n                        data\n                    );\n            }\n        }\n    }\n\n    // ========== VIEW FUNCTIONS ========== //\n\n    /// @inheritdoc IPeriodicTaskManager\n    function getPeriodicTaskCount() external view override returns (uint256) {\n        return _periodicTaskAddresses.length;\n    }\n\n    /// @inheritdoc IPeriodicTaskManager\n    function getPeriodicTaskAtIndex(\n        uint256 index_\n    ) external view override returns (address, bytes4) {\n        address task = _periodicTaskAddresses[index_];\n\n        return (task, _periodicTaskCustomSelectors[task]);\n    }\n\n    /// @inheritdoc IPeriodicTaskManager\n    function getPeriodicTasks() external view override returns (address[] memory, bytes4[] memory) {\n        address[] memory tasks = new address[](_periodicTaskAddresses.length);\n        bytes4[] memory customSelectors = new bytes4[](_periodicTaskAddresses.length);\n\n        for (uint256 i = 0; i < _periodicTaskAddresses.length; i++) {\n            tasks[i] = _periodicTaskAddresses[i];\n            customSelectors[i] = _periodicTaskCustomSelectors[_periodicTaskAddresses[i]];\n        }\n\n        return (tasks, customSelectors);\n    }\n\n    /// @inheritdoc IPeriodicTaskManager\n    ///\n    /// @return _index  The index of the task, or type(uint256).max if not found\n    function getPeriodicTaskIndex(address task_) public view override returns (uint256 _index) {\n        uint256 length = _periodicTaskAddresses.length;\n        _index = type(uint256).max;\n        for (uint256 i = 0; i < length; i++) {\n            if (_periodicTaskAddresses[i] == task_) {\n                _index = i;\n                break;\n            }\n        }\n\n        return _index;\n    }\n\n    /// @inheritdoc IPeriodicTaskManager\n    function hasPeriodicTask(address task_) public view override returns (bool) {\n        return getPeriodicTaskIndex(task_) != type(uint256).max;\n    }\n}\n"
+    },
+    "src/policies/utils/PolicyEnabler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\nimport {IEnabler} from \"src/periphery/interfaces/IEnabler.sol\";\nimport {PolicyAdmin} from \"./PolicyAdmin.sol\";\n\n/// @title  PolicyEnabler\n/// @notice This contract is designed to be inherited by contracts that need to be enabled or disabled. It replaces the inconsistent usage of `active` and `locallyActive` state variables across the codebase.\n/// @dev    A contract that inherits from this contract should use the `onlyEnabled` and `onlyDisabled` modifiers to gate access to certain functions.\n///\n///         Inheriting contracts must do the following:\n///         - In `configureDependencies()`, assign the module address to the `ROLES` state variable, e.g. `ROLES = ROLESv1(getModuleAddress(toKeycode(\"ROLES\")));`\n///\n///         The following are optional:\n///         - Override the `_enable()` and `_disable()` functions if custom logic and/or parameters are needed for the enable/disable functions.\n///           - For example, `enable()` could be called with initialisation data that is decoded, validated and assigned in `_enable()`.\nabstract contract PolicyEnabler is IEnabler, PolicyAdmin {\n    // ===== STATE VARIABLES ===== //\n\n    /// @notice Whether the policy functionality is enabled\n    bool public isEnabled;\n\n    // ===== MODIFIERS ===== //\n\n    function _onlyEnabled() internal view {\n        if (!isEnabled) revert NotEnabled();\n    }\n\n    /// @notice Modifier that reverts if the policy is not enabled\n    modifier onlyEnabled() {\n        _onlyEnabled();\n        _;\n    }\n\n    function _onlyDisabled() internal view {\n        if (isEnabled) revert NotDisabled();\n    }\n\n    /// @notice Modifier that reverts if the policy is enabled\n    modifier onlyDisabled() {\n        _onlyDisabled();\n        _;\n    }\n\n    // ===== ENABLEABLE FUNCTIONS ===== //\n\n    /// @notice Enable the contract\n    /// @dev    This function performs the following steps:\n    ///         1. Validates that the caller has the admin role\n    ///         2. Validates that the contract is disabled\n    ///         3. Calls the implementation-specific `_enable()` function\n    ///         4. Changes the state of the contract to enabled\n    ///         5. Emits the `Enabled` event\n    ///\n    /// @param  enableData_ The data to pass to the implementation-specific `_enable()` function\n    function enable(bytes calldata enableData_) public onlyAdminRole onlyDisabled {\n        // Call the implementation-specific enable function\n        _enable(enableData_);\n\n        // Change the state\n        isEnabled = true;\n\n        // Emit the enabled event\n        emit Enabled();\n    }\n\n    /// @notice Implementation-specific enable function\n    /// @dev    This function is called by the `enable()` function\n    ///\n    ///         The implementing contract can override this function and perform the following:\n    ///         1. Validate any parameters (if needed) or revert\n    ///         2. Validate state (if needed) or revert\n    ///         3. Perform any necessary actions, apart from modifying the `isEnabled` state variable\n    ///\n    /// @param  enableData_ Custom data that can be used by the implementation. The format of this data is\n    ///         left to the discretion of the implementation.\n    function _enable(bytes calldata enableData_) internal virtual {}\n\n    /// @notice Disable the contract\n    /// @dev    This function performs the following steps:\n    ///         1. Validates that the caller has the admin or emergency role\n    ///         2. Validates that the contract is enabled\n    ///         3. Calls the implementation-specific `_disable()` function\n    ///         4. Changes the state of the contract to disabled\n    ///         5. Emits the `Disabled` event\n    ///\n    /// @param  disableData_ The data to pass to the implementation-specific `_disable()` function\n    function disable(bytes calldata disableData_) public onlyEmergencyOrAdminRole onlyEnabled {\n        // Call the implementation-specific disable function\n        _disable(disableData_);\n\n        // Change the state\n        isEnabled = false;\n\n        // Emit the disabled event\n        emit Disabled();\n    }\n\n    /// @notice Implementation-specific disable function\n    /// @dev    This function is called by the `disable()` function.\n    ///\n    ///         The implementing contract can override this function and perform the following:\n    ///         1. Validate any parameters (if needed) or revert\n    ///         2. Validate state (if needed) or revert\n    ///         3. Perform any necessary actions, apart from modifying the `isEnabled` state variable\n    ///\n    /// @param  disableData_ Custom data that can be used by the implementation. The format of this data is\n    ///         left to the discretion of the implementation.\n    function _disable(bytes calldata disableData_) internal virtual {}\n\n    // ========== ERC165 ========== //\n\n    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {\n        return\n            interfaceId == bytes4(0x01ffc9a7) || // ERC-165\n            interfaceId == type(IEnabler).interfaceId;\n    }\n}\n"
+    },
+    "src/Kernel.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\n//     ███████    █████       █████ █████ ██████   ██████ ███████████  █████  █████  █████████\n//   ███░░░░░███ ░░███       ░░███ ░░███ ░░██████ ██████ ░░███░░░░░███░░███  ░░███  ███░░░░░███\n//  ███     ░░███ ░███        ░░███ ███   ░███░█████░███  ░███    ░███ ░███   ░███ ░███    ░░░\n// ░███      ░███ ░███         ░░█████    ░███░░███ ░███  ░██████████  ░███   ░███ ░░█████████\n// ░███      ░███ ░███          ░░███     ░███ ░░░  ░███  ░███░░░░░░   ░███   ░███  ░░░░░░░░███\n// ░░███     ███  ░███      █    ░███     ░███      ░███  ░███         ░███   ░███  ███    ░███\n//  ░░░███████░   ███████████    █████    █████     █████ █████        ░░████████  ░░█████████\n//    ░░░░░░░    ░░░░░░░░░░░    ░░░░░    ░░░░░     ░░░░░ ░░░░░          ░░░░░░░░    ░░░░░░░░░\n\n//============================================================================================//\n//                                        GLOBAL TYPES                                        //\n//============================================================================================//\n\n/// @notice Actions to trigger state changes in the kernel. Passed by the executor\nenum Actions {\n    InstallModule,\n    UpgradeModule,\n    ActivatePolicy,\n    DeactivatePolicy,\n    ChangeExecutor,\n    MigrateKernel\n}\n\n/// @notice Used by executor to select an action and a target contract for a kernel action\nstruct Instruction {\n    Actions action;\n    address target;\n}\n\n/// @notice Used to define which module functions a policy needs access to\nstruct Permissions {\n    Keycode keycode;\n    bytes4 funcSelector;\n}\n\ntype Keycode is bytes5;\n\n//============================================================================================//\n//                                       UTIL FUNCTIONS                                       //\n//============================================================================================//\n\nerror TargetNotAContract(address target_);\nerror InvalidKeycode(Keycode keycode_);\n\n// solhint-disable-next-line func-visibility\nfunction toKeycode(bytes5 keycode_) pure returns (Keycode) {\n    return Keycode.wrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction fromKeycode(Keycode keycode_) pure returns (bytes5) {\n    return Keycode.unwrap(keycode_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureContract(address target_) view {\n    if (target_.code.length == 0) revert TargetNotAContract(target_);\n}\n\n// solhint-disable-next-line func-visibility\nfunction ensureValidKeycode(Keycode keycode_) pure {\n    bytes5 unwrapped = Keycode.unwrap(keycode_);\n    for (uint256 i = 0; i < 5; ) {\n        bytes1 char = unwrapped[i];\n        if (char < 0x41 || char > 0x5A) revert InvalidKeycode(keycode_); // A-Z only\n        unchecked {\n            i++;\n        }\n    }\n}\n\n//============================================================================================//\n//                                        COMPONENTS                                          //\n//============================================================================================//\n\n/// @notice Generic adapter interface for kernel access in modules and policies.\nabstract contract KernelAdapter {\n    error KernelAdapter_OnlyKernel(address caller_);\n\n    Kernel public kernel;\n\n    constructor(Kernel kernel_) {\n        kernel = kernel_;\n    }\n\n    /// @notice Modifier to restrict functions to be called only by kernel.\n    modifier onlyKernel() {\n        if (msg.sender != address(kernel)) revert KernelAdapter_OnlyKernel(msg.sender);\n        _;\n    }\n\n    /// @notice Function used by kernel when migrating to a new kernel.\n    function changeKernel(Kernel newKernel_) external onlyKernel {\n        kernel = newKernel_;\n    }\n}\n\n/// @notice Base level extension of the kernel. Modules act as independent state components to be\n///         interacted with and mutated through policies.\n/// @dev    Modules are installed and uninstalled via the executor.\nabstract contract Module is KernelAdapter {\n    error Module_PolicyNotPermitted(address policy_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Modifier to restrict which policies have access to module functions.\n    modifier permissioned() {\n        if (\n            msg.sender == address(kernel) ||\n            !kernel.modulePermissions(KEYCODE(), Policy(msg.sender), msg.sig)\n        ) revert Module_PolicyNotPermitted(msg.sender);\n        _;\n    }\n\n    /// @notice 5 byte identifier for a module.\n    function KEYCODE() public pure virtual returns (Keycode) {}\n\n    /// @notice Returns which semantic version of a module is being implemented.\n    /// @return major - Major version upgrade indicates breaking change to the interface.\n    /// @return minor - Minor version change retains backward-compatible interface.\n    function VERSION() external pure virtual returns (uint8 major, uint8 minor) {}\n\n    /// @notice Initialization function for the module\n    /// @dev    This function is called when the module is installed or upgraded by the kernel.\n    /// @dev    MUST BE GATED BY onlyKernel. Used to encompass any initialization or upgrade logic.\n    function INIT() external virtual onlyKernel {}\n}\n\n/// @notice Policies are application logic and external interface for the kernel and installed modules.\n/// @dev    Policies are activated and deactivated in the kernel by the executor.\n/// @dev    Module dependencies and function permissions must be defined in appropriate functions.\nabstract contract Policy is KernelAdapter {\n    error Policy_ModuleDoesNotExist(Keycode keycode_);\n    error Policy_WrongModuleVersion(bytes expected_);\n\n    constructor(Kernel kernel_) KernelAdapter(kernel_) {}\n\n    /// @notice Easily accessible indicator for if a policy is activated or not.\n    function isActive() external view returns (bool) {\n        return kernel.isPolicyActive(this);\n    }\n\n    /// @notice Function to grab module address from a given keycode.\n    function getModuleAddress(Keycode keycode_) internal view returns (address) {\n        address moduleForKeycode = address(kernel.getModuleForKeycode(keycode_));\n        if (moduleForKeycode == address(0)) revert Policy_ModuleDoesNotExist(keycode_);\n        return moduleForKeycode;\n    }\n\n    /// @notice Define module dependencies for this policy.\n    /// @return dependencies - Keycode array of module dependencies.\n    function configureDependencies() external virtual returns (Keycode[] memory dependencies) {}\n\n    /// @notice Function called by kernel to set module function permissions.\n    /// @return requests - Array of keycodes and function selectors for requested permissions.\n    function requestPermissions() external view virtual returns (Permissions[] memory requests) {}\n}\n\n/// @notice Main contract that acts as a central component registry for the protocol.\n/// @dev    The kernel manages modules and policies. The kernel is mutated via predefined Actions,\n/// @dev    which are input from any address assigned as the executor. The executor can be changed as needed.\ncontract Kernel {\n    // =========  EVENTS ========= //\n\n    event PermissionsUpdated(\n        Keycode indexed keycode_,\n        Policy indexed policy_,\n        bytes4 funcSelector_,\n        bool granted_\n    );\n    event ActionExecuted(Actions indexed action_, address indexed target_);\n\n    // =========  ERRORS ========= //\n\n    error Kernel_OnlyExecutor(address caller_);\n    error Kernel_ModuleAlreadyInstalled(Keycode module_);\n    error Kernel_InvalidModuleUpgrade(Keycode module_);\n    error Kernel_PolicyAlreadyActivated(address policy_);\n    error Kernel_PolicyNotActivated(address policy_);\n\n    // =========  PRIVILEGED ADDRESSES ========= //\n\n    /// @notice Address that is able to initiate Actions in the kernel. Can be assigned to a multisig or governance contract.\n    address public executor;\n\n    // =========  MODULE MANAGEMENT ========= //\n\n    /// @notice Array of all modules currently installed.\n    Keycode[] public allKeycodes;\n\n    /// @notice Mapping of module address to keycode.\n    mapping(Keycode => Module) public getModuleForKeycode;\n\n    /// @notice Mapping of keycode to module address.\n    mapping(Module => Keycode) public getKeycodeForModule;\n\n    /// @notice Mapping of a keycode to all of its policy dependents. Used to efficiently reconfigure policy dependencies.\n    mapping(Keycode => Policy[]) public moduleDependents;\n\n    /// @notice Helper for module dependent arrays. Prevents the need to loop through array.\n    mapping(Keycode => mapping(Policy => uint256)) public getDependentIndex;\n\n    /// @notice Module <> Policy Permissions.\n    /// @dev    Keycode -> Policy -> Function Selector -> bool for permission\n    mapping(Keycode => mapping(Policy => mapping(bytes4 => bool))) public modulePermissions;\n\n    // =========  POLICY MANAGEMENT ========= //\n\n    /// @notice List of all active policies\n    Policy[] public activePolicies;\n\n    /// @notice Helper to get active policy quickly. Prevents need to loop through array.\n    mapping(Policy => uint256) public getPolicyIndex;\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    constructor() {\n        executor = msg.sender;\n    }\n\n    /// @notice Modifier to check if caller is the executor.\n    modifier onlyExecutor() {\n        if (msg.sender != executor) revert Kernel_OnlyExecutor(msg.sender);\n        _;\n    }\n\n    function isPolicyActive(Policy policy_) public view returns (bool) {\n        return activePolicies.length > 0 && activePolicies[getPolicyIndex[policy_]] == policy_;\n    }\n\n    /// @notice Main kernel function. Initiates state changes to kernel depending on Action passed in.\n    function executeAction(Actions action_, address target_) external onlyExecutor {\n        if (action_ == Actions.InstallModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _installModule(Module(target_));\n        } else if (action_ == Actions.UpgradeModule) {\n            ensureContract(target_);\n            ensureValidKeycode(Module(target_).KEYCODE());\n            _upgradeModule(Module(target_));\n        } else if (action_ == Actions.ActivatePolicy) {\n            ensureContract(target_);\n            _activatePolicy(Policy(target_));\n        } else if (action_ == Actions.DeactivatePolicy) {\n            ensureContract(target_);\n            _deactivatePolicy(Policy(target_));\n        } else if (action_ == Actions.ChangeExecutor) {\n            executor = target_;\n        } else if (action_ == Actions.MigrateKernel) {\n            ensureContract(target_);\n            _migrateKernel(Kernel(target_));\n        }\n\n        emit ActionExecuted(action_, target_);\n    }\n\n    function _installModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n\n        if (address(getModuleForKeycode[keycode]) != address(0))\n            revert Kernel_ModuleAlreadyInstalled(keycode);\n\n        getModuleForKeycode[keycode] = newModule_;\n        getKeycodeForModule[newModule_] = keycode;\n        allKeycodes.push(keycode);\n\n        newModule_.INIT();\n    }\n\n    function _upgradeModule(Module newModule_) internal {\n        Keycode keycode = newModule_.KEYCODE();\n        Module oldModule = getModuleForKeycode[keycode];\n\n        if (address(oldModule) == address(0) || oldModule == newModule_)\n            revert Kernel_InvalidModuleUpgrade(keycode);\n\n        getKeycodeForModule[oldModule] = Keycode.wrap(bytes5(0));\n        getKeycodeForModule[newModule_] = keycode;\n        getModuleForKeycode[keycode] = newModule_;\n\n        newModule_.INIT();\n\n        _reconfigurePolicies(keycode);\n    }\n\n    function _activatePolicy(Policy policy_) internal {\n        if (isPolicyActive(policy_)) revert Kernel_PolicyAlreadyActivated(address(policy_));\n\n        // Add policy to list of active policies\n        activePolicies.push(policy_);\n        getPolicyIndex[policy_] = activePolicies.length - 1;\n\n        // Record module dependencies\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depLength = dependencies.length;\n\n        for (uint256 i; i < depLength; ) {\n            Keycode keycode = dependencies[i];\n\n            moduleDependents[keycode].push(policy_);\n            getDependentIndex[keycode][policy_] = moduleDependents[keycode].length - 1;\n\n            unchecked {\n                ++i;\n            }\n        }\n\n        // Grant permissions for policy to access restricted module functions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, true);\n    }\n\n    function _deactivatePolicy(Policy policy_) internal {\n        if (!isPolicyActive(policy_)) revert Kernel_PolicyNotActivated(address(policy_));\n\n        // Revoke permissions\n        Permissions[] memory requests = policy_.requestPermissions();\n        _setPolicyPermissions(policy_, requests, false);\n\n        // Remove policy from all policy data structures\n        uint256 idx = getPolicyIndex[policy_];\n        Policy lastPolicy = activePolicies[activePolicies.length - 1];\n\n        activePolicies[idx] = lastPolicy;\n        activePolicies.pop();\n        getPolicyIndex[lastPolicy] = idx;\n        delete getPolicyIndex[policy_];\n\n        // Remove policy from module dependents\n        _pruneFromDependents(policy_);\n    }\n\n    /// @notice All functionality will move to the new kernel. WARNING: ACTION WILL BRICK THIS KERNEL.\n    /// @dev    New kernel must add in all of the modules and policies via executeAction.\n    /// @dev    NOTE: Data does not get cleared from this kernel.\n    function _migrateKernel(Kernel newKernel_) internal {\n        uint256 keycodeLen = allKeycodes.length;\n        for (uint256 i; i < keycodeLen; ) {\n            Module module = Module(getModuleForKeycode[allKeycodes[i]]);\n            module.changeKernel(newKernel_);\n            unchecked {\n                ++i;\n            }\n        }\n\n        uint256 policiesLen = activePolicies.length;\n        for (uint256 j; j < policiesLen; ) {\n            Policy policy = activePolicies[j];\n\n            // Deactivate before changing kernel\n            policy.changeKernel(newKernel_);\n            unchecked {\n                ++j;\n            }\n        }\n    }\n\n    function _reconfigurePolicies(Keycode keycode_) internal {\n        Policy[] memory dependents = moduleDependents[keycode_];\n        uint256 depLength = dependents.length;\n\n        for (uint256 i; i < depLength; ) {\n            dependents[i].configureDependencies();\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _setPolicyPermissions(\n        Policy policy_,\n        Permissions[] memory requests_,\n        bool grant_\n    ) internal {\n        uint256 reqLength = requests_.length;\n        for (uint256 i = 0; i < reqLength; ) {\n            Permissions memory request = requests_[i];\n            modulePermissions[request.keycode][policy_][request.funcSelector] = grant_;\n\n            emit PermissionsUpdated(request.keycode, policy_, request.funcSelector, grant_);\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n\n    function _pruneFromDependents(Policy policy_) internal {\n        Keycode[] memory dependencies = policy_.configureDependencies();\n        uint256 depcLength = dependencies.length;\n\n        for (uint256 i; i < depcLength; ) {\n            Keycode keycode = dependencies[i];\n            Policy[] storage dependents = moduleDependents[keycode];\n\n            uint256 origIndex = getDependentIndex[keycode][policy_];\n            Policy lastPolicy = dependents[dependents.length - 1];\n\n            // Swap with last and pop\n            dependents[origIndex] = lastPolicy;\n            dependents.pop();\n\n            // Record new index and delete deactivated policy index\n            getDependentIndex[keycode][lastPolicy] = origIndex;\n            delete getDependentIndex[keycode][policy_];\n\n            unchecked {\n                ++i;\n            }\n        }\n    }\n}\n"
+    },
+    "src/interfaces/IStaking.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\ninterface IStaking {\n    /* ========== DATA STRUCTURES ========== */\n\n    struct Epoch {\n        uint256 length; // in seconds\n        uint256 number; // since inception\n        uint256 end; // timestamp\n        uint256 distribute; // amount\n    }\n\n    /* ========== MUTATIVE FUNCTIONS ========== */\n\n    function rebase() external returns (uint256);\n\n    function unstake(address, uint256, bool _trigger, bool) external returns (uint256);\n\n    /* ========== ADMIN FUNCTIONS ========== */\n\n    function setDistributor(address _distributor) external;\n\n    /* ========== VIEW FUNCTIONS ========== */\n\n    function secondsToNextEpoch() external view returns (uint256);\n\n    function epoch() external view returns (uint256, uint256, uint256, uint256);\n}\n"
+    },
+    "src/interfaces/AggregatorV2V3Interface.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface AggregatorInterface {\n    function latestAnswer() external view returns (int256);\n\n    function latestTimestamp() external view returns (uint256);\n\n    function latestRound() external view returns (uint256);\n\n    function getAnswer(uint256 roundId) external view returns (int256);\n\n    function getTimestamp(uint256 roundId) external view returns (uint256);\n\n    event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt);\n\n    event NewRound(uint256 indexed roundId, address indexed startedBy, uint256 startedAt);\n}\n\ninterface AggregatorV3Interface {\n    function decimals() external view returns (uint8);\n\n    function description() external view returns (string memory);\n\n    function version() external view returns (uint256);\n\n    // getRoundData and latestRoundData should both raise \"No data present\"\n    // if they do not have data to report, instead of returning unset values\n    // which could be misinterpreted as actual reported values.\n    function getRoundData(\n        uint80 _roundId\n    )\n        external\n        view\n        returns (\n            uint80 roundId,\n            int256 answer,\n            uint256 startedAt,\n            uint256 updatedAt,\n            uint80 answeredInRound\n        );\n\n    function latestRoundData()\n        external\n        view\n        returns (\n            uint80 roundId,\n            int256 answer,\n            uint256 startedAt,\n            uint256 updatedAt,\n            uint80 answeredInRound\n        );\n}\n\ninterface AggregatorV2V3Interface is AggregatorInterface, AggregatorV3Interface {}\n"
+    },
+    "src/external/OlympusERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity >=0.7.5;\n\n/// @notice Olympus OHM token\n/// @dev This contract is the legacy v2 OHM token. Included in the repo for completeness,\n///      since it is not being changed and is imported in some contracts.\n\ninterface IOlympusAuthority {\n    // =========  EVENTS ========= //\n\n    event GovernorPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event GuardianPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event PolicyPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n    event VaultPushed(address indexed from, address indexed to, bool _effectiveImmediately);\n\n    event GovernorPulled(address indexed from, address indexed to);\n    event GuardianPulled(address indexed from, address indexed to);\n    event PolicyPulled(address indexed from, address indexed to);\n    event VaultPulled(address indexed from, address indexed to);\n\n    // =========  VIEW ========= //\n\n    function governor() external view returns (address);\n\n    function guardian() external view returns (address);\n\n    function policy() external view returns (address);\n\n    function vault() external view returns (address);\n}\n\n// File: types/OlympusAccessControlled.sol\n\nabstract contract OlympusAccessControlled {\n    // =========  EVENTS ========= //\n\n    event AuthorityUpdated(IOlympusAuthority indexed authority);\n\n    string internal UNAUTHORIZED = \"UNAUTHORIZED\"; // save gas\n\n    // =========  STATE VARIABLES ========= //\n\n    IOlympusAuthority public authority;\n\n    // =========  Constructor ========= //\n\n    constructor(IOlympusAuthority _authority) {\n        authority = _authority;\n        emit AuthorityUpdated(_authority);\n    }\n\n    // =========  MODIFIERS ========= //\n\n    modifier onlyGovernor() {\n        require(msg.sender == authority.governor(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyGuardian() {\n        require(msg.sender == authority.guardian(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyPermitted() {\n        require(msg.sender == authority.policy(), UNAUTHORIZED);\n        _;\n    }\n\n    modifier onlyVault() {\n        require(msg.sender == authority.vault(), UNAUTHORIZED);\n        _;\n    }\n\n    // =========  GOV ONLY ========= //\n\n    function setAuthority(IOlympusAuthority _newAuthority) external onlyGovernor {\n        authority = _newAuthority;\n        emit AuthorityUpdated(_newAuthority);\n    }\n}\n\n// File: cryptography/ECDSA.sol\n\n/**\n * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.\n *\n * These functions can be used to verify that a message was signed by the holder\n * of the private keys of a given address.\n */\nlibrary ECDSA {\n    enum RecoverError {\n        NoError,\n        InvalidSignature,\n        InvalidSignatureLength,\n        InvalidSignatureS,\n        InvalidSignatureV\n    }\n\n    function _throwError(RecoverError error) private pure {\n        if (error == RecoverError.NoError) {\n            return; // no error: do nothing\n        } else if (error == RecoverError.InvalidSignature) {\n            revert(\"ECDSA: invalid signature\");\n        } else if (error == RecoverError.InvalidSignatureLength) {\n            revert(\"ECDSA: invalid signature length\");\n        } else if (error == RecoverError.InvalidSignatureS) {\n            revert(\"ECDSA: invalid signature 's' value\");\n        } else if (error == RecoverError.InvalidSignatureV) {\n            revert(\"ECDSA: invalid signature 'v' value\");\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature` or error string. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     *\n     * Documentation for signature generation:\n     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]\n     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes memory signature\n    ) internal pure returns (address, RecoverError) {\n        // Check the signature length\n        // - case 65: r,s,v signature (standard)\n        // - case 64: r,vs signature (cf https://eips.ethereum.org/EIPS/eip-2098) _Available since v4.1._\n        if (signature.length == 65) {\n            bytes32 r;\n            bytes32 s;\n            uint8 v;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                s := mload(add(signature, 0x40))\n                v := byte(0, mload(add(signature, 0x60)))\n            }\n            return tryRecover(hash, v, r, s);\n        } else if (signature.length == 64) {\n            bytes32 r;\n            bytes32 vs;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            assembly {\n                r := mload(add(signature, 0x20))\n                vs := mload(add(signature, 0x40))\n            }\n            return tryRecover(hash, r, vs);\n        } else {\n            return (address(0), RecoverError.InvalidSignatureLength);\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature`. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM opcode allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {toEthSignedMessageHash} on it.\n     */\n    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, signature);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.\n     *\n     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        bytes32 r,\n        bytes32 vs\n    ) internal pure returns (address, RecoverError) {\n        bytes32 s;\n        uint8 v;\n        assembly {\n            s := and(vs, 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff)\n            v := add(shr(255, vs), 27)\n        }\n        return tryRecover(hash, v, r, s);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.\n     *\n     * _Available since v4.2._\n     */\n    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, r, vs);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     *\n     * _Available since v4.3._\n     */\n    function tryRecover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address, RecoverError) {\n        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature\n        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most\n        // signatures from current libraries generate a unique signature with an s-value in the lower half order.\n        //\n        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value\n        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or\n        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept\n        // these malleable signatures as well.\n        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {\n            return (address(0), RecoverError.InvalidSignatureS);\n        }\n        if (v != 27 && v != 28) {\n            return (address(0), RecoverError.InvalidSignatureV);\n        }\n\n        // If the signature is valid (and not malleable), return the signer address\n        address signer = ecrecover(hash, v, r, s);\n        if (signer == address(0)) {\n            return (address(0), RecoverError.InvalidSignature);\n        }\n\n        return (signer, RecoverError.NoError);\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {\n        (address recovered, RecoverError error) = tryRecover(hash, v, r, s);\n        _throwError(error);\n        return recovered;\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Message, created from a `hash`. This\n     * produces hash corresponding to the one signed with the\n     * https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`]\n     * JSON-RPC method as part of EIP-191.\n     *\n     * See {recover}.\n     */\n    function toEthSignedMessageHash(bytes32 hash) internal pure returns (bytes32) {\n        // 32 is the length in bytes of hash,\n        // enforced by the type signature above\n        return keccak256(abi.encodePacked(\"\\x19Ethereum Signed Message:\\n32\", hash));\n    }\n\n    /**\n     * @dev Returns an Ethereum Signed Typed Data, created from a\n     * `domainSeparator` and a `structHash`. This produces hash corresponding\n     * to the one signed with the\n     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`]\n     * JSON-RPC method as part of EIP-712.\n     *\n     * See {recover}.\n     */\n    function toTypedDataHash(\n        bytes32 domainSeparator,\n        bytes32 structHash\n    ) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(\"\\x19\\x01\", domainSeparator, structHash));\n    }\n}\n\n// File: cryptography/EIP712.sol\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.\n *\n * The encoding specified in the EIP is very generic, and such a generic implementation in Solidity is not feasible,\n * thus this contract does not implement the encoding itself. Protocols need to implement the type-specific encoding\n * they need in their contracts using a combination of `abi.encode` and `keccak256`.\n *\n * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding\n * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA\n * ({_hashTypedDataV4}).\n *\n * The implementation of the domain separator was designed to be as efficient as possible while still properly updating\n * the chain id to protect against replay attacks on an eventual fork of the chain.\n *\n * NOTE: This contract implements the version of the encoding known as \"v4\", as implemented by the JSON RPC method\n * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].\n *\n * _Available since v3.4._\n */\nabstract contract EIP712 {\n    /* solhint-disable var-name-mixedcase */\n    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to\n    // invalidate the cached domain separator if the chain id changes.\n    bytes32 private immutable _CACHED_DOMAIN_SEPARATOR;\n    uint256 private immutable _CACHED_CHAIN_ID;\n\n    bytes32 private immutable _HASHED_NAME;\n    bytes32 private immutable _HASHED_VERSION;\n    bytes32 private immutable _TYPE_HASH;\n\n    /* solhint-enable var-name-mixedcase */\n\n    /**\n     * @dev Initializes the domain separator and parameter caches.\n     *\n     * The meaning of `name` and `version` is specified in\n     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:\n     *\n     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.\n     * - `version`: the current major version of the signing domain.\n     *\n     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart\n     * contract upgrade].\n     */\n    constructor(string memory name, string memory version) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        bytes32 hashedName = keccak256(bytes(name));\n        bytes32 hashedVersion = keccak256(bytes(version));\n        bytes32 typeHash = keccak256(\n            \"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\"\n        );\n        _HASHED_NAME = hashedName;\n        _HASHED_VERSION = hashedVersion;\n        _CACHED_CHAIN_ID = chainID;\n        _CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator(typeHash, hashedName, hashedVersion);\n        _TYPE_HASH = typeHash;\n    }\n\n    /**\n     * @dev Returns the domain separator for the current chain.\n     */\n    function _domainSeparatorV4() internal view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        if (chainID == _CACHED_CHAIN_ID) {\n            return _CACHED_DOMAIN_SEPARATOR;\n        } else {\n            return _buildDomainSeparator(_TYPE_HASH, _HASHED_NAME, _HASHED_VERSION);\n        }\n    }\n\n    function _buildDomainSeparator(\n        bytes32 typeHash,\n        bytes32 nameHash,\n        bytes32 versionHash\n    ) private view returns (bytes32) {\n        uint256 chainID;\n        assembly {\n            chainID := chainid()\n        }\n\n        return keccak256(abi.encode(typeHash, nameHash, versionHash, chainID, address(this)));\n    }\n\n    /**\n     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this\n     * function returns the hash of the fully encoded EIP712 message for this domain.\n     *\n     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:\n     *\n     * ```solidity\n     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(\n     *     keccak256(\"Mail(address to,string contents)\"),\n     *     mailTo,\n     *     keccak256(bytes(mailContents))\n     * )));\n     * address signer = ECDSA.recover(digest, signature);\n     * ```\n     */\n    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {\n        return ECDSA.toTypedDataHash(_domainSeparatorV4(), structHash);\n    }\n}\n\n// File: interfaces/IERC20Permit.sol\n\n/**\n * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n */\ninterface IERC20Permit {\n    /**\n     * @dev Sets `value` as th xe allowance of `spender` over ``owner``'s tokens,\n     * given ``owner``'s signed approval.\n     *\n     * IMPORTANT: The same issues {IERC20-approve} has related to transaction\n     * ordering also apply here.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `deadline` must be a timestamp in the future.\n     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`\n     * over the EIP712-formatted function arguments.\n     * - the signature must use ``owner``'s current nonce (see {nonces}).\n     *\n     * For more information on the signature format, see the\n     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP\n     * section].\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n\n    /**\n     * @dev Returns the current nonce for `owner`. This value must be\n     * included whenever a signature is generated for {permit}.\n     *\n     * Every successful call to {permit} increases ``owner``'s nonce by one. This\n     * prevents a signature from being used multiple times.\n     */\n    function nonces(address owner) external view returns (uint256);\n\n    /**\n     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n}\n\n// File: interfaces/IERC20.sol\n\ninterface IERC20 {\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `recipient`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address recipient, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `sender` to `recipient` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) external returns (bool);\n\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n\n// File: interfaces/IOHM.sol\n\ninterface IOHM is IERC20 {\n    function mint(address account_, uint256 amount_) external;\n\n    function burn(uint256 amount) external;\n\n    function burnFrom(address account_, uint256 amount_) external;\n}\n\n// File: libraries/SafeMath.sol\n\nlibrary SafeMath {\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        uint256 c = a + b;\n        require(c >= a, \"SafeMath: addition overflow\");\n\n        return c;\n    }\n\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return sub(a, b, \"SafeMath: subtraction overflow\");\n    }\n\n    function sub(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b <= a, errorMessage);\n        uint256 c = a - b;\n\n        return c;\n    }\n\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        uint256 c = a * b;\n        require(c / a == b, \"SafeMath: multiplication overflow\");\n\n        return c;\n    }\n\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        return div(a, b, \"SafeMath: division by zero\");\n    }\n\n    function div(uint256 a, uint256 b, string memory errorMessage) internal pure returns (uint256) {\n        require(b > 0, errorMessage);\n        uint256 c = a / b;\n        assert(a == b * c + (a % b)); // There is no case in which this doesn't hold\n\n        return c;\n    }\n\n    // Only used in the  BondingCalculator.sol\n    function sqrrt(uint256 a) internal pure returns (uint256 c) {\n        if (a > 3) {\n            c = a;\n            uint256 b = add(div(a, 2), 1);\n            while (b < c) {\n                c = b;\n                b = div(add(div(a, b), b), 2);\n            }\n        } else if (a != 0) {\n            c = 1;\n        }\n    }\n}\n\n// File: libraries/Counters.sol\n\nlibrary Counters {\n    using SafeMath for uint256;\n\n    struct Counter {\n        // This variable should never be directly accessed by users of the library: interactions must be restricted to\n        // the library's function. As of Solidity v0.5.2, this cannot be enforced, though there is a proposal to add\n        // this feature: see https://github.com/ethereum/solidity/issues/4637\n        uint256 _value; // default: 0\n    }\n\n    function current(Counter storage counter) internal view returns (uint256) {\n        return counter._value;\n    }\n\n    function increment(Counter storage counter) internal {\n        // The {SafeMath} overflow check can be skipped here, see the comment at the top\n        counter._value += 1;\n    }\n\n    function decrement(Counter storage counter) internal {\n        counter._value = counter._value.sub(1);\n    }\n}\n\n// File: types/ERC20.sol\n\nabstract contract ERC20 is IERC20 {\n    using SafeMath for uint256;\n\n    // TODO comment actual hash value.\n    bytes32 private constant ERC20TOKEN_ERC1820_INTERFACE_ID = keccak256(\"ERC20Token\");\n\n    mapping(address => uint256) internal _balances;\n\n    mapping(address => mapping(address => uint256)) internal _allowances;\n\n    uint256 internal _totalSupply;\n\n    string internal _name;\n\n    string internal _symbol;\n\n    uint8 internal immutable _decimals;\n\n    constructor(string memory name_, string memory symbol_, uint8 decimals_) {\n        _name = name_;\n        _symbol = symbol_;\n        _decimals = decimals_;\n    }\n\n    function name() public view returns (string memory) {\n        return _name;\n    }\n\n    function symbol() public view returns (string memory) {\n        return _symbol;\n    }\n\n    function decimals() public view virtual returns (uint8) {\n        return _decimals;\n    }\n\n    function totalSupply() public view override returns (uint256) {\n        return _totalSupply;\n    }\n\n    function balanceOf(address account) public view virtual override returns (uint256) {\n        return _balances[account];\n    }\n\n    function transfer(address recipient, uint256 amount) public virtual override returns (bool) {\n        _transfer(msg.sender, recipient, amount);\n        return true;\n    }\n\n    function allowance(\n        address owner,\n        address spender\n    ) public view virtual override returns (uint256) {\n        return _allowances[owner][spender];\n    }\n\n    function approve(address spender, uint256 amount) public virtual override returns (bool) {\n        _approve(msg.sender, spender, amount);\n        return true;\n    }\n\n    function transferFrom(\n        address sender,\n        address recipient,\n        uint256 amount\n    ) public virtual override returns (bool) {\n        _transfer(sender, recipient, amount);\n        _approve(\n            sender,\n            msg.sender,\n            _allowances[sender][msg.sender].sub(amount, \"ERC20: transfer amount exceeds allowance\")\n        );\n        return true;\n    }\n\n    function increaseAllowance(address spender, uint256 addedValue) public virtual returns (bool) {\n        _approve(msg.sender, spender, _allowances[msg.sender][spender].add(addedValue));\n        return true;\n    }\n\n    function decreaseAllowance(\n        address spender,\n        uint256 subtractedValue\n    ) public virtual returns (bool) {\n        _approve(\n            msg.sender,\n            spender,\n            _allowances[msg.sender][spender].sub(\n                subtractedValue,\n                \"ERC20: decreased allowance below zero\"\n            )\n        );\n        return true;\n    }\n\n    function _transfer(address sender, address recipient, uint256 amount) internal virtual {\n        require(sender != address(0), \"ERC20: transfer from the zero address\");\n        require(recipient != address(0), \"ERC20: transfer to the zero address\");\n\n        _beforeTokenTransfer(sender, recipient, amount);\n\n        _balances[sender] = _balances[sender].sub(amount, \"ERC20: transfer amount exceeds balance\");\n        _balances[recipient] = _balances[recipient].add(amount);\n        emit Transfer(sender, recipient, amount);\n    }\n\n    function _mint(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: mint to the zero address\");\n        _beforeTokenTransfer(address(0), account, amount);\n        _totalSupply = _totalSupply.add(amount);\n        _balances[account] = _balances[account].add(amount);\n        emit Transfer(address(0), account, amount);\n    }\n\n    function _burn(address account, uint256 amount) internal virtual {\n        require(account != address(0), \"ERC20: burn from the zero address\");\n\n        _beforeTokenTransfer(account, address(0), amount);\n\n        _balances[account] = _balances[account].sub(amount, \"ERC20: burn amount exceeds balance\");\n        _totalSupply = _totalSupply.sub(amount);\n        emit Transfer(account, address(0), amount);\n    }\n\n    function _approve(address owner, address spender, uint256 amount) internal virtual {\n        require(owner != address(0), \"ERC20: approve from the zero address\");\n        require(spender != address(0), \"ERC20: approve to the zero address\");\n\n        _allowances[owner][spender] = amount;\n        emit Approval(owner, spender, amount);\n    }\n\n    function _beforeTokenTransfer(address from_, address to_, uint256 amount_) internal virtual {}\n}\n\n// File: types/ERC20Permit.sol\n\n/**\n * @dev Implementation of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on `{IERC20-approve}`, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n *\n * _Available since v3.4._\n */\nabstract contract ERC20Permit is ERC20, IERC20Permit, EIP712 {\n    using Counters for Counters.Counter;\n\n    mapping(address => Counters.Counter) private _nonces;\n\n    // solhint-disable-next-line var-name-mixedcase\n    bytes32 private immutable _PERMIT_TYPEHASH =\n        keccak256(\n            \"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\"\n        );\n\n    /**\n     * @dev Initializes the {EIP712} domain separator using the `name` parameter, and setting `version` to `\"1\"`.\n     *\n     * It's a good idea to use the same `name` that is defined as the ERC20 token name.\n     */\n    constructor(string memory name) EIP712(name, \"1\") {}\n\n    /**\n     * @dev See {IERC20Permit-permit}.\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) public virtual override {\n        require(block.timestamp <= deadline, \"ERC20Permit: expired deadline\");\n\n        bytes32 structHash = keccak256(\n            abi.encode(_PERMIT_TYPEHASH, owner, spender, value, _useNonce(owner), deadline)\n        );\n\n        bytes32 hash = _hashTypedDataV4(structHash);\n\n        address signer = ECDSA.recover(hash, v, r, s);\n        require(signer == owner, \"ERC20Permit: invalid signature\");\n\n        _approve(owner, spender, value);\n    }\n\n    /**\n     * @dev See {IERC20Permit-nonces}.\n     */\n    function nonces(address owner) public view virtual override returns (uint256) {\n        return _nonces[owner].current();\n    }\n\n    /**\n     * @dev See {IERC20Permit-DOMAIN_SEPARATOR}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view override returns (bytes32) {\n        return _domainSeparatorV4();\n    }\n\n    /**\n     * @dev \"Consume a nonce\": return the current value and increment.\n     *\n     * _Available since v4.1._\n     */\n    function _useNonce(address owner) internal virtual returns (uint256 current) {\n        Counters.Counter storage nonce = _nonces[owner];\n        current = nonce.current();\n        nonce.increment();\n    }\n}\n\n// File: OlympusERC20.sol\n\ncontract OlympusERC20Token is ERC20Permit, IOHM, OlympusAccessControlled {\n    using SafeMath for uint256;\n\n    constructor(\n        address _authority\n    )\n        ERC20(\"Olympus\", \"OHM\", 9)\n        ERC20Permit(\"Olympus\")\n        OlympusAccessControlled(IOlympusAuthority(_authority))\n    {}\n\n    function mint(address account_, uint256 amount_) external override onlyVault {\n        _mint(account_, amount_);\n    }\n\n    function burn(uint256 amount) external override {\n        _burn(msg.sender, amount);\n    }\n\n    function burnFrom(address account_, uint256 amount_) external override {\n        _burnFrom(account_, amount_);\n    }\n\n    function _burnFrom(address account_, uint256 amount_) internal {\n        uint256 decreasedAllowance_ = allowance(account_, msg.sender).sub(\n            amount_,\n            \"ERC20: burn amount exceeds allowance\"\n        );\n\n        _approve(account_, msg.sender, decreasedAllowance_);\n        _burn(account_, amount_);\n    }\n}\n"
+    },
+    "src/interfaces/IPeriodicTask.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\n/// @title  IPeriodicTask\n/// @notice Interface for a contract that can perform a task at a specified interval\ninterface IPeriodicTask {\n    // ========== FUNCTIONS ========== //\n\n    /// @notice Executes the periodic task\n    /// @dev    Guidelines for implementing functions:\n    /// @dev    - The implementing function is responsible for checking if the task is due to be executed.\n    /// @dev    - The implementing function should avoid reverting, as that would cause the calling contract to revert.\n    /// @dev    - The implementing function should be protected by a role check for the \"heart\" role.\n    function execute() external;\n\n    /// @notice ERC165 interface support\n    function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    },
+    "src/bases/interfaces/IPeriodicTaskManager.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\n/// @title  IPeriodicTaskManager\n/// @notice Interface for a contract that can manage periodic tasks with ordering capabilities\ninterface IPeriodicTaskManager {\n    // ========== EVENTS ========== //\n\n    /// @notice Emitted when a periodic task is added\n    ///\n    /// @param task_ The address of the periodic task\n    /// @param index_ The index where the task was added\n    event PeriodicTaskAdded(address indexed task_, bytes4 customSelector_, uint256 indexed index_);\n\n    /// @notice Emitted when a periodic task is removed\n    ///\n    /// @param task_ The address of the periodic task\n    /// @param index_ The index where the task was removed from\n    event PeriodicTaskRemoved(address indexed task_, uint256 indexed index_);\n\n    // ========== ERRORS ========== //\n\n    /// @notice Error thrown when trying to remove a task that doesn't exist\n    error PeriodicTaskManager_TaskNotFound(address task_);\n\n    /// @notice Error thrown when trying to add a task that already exists\n    error PeriodicTaskManager_TaskAlreadyExists(address task_);\n\n    /// @notice Error thrown when the provided task address is zero\n    error PeriodicTaskManager_ZeroAddress();\n\n    /// @notice Error thrown when the provided task does not implement the IPeriodicTask interface\n    error PeriodicTaskManager_NotPeriodicTask(address task_);\n\n    /// @notice Error thrown when a custom selector fails\n    error PeriodicTaskManager_CustomSelectorFailed(\n        address task_,\n        bytes4 customSelector_,\n        bytes reason_\n    );\n\n    // ========== TASK MANAGEMENT FUNCTIONS ========== //\n\n    /// @notice Adds a periodic task to the end of the task list\n    /// @dev    This function should be protected by a role check for the \"admin\" role\n    ///\n    /// @param  task_ The periodic task to add\n    function addPeriodicTask(address task_) external;\n\n    /// @notice Adds a periodic task at a specific index in the task list\n    /// @dev    This function should be protected by a role check for the \"admin\" role\n    /// @dev    If the index is greater than the current length, the task will be added at the end\n    ///\n    /// @param  task_           The periodic task to add\n    /// @param  customSelector_ The custom selector to use for the task (or 0)\n    /// @param  index_          The index where to insert the task\n    function addPeriodicTaskAtIndex(address task_, bytes4 customSelector_, uint256 index_) external;\n\n    /// @notice Removes a periodic task from the task list\n    /// @dev    This function should be protected by a role check for the \"admin\" role\n    ///\n    /// @param  task_ The periodic task to remove\n    function removePeriodicTask(address task_) external;\n\n    /// @notice Removes a periodic task at a specific index\n    /// @dev    This function should be protected by a role check for the \"admin\" role\n    ///\n    /// @param  index_ The index of the task to remove\n    function removePeriodicTaskAtIndex(uint256 index_) external;\n\n    // ========== VIEW FUNCTIONS ========== //\n\n    /// @notice Gets the total number of periodic tasks\n    ///\n    /// @return _taskCount  The number of periodic tasks\n    function getPeriodicTaskCount() external view returns (uint256 _taskCount);\n\n    /// @notice Gets a periodic task at a specific index\n    ///\n    /// @param  index_          The index of the task to get\n    /// @return _task           The address of the periodic task at the specified index\n    /// @return _customSelector The custom selector for the task (or 0)\n    function getPeriodicTaskAtIndex(\n        uint256 index_\n    ) external view returns (address _task, bytes4 _customSelector);\n\n    /// @notice Gets all periodic tasks\n    ///\n    /// @return _tasks              An array of all periodic tasks in order\n    /// @return _customSelectors    An array of all custom selectors in order\n    function getPeriodicTasks()\n        external\n        view\n        returns (address[] memory _tasks, bytes4[] memory _customSelectors);\n\n    /// @notice Gets the index of a specific periodic task\n    ///\n    /// @param  task_   The periodic task to find\n    /// @return _index  The index of the task, or type(uint256).max if not found\n    function getPeriodicTaskIndex(address task_) external view returns (uint256 _index);\n\n    /// @notice Checks if a periodic task exists in the manager\n    ///\n    /// @param  task_   The periodic task to check\n    /// @return _exists True if the task exists, false otherwise\n    function hasPeriodicTask(address task_) external view returns (bool _exists);\n}\n"
+    },
+    "dependencies/openzeppelin-4.8.0/contracts/interfaces/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (interfaces/IERC165.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../utils/introspection/IERC165.sol\";\n"
+    },
+    "src/libraries/AddressStorageArray.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\n/// @title  AddressStorageArray\n/// @notice A library for managing a storage array of addresses, with support for insertion and removal at a specific index\nlibrary AddressStorageArray {\n    error AddressStorageArray_IndexOutOfBounds(uint256 index, uint256 length);\n\n    /// @notice Inserts an address at a specific index\n    function insert(address[] storage array, address value_, uint256 index_) internal {\n        // Validate that the index is within the bounds or the end of the array\n        if (index_ > array.length)\n            revert AddressStorageArray_IndexOutOfBounds(index_, array.length);\n\n        // Add a new element to the end of the array\n        array.push(address(0));\n\n        // Shift all elements after the index to the right\n        for (uint256 i = array.length - 1; i > index_; i--) {\n            array[i] = array[i - 1];\n        }\n\n        // Insert the value at the index\n        array[index_] = value_;\n    }\n\n    /// @notice Removes an address at a specific index\n    function remove(address[] storage array, uint256 index_) internal returns (address) {\n        // Validate that the index is within the bounds of the array\n        if (index_ >= array.length)\n            revert AddressStorageArray_IndexOutOfBounds(index_, array.length);\n\n        // Get the value at the index\n        address removedValue = array[index_];\n\n        // Shift all elements after the index to the left\n        for (uint256 i = index_; i < array.length - 1; i++) {\n            array[i] = array[i + 1];\n        }\n\n        // Remove the last (empty) element\n        array.pop();\n\n        // Return the removed value\n        return removedValue;\n    }\n}\n"
+    },
+    "src/periphery/interfaces/IEnabler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\n/// @title IEnabler\n/// @notice Interface for contracts that can be enabled and disabled\n/// @dev    This is designed for usage by periphery contracts that cannot inherit from `PolicyEnabler`. Authorization is deliberately left open to the implementing contract.\ninterface IEnabler {\n    // ============ EVENTS ============ //\n\n    /// @notice Emitted when the contract is enabled\n    event Enabled();\n\n    /// @notice Emitted when the contract is disabled\n    event Disabled();\n\n    // ============ ERRORS ============ //\n\n    /// @notice Thrown when the contract is not enabled\n    error NotEnabled();\n\n    /// @notice Thrown when the contract is not disabled\n    error NotDisabled();\n\n    // ============ FUNCTIONS ============ //\n\n    /// @notice         Returns true if the contract is enabled\n    /// @return enabled True if the contract is enabled, false otherwise\n    function isEnabled() external view returns (bool enabled);\n\n    /// @notice             Enables the contract\n    /// @dev                Implementing contracts should implement permissioning logic\n    ///\n    /// @param enableData_  Optional data to pass to a custom enable function\n    function enable(bytes calldata enableData_) external;\n\n    /// @notice             Disables the contract\n    /// @dev                Implementing contracts should implement permissioning logic\n    ///\n    /// @param disableData_ Optional data to pass to a custom disable function\n    function disable(bytes calldata disableData_) external;\n}\n"
+    },
+    "src/policies/utils/PolicyAdmin.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\nimport {ROLESv1} from \"src/modules/ROLES/ROLES.v1.sol\";\nimport {RolesConsumer} from \"src/modules/ROLES/OlympusRoles.sol\";\nimport {ADMIN_ROLE, EMERGENCY_ROLE, MANAGER_ROLE} from \"./RoleDefinitions.sol\";\n\nabstract contract PolicyAdmin is RolesConsumer {\n    error NotAuthorised();\n\n    /// @notice Modifier that reverts if the caller does not have the emergency or admin role\n    modifier onlyEmergencyOrAdminRole() {\n        if (!_isEmergency(msg.sender) && !_isAdmin(msg.sender)) revert NotAuthorised();\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the manager or admin role\n    modifier onlyManagerOrAdminRole() {\n        if (!_isManager(msg.sender) && !_isAdmin(msg.sender)) revert NotAuthorised();\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the admin role\n    modifier onlyAdminRole() {\n        if (!_isAdmin(msg.sender)) revert ROLESv1.ROLES_RequireRole(ADMIN_ROLE);\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the emergency role\n    modifier onlyEmergencyRole() {\n        if (!_isEmergency(msg.sender)) revert ROLESv1.ROLES_RequireRole(EMERGENCY_ROLE);\n        _;\n    }\n\n    /// @notice Modifier that reverts if the caller does not have the manager role\n    modifier onlyManagerRole() {\n        if (!_isManager(msg.sender)) revert ROLESv1.ROLES_RequireRole(MANAGER_ROLE);\n        _;\n    }\n\n    /// @notice Check if an account has the admin role\n    ///\n    /// @param  account_ The account to check\n    /// @return true if the account has the admin role, false otherwise\n    function _isAdmin(address account_) internal view returns (bool) {\n        return ROLES.hasRole(account_, ADMIN_ROLE);\n    }\n\n    /// @notice Check if an account has the emergency role\n    ///\n    /// @param  account_ The account to check\n    /// @return true if the account has the emergency role, false otherwise\n    function _isEmergency(address account_) internal view returns (bool) {\n        return ROLES.hasRole(account_, EMERGENCY_ROLE);\n    }\n\n    /// @notice Check if an account has the manager role\n    ///\n    /// @param  account_ The account to check\n    /// @return true if the account has the manager role, false otherwise\n    function _isManager(address account_) internal view returns (bool) {\n        return ROLES.hasRole(account_, MANAGER_ROLE);\n    }\n}\n"
+    },
+    "dependencies/openzeppelin-4.8.0/contracts/utils/introspection/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n    /**\n     * @dev Returns true if this contract implements the interface defined by\n     * `interfaceId`. See the corresponding\n     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n     * to learn more about how these ids are created.\n     *\n     * This function call must use less than 30 000 gas.\n     */\n    function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    },
+    "src/modules/ROLES/OlympusRoles.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\nimport {ROLESv1} from \"src/modules/ROLES/ROLES.v1.sol\";\nimport \"src/Kernel.sol\";\n\n/// @notice Abstract contract to have the `onlyRole` modifier\n/// @dev    Inheriting this automatically makes ROLES module a dependency\nabstract contract RolesConsumer {\n    ROLESv1 public ROLES;\n\n    modifier onlyRole(bytes32 role_) {\n        ROLES.requireRole(role_, msg.sender);\n        _;\n    }\n}\n\n/// @notice Module that holds multisig roles needed by various policies.\ncontract OlympusRoles is ROLESv1 {\n    //============================================================================================//\n    //                                        MODULE SETUP                                        //\n    //============================================================================================//\n\n    constructor(Kernel kernel_) Module(kernel_) {}\n\n    /// @inheritdoc Module\n    function KEYCODE() public pure override returns (Keycode) {\n        return toKeycode(\"ROLES\");\n    }\n\n    /// @inheritdoc Module\n    function VERSION() external pure override returns (uint8 major, uint8 minor) {\n        major = 1;\n        minor = 0;\n    }\n\n    //============================================================================================//\n    //                                       CORE FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc ROLESv1\n    function saveRole(bytes32 role_, address addr_) external override permissioned {\n        if (hasRole[addr_][role_]) revert ROLES_AddressAlreadyHasRole(addr_, role_);\n\n        ensureValidRole(role_);\n\n        // Grant role to the address\n        hasRole[addr_][role_] = true;\n\n        emit RoleGranted(role_, addr_);\n    }\n\n    /// @inheritdoc ROLESv1\n    function removeRole(bytes32 role_, address addr_) external override permissioned {\n        if (!hasRole[addr_][role_]) revert ROLES_AddressDoesNotHaveRole(addr_, role_);\n\n        hasRole[addr_][role_] = false;\n\n        emit RoleRevoked(role_, addr_);\n    }\n\n    //============================================================================================//\n    //                                       VIEW FUNCTIONS                                       //\n    //============================================================================================//\n\n    /// @inheritdoc ROLESv1\n    function requireRole(bytes32 role_, address caller_) external view override {\n        if (!hasRole[caller_][role_]) revert ROLES_RequireRole(role_);\n    }\n\n    /// @inheritdoc ROLESv1\n    function ensureValidRole(bytes32 role_) public pure override {\n        for (uint256 i = 0; i < 32; ) {\n            bytes1 char = role_[i];\n            if ((char < 0x61 || char > 0x7A) && char != 0x5f && char != 0x00) {\n                revert ROLES_InvalidRole(role_); // a-z only\n            }\n            unchecked {\n                i++;\n            }\n        }\n    }\n}\n"
+    },
+    "src/policies/utils/RoleDefinitions.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\n/// @dev Allows enabling/disabling the protocol/policies in an emergency\nbytes32 constant EMERGENCY_ROLE = \"emergency\";\n/// @dev Administrative access, e.g. configuration parameters. Typically assigned to on-chain governance.\nbytes32 constant ADMIN_ROLE = \"admin\";\n/// @dev Managerial access, e.g. managing specific protocol parameters. Typically assigned to a multisig/council.\nbytes32 constant MANAGER_ROLE = \"manager\";\n/// @dev Heart role, e.g. performing periodic tasks.\nbytes32 constant HEART_ROLE = \"heart\";\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.30+commit.73712a01"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "kernel_",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IDistributor",
+              "name": "distributor_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxReward_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint48",
+              "name": "auctionDuration_",
+              "type": "uint48"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "index",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "length",
+              "type": "uint256"
+            }
+          ],
+          "name": "AddressStorageArray_IndexOutOfBounds",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Heart_BeatAvailable",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Heart_BeatStopped",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Heart_InvalidFrequency",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Heart_InvalidParams",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Heart_OutOfCycle",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "caller_",
+              "type": "address"
+            }
+          ],
+          "name": "KernelAdapter_OnlyKernel",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotAuthorised",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotDisabled",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotEnabled",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes4",
+              "name": "customSelector_",
+              "type": "bytes4"
+            },
+            {
+              "internalType": "bytes",
+              "name": "reason_",
+              "type": "bytes"
+            }
+          ],
+          "name": "PeriodicTaskManager_CustomSelectorFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            }
+          ],
+          "name": "PeriodicTaskManager_NotPeriodicTask",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            }
+          ],
+          "name": "PeriodicTaskManager_TaskAlreadyExists",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            }
+          ],
+          "name": "PeriodicTaskManager_TaskNotFound",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "PeriodicTaskManager_ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "Keycode",
+              "name": "keycode_",
+              "type": "bytes5"
+            }
+          ],
+          "name": "Policy_ModuleDoesNotExist",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "expected_",
+              "type": "bytes"
+            }
+          ],
+          "name": "Policy_WrongModuleVersion",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role_",
+              "type": "bytes32"
+            }
+          ],
+          "name": "ROLES_RequireRole",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "timestamp_",
+              "type": "uint256"
+            }
+          ],
+          "name": "Beat",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Disabled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Enabled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes4",
+              "name": "customSelector_",
+              "type": "bytes4"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "index_",
+              "type": "uint256"
+            }
+          ],
+          "name": "PeriodicTaskAdded",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "index_",
+              "type": "uint256"
+            }
+          ],
+          "name": "PeriodicTaskRemoved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "to_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "rewardAmount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "RewardIssued",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "maxRewardAmount_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint48",
+              "name": "auctionDuration_",
+              "type": "uint48"
+            }
+          ],
+          "name": "RewardUpdated",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "ROLES",
+          "outputs": [
+            {
+              "internalType": "contract ROLESv1",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "VERSION",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "major",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint8",
+              "name": "minor",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            }
+          ],
+          "name": "addPeriodicTask",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes4",
+              "name": "customSelector_",
+              "type": "bytes4"
+            },
+            {
+              "internalType": "uint256",
+              "name": "index_",
+              "type": "uint256"
+            }
+          ],
+          "name": "addPeriodicTaskAtIndex",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "auctionDuration",
+          "outputs": [
+            {
+              "internalType": "uint48",
+              "name": "",
+              "type": "uint48"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "beat",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "newKernel_",
+              "type": "address"
+            }
+          ],
+          "name": "changeKernel",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "configureDependencies",
+          "outputs": [
+            {
+              "internalType": "Keycode[]",
+              "name": "dependencies",
+              "type": "bytes5[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "currentReward",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "disableData_",
+              "type": "bytes"
+            }
+          ],
+          "name": "disable",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "distributor",
+          "outputs": [
+            {
+              "internalType": "contract IDistributor",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "enableData_",
+              "type": "bytes"
+            }
+          ],
+          "name": "enable",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "frequency",
+          "outputs": [
+            {
+              "internalType": "uint48",
+              "name": "",
+              "type": "uint48"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "index_",
+              "type": "uint256"
+            }
+          ],
+          "name": "getPeriodicTaskAtIndex",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes4",
+              "name": "",
+              "type": "bytes4"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getPeriodicTaskCount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            }
+          ],
+          "name": "getPeriodicTaskIndex",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "_index",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getPeriodicTasks",
+          "outputs": [
+            {
+              "internalType": "address[]",
+              "name": "",
+              "type": "address[]"
+            },
+            {
+              "internalType": "bytes4[]",
+              "name": "",
+              "type": "bytes4[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            }
+          ],
+          "name": "hasPeriodicTask",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isActive",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isEnabled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "kernel",
+          "outputs": [
+            {
+              "internalType": "contract Kernel",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lastBeat",
+          "outputs": [
+            {
+              "internalType": "uint48",
+              "name": "",
+              "type": "uint48"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxReward",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "task_",
+              "type": "address"
+            }
+          ],
+          "name": "removePeriodicTask",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "index_",
+              "type": "uint256"
+            }
+          ],
+          "name": "removePeriodicTaskAtIndex",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "requestPermissions",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "Keycode",
+                  "name": "keycode",
+                  "type": "bytes5"
+                },
+                {
+                  "internalType": "bytes4",
+                  "name": "funcSelector",
+                  "type": "bytes4"
+                }
+              ],
+              "internalType": "struct Permissions[]",
+              "name": "permissions",
+              "type": "tuple[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "resetBeat",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "distributor_",
+              "type": "address"
+            }
+          ],
+          "name": "setDistributor",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "maxReward_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint48",
+              "name": "auctionDuration_",
+              "type": "uint48"
+            }
+          ],
+          "name": "setRewardAuctionParams",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes4",
+              "name": "interfaceId",
+              "type": "bytes4"
+            }
+          ],
+          "name": "supportsInterface",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "details": "The Olympus Heart contract provides keeper rewards to call the heart beat function which fuels         Olympus market operations. The Heart orchestrates state updates in the correct order to ensure         market operations use up to date information.         This version implements an auction style reward system where the reward is linearly increasing up to a max reward.         Rewards are issued in OHM.",
+        "events": {
+          "PeriodicTaskAdded(address,bytes4,uint256)": {
+            "params": {
+              "index_": "The index where the task was added",
+              "task_": "The address of the periodic task"
+            }
+          },
+          "PeriodicTaskRemoved(address,uint256)": {
+            "params": {
+              "index_": "The index where the task was removed from",
+              "task_": "The address of the periodic task"
+            }
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "VERSION()": {
+            "returns": {
+              "major": "The major version of the policy.",
+              "minor": "The minor version of the policy."
+            }
+          },
+          "addPeriodicTask(address)": {
+            "details": "This function reverts if:             - The caller is not the admin             - The task is already added             - The task is not a valid periodic task",
+            "params": {
+              "task_": "The periodic task to add"
+            }
+          },
+          "addPeriodicTaskAtIndex(address,bytes4,uint256)": {
+            "details": "This function reverts if:             - The caller is not the admin             - The task is already added             - The task is not a valid periodic task             - The index is out of bounds             If a custom selector is provided, care must be taken to ensure that the selector exists on {task_}.             If the selector does not exist, all of the periodic tasks will revert.",
+            "params": {
+              "customSelector_": "The custom selector to use for the task (or 0)",
+              "index_": "The index where to insert the task",
+              "task_": "The periodic task to add"
+            }
+          },
+          "beat()": {
+            "details": "Triggers price oracle update and market operations"
+          },
+          "configureDependencies()": {
+            "returns": {
+              "dependencies": "- Keycode array of module dependencies."
+            }
+          },
+          "constructor": {
+            "details": "Auction duration must be less than or equal to frequency, but we cannot validate that in the constructor because PRICE is not yet set.      Therefore, manually ensure that the value is valid when deploying the contract."
+          },
+          "disable(bytes)": {
+            "details": "This function performs the following steps:         1. Validates that the caller has the admin or emergency role         2. Validates that the contract is enabled         3. Calls the implementation-specific `_disable()` function         4. Changes the state of the contract to disabled         5. Emits the `Disabled` event",
+            "params": {
+              "disableData_": "The data to pass to the implementation-specific `_disable()` function"
+            }
+          },
+          "enable(bytes)": {
+            "details": "This function performs the following steps:         1. Validates that the caller has the admin role         2. Validates that the contract is disabled         3. Calls the implementation-specific `_enable()` function         4. Changes the state of the contract to enabled         5. Emits the `Enabled` event",
+            "params": {
+              "enableData_": "The data to pass to the implementation-specific `_enable()` function"
+            }
+          },
+          "getPeriodicTaskAtIndex(uint256)": {
+            "params": {
+              "index_": "The index of the task to get"
+            },
+            "returns": {
+              "_0": "          The address of the periodic task at the specified index",
+              "_1": "The custom selector for the task (or 0)"
+            }
+          },
+          "getPeriodicTaskCount()": {
+            "returns": {
+              "_0": " The number of periodic tasks"
+            }
+          },
+          "getPeriodicTaskIndex(address)": {
+            "params": {
+              "task_": "The periodic task to find"
+            },
+            "returns": {
+              "_index": " The index of the task, or type(uint256).max if not found"
+            }
+          },
+          "getPeriodicTasks()": {
+            "returns": {
+              "_0": "             An array of all periodic tasks in order",
+              "_1": "   An array of all custom selectors in order"
+            }
+          },
+          "hasPeriodicTask(address)": {
+            "params": {
+              "task_": "The periodic task to check"
+            },
+            "returns": {
+              "_0": "True if the task exists, false otherwise"
+            }
+          },
+          "removePeriodicTask(address)": {
+            "details": "This function reverts if:             - The caller is not the admin             - The task is not added",
+            "params": {
+              "task_": "The periodic task to remove"
+            }
+          },
+          "removePeriodicTaskAtIndex(uint256)": {
+            "details": "This function reverts if:             - The caller is not the admin             - The index is out of bounds",
+            "params": {
+              "index_": "The index of the task to remove"
+            }
+          },
+          "requestPermissions()": {
+            "returns": {
+              "permissions": "- Array of keycodes and function selectors for requested permissions."
+            }
+          },
+          "resetBeat()": {
+            "details": "This function is gated to the ADMIN or MANAGER roles"
+          },
+          "setDistributor(address)": {
+            "details": "This function is gated to the ADMIN role",
+            "params": {
+              "distributor_": "The address of the new Distributor contract"
+            }
+          },
+          "setRewardAuctionParams(uint256,uint48)": {
+            "details": "This function is gated to the ADMIN role",
+            "params": {
+              "auctionDuration_": "- New auction duration, in seconds",
+              "maxReward_": "- New max reward amount, in units of the reward token"
+            }
+          }
+        },
+        "title": "Olympus Heart",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "NotDisabled()": [
+            {
+              "notice": "Thrown when the contract is not disabled"
+            }
+          ],
+          "NotEnabled()": [
+            {
+              "notice": "Thrown when the contract is not enabled"
+            }
+          ],
+          "PeriodicTaskManager_CustomSelectorFailed(address,bytes4,bytes)": [
+            {
+              "notice": "Error thrown when a custom selector fails"
+            }
+          ],
+          "PeriodicTaskManager_NotPeriodicTask(address)": [
+            {
+              "notice": "Error thrown when the provided task does not implement the IPeriodicTask interface"
+            }
+          ],
+          "PeriodicTaskManager_TaskAlreadyExists(address)": [
+            {
+              "notice": "Error thrown when trying to add a task that already exists"
+            }
+          ],
+          "PeriodicTaskManager_TaskNotFound(address)": [
+            {
+              "notice": "Error thrown when trying to remove a task that doesn't exist"
+            }
+          ],
+          "PeriodicTaskManager_ZeroAddress()": [
+            {
+              "notice": "Error thrown when the provided task address is zero"
+            }
+          ]
+        },
+        "events": {
+          "Disabled()": {
+            "notice": "Emitted when the contract is disabled"
+          },
+          "Enabled()": {
+            "notice": "Emitted when the contract is enabled"
+          },
+          "PeriodicTaskAdded(address,bytes4,uint256)": {
+            "notice": "Emitted when a periodic task is added"
+          },
+          "PeriodicTaskRemoved(address,uint256)": {
+            "notice": "Emitted when a periodic task is removed"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "VERSION()": {
+            "notice": "Returns the version of the policy."
+          },
+          "addPeriodicTask(address)": {
+            "notice": "Adds a periodic task to the end of the task list"
+          },
+          "addPeriodicTaskAtIndex(address,bytes4,uint256)": {
+            "notice": "Adds a periodic task at a specific index in the task list"
+          },
+          "auctionDuration()": {
+            "notice": "Duration of the reward auction (in seconds)"
+          },
+          "beat()": {
+            "notice": "Beats the heartOnly callable when enough time has passed since last beat (determined by frequency variable)This function is incentivized with a token reward (see rewardToken and reward variables)."
+          },
+          "changeKernel(address)": {
+            "notice": "Function used by kernel when migrating to a new kernel."
+          },
+          "configureDependencies()": {
+            "notice": "Define module dependencies for this policy."
+          },
+          "currentReward()": {
+            "notice": "Current reward amount based on linear auction"
+          },
+          "disable(bytes)": {
+            "notice": "Disable the contract"
+          },
+          "enable(bytes)": {
+            "notice": "Enable the contract"
+          },
+          "frequency()": {
+            "notice": "Heart beat frequency, in seconds"
+          },
+          "getPeriodicTaskAtIndex(uint256)": {
+            "notice": "Gets a periodic task at a specific index"
+          },
+          "getPeriodicTaskCount()": {
+            "notice": "Gets the total number of periodic tasks"
+          },
+          "getPeriodicTaskIndex(address)": {
+            "notice": "Gets the index of a specific periodic task"
+          },
+          "getPeriodicTasks()": {
+            "notice": "Gets all periodic tasks"
+          },
+          "hasPeriodicTask(address)": {
+            "notice": "Checks if a periodic task exists in the manager"
+          },
+          "isActive()": {
+            "notice": "Easily accessible indicator for if a policy is activated or not."
+          },
+          "isEnabled()": {
+            "notice": "Whether the policy functionality is enabled"
+          },
+          "lastBeat()": {
+            "notice": "Timestamp of the last beat (UTC, in seconds)"
+          },
+          "maxReward()": {
+            "notice": "Max reward for beating the Heart (in reward token decimals)"
+          },
+          "removePeriodicTask(address)": {
+            "notice": "Removes a periodic task from the task list"
+          },
+          "removePeriodicTaskAtIndex(uint256)": {
+            "notice": "Removes a periodic task at a specific index"
+          },
+          "requestPermissions()": {
+            "notice": "Function called by kernel to set module function permissions."
+          },
+          "resetBeat()": {
+            "notice": "Unlocks the cycle if stuck on one side, eject functionAccess restricted"
+          },
+          "setDistributor(address)": {
+            "notice": "Updates the Distributor contract address that the Heart calls on a beatAccess restricted"
+          },
+          "setRewardAuctionParams(uint256,uint48)": {
+            "notice": "Sets the max reward amount, and auction duration for the beat functionAccess restricted"
+          }
+        },
+        "notice": "Olympus Heart (Policy) Contract",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/policies/Heart.sol": "OlympusHeart"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10000
+      },
+      "remappings": [
+        ":@addresses/=dependencies/forge-proposal-simulator-1.0.1/addresses/",
+        ":@base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        ":@base64-1.1.0/=dependencies/base64-1.1.0/",
+        ":@chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/",
+        ":@chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        ":@chainlink/contracts-ccip/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/",
+        ":@chainlink/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/",
+        ":@chainlink/local/src/=dependencies/chainlink-local-0.2.5/src/",
+        ":@clones-with-immutable-args-1.1.2/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        ":@examples/=dependencies/forge-proposal-simulator-1.0.1/examples/",
+        ":@forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        ":@layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":@openzeppelin-4.8.0/=dependencies/openzeppelin-4.8.0/contracts/",
+        ":@openzeppelin-5.3.0/=dependencies/openzeppelin-new-5.3.0/contracts/",
+        ":@openzeppelin/contracts/=dependencies/openzeppelin-4.8.0/contracts/",
+        ":@proposals/=dependencies/forge-proposal-simulator-1.0.1/proposals/",
+        ":@safe-utils-0.0.13/=dependencies/safe-utils-0.0.13/src/",
+        ":@script/=dependencies/forge-proposal-simulator-1.0.1/script/",
+        ":@solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        ":@surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":@test/=dependencies/forge-proposal-simulator-1.0.1/test/",
+        ":@utils/=dependencies/forge-proposal-simulator-1.0.1/utils/",
+        ":Governors/=dependencies/forge-proposal-simulator-1.0.1/Governors/",
+        ":base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        ":base64-1.1.0/=dependencies/base64-1.1.0/",
+        ":chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/",
+        ":chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        ":clones-with-immutable-args-1.1.2/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        ":clones/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        ":comp-governance/=dependencies/forge-proposal-simulator-1.0.1/lib/compound-governance/contracts/",
+        ":ds-test/=dependencies/clones-with-immutable-args-1.1.2/lib/ds-test/src/",
+        ":forge-proposal-simulator-1.0.1/=dependencies/forge-proposal-simulator-1.0.1/",
+        ":forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        ":forge-std/=dependencies/forge-std-1.9.6/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":layer-zero/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin-4.8.0/=dependencies/openzeppelin-4.8.0/",
+        ":openzeppelin-new-5.3.0/=dependencies/openzeppelin-new-5.3.0/",
+        ":openzeppelin/=dependencies/openzeppelin-4.8.0/contracts/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=dependencies/forge-proposal-simulator-1.0.1/",
+        ":safe-smart-account-1.4.1/=dependencies/safe-smart-account-1.4.1/",
+        ":safe-smart-account/=dependencies/safe-smart-account-1.4.1/contracts/",
+        ":safe-utils-0.0.13/=dependencies/safe-utils-0.0.13/src/",
+        ":solidity-http-0.0.6/=dependencies/solidity-http-0.0.6/src/",
+        ":solidity-http/=dependencies/solidity-http-0.0.6/src/",
+        ":solidity-stringutils/=dependencies/solidity-http-0.0.6/lib/solidity-stringutils/",
+        ":solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        ":solmate/=dependencies/solmate-6.2.0/src/",
+        ":surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":test/=src/test/",
+        ":test/lib/=src/test/lib/",
+        ":test/mocks/=src/test/mocks/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@addresses/=dependencies/forge-proposal-simulator-1.0.1/addresses/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@proposals/=dependencies/forge-proposal-simulator-1.0.1/proposals/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@utils/=dependencies/forge-proposal-simulator-1.0.1/utils/"
+      ]
+    },
+    "sources": {
+      "dependencies/openzeppelin-4.8.0/contracts/interfaces/IERC165.sol": {
+        "keccak256": "0xd04b0f06e0666f29cf7cccc82894de541e19bb30a765b107b1e40bb7fe5f7d7a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7b652499d098e88d8d878374616bb58434301061cae2253298b3f374044e0ddb",
+          "dweb:/ipfs/QmbhAzctqo5jrSKU6idHdVyqfmzCcDbNUPvmx4GiXxfA6q"
+        ]
+      },
+      "dependencies/openzeppelin-4.8.0/contracts/utils/introspection/IERC165.sol": {
+        "keccak256": "0x447a5f3ddc18419d41ff92b3773fb86471b1db25773e07f877f548918a185bf1",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://be161e54f24e5c6fae81a12db1a8ae87bc5ae1b0ddc805d82a1440a68455088f",
+          "dweb:/ipfs/QmP7C3CHdY9urF4dEMb9wmsp1wMxHF6nhA2yQE5SKiPAdy"
+        ]
+      },
+      "dependencies/solmate-6.2.0/src/tokens/ERC20.sol": {
+        "keccak256": "0xcdfd8db76b2a3415620e4d18cc5545f3d50de792dbf2c3dd5adb40cbe6f94b10",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://57b3ab70cde374af1cf2c9888636e8de6cf660f087b1c9abd805e9271e19fa35",
+          "dweb:/ipfs/QmNrLDBAHYFjpjSd12jerm1AdBkDqEYUUaXgnT854BUZ97"
+        ]
+      },
+      "dependencies/solmate-6.2.0/src/utils/ReentrancyGuard.sol": {
+        "keccak256": "0xb282dd78aa7375d6b200b9a5d8dd214b2e5df1004f8217a4b4c2b07f0c5bfd01",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://5fca62eb8d3dbd2b3b7e4bb051f6da16f4d0ff9cee61c39cebb80f031f6a8800",
+          "dweb:/ipfs/QmbrsXPK91iBFwHKwJs2HLRud2KzMoBDRiWYMUtyV5H57j"
+        ]
+      },
+      "src/Kernel.sol": {
+        "keccak256": "0xece14c326a5f22d58cde3d85ad86ea31c8324d836359b0ae46581df2ff25b4db",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://cb0be215fcf96fe0e1a56f2215f100e07fd1432903a88afffc61b5f7575ed4c8",
+          "dweb:/ipfs/QmYcpER8BXi6tA4fBWCY2RsiweShqxo1nXFDJ4ixJZEvid"
+        ]
+      },
+      "src/bases/BasePeriodicTaskManager.sol": {
+        "keccak256": "0xf7b4b35e950981fcde6a78c4bcb939bad2142bded7d0ffed46b36fa6209b3d06",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6c7332fb98a660016dd1f37dc39ad6d34cafb60033bb8f3b37cd3aa9fa6f40f9",
+          "dweb:/ipfs/QmbzKhxy74h4EbRs35QTU1LRYofPETTT57Udzmp62LvEhs"
+        ]
+      },
+      "src/bases/interfaces/IPeriodicTaskManager.sol": {
+        "keccak256": "0xe57c0f9bab794c4be79e987d7fc48aec90de599317c59ae3fef92e5323ef1a88",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://463e60eb4d14236b3d18dfbbd58e87d71ffec6fd2730f0f575d23d071fc1592e",
+          "dweb:/ipfs/QmdWtTocZMvGQRVMRFg4uJhkH7Ey8U1TkPrqYRWkaHzaYi"
+        ]
+      },
+      "src/external/OlympusERC20.sol": {
+        "keccak256": "0x615c2c31c85f680c81bf456550f0dc8da0e45abc6cc7846bb87a067d04772601",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://e5cde097f699ccd42d77e87ca2c7f89cf8e1b1ec40c3da4984489522c1b9b793",
+          "dweb:/ipfs/QmWdb7aBcGG3Fiy1eyfgpsmykeUghZbwx4E53NyGXheraX"
+        ]
+      },
+      "src/interfaces/AggregatorV2V3Interface.sol": {
+        "keccak256": "0xa9b62ce8688bc49619332604378180d4b537e141c157b29d5081c9d529709c6b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://35f300f0aacfa07d72b0dfef92b1b796bdab89331ee6e5822cc297a2779793fb",
+          "dweb:/ipfs/QmdS7BxPHaa4UXUxU8MGNxxbfVtdwdzoNGdVipsY3fwzp7"
+        ]
+      },
+      "src/interfaces/IPeriodicTask.sol": {
+        "keccak256": "0xb9df032d72de8bf03ad4dbeebf244cff2c79d76fc7b84c57fea6b0d584bacf29",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b24adff49543870d9a1776cc834b3e7adea140f95eafbfb8ddde430d1e3dd5ad",
+          "dweb:/ipfs/Qmcs2unHWXXSncnRVdjeCGV3kxdAqqFBkGF2gPewEUM7wP"
+        ]
+      },
+      "src/interfaces/IStaking.sol": {
+        "keccak256": "0xf33c35f41f423c17a403b10e458569212d01710aa9d53779dab37c5a57033e57",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://1cb8d7984f14cdb50f9a700d2585601df1872f3b1bf4d3781710cd7aba58c45d",
+          "dweb:/ipfs/Qmc3EC3WKcHaYzcVTLCeDdTchwDev5mvT1hkk8wGBwrMHB"
+        ]
+      },
+      "src/libraries/AddressStorageArray.sol": {
+        "keccak256": "0x51362b1760f92da5e628e905cb3805da512b10b7bc8dd3a95bd81fa681da23c5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://3bb1e83836e8faff92a602daa59d5be089b7adc32c075e453e93bf3c3c221ede",
+          "dweb:/ipfs/QmVw57AyugjrVjuimKHpFi1PsQpZDE9kpXqzVcH7TKhRYT"
+        ]
+      },
+      "src/libraries/TransferHelper.sol": {
+        "keccak256": "0xdf2d29ee29a5bc604d83bf7b94c7eff83d99524e6104b1b44fdf02e564d96431",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://db349e9ca2701ebb6968d307d816c5251d8c29c8935ee5076dcd4d7aa2628dc9",
+          "dweb:/ipfs/Qmf3GPP7pHvxpgepwPa8XzhzAxar2DvVSwQMn2cnyhPmv1"
+        ]
+      },
+      "src/modules/MINTR/MINTR.v1.sol": {
+        "keccak256": "0xdef430e901a3900238b525fa6457bfb70b60e660bdef51ed80b5f74581179439",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://86c1ffa8a62354c38e8c8b2ca7a18a0c66aba2beff0982337028d21f33916192",
+          "dweb:/ipfs/QmWV6JsxLmYECE3mVtntrLBffUbvWAbCiQakpfPM1GdMsZ"
+        ]
+      },
+      "src/modules/PRICE/PRICE.v1.sol": {
+        "keccak256": "0x71ba34d6d642daabc5dc0e30077a67e64ecffb4f7167198e409bf10536da7958",
+        "license": "AGPL-3.0",
+        "urls": [
+          "bzz-raw://93a72a89f17c6ed4e770c0def5aa221152959034de1b1d48c9c9af12cc0dda83",
+          "dweb:/ipfs/QmeBbWgWhEXr98WLfkh1ycURD2ZoYYfLmqxznJzXC1VZcS"
+        ]
+      },
+      "src/modules/ROLES/OlympusRoles.sol": {
+        "keccak256": "0xeab9a514b3974cd62487a08e9aaf6f2258fb86792aa61283ac178a0cc18dfd53",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://01411398729a17f86ee4c70658819e723df9ac6824f2d68914744bb3f172ce00",
+          "dweb:/ipfs/QmQvq8oBhVsEui66dXCxjTL2ZbpkveVxFUMGeLLYXtukRo"
+        ]
+      },
+      "src/modules/ROLES/ROLES.v1.sol": {
+        "keccak256": "0xdfde6004b8ac6729dc9907bd965093ce91204b143c78af1165381980090e5e5f",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://dfdbd0c250331d61a875b30da5484ccad7eb9345d106fa67b3ef78add59b5691",
+          "dweb:/ipfs/QmTf1DyFPWTUzoqLohQzAZsdhBcihq9WF9pquqnQ8gM59q"
+        ]
+      },
+      "src/periphery/interfaces/IEnabler.sol": {
+        "keccak256": "0xf3aa4c7fd7237e0cad838a16f58160b2ca7716c2b717a134e5f0ff110d87f278",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://636f3e9a5cfe13a5328a5552c7c0bc2c0d98c585b063361e3aee41837339e3ec",
+          "dweb:/ipfs/QmdCQ8rRWSRJX6uAq9Q5rRC35ScbnfBRm3UdFjsJWmKgtP"
+        ]
+      },
+      "src/policies/Heart.sol": {
+        "keccak256": "0x2dadd5d2dcbd670bbfc98da73ce74d0eeab4b836f840f0ab79676087e6ae8e2f",
+        "license": "AGPL-3.0",
+        "urls": [
+          "bzz-raw://b3fc3bb5c7f5ddb8031737fe735add765781815a5e86e81f911170d947c76d7a",
+          "dweb:/ipfs/QmRXttTcbNVSAAcreWMz3s7akNfX4h4PTEYoaDhLJaN7XB"
+        ]
+      },
+      "src/policies/interfaces/IDistributor.sol": {
+        "keccak256": "0x8fb4d86ca013bbbffed72f90113faf24fef71487eaf647fd9b1637cdbf7e4078",
+        "license": "AGPL-3.0",
+        "urls": [
+          "bzz-raw://5db3ca4282fe0ba12c3ce1d0ea916ffa998403fb8e40792260a77386a83174de",
+          "dweb:/ipfs/QmZ794TMyKGRGEToBGawH8tMr3tKfxvYjV3ZXzCdACRWhw"
+        ]
+      },
+      "src/policies/interfaces/IHeart.sol": {
+        "keccak256": "0x6d2f28fbdbda0f68f4c7715986591d6cdfee4a0d49b5611cd0f33a50039231de",
+        "license": "AGPL-3.0",
+        "urls": [
+          "bzz-raw://bbc5b76e63d2b3ee7c7f22a204fe2d3d4ac4f398dc8cc3225df49469245c1f17",
+          "dweb:/ipfs/QmTFexYMQnaiB5YZkYRALQ2QaXZXaptwM3qk2zL93LED2y"
+        ]
+      },
+      "src/policies/utils/PolicyAdmin.sol": {
+        "keccak256": "0x0f654ec5b6a51d1135e3c7e71fe3e51f431a9cadfe469fa1383a0c7e35085b0b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b464a76810ad64bff09f3bdba069cb9849952eddc9fe0daf2f9855e18a8da0ca",
+          "dweb:/ipfs/Qmc13vJgiQM1AcJqUXUyEdkEjZQ9uzuZEqhvvR29uuFBoK"
+        ]
+      },
+      "src/policies/utils/PolicyEnabler.sol": {
+        "keccak256": "0x32e02c75fd4102683464b045bdb84e949634d127c14e8ca348612cd8c2432485",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5cbef0dca176dfc0b46d92f52b409af3d15eaa2bf45e68ff152d58450403f4e4",
+          "dweb:/ipfs/QmTKEQPUkL8GQnzzQkGkyUBQBXG75NaLWD81SveNKEvrXu"
+        ]
+      },
+      "src/policies/utils/RoleDefinitions.sol": {
+        "keccak256": "0xff8923bf8280682bb12f07308cb5d9aece1d52c0604e535027b11905b88fe029",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4c61edc4477c4849e1a6aef4dac8459e6dfc53dcac79487ab83317fb3c3dbd93",
+          "dweb:/ipfs/QmcCmrzTfSvqob6XMz47b7wxKTaGXAyY6SfB5pRnQqQq8u"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.30+commit.73712a01",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 10000,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "interfaces/=src/interfaces/",
+        "modules/=src/modules/",
+        "policies/=src/policies/",
+        "libraries/=src/libraries/",
+        "test/=src/test/",
+        "test/mocks/=src/test/mocks/",
+        "test/lib/=src/test/lib/",
+        "@base64-1.1.0/=dependencies/base64-1.1.0/",
+        "@surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        "@chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/",
+        "@chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        "@chainlink/contracts-ccip/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/",
+        "@chainlink/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/",
+        "@forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        "forge-std/=dependencies/forge-std-1.9.6/src/",
+        "@safe-utils-0.0.13/=dependencies/safe-utils-0.0.13/src/",
+        "@base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        "@clones-with-immutable-args-1.1.2/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        "clones/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        "@layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "layer-zero/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "@solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        "solmate/=dependencies/solmate-6.2.0/src/",
+        "@openzeppelin-4.8.0/=dependencies/openzeppelin-4.8.0/contracts/",
+        "@openzeppelin/contracts/=dependencies/openzeppelin-4.8.0/contracts/",
+        "openzeppelin/=dependencies/openzeppelin-4.8.0/contracts/",
+        "@openzeppelin-5.3.0/=dependencies/openzeppelin-new-5.3.0/contracts/",
+        "proposal-sim/=dependencies/forge-proposal-simulator-1.0.1/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@addresses/=dependencies/forge-proposal-simulator-1.0.1/addresses/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@utils/=dependencies/forge-proposal-simulator-1.0.1/utils/",
+        "dependencies/forge-proposal-simulator-1.0.1/:@proposals/=dependencies/forge-proposal-simulator-1.0.1/proposals/",
+        "Governors/=dependencies/forge-proposal-simulator-1.0.1/Governors/",
+        "safe-smart-account/=dependencies/safe-smart-account-1.4.1/contracts/",
+        "solidity-http/=dependencies/solidity-http-0.0.6/src/",
+        "@addresses/=dependencies/forge-proposal-simulator-1.0.1/addresses/",
+        "@chainlink/local/src/=dependencies/chainlink-local-0.2.5/src/",
+        "@examples/=dependencies/forge-proposal-simulator-1.0.1/examples/",
+        "@proposals/=dependencies/forge-proposal-simulator-1.0.1/proposals/",
+        "@script/=dependencies/forge-proposal-simulator-1.0.1/script/",
+        "@test/=dependencies/forge-proposal-simulator-1.0.1/test/",
+        "@utils/=dependencies/forge-proposal-simulator-1.0.1/utils/",
+        "base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        "base64-1.1.0/=dependencies/base64-1.1.0/",
+        "chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/",
+        "chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        "clones-with-immutable-args-1.1.2/=dependencies/clones-with-immutable-args-1.1.2/src/",
+        "comp-governance/=dependencies/forge-proposal-simulator-1.0.1/lib/compound-governance/contracts/",
+        "ds-test/=dependencies/clones-with-immutable-args-1.1.2/lib/ds-test/src/",
+        "forge-proposal-simulator-1.0.1/=dependencies/forge-proposal-simulator-1.0.1/",
+        "forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        "layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "openzeppelin-4.8.0/=dependencies/openzeppelin-4.8.0/",
+        "openzeppelin-new-5.3.0/=dependencies/openzeppelin-new-5.3.0/",
+        "safe-smart-account-1.4.1/=dependencies/safe-smart-account-1.4.1/",
+        "safe-utils-0.0.13/=dependencies/safe-utils-0.0.13/src/",
+        "solidity-http-0.0.6/=dependencies/solidity-http-0.0.6/src/",
+        "solidity-stringutils/=dependencies/solidity-http-0.0.6/lib/solidity-stringutils/",
+        "solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        "surl-1.0.0/=dependencies/surl-1.0.0/src/"
+      ]
+    },
+    "name": "OlympusHeart",
+    "fullyQualifiedName": "src/policies/Heart.sol:OlympusHeart"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "23867295",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-03-19T06:45:24Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0x5824850D8A6E46a473445a5AF214C7EbD46c5ECB"
+}

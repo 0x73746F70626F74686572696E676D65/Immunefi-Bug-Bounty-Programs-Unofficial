@@ -1,0 +1,1545 @@
+{
+  "sources": {
+    "src/periphery/bridge/CCIPCrossChainBridge.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\n// Interfaces\nimport {IERC20} from \"src/interfaces/IERC20.sol\";\nimport {IRouterClient} from \"@chainlink-ccip-1.6.0/ccip/interfaces/IRouterClient.sol\";\nimport {ICCIPCrossChainBridge} from \"src/periphery/interfaces/ICCIPCrossChainBridge.sol\";\nimport {ICCIPClient} from \"src/external/bridge/ICCIPClient.sol\";\n\n// Libraries\nimport {Owned} from \"solmate/auth/Owned.sol\";\nimport {Client} from \"@chainlink-ccip-1.6.0/ccip/libraries/Client.sol\";\n\n// Contracts\nimport {PeripheryEnabler} from \"src/periphery/PeripheryEnabler.sol\";\nimport {CCIPReceiver} from \"@chainlink-ccip-1.6.0/ccip/applications/CCIPReceiver.sol\";\n\n/// @title  CCIPCrossChainBridge\n/// @notice Sends and receives OHM between chains using Chainlink CCIP\n///         It is a periphery contract, as it does not require any privileged access to the Olympus protocol.\n///\n///         The contract is designed to be an intermediary when receiving OHM, so that failed messages can be retried.\ncontract CCIPCrossChainBridge is CCIPReceiver, PeripheryEnabler, Owned, ICCIPCrossChainBridge {\n    // ========= STATE VARIABLES ========= //\n\n    IERC20 public immutable OHM;\n\n    /// @notice Mapping of EVM chain selectors to trusted bridge contracts\n    /// @dev    When sending, this is used to determine the initial recipient of a bridging message.\n    ///         When receiving, this is used to validate the sender of the message.\n    ///         As the zero address can be a trusted remote, the `isSet` flag is used to determine if the trusted remote is set.\n    mapping(uint64 => TrustedRemoteEVM) internal _trustedRemoteEVM;\n\n    /// @notice Mapping of SVM chain selectors to trusted recipients\n    /// @dev    When sending, this is used to determine the initial recipient of a bridging message.\n    ///         When receiving, this is used to validate the sender of the message.\n    ///         As the zero address can be a trusted remote, the `isSet` flag is used to determine if the trusted remote is set.\n    mapping(uint64 => TrustedRemoteSVM) internal _trustedRemoteSVM;\n\n    /// @notice Mapping of message IDs to failed messages\n    /// @dev    When a message fails to receive, it is stored here to allow for retries.\n    mapping(bytes32 => Client.Any2EVMMessage) internal _failedMessages;\n\n    /// @notice Mapping of destination chain selectors to gas limits\n    /// @dev    When sending, this is used to determine the gas limit for the message.\n    mapping(uint64 => uint32) internal _gasLimits;\n\n    // ========= CONSTRUCTOR ========= //\n\n    constructor(\n        address ohm_,\n        address ccipRouter_,\n        address owner_\n    ) Owned(owner_) CCIPReceiver(ccipRouter_) {\n        // Validate\n        if (ohm_ == address(0)) revert Bridge_InvalidAddress(\"ohm\");\n        if (owner_ == address(0)) revert Bridge_InvalidAddress(\"owner\");\n\n        // Set state\n        OHM = IERC20(ohm_);\n\n        // Disabled by default\n    }\n\n    // ========= SENDING OHM ========= //\n\n    function _buildCCIPMessage(\n        bytes memory to_,\n        uint256 amount_,\n        bytes memory data_,\n        bytes memory extraArgs_\n    ) internal view returns (Client.EVM2AnyMessage memory) {\n        // Set the token amounts\n        Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);\n        tokenAmounts[0] = Client.EVMTokenAmount({token: address(OHM), amount: amount_});\n\n        // Prepare the message struct\n        return\n            Client.EVM2AnyMessage({\n                receiver: to_, // Receiver address\n                data: data_, // Data\n                tokenAmounts: tokenAmounts, // Token amounts\n                extraArgs: extraArgs_, // Extra args\n                feeToken: address(0) // Fee paid in native token\n            });\n    }\n\n    function _getSVMExtraArgs(\n        uint64 dstChainSelector_,\n        bytes32 to_\n    ) internal view returns (bytes memory) {\n        return\n            Client._svmArgsToBytes(\n                Client.SVMExtraArgsV1({\n                    computeUnits: _gasLimits[dstChainSelector_],\n                    accountIsWritableBitmap: 0,\n                    allowOutOfOrderExecution: true,\n                    tokenReceiver: to_,\n                    accounts: new bytes32[](0)\n                })\n            );\n    }\n\n    function _getEVMExtraArgs(uint64 dstChainSelector_) internal view returns (bytes memory) {\n        return\n            Client._argsToBytes(\n                Client.GenericExtraArgsV2({\n                    gasLimit: _gasLimits[dstChainSelector_],\n                    allowOutOfOrderExecution: true\n                })\n            );\n    }\n\n    function _getEVMData(\n        uint64 dstChainSelector_,\n        address to_\n    ) internal view returns (bytes memory recipient, bytes memory data, bytes memory extraArgs) {\n        // Validate that the recipient is not the zero address\n        if (to_ == address(0)) revert Bridge_InvalidAddress(\"recipient\");\n\n        // Validate that the destination chain has a trusted remote\n        TrustedRemoteEVM memory trustedRemote = _trustedRemoteEVM[dstChainSelector_];\n        if (!trustedRemote.isSet) revert Bridge_DestinationNotTrusted();\n\n        // Initial recipient is the trusted remote (this contract on the destination chain)\n        recipient = abi.encode(trustedRemote.remoteAddress);\n        // Data contains the actual recipient address\n        data = abi.encode(to_);\n        // Extra args\n        extraArgs = _getEVMExtraArgs(dstChainSelector_);\n\n        return (recipient, data, extraArgs);\n    }\n\n    function _getSVMData(\n        uint64 dstChainSelector_,\n        bytes32 to_\n    ) internal view returns (bytes memory recipient, bytes memory data, bytes memory extraArgs) {\n        // Validate that the destination chain has a trusted remote\n        TrustedRemoteSVM memory trustedRemote = _trustedRemoteSVM[dstChainSelector_];\n        // The default receiver on SVM is the zero address, so an alternative check is needed\n        // Source: https://docs.chain.link/ccip/tutorials/svm/destination/build-messages#receiver\n        if (!trustedRemote.isSet) revert Bridge_DestinationNotTrusted();\n\n        // Initial recipient is the trusted remote\n        recipient = abi.encodePacked(trustedRemote.remoteAddress);\n        // Data is empty\n        data = \"\";\n        // Extra args\n        extraArgs = _getSVMExtraArgs(dstChainSelector_, to_);\n        return (recipient, data, extraArgs);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function getFeeSVM(\n        uint64 dstChainSelector_,\n        bytes32 to_,\n        uint256 amount_\n    ) external view returns (uint256 fee_) {\n        // Get the recipient and data\n        // This also validates that the destination chain is supported\n        (bytes memory recipient, bytes memory data, bytes memory extraArgs) = _getSVMData(\n            dstChainSelector_,\n            to_\n        );\n\n        fee_ = IRouterClient(i_ccipRouter).getFee(\n            dstChainSelector_,\n            _buildCCIPMessage(recipient, amount_, data, extraArgs)\n        );\n        return fee_;\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function getFeeEVM(\n        uint64 dstChainSelector_,\n        address to_,\n        uint256 amount_\n    ) external view returns (uint256 fee_) {\n        // Get the recipient and data\n        // This also validates that the destination chain is supported\n        (bytes memory recipient, bytes memory data, bytes memory extraArgs) = _getEVMData(\n            dstChainSelector_,\n            to_\n        );\n\n        // Get the fees\n        fee_ = IRouterClient(i_ccipRouter).getFee(\n            dstChainSelector_,\n            _buildCCIPMessage(recipient, amount_, data, extraArgs)\n        );\n        return fee_;\n    }\n\n    function _sendOhm(\n        uint64 dstChainSelector_,\n        bytes memory to_,\n        uint256 amount_,\n        bytes memory data_,\n        bytes memory extraArgs_\n    ) internal returns (bytes32) {\n        // Validate the amount\n        if (amount_ == 0) revert Bridge_ZeroAmount();\n\n        // Build the CCIP message\n        Client.EVM2AnyMessage memory ccipMessage = _buildCCIPMessage(\n            to_,\n            amount_,\n            data_,\n            extraArgs_\n        );\n\n        // Determine the fees\n        uint256 fees = IRouterClient(i_ccipRouter).getFee(dstChainSelector_, ccipMessage);\n\n        // Validate that the sender has provided sufficient native token to cover fees\n        if (msg.value < fees) revert Bridge_InsufficientNativeToken(fees, msg.value);\n\n        // Sending the excess native token to the sender can create problems if the sender cannot receive it\n        // Any excess can be retrieved by the owner via the `withdraw` function\n\n        // Validate that the sender has sufficient OHM\n        if (OHM.balanceOf(msg.sender) < amount_)\n            revert Bridge_InsufficientAmount(amount_, OHM.balanceOf(msg.sender));\n\n        // Pull in OHM from the sender\n        OHM.transferFrom(msg.sender, address(this), amount_);\n\n        // Approve the Router to spend the token\n        OHM.approve(address(i_ccipRouter), amount_);\n\n        // Send the message to the router\n        // The TokenPool will perform validation on the routing\n        bytes32 ccipMessageId = IRouterClient(i_ccipRouter).ccipSend{value: fees}(\n            dstChainSelector_,\n            ccipMessage\n        );\n\n        // Emit the event\n        emit Bridged(ccipMessageId, dstChainSelector_, msg.sender, amount_, fees);\n\n        // Return the message ID\n        return ccipMessageId;\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    /// @dev        Unless specified for the chain through `setGasLimit()`, the gas limit will be 0\n    function sendToSVM(\n        uint64 dstChainSelector_,\n        bytes32 to_,\n        uint256 amount_\n    ) external payable onlyEnabled returns (bytes32) {\n        // Get the recipient and data\n        // This also validates that the destination chain is supported\n        (bytes memory recipient, bytes memory data, bytes memory extraArgs) = _getSVMData(\n            dstChainSelector_,\n            to_\n        );\n\n        // Send the message to the router\n        return _sendOhm(dstChainSelector_, recipient, amount_, data, extraArgs);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    /// @dev        Unless specified for the chain through `setGasLimit()`, the gas limit will be 0\n    function sendToEVM(\n        uint64 dstChainSelector_,\n        address to_,\n        uint256 amount_\n    ) external payable onlyEnabled returns (bytes32) {\n        // Get the recipient and data\n        // This also validates that the destination chain is supported\n        (bytes memory recipient, bytes memory data, bytes memory extraArgs) = _getEVMData(\n            dstChainSelector_,\n            to_\n        );\n\n        // Send the message to the router\n        return _sendOhm(dstChainSelector_, recipient, amount_, data, extraArgs);\n    }\n\n    // ========= TOKEN WITHDRAWAL ========= //\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function withdraw(address recipient_) external onlyOwner {\n        // Validate the recipient address\n        if (recipient_ == address(0)) revert Bridge_InvalidAddress(\"recipient\");\n\n        // Get the balance of the contract\n        uint256 balance = address(this).balance;\n\n        // Revert if the balance is zero\n        if (balance == 0) revert Bridge_ZeroAmount();\n\n        // Send the balance to the recipient\n        (bool success, ) = recipient_.call{value: balance}(\"\");\n        if (!success) revert Bridge_TransferFailed(msg.sender, recipient_, balance);\n\n        // Emit the event\n        emit Withdrawn(recipient_, balance);\n    }\n\n    // ========= CCIP RECEIVER ========= //\n\n    /// @inheritdoc CCIPReceiver\n    /// @dev        This function is designed to not revert, and instead will capture any errors in order to mark the message as failed. The message can be retried using the `retryFailedMessage()` function.\n    function _ccipReceive(Client.Any2EVMMessage memory message_) internal override {\n        // Assumptions:\n        // - The caller has already been validated by the `ccipReceive()` function to be the CCIP router\n        // - Bridging from SVM will not go through this contract\n\n        // Attempt to receive the message\n        // We catch any errors in order to mark the message as failed\n        try this.receiveMessage(message_) {\n            // Message received successfully\n        } catch {\n            // Message failed to receive\n            // Mark the message as failed\n\n            Client.Any2EVMMessage storage failedMessage = _failedMessages[message_.messageId];\n            failedMessage.messageId = message_.messageId;\n            failedMessage.sourceChainSelector = message_.sourceChainSelector;\n            failedMessage.sender = message_.sender;\n            failedMessage.data = message_.data;\n\n            // Delete the array, in case it was previously set (however unlikely)\n            delete failedMessage.destTokenAmounts;\n            // Iterate over the token amounts and add them. This is needed as Solidity does not support adding a memory array to a struct in storage.\n            for (uint256 i = 0; i < message_.destTokenAmounts.length; i++) {\n                failedMessage.destTokenAmounts.push(message_.destTokenAmounts[i]);\n            }\n\n            emit MessageFailed(message_.messageId);\n        }\n    }\n\n    /// @notice Actual handler for receiving CCIP messages\n    /// @dev    Does NOT support receiving messages from SVM, since they will not go through this contract\n    function _receiveMessage(Client.Any2EVMMessage memory message_) internal {\n        // Validate that the contract is enabled\n        if (!isEnabled) revert NotEnabled();\n\n        // Validate that the sender is a trusted remote\n        // This will be the sending bridge contract, as it is set in the OnRamp.forwardFromRouter() function\n        // Be pessimistic and ensure the trusted remote is set (otherwise the trusted remote check will not revert)\n        address sourceBridge = abi.decode(message_.sender, (address));\n        TrustedRemoteEVM memory trustedRemote = _trustedRemoteEVM[message_.sourceChainSelector];\n        if (!trustedRemote.isSet || sourceBridge != trustedRemote.remoteAddress)\n            revert Bridge_SourceNotTrusted();\n\n        // There should only be a single token and amount specified in the message\n        if (message_.destTokenAmounts.length != 1) revert Bridge_InvalidPayloadTokensLength();\n\n        // Validate that the token is OHM\n        if (message_.destTokenAmounts[0].token != address(OHM)) revert Bridge_InvalidPayloadToken();\n\n        // Decode the message data\n        address recipient = abi.decode(message_.data, (address));\n\n        // Transfer the OHM to the actual recipient\n        OHM.transfer(recipient, message_.destTokenAmounts[0].amount);\n\n        // Emit the event\n        emit Received(\n            message_.messageId,\n            message_.sourceChainSelector,\n            sourceBridge,\n            message_.destTokenAmounts[0].amount\n        );\n    }\n\n    /// @notice Receives a message from the CCIP router\n    /// @dev    This function can only be called by the contract\n    function receiveMessage(Client.Any2EVMMessage calldata message_) external {\n        // Validate that the caller is this contract\n        if (msg.sender != address(this)) revert Bridge_InvalidCaller();\n\n        // Call the handler\n        _receiveMessage(message_);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    /// @dev        This function will revert if:\n    ///             - The message is not in the failedMessages mapping\n    ///             - The message sender is not a trusted remote\n    ///             - The message tokens array is not of length 1\n    ///             - The message token is not OHM\n    ///             - The message data is not a valid EVM address\n    function retryFailedMessage(bytes32 messageId_) external {\n        // Validate that the message is in the failedMessages mapping\n        if (_failedMessages[messageId_].sourceChainSelector == 0)\n            revert Bridge_FailedMessageNotFound(messageId_);\n\n        // Remove the message from the failedMessages mapping\n        Client.Any2EVMMessage memory message = _failedMessages[messageId_];\n        delete _failedMessages[messageId_];\n\n        // Call the handler\n        _receiveMessage(message);\n\n        // Emit the event\n        emit RetryMessageSuccess(messageId_);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    /// @dev        This function re-creates the Client.Any2EVMMessage struct in order to return the correct type. This is done to avoid requiring the caller to import the `Client` library.\n    function getFailedMessage(\n        bytes32 messageId_\n    ) external view returns (ICCIPClient.Any2EVMMessage memory) {\n        Client.Any2EVMMessage memory message = _failedMessages[messageId_];\n\n        ICCIPClient.EVMTokenAmount[] memory destTokenAmounts = new ICCIPClient.EVMTokenAmount[](\n            message.destTokenAmounts.length\n        );\n        for (uint256 i = 0; i < message.destTokenAmounts.length; i++) {\n            destTokenAmounts[i] = ICCIPClient.EVMTokenAmount({\n                token: message.destTokenAmounts[i].token,\n                amount: message.destTokenAmounts[i].amount\n            });\n        }\n\n        return\n            ICCIPClient.Any2EVMMessage({\n                messageId: message.messageId,\n                sourceChainSelector: message.sourceChainSelector,\n                sender: message.sender,\n                data: message.data,\n                destTokenAmounts: destTokenAmounts\n            });\n    }\n\n    // ========= TRUSTED REMOTES ========= //\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function setTrustedRemoteEVM(uint64 dstChainSelector_, address to_) external onlyOwner {\n        _trustedRemoteEVM[dstChainSelector_] = TrustedRemoteEVM({remoteAddress: to_, isSet: true});\n        emit TrustedRemoteEVMSet(dstChainSelector_, to_);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function unsetTrustedRemoteEVM(uint64 dstChainSelector_) external onlyOwner {\n        // Validate that the trusted remote is set\n        TrustedRemoteEVM memory trustedRemote = _trustedRemoteEVM[dstChainSelector_];\n        if (!trustedRemote.isSet) revert Bridge_TrustedRemoteNotSet();\n\n        delete _trustedRemoteEVM[dstChainSelector_];\n        emit TrustedRemoteEVMUnset(dstChainSelector_);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    /// @dev        This function will revert if the trusted remote is not set\n    function getTrustedRemoteEVM(\n        uint64 dstChainSelector_\n    ) external view returns (TrustedRemoteEVM memory) {\n        return _trustedRemoteEVM[dstChainSelector_];\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function setTrustedRemoteSVM(uint64 dstChainSelector_, bytes32 to_) external onlyOwner {\n        _trustedRemoteSVM[dstChainSelector_] = TrustedRemoteSVM({remoteAddress: to_, isSet: true});\n        emit TrustedRemoteSVMSet(dstChainSelector_, to_);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function unsetTrustedRemoteSVM(uint64 dstChainSelector_) external onlyOwner {\n        // Validate that the trusted remote is set\n        TrustedRemoteSVM memory trustedRemote = _trustedRemoteSVM[dstChainSelector_];\n        if (!trustedRemote.isSet) revert Bridge_TrustedRemoteNotSet();\n\n        delete _trustedRemoteSVM[dstChainSelector_];\n        emit TrustedRemoteSVMUnset(dstChainSelector_);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    /// @dev        This function will revert if the trusted remote is not set\n    function getTrustedRemoteSVM(\n        uint64 dstChainSelector_\n    ) external view returns (TrustedRemoteSVM memory) {\n        return _trustedRemoteSVM[dstChainSelector_];\n    }\n\n    // ========= GAS LIMITS ========= //\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function setGasLimit(uint64 dstChainSelector_, uint32 gasLimit_) external onlyOwner {\n        _gasLimits[dstChainSelector_] = gasLimit_;\n        emit GasLimitSet(dstChainSelector_, gasLimit_);\n    }\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function getGasLimit(uint64 dstChainSelector_) external view returns (uint32) {\n        return _gasLimits[dstChainSelector_];\n    }\n\n    // ========= CONFIGURATION ========= //\n\n    /// @inheritdoc ICCIPCrossChainBridge\n    function getCCIPRouter() external view returns (address) {\n        return i_ccipRouter;\n    }\n\n    function supportsInterface(\n        bytes4 interfaceId_\n    ) public view virtual override(CCIPReceiver, PeripheryEnabler) returns (bool) {\n        return\n            interfaceId_ == type(ICCIPCrossChainBridge).interfaceId ||\n            CCIPReceiver.supportsInterface(interfaceId_) ||\n            PeripheryEnabler.supportsInterface(interfaceId_);\n    }\n\n    // ========= ENABLER FUNCTIONS ========= //\n\n    /// @inheritdoc PeripheryEnabler\n    function _enable(bytes calldata) internal override {}\n\n    /// @inheritdoc PeripheryEnabler\n    function _disable(bytes calldata) internal override {}\n\n    /// @inheritdoc PeripheryEnabler\n    function _onlyOwner() internal view override {\n        // Validate that the caller is the owner\n        // String literal to keep it consistent with the solmate onlyOwner modifier\n        // solhint-disable-next-line gas-custom-errors\n        if (msg.sender != owner) revert(\"UNAUTHORIZED\");\n    }\n}\n"
+    },
+    "src/interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\n// Imported from forge-std\n\n/// @dev Interface of the ERC20 standard as defined in the EIP.\n/// @dev This includes the optional name, symbol, and decimals metadata.\ninterface IERC20 {\n    /// @dev Emitted when `value` tokens are moved from one account (`from`) to another (`to`).\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /// @dev Emitted when the allowance of a `spender` for an `owner` is set, where `value`\n    /// is the new allowance.\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /// @notice Returns the amount of tokens in existence.\n    function totalSupply() external view returns (uint256);\n\n    /// @notice Returns the amount of tokens owned by `account`.\n    function balanceOf(address account) external view returns (uint256);\n\n    /// @notice Moves `amount` tokens from the caller's account to `to`.\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the remaining number of tokens that `spender` is allowed\n    /// to spend on behalf of `owner`\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /// @notice Sets `amount` as the allowance of `spender` over the caller's tokens.\n    /// @dev Be aware of front-running risks: https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /// @notice Moves `amount` tokens from `from` to `to` using the allowance mechanism.\n    /// `amount` is then deducted from the caller's allowance.\n    function transferFrom(address from, address to, uint256 amount) external returns (bool);\n\n    /// @notice Returns the name of the token.\n    function name() external view returns (string memory);\n\n    /// @notice Returns the symbol of the token.\n    function symbol() external view returns (string memory);\n\n    /// @notice Returns the decimals places of the token.\n    function decimals() external view returns (uint8);\n}\n"
+    },
+    "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/interfaces/IRouterClient.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.4;\n\nimport {Client} from \"../libraries/Client.sol\";\n\ninterface IRouterClient {\n  error UnsupportedDestinationChain(uint64 destChainSelector);\n  error InsufficientFeeTokenAmount();\n  error InvalidMsgValue();\n\n  /// @notice Checks if the given chain ID is supported for sending/receiving.\n  /// @param destChainSelector The chain to check.\n  /// @return supported is true if it is supported, false if not.\n  function isChainSupported(\n    uint64 destChainSelector\n  ) external view returns (bool supported);\n\n  /// @param destinationChainSelector The destination chainSelector.\n  /// @param message The cross-chain CCIP message including data and/or tokens.\n  /// @return fee returns execution fee for the message.\n  /// delivery to destination chain, denominated in the feeToken specified in the message.\n  /// @dev Reverts with appropriate reason upon invalid message.\n  function getFee(\n    uint64 destinationChainSelector,\n    Client.EVM2AnyMessage memory message\n  ) external view returns (uint256 fee);\n\n  /// @notice Request a message to be sent to the destination chain.\n  /// @param destinationChainSelector The destination chain ID.\n  /// @param message The cross-chain CCIP message including data and/or tokens.\n  /// @return messageId The message ID.\n  /// @dev Note if msg.value is larger than the required fee (from getFee) we accept.\n  /// the overpayment with no refund.\n  /// @dev Reverts with appropriate reason upon invalid message.\n  function ccipSend(\n    uint64 destinationChainSelector,\n    Client.EVM2AnyMessage calldata message\n  ) external payable returns (bytes32);\n}\n"
+    },
+    "src/periphery/interfaces/ICCIPCrossChainBridge.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.0;\n\nimport {ICCIPClient} from \"src/external/bridge/ICCIPClient.sol\";\n\ninterface ICCIPCrossChainBridge {\n    // ========= ERRORS ========= //\n\n    error Bridge_InvalidAddress(string param);\n\n    error Bridge_ZeroAmount();\n\n    error Bridge_InsufficientAmount(uint256 expected, uint256 actual);\n\n    error Bridge_InsufficientNativeToken(uint256 expected, uint256 actual);\n\n    error Bridge_TransferFailed(address caller, address recipient, uint256 amount);\n\n    error Bridge_DestinationNotTrusted();\n\n    error Bridge_SourceNotTrusted();\n\n    error Bridge_InvalidCaller();\n\n    error Bridge_FailedMessageNotFound(bytes32 messageId);\n\n    error Bridge_InvalidPayloadTokensLength();\n\n    error Bridge_InvalidPayloadToken();\n\n    error Bridge_TrustedRemoteNotSet();\n\n    // ========= EVENTS ========= //\n\n    event Bridged(\n        bytes32 messageId,\n        uint64 destinationChainSelector,\n        address indexed sender,\n        uint256 amount,\n        uint256 fees\n    );\n\n    event Received(\n        bytes32 messageId,\n        uint64 sourceChainSelector,\n        address indexed sender,\n        uint256 amount\n    );\n\n    event Withdrawn(address indexed recipient, uint256 amount);\n\n    event TrustedRemoteEVMSet(uint64 indexed dstChainSelector, address indexed to);\n\n    event TrustedRemoteEVMUnset(uint64 indexed dstChainSelector);\n\n    event TrustedRemoteSVMSet(uint64 indexed dstChainSelector, bytes32 indexed to);\n\n    event TrustedRemoteSVMUnset(uint64 indexed dstChainSelector);\n\n    event GasLimitSet(uint64 indexed dstChainSelector, uint32 gasLimit);\n\n    event MessageFailed(bytes32 messageId);\n\n    event RetryMessageSuccess(bytes32 messageId);\n\n    // ========= DATA STRUCTURES ========= //\n\n    struct TrustedRemoteEVM {\n        address remoteAddress;\n        bool isSet;\n    }\n\n    struct TrustedRemoteSVM {\n        bytes32 remoteAddress;\n        bool isSet;\n    }\n\n    // ========= SEND OHM ========= //\n\n    /// @notice Gets the fee for sending OHM to the specified destination SVM chain\n    /// @dev    This can be used to send to an address on any chain supported by CCIP\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    /// @param to_                  The destination address\n    /// @param amount_              The amount of OHM to send\n    ///\n    /// @return fee_                The fee for sending OHM to the specified destination chain\n    function getFeeSVM(\n        uint64 dstChainSelector_,\n        bytes32 to_,\n        uint256 amount_\n    ) external view returns (uint256 fee_);\n\n    /// @notice Gets the fee for sending OHM to the specified destination EVM chain\n    /// @dev    This can be used to send to an address on any EVM chain supported by CCIP\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    /// @param to_                  The destination address\n    /// @param amount_              The amount of OHM to send\n    ///\n    /// @return fee_                The fee for sending OHM to the specified destination EVM chain\n    function getFeeEVM(\n        uint64 dstChainSelector_,\n        address to_,\n        uint256 amount_\n    ) external view returns (uint256 fee_);\n\n    /// @notice Sends OHM to the specified destination SVM chain\n    /// @dev    This can be used to send to an address on any chain supported by CCIP\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    /// @param to_                  The destination address\n    /// @param amount_              The amount of OHM to send\n    /// @return messageId           The message ID of the sent message\n    function sendToSVM(\n        uint64 dstChainSelector_,\n        bytes32 to_,\n        uint256 amount_\n    ) external payable returns (bytes32 messageId);\n\n    /// @notice Sends OHM to the specified destination EVM chain\n    /// @dev    This can be used to send to an address on any EVM chain supported by CCIP\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    /// @param to_                  The destination address\n    /// @param amount_              The amount of OHM to send\n    /// @return messageId           The message ID of the sent message\n    function sendToEVM(\n        uint64 dstChainSelector_,\n        address to_,\n        uint256 amount_\n    ) external payable returns (bytes32 messageId);\n\n    // ========= RECEIVE OHM ========= //\n\n    /// @notice Gets the failed message for the specified message ID\n    ///\n    /// @param messageId_ The message ID\n    /// @return message_ The failed message\n    function getFailedMessage(\n        bytes32 messageId_\n    ) external view returns (ICCIPClient.Any2EVMMessage memory);\n\n    /// @notice Retries a failed message\n    ///\n    /// @param messageId_ The message ID\n    function retryFailedMessage(bytes32 messageId_) external;\n\n    // ========= TOKEN WITHDRAWAL ========= //\n\n    /// @notice Allows the owner to withdraw the native token from the contract\n    /// @dev    This is needed as senders may provide more native token than needed to cover fees\n    ///\n    /// @param  recipient_  The recipient of the native token\n    function withdraw(address recipient_) external;\n\n    // ========= TRUSTED REMOTES ========= //\n\n    /// @notice Sets the trusted remote for the specified destination EVM chain\n    /// @dev    This is needed to send/receive messages to/from the specified destination EVM chain\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    /// @param to_                  The destination address\n    function setTrustedRemoteEVM(uint64 dstChainSelector_, address to_) external;\n\n    /// @notice Unsets the trusted remote for the specified destination EVM chain\n    /// @dev    This is needed to stop sending/receiving messages to/from the specified destination EVM chain\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    function unsetTrustedRemoteEVM(uint64 dstChainSelector_) external;\n\n    /// @notice Gets the trusted remote for the specified destination EVM chain\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    /// @return to_                The destination address\n    function getTrustedRemoteEVM(\n        uint64 dstChainSelector_\n    ) external view returns (TrustedRemoteEVM memory);\n\n    /// @notice Sets the trusted remote for the specified destination SVM chain\n    /// @dev    This is needed to send/receive messages to/from the specified destination SVM chain\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    /// @param to_                  The destination address\n    function setTrustedRemoteSVM(uint64 dstChainSelector_, bytes32 to_) external;\n\n    /// @notice Unsets the trusted remote for the specified destination SVM chain\n    /// @dev    This is needed to stop sending/receiving messages to/from the specified destination SVM chain\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    function unsetTrustedRemoteSVM(uint64 dstChainSelector_) external;\n\n    /// @notice Gets the trusted remote for the specified destination SVM chain\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    ///\n    /// @return to_                The destination address\n    function getTrustedRemoteSVM(\n        uint64 dstChainSelector_\n    ) external view returns (TrustedRemoteSVM memory);\n\n    // ========= GAS LIMITS ========= //\n\n    /// @notice Sets the gas limit for the specified destination chain\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    /// @param gasLimit_            The gas limit\n    function setGasLimit(uint64 dstChainSelector_, uint32 gasLimit_) external;\n\n    /// @notice Gets the gas limit for the specified destination chain\n    ///\n    /// @param dstChainSelector_    The destination chain selector\n    ///\n    /// @return gasLimit_           The gas limit, or 0 if not set\n    function getGasLimit(uint64 dstChainSelector_) external view returns (uint32);\n\n    // ========= CONFIGURATION ========= //\n\n    /// @notice Gets the CCIP router address\n    ///\n    /// @return ccipRouter_ The CCIP router address\n    function getCCIPRouter() external view returns (address);\n}\n"
+    },
+    "src/external/bridge/ICCIPClient.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\n/// @dev Copied from `Client.sol` in `chainlink-ccip-1.6.0`\ninterface ICCIPClient {\n    struct EVMTokenAmount {\n        address token; // token address on the local chain.\n        uint256 amount; // Amount of tokens.\n    }\n\n    struct Any2EVMMessage {\n        bytes32 messageId; // MessageId corresponding to ccipSend on source.\n        uint64 sourceChainSelector; // Source chain selector.\n        bytes sender; // abi.decode(sender) if coming from an EVM chain.\n        bytes data; // payload sent in original message.\n        EVMTokenAmount[] destTokenAmounts; // Tokens and their amounts in their destination chain representation.\n    }\n}\n"
+    },
+    "dependencies/solmate-6.2.0/src/auth/Owned.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.0;\n\n/// @notice Simple single owner authorization mixin.\n/// @author Solmate (https://github.com/transmissions11/solmate/blob/main/src/auth/Owned.sol)\nabstract contract Owned {\n    /*//////////////////////////////////////////////////////////////\n                                 EVENTS\n    //////////////////////////////////////////////////////////////*/\n\n    event OwnershipTransferred(address indexed user, address indexed newOwner);\n\n    /*//////////////////////////////////////////////////////////////\n                            OWNERSHIP STORAGE\n    //////////////////////////////////////////////////////////////*/\n\n    address public owner;\n\n    modifier onlyOwner() virtual {\n        require(msg.sender == owner, \"UNAUTHORIZED\");\n\n        _;\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                               CONSTRUCTOR\n    //////////////////////////////////////////////////////////////*/\n\n    constructor(address _owner) {\n        owner = _owner;\n\n        emit OwnershipTransferred(address(0), _owner);\n    }\n\n    /*//////////////////////////////////////////////////////////////\n                             OWNERSHIP LOGIC\n    //////////////////////////////////////////////////////////////*/\n\n    function transferOwnership(address newOwner) public virtual onlyOwner {\n        owner = newOwner;\n\n        emit OwnershipTransferred(msg.sender, newOwner);\n    }\n}\n"
+    },
+    "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/libraries/Client.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\n// End consumer library.\nlibrary Client {\n  struct EVMTokenAmount {\n    address token; // token address on the local chain.\n    uint256 amount; // Amount of tokens.\n  }\n\n  struct Any2EVMMessage {\n    bytes32 messageId; // MessageId corresponding to ccipSend on source.\n    uint64 sourceChainSelector; // Source chain selector.\n    bytes sender; // abi.decode(sender) if coming from an EVM chain.\n    bytes data; // payload sent in original message.\n    EVMTokenAmount[] destTokenAmounts; // Tokens and their amounts in their destination chain representation.\n  }\n\n  // If extraArgs is empty bytes, the default is 200k gas limit.\n  struct EVM2AnyMessage {\n    bytes receiver; // abi.encode(receiver address) for dest EVM chains.\n    bytes data; // Data payload.\n    EVMTokenAmount[] tokenAmounts; // Token transfers.\n    address feeToken; // Address of feeToken. address(0) means you will send msg.value.\n    bytes extraArgs; // Populate this with _argsToBytes(EVMExtraArgsV2).\n  }\n\n  // Tag to indicate only a gas limit. Only usable for EVM as destination chain.\n  bytes4 public constant EVM_EXTRA_ARGS_V1_TAG = 0x97a657c9;\n\n  struct EVMExtraArgsV1 {\n    uint256 gasLimit;\n  }\n\n  function _argsToBytes(\n    EVMExtraArgsV1 memory extraArgs\n  ) internal pure returns (bytes memory bts) {\n    return abi.encodeWithSelector(EVM_EXTRA_ARGS_V1_TAG, extraArgs);\n  }\n\n  // Tag to indicate a gas limit (or dest chain equivalent processing units) and Out Of Order Execution. This tag is\n  // available for multiple chain families. If there is no chain family specific tag, this is the default available\n  // for a chain.\n  // Note: not available for Solana VM based chains.\n  bytes4 public constant GENERIC_EXTRA_ARGS_V2_TAG = 0x181dcf10;\n\n  /// @param gasLimit: gas limit for the callback on the destination chain.\n  /// @param allowOutOfOrderExecution: if true, it indicates that the message can be executed in any order relative to\n  /// other messages from the same sender. This value's default varies by chain. On some chains, a particular value is\n  /// enforced, meaning if the expected value is not set, the message request will revert.\n  /// @dev Fully compatible with the previously existing EVMExtraArgsV2.\n  struct GenericExtraArgsV2 {\n    uint256 gasLimit;\n    bool allowOutOfOrderExecution;\n  }\n\n  // Extra args tag for chains that use the Solana VM.\n  bytes4 public constant SVM_EXTRA_ARGS_V1_TAG = 0x1f3b3aba;\n\n  struct SVMExtraArgsV1 {\n    uint32 computeUnits;\n    uint64 accountIsWritableBitmap;\n    bool allowOutOfOrderExecution;\n    bytes32 tokenReceiver;\n    bytes32[] accounts;\n  }\n\n  /// @dev The maximum number of accounts that can be passed in SVMExtraArgs.\n  uint256 public constant SVM_EXTRA_ARGS_MAX_ACCOUNTS = 64;\n\n  function _argsToBytes(\n    GenericExtraArgsV2 memory extraArgs\n  ) internal pure returns (bytes memory bts) {\n    return abi.encodeWithSelector(GENERIC_EXTRA_ARGS_V2_TAG, extraArgs);\n  }\n\n  function _svmArgsToBytes(\n    SVMExtraArgsV1 memory extraArgs\n  ) internal pure returns (bytes memory bts) {\n    return abi.encodeWithSelector(SVM_EXTRA_ARGS_V1_TAG, extraArgs);\n  }\n}\n"
+    },
+    "src/periphery/PeripheryEnabler.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity >=0.8.15;\n\n// Interfaces\nimport {IEnabler} from \"src/periphery/interfaces/IEnabler.sol\";\n\n/// @title PeripheryEnabler\n/// @notice Abstract contract that implements the `IEnabler` interface\n/// @dev    This contract is designed to be used as a base contract for periphery contracts that need to be enabled and disabled.\n///         It additionally is not opionated about whether a caller is permitted to enable/disable the contract, and delegates it to a virtual function.\n///         It is a periphery contract, as it does not require any privileged access to the Olympus protocol.\nabstract contract PeripheryEnabler is IEnabler {\n    // ========= STATE VARIABLES ========= //\n\n    /// @notice Whether the contract is enabled\n    bool public isEnabled;\n\n    // ========= MODIFIERS ========= //\n\n    modifier onlyEnabled() {\n        if (!isEnabled) revert NotEnabled();\n        _;\n    }\n\n    modifier onlyDisabled() {\n        if (isEnabled) revert NotDisabled();\n        _;\n    }\n\n    // ========= OWNERSHIP ========= //\n\n    /// @notice Implementation-specific validation of ownership\n    /// @dev    Implementing contracts should override this function to perform the appropriate validation and revert if the caller is not permitted to enable/disable the contract.\n    function _onlyOwner() internal view virtual;\n\n    // ========= ENABLER FUNCTIONS ========= //\n\n    /// @notice Implementation-specific enable function\n    /// @dev    This function is called by the `enable()` function\n    ///\n    ///         The implementing contract can override this function and perform the following:\n    ///         1. Validate any parameters (if needed) or revert\n    ///         2. Validate state (if needed) or revert\n    ///         3. Perform any necessary actions, apart from modifying the `isEnabled` state variable\n    ///\n    /// @param  enableData_ Custom data that can be used by the implementation. The format of this data is\n    ///         left to the discretion of the implementation.\n    function _enable(bytes calldata enableData_) internal virtual;\n\n    /// @inheritdoc IEnabler\n    function enable(bytes calldata enableData_) external onlyDisabled {\n        // Validate that the caller is permissioned\n        _onlyOwner();\n\n        // Call the implementation-specific enable function\n        _enable(enableData_);\n\n        // Change the state\n        isEnabled = true;\n\n        // Emit the enabled event\n        emit Enabled();\n    }\n\n    /// @notice Implementation-specific disable function\n    /// @dev    This function is called by the `disable()` function\n    ///\n    ///         The implementing contract can override this function and perform the following:\n    ///         1. Validate any parameters (if needed) or revert\n    ///         2. Validate state (if needed) or revert\n    ///         3. Perform any necessary actions, apart from modifying the `isEnabled` state variable\n    ///\n    /// @param  disableData_ Custom data that can be used by the implementation. The format of this data is\n    ///         left to the discretion of the implementation.\n    function _disable(bytes calldata disableData_) internal virtual;\n\n    /// @inheritdoc IEnabler\n    function disable(bytes calldata disableData_) external onlyEnabled {\n        // Validate that the caller is permissioned\n        _onlyOwner();\n\n        // Call the implementation-specific disable function\n        _disable(disableData_);\n\n        // Change the state\n        isEnabled = false;\n\n        // Emit the disabled event\n        emit Disabled();\n    }\n\n    // ========= ERC165 ========= //\n\n    function supportsInterface(bytes4 interfaceId) public view virtual returns (bool) {\n        return interfaceId == type(IEnabler).interfaceId;\n    }\n}\n"
+    },
+    "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/applications/CCIPReceiver.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.4;\n\nimport {IAny2EVMMessageReceiver} from \"../interfaces/IAny2EVMMessageReceiver.sol\";\n\nimport {Client} from \"../libraries/Client.sol\";\n\nimport {IERC165} from \"../../vendor/openzeppelin-solidity/v5.0.2/contracts/utils/introspection/IERC165.sol\";\n\n/// @title CCIPReceiver - Base contract for CCIP applications that can receive messages.\nabstract contract CCIPReceiver is IAny2EVMMessageReceiver, IERC165 {\n  address internal immutable i_ccipRouter;\n\n  constructor(\n    address router\n  ) {\n    if (router == address(0)) revert InvalidRouter(address(0));\n    i_ccipRouter = router;\n  }\n\n  /// @notice IERC165 supports an interfaceId.\n  /// @param interfaceId The interfaceId to check.\n  /// @return true if the interfaceId is supported.\n  /// @dev Should indicate whether the contract implements IAny2EVMMessageReceiver.\n  /// e.g. return interfaceId == type(IAny2EVMMessageReceiver).interfaceId || interfaceId == type(IERC165).interfaceId\n  /// This allows CCIP to check if ccipReceive is available before calling it.\n  /// - If this returns false or reverts, only tokens are transferred to the receiver.\n  /// - If this returns true, tokens are transferred and ccipReceive is called atomically.\n  /// Additionally, if the receiver address does not have code associated with it at the time of\n  /// execution (EXTCODESIZE returns 0), only tokens will be transferred.\n  function supportsInterface(\n    bytes4 interfaceId\n  ) public view virtual override returns (bool) {\n    return interfaceId == type(IAny2EVMMessageReceiver).interfaceId || interfaceId == type(IERC165).interfaceId;\n  }\n\n  /// @inheritdoc IAny2EVMMessageReceiver\n  function ccipReceive(\n    Client.Any2EVMMessage calldata message\n  ) external virtual override onlyRouter {\n    _ccipReceive(message);\n  }\n\n  /// @notice Override this function in your implementation.\n  /// @param message Any2EVMMessage.\n  function _ccipReceive(\n    Client.Any2EVMMessage memory message\n  ) internal virtual;\n\n  /// @notice Return the current router\n  /// @return CCIP router address\n  function getRouter() public view virtual returns (address) {\n    return address(i_ccipRouter);\n  }\n\n  error InvalidRouter(address router);\n\n  /// @dev only calls from the set router are accepted.\n  modifier onlyRouter() {\n    if (msg.sender != getRouter()) revert InvalidRouter(msg.sender);\n    _;\n  }\n}\n"
+    },
+    "src/periphery/interfaces/IEnabler.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity >=0.8.15;\n\n/// @title IEnabler\n/// @notice Interface for contracts that can be enabled and disabled\n/// @dev    This is designed for usage by periphery contracts that cannot inherit from `PolicyEnabler`. Authorization is deliberately left open to the implementing contract.\ninterface IEnabler {\n    // ============ EVENTS ============ //\n\n    /// @notice Emitted when the contract is enabled\n    event Enabled();\n\n    /// @notice Emitted when the contract is disabled\n    event Disabled();\n\n    // ============ ERRORS ============ //\n\n    /// @notice Thrown when the contract is not enabled\n    error NotEnabled();\n\n    /// @notice Thrown when the contract is not disabled\n    error NotDisabled();\n\n    // ============ FUNCTIONS ============ //\n\n    /// @notice         Returns true if the contract is enabled\n    /// @return enabled True if the contract is enabled, false otherwise\n    function isEnabled() external view returns (bool enabled);\n\n    /// @notice             Enables the contract\n    /// @dev                Implementing contracts should implement permissioning logic\n    ///\n    /// @param enableData_  Optional data to pass to a custom enable function\n    function enable(bytes calldata enableData_) external;\n\n    /// @notice             Disables the contract\n    /// @dev                Implementing contracts should implement permissioning logic\n    ///\n    /// @param disableData_ Optional data to pass to a custom disable function\n    function disable(bytes calldata disableData_) external;\n}\n"
+    },
+    "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/interfaces/IAny2EVMMessageReceiver.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport {Client} from \"../libraries/Client.sol\";\n\n/// @notice Application contracts that intend to receive messages from  the router should implement this interface.\ninterface IAny2EVMMessageReceiver {\n  /// @notice Called by the Router to deliver a message. If this reverts, any token transfers also revert.\n  /// The message will move to a FAILED state and become available for manual execution.\n  /// @param message CCIP Message.\n  /// @dev Note ensure you check the msg.sender is the OffRampRouter.\n  function ccipReceive(\n    Client.Any2EVMMessage calldata message\n  ) external;\n}\n"
+    },
+    "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/vendor/openzeppelin-solidity/v5.0.2/contracts/utils/introspection/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n    /**\n     * @dev Returns true if this contract implements the interface defined by\n     * `interfaceId`. See the corresponding\n     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n     * to learn more about how these ids are created.\n     *\n     * This function call must use less than 30 000 gas.\n     */\n    function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.24+commit.e11b9ed9"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "ohm_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "ccipRouter_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "owner_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_DestinationNotTrusted",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "messageId",
+              "type": "bytes32"
+            }
+          ],
+          "name": "Bridge_FailedMessageNotFound",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "actual",
+              "type": "uint256"
+            }
+          ],
+          "name": "Bridge_InsufficientAmount",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "actual",
+              "type": "uint256"
+            }
+          ],
+          "name": "Bridge_InsufficientNativeToken",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "string",
+              "name": "param",
+              "type": "string"
+            }
+          ],
+          "name": "Bridge_InvalidAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_InvalidCaller",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_InvalidPayloadToken",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_InvalidPayloadTokensLength",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_SourceNotTrusted",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "caller",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Bridge_TransferFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_TrustedRemoteNotSet",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Bridge_ZeroAmount",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "router",
+              "type": "address"
+            }
+          ],
+          "name": "InvalidRouter",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotDisabled",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotEnabled",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "messageId",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "destinationChainSelector",
+              "type": "uint64"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "fees",
+              "type": "uint256"
+            }
+          ],
+          "name": "Bridged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Disabled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "Enabled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint64",
+              "name": "dstChainSelector",
+              "type": "uint64"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint32",
+              "name": "gasLimit",
+              "type": "uint32"
+            }
+          ],
+          "name": "GasLimitSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "messageId",
+              "type": "bytes32"
+            }
+          ],
+          "name": "MessageFailed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipTransferred",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "messageId",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "sourceChainSelector",
+              "type": "uint64"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Received",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "messageId",
+              "type": "bytes32"
+            }
+          ],
+          "name": "RetryMessageSuccess",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint64",
+              "name": "dstChainSelector",
+              "type": "uint64"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            }
+          ],
+          "name": "TrustedRemoteEVMSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint64",
+              "name": "dstChainSelector",
+              "type": "uint64"
+            }
+          ],
+          "name": "TrustedRemoteEVMUnset",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint64",
+              "name": "dstChainSelector",
+              "type": "uint64"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "to",
+              "type": "bytes32"
+            }
+          ],
+          "name": "TrustedRemoteSVMSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint64",
+              "name": "dstChainSelector",
+              "type": "uint64"
+            }
+          ],
+          "name": "TrustedRemoteSVMUnset",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Withdrawn",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "OHM",
+          "outputs": [
+            {
+              "internalType": "contract IERC20",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes32",
+                  "name": "messageId",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "uint64",
+                  "name": "sourceChainSelector",
+                  "type": "uint64"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "sender",
+                  "type": "bytes"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "token",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "amount",
+                      "type": "uint256"
+                    }
+                  ],
+                  "internalType": "struct Client.EVMTokenAmount[]",
+                  "name": "destTokenAmounts",
+                  "type": "tuple[]"
+                }
+              ],
+              "internalType": "struct Client.Any2EVMMessage",
+              "name": "message",
+              "type": "tuple"
+            }
+          ],
+          "name": "ccipReceive",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "disableData_",
+              "type": "bytes"
+            }
+          ],
+          "name": "disable",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "enableData_",
+              "type": "bytes"
+            }
+          ],
+          "name": "enable",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getCCIPRouter",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "messageId_",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getFailedMessage",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes32",
+                  "name": "messageId",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "uint64",
+                  "name": "sourceChainSelector",
+                  "type": "uint64"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "sender",
+                  "type": "bytes"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "token",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "amount",
+                      "type": "uint256"
+                    }
+                  ],
+                  "internalType": "struct ICCIPClient.EVMTokenAmount[]",
+                  "name": "destTokenAmounts",
+                  "type": "tuple[]"
+                }
+              ],
+              "internalType": "struct ICCIPClient.Any2EVMMessage",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "address",
+              "name": "to_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "getFeeEVM",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "fee_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "to_",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "getFeeSVM",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "fee_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            }
+          ],
+          "name": "getGasLimit",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getRouter",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            }
+          ],
+          "name": "getTrustedRemoteEVM",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "remoteAddress",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "isSet",
+                  "type": "bool"
+                }
+              ],
+              "internalType": "struct ICCIPCrossChainBridge.TrustedRemoteEVM",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            }
+          ],
+          "name": "getTrustedRemoteSVM",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes32",
+                  "name": "remoteAddress",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "isSet",
+                  "type": "bool"
+                }
+              ],
+              "internalType": "struct ICCIPCrossChainBridge.TrustedRemoteSVM",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isEnabled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes32",
+                  "name": "messageId",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "uint64",
+                  "name": "sourceChainSelector",
+                  "type": "uint64"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "sender",
+                  "type": "bytes"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "token",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "amount",
+                      "type": "uint256"
+                    }
+                  ],
+                  "internalType": "struct Client.EVMTokenAmount[]",
+                  "name": "destTokenAmounts",
+                  "type": "tuple[]"
+                }
+              ],
+              "internalType": "struct Client.Any2EVMMessage",
+              "name": "message_",
+              "type": "tuple"
+            }
+          ],
+          "name": "receiveMessage",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "messageId_",
+              "type": "bytes32"
+            }
+          ],
+          "name": "retryFailedMessage",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "address",
+              "name": "to_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "sendToEVM",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "to_",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            }
+          ],
+          "name": "sendToSVM",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "uint32",
+              "name": "gasLimit_",
+              "type": "uint32"
+            }
+          ],
+          "name": "setGasLimit",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "address",
+              "name": "to_",
+              "type": "address"
+            }
+          ],
+          "name": "setTrustedRemoteEVM",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "to_",
+              "type": "bytes32"
+            }
+          ],
+          "name": "setTrustedRemoteSVM",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes4",
+              "name": "interfaceId_",
+              "type": "bytes4"
+            }
+          ],
+          "name": "supportsInterface",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "transferOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            }
+          ],
+          "name": "unsetTrustedRemoteEVM",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint64",
+              "name": "dstChainSelector_",
+              "type": "uint64"
+            }
+          ],
+          "name": "unsetTrustedRemoteSVM",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "recipient_",
+              "type": "address"
+            }
+          ],
+          "name": "withdraw",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "ccipReceive((bytes32,uint64,bytes,bytes,(address,uint256)[]))": {
+            "details": "Note ensure you check the msg.sender is the OffRampRouter.",
+            "params": {
+              "message": "CCIP Message."
+            }
+          },
+          "disable(bytes)": {
+            "details": "Implementing contracts should implement permissioning logic",
+            "params": {
+              "disableData_": "Optional data to pass to a custom disable function"
+            }
+          },
+          "enable(bytes)": {
+            "details": "Implementing contracts should implement permissioning logic",
+            "params": {
+              "enableData_": "Optional data to pass to a custom enable function"
+            }
+          },
+          "getCCIPRouter()": {
+            "returns": {
+              "_0": "ccipRouter_ The CCIP router address"
+            }
+          },
+          "getFailedMessage(bytes32)": {
+            "details": "This function re-creates the Client.Any2EVMMessage struct in order to return the correct type. This is done to avoid requiring the caller to import the `Client` library.",
+            "params": {
+              "messageId_": "The message ID"
+            },
+            "returns": {
+              "_0": "message_ The failed message"
+            }
+          },
+          "getFeeEVM(uint64,address,uint256)": {
+            "details": "This can be used to send to an address on any EVM chain supported by CCIP",
+            "params": {
+              "amount_": "The amount of OHM to send",
+              "dstChainSelector_": "The destination chain selector",
+              "to_": "The destination address"
+            },
+            "returns": {
+              "fee_": "               The fee for sending OHM to the specified destination EVM chain"
+            }
+          },
+          "getFeeSVM(uint64,bytes32,uint256)": {
+            "details": "This can be used to send to an address on any chain supported by CCIP",
+            "params": {
+              "amount_": "The amount of OHM to send",
+              "dstChainSelector_": "The destination chain selector",
+              "to_": "The destination address"
+            },
+            "returns": {
+              "fee_": "               The fee for sending OHM to the specified destination chain"
+            }
+          },
+          "getGasLimit(uint64)": {
+            "params": {
+              "dstChainSelector_": "The destination chain selector"
+            },
+            "returns": {
+              "_0": "gasLimit_           The gas limit, or 0 if not set"
+            }
+          },
+          "getRouter()": {
+            "returns": {
+              "_0": "CCIP router address"
+            }
+          },
+          "getTrustedRemoteEVM(uint64)": {
+            "details": "This function will revert if the trusted remote is not set",
+            "params": {
+              "dstChainSelector_": "The destination chain selector"
+            },
+            "returns": {
+              "_0": "to_                The destination address"
+            }
+          },
+          "getTrustedRemoteSVM(uint64)": {
+            "details": "This function will revert if the trusted remote is not set",
+            "params": {
+              "dstChainSelector_": "The destination chain selector"
+            },
+            "returns": {
+              "_0": "to_                The destination address"
+            }
+          },
+          "receiveMessage((bytes32,uint64,bytes,bytes,(address,uint256)[]))": {
+            "details": "This function can only be called by the contract"
+          },
+          "retryFailedMessage(bytes32)": {
+            "details": "This function will revert if:             - The message is not in the failedMessages mapping             - The message sender is not a trusted remote             - The message tokens array is not of length 1             - The message token is not OHM             - The message data is not a valid EVM address",
+            "params": {
+              "messageId_": "The message ID"
+            }
+          },
+          "sendToEVM(uint64,address,uint256)": {
+            "details": "Unless specified for the chain through `setGasLimit()`, the gas limit will be 0",
+            "params": {
+              "amount_": "The amount of OHM to send",
+              "dstChainSelector_": "The destination chain selector",
+              "to_": "The destination address"
+            },
+            "returns": {
+              "_0": "          The message ID of the sent message"
+            }
+          },
+          "sendToSVM(uint64,bytes32,uint256)": {
+            "details": "Unless specified for the chain through `setGasLimit()`, the gas limit will be 0",
+            "params": {
+              "amount_": "The amount of OHM to send",
+              "dstChainSelector_": "The destination chain selector",
+              "to_": "The destination address"
+            },
+            "returns": {
+              "_0": "          The message ID of the sent message"
+            }
+          },
+          "setGasLimit(uint64,uint32)": {
+            "params": {
+              "dstChainSelector_": "The destination chain selector",
+              "gasLimit_": "The gas limit"
+            }
+          },
+          "setTrustedRemoteEVM(uint64,address)": {
+            "details": "This is needed to send/receive messages to/from the specified destination EVM chain",
+            "params": {
+              "dstChainSelector_": "The destination chain selector",
+              "to_": "The destination address"
+            }
+          },
+          "setTrustedRemoteSVM(uint64,bytes32)": {
+            "details": "This is needed to send/receive messages to/from the specified destination SVM chain",
+            "params": {
+              "dstChainSelector_": "The destination chain selector",
+              "to_": "The destination address"
+            }
+          },
+          "unsetTrustedRemoteEVM(uint64)": {
+            "details": "This is needed to stop sending/receiving messages to/from the specified destination EVM chain",
+            "params": {
+              "dstChainSelector_": "The destination chain selector"
+            }
+          },
+          "unsetTrustedRemoteSVM(uint64)": {
+            "details": "This is needed to stop sending/receiving messages to/from the specified destination SVM chain",
+            "params": {
+              "dstChainSelector_": "The destination chain selector"
+            }
+          },
+          "withdraw(address)": {
+            "details": "This is needed as senders may provide more native token than needed to cover fees",
+            "params": {
+              "recipient_": "The recipient of the native token"
+            }
+          }
+        },
+        "stateVariables": {
+          "_failedMessages": {
+            "details": "When a message fails to receive, it is stored here to allow for retries."
+          },
+          "_gasLimits": {
+            "details": "When sending, this is used to determine the gas limit for the message."
+          },
+          "_trustedRemoteEVM": {
+            "details": "When sending, this is used to determine the initial recipient of a bridging message.         When receiving, this is used to validate the sender of the message.         As the zero address can be a trusted remote, the `isSet` flag is used to determine if the trusted remote is set."
+          },
+          "_trustedRemoteSVM": {
+            "details": "When sending, this is used to determine the initial recipient of a bridging message.         When receiving, this is used to validate the sender of the message.         As the zero address can be a trusted remote, the `isSet` flag is used to determine if the trusted remote is set."
+          }
+        },
+        "title": "CCIPCrossChainBridge",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "NotDisabled()": [
+            {
+              "notice": "Thrown when the contract is not disabled"
+            }
+          ],
+          "NotEnabled()": [
+            {
+              "notice": "Thrown when the contract is not enabled"
+            }
+          ]
+        },
+        "events": {
+          "Disabled()": {
+            "notice": "Emitted when the contract is disabled"
+          },
+          "Enabled()": {
+            "notice": "Emitted when the contract is enabled"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "ccipReceive((bytes32,uint64,bytes,bytes,(address,uint256)[]))": {
+            "notice": "Called by the Router to deliver a message. If this reverts, any token transfers also revert. The message will move to a FAILED state and become available for manual execution."
+          },
+          "disable(bytes)": {
+            "notice": "Disables the contract"
+          },
+          "enable(bytes)": {
+            "notice": "Enables the contract"
+          },
+          "getCCIPRouter()": {
+            "notice": "Gets the CCIP router address"
+          },
+          "getFailedMessage(bytes32)": {
+            "notice": "Gets the failed message for the specified message ID"
+          },
+          "getFeeEVM(uint64,address,uint256)": {
+            "notice": "Gets the fee for sending OHM to the specified destination EVM chain"
+          },
+          "getFeeSVM(uint64,bytes32,uint256)": {
+            "notice": "Gets the fee for sending OHM to the specified destination SVM chain"
+          },
+          "getGasLimit(uint64)": {
+            "notice": "Gets the gas limit for the specified destination chain"
+          },
+          "getRouter()": {
+            "notice": "Return the current router"
+          },
+          "getTrustedRemoteEVM(uint64)": {
+            "notice": "Gets the trusted remote for the specified destination EVM chain"
+          },
+          "getTrustedRemoteSVM(uint64)": {
+            "notice": "Gets the trusted remote for the specified destination SVM chain"
+          },
+          "isEnabled()": {
+            "notice": "Whether the contract is enabled"
+          },
+          "receiveMessage((bytes32,uint64,bytes,bytes,(address,uint256)[]))": {
+            "notice": "Receives a message from the CCIP router"
+          },
+          "retryFailedMessage(bytes32)": {
+            "notice": "Retries a failed message"
+          },
+          "sendToEVM(uint64,address,uint256)": {
+            "notice": "Sends OHM to the specified destination EVM chain"
+          },
+          "sendToSVM(uint64,bytes32,uint256)": {
+            "notice": "Sends OHM to the specified destination SVM chain"
+          },
+          "setGasLimit(uint64,uint32)": {
+            "notice": "Sets the gas limit for the specified destination chain"
+          },
+          "setTrustedRemoteEVM(uint64,address)": {
+            "notice": "Sets the trusted remote for the specified destination EVM chain"
+          },
+          "setTrustedRemoteSVM(uint64,bytes32)": {
+            "notice": "Sets the trusted remote for the specified destination SVM chain"
+          },
+          "unsetTrustedRemoteEVM(uint64)": {
+            "notice": "Unsets the trusted remote for the specified destination EVM chain"
+          },
+          "unsetTrustedRemoteSVM(uint64)": {
+            "notice": "Unsets the trusted remote for the specified destination SVM chain"
+          },
+          "withdraw(address)": {
+            "notice": "Allows the owner to withdraw the native token from the contract"
+          }
+        },
+        "notice": "Sends and receives OHM between chains using Chainlink CCIP         It is a periphery contract, as it does not require any privileged access to the Olympus protocol.         The contract is designed to be an intermediary when receiving OHM, so that failed messages can be retried.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/periphery/bridge/CCIPCrossChainBridge.sol": "CCIPCrossChainBridge"
+      },
+      "evmVersion": "cancun",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 10000
+      },
+      "remappings": [
+        ":@addresses/=dependencies/forge-proposal-simulator-1.0.0/addresses/",
+        ":@base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        ":@chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/",
+        ":@chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        ":@chainlink/contracts-ccip/=dependencies/chainlink-local-0.2.5/lib/chainlink-ccip/chains/evm/",
+        ":@chainlink/contracts/=dependencies/chainlink-local-0.2.5/lib/chainlink-evm/contracts/",
+        ":@chainlink/local/src/=dependencies/chainlink-local-0.2.5/src/",
+        ":@clones-with-immutable-args-1.0.0/=dependencies/clones-with-immutable-args-1.0.0/src/",
+        ":@examples/=dependencies/forge-proposal-simulator-1.0.0/examples/",
+        ":@forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        ":@layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":@openzeppelin-4.8.0/=dependencies/@openzeppelin-contracts-4.8.0/",
+        ":@openzeppelin-contracts-4.8.0/=dependencies/@openzeppelin-contracts-4.8.0/",
+        ":@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-4.8.0/",
+        ":@proposals/=dependencies/forge-proposal-simulator-1.0.0/proposals/",
+        ":@safe-utils-0.0.13/=dependencies/safe-utils-0.0.13/src/",
+        ":@script/=dependencies/forge-proposal-simulator-1.0.0/script/",
+        ":@solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        ":@surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":@test/=dependencies/forge-proposal-simulator-1.0.0/test/",
+        ":@utils/=dependencies/forge-proposal-simulator-1.0.0/utils/",
+        ":base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        ":chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/",
+        ":chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        ":clones-with-immutable-args-1.0.0/=dependencies/clones-with-immutable-args-1.0.0/src/",
+        ":clones/=dependencies/clones-with-immutable-args-1.0.0/src/",
+        ":comp-governance/=dependencies/forge-proposal-simulator-1.0.0/lib/compound-governance/contracts/",
+        ":ds-test/=dependencies/safe-utils-0.0.13/lib/solidity-stringutils/lib/ds-test/src/",
+        ":forge-proposal-simulator-1.0.0/=dependencies/forge-proposal-simulator-1.0.0/",
+        ":forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        ":forge-std/=dependencies/forge-std-1.9.6/src/",
+        ":interfaces/=src/interfaces/",
+        ":layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":layer-zero/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        ":libraries/=src/libraries/",
+        ":modules/=src/modules/",
+        ":openzeppelin/=dependencies/@openzeppelin-contracts-4.8.0/",
+        ":policies/=src/policies/",
+        ":proposal-sim/=dependencies/forge-proposal-simulator-1.0.0/",
+        ":safe-smart-account/=dependencies/safe-utils-0.0.13/lib/safe-smart-account/",
+        ":safe-utils-0.0.13/=dependencies/safe-utils-0.0.13/src/",
+        ":solidity-http/=dependencies/safe-utils-0.0.13/lib/solidity-http/src/",
+        ":solidity-stringutils/=dependencies/safe-utils-0.0.13/lib/solidity-stringutils/",
+        ":solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        ":solmate/=dependencies/solmate-6.2.0/src/",
+        ":surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        ":test/=src/test/",
+        ":test/lib/=src/test/lib/",
+        ":test/mocks/=src/test/mocks/",
+        "dependencies/chainlink-local-0.2.5/:@chainlink/contracts-ccip/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/",
+        "dependencies/chainlink-local-0.2.5/:@chainlink/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/",
+        "dependencies/forge-proposal-simulator-1.0.0/:@addresses/=dependencies/forge-proposal-simulator-1.0.0/addresses/",
+        "dependencies/forge-proposal-simulator-1.0.0/:@proposals/=dependencies/forge-proposal-simulator-1.0.0/proposals/",
+        "dependencies/forge-proposal-simulator-1.0.0/:@utils/=dependencies/forge-proposal-simulator-1.0.0/utils/",
+        "dependencies/forge-proposal-simulator-1.0.0/:Governors/=dependencies/forge-proposal-simulator-1.0.0/Governors/"
+      ]
+    },
+    "sources": {
+      "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/applications/CCIPReceiver.sol": {
+        "keccak256": "0x55dd8b75751ff4fca499bdb1371e78185dc8924e4266bea05173acf8a5852df7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d98a46c648b5d9ed1d4d5d9c10ae720ad3ade8f26ae537cb79d9084eacb095e2",
+          "dweb:/ipfs/QmVzqrf5ve4DvuFenQbg3nvLhVZfo6Wxvf4xh5YYp3A83G"
+        ]
+      },
+      "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/interfaces/IAny2EVMMessageReceiver.sol": {
+        "keccak256": "0x8f67554db88baee2d8facee3320fb85fd566f843b9e4bdb6870eafe1637d7919",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4fb75a68a7a53c0d2d444f996b60b77f329c6e25e96d695f6b6219eb92baebc5",
+          "dweb:/ipfs/QmWCaGFSHSx17TgDou3EX2yuofPQnmkiuGX3isUmfHe3mb"
+        ]
+      },
+      "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/interfaces/IRouterClient.sol": {
+        "keccak256": "0x21280104a988eb7022f8968b1672bafba80a74e59f5512415009dff9a37be46a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://1bbcde3e9cd0c60f540ec0f2bbd70724cd6c9650428a1fade8c0589ef163d6ca",
+          "dweb:/ipfs/QmajfuurMHa1SKWVVXsydeKuPCGzXkKtRUi2HW5EA7p6gr"
+        ]
+      },
+      "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/libraries/Client.sol": {
+        "keccak256": "0xf806e9787d52ac3099d549dbdce9a890e99e3fc6f5557b7336104fb2b7713e99",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://54f9c55da352b3c043a852db74013fc4a3532a39eceb2eb39455c10ed683ecd3",
+          "dweb:/ipfs/QmS91D4RHyNt9TnRRsWMmJCzDWiuzwhXrVgzrqh4EgdSMY"
+        ]
+      },
+      "dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/vendor/openzeppelin-solidity/v5.0.2/contracts/utils/introspection/IERC165.sol": {
+        "keccak256": "0x4296879f55019b23e135000eb36896057e7101fb7fb859c5ef690cf14643757b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://87b3541437c8c443ccd36795e56a338ed12855eec17f8da624511b8d1a7e14df",
+          "dweb:/ipfs/QmeJQCtZrQjtJLr6u7ZHWeH3pBnjtLWzvRrKViAi7UZqxL"
+        ]
+      },
+      "dependencies/solmate-6.2.0/src/auth/Owned.sol": {
+        "keccak256": "0xfedb27d14c508342c33eb067c9a02eabcdb0f9dcf93b04ded1001f580d12d0ea",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://1ff52bbee698b9cf9e4574615e6550be0887ccf355f6571e23d6f25b332e79b4",
+          "dweb:/ipfs/QmVorA2apojVRStzS7h8aFccR3Uv32G6HVtBtFHZrE7YXx"
+        ]
+      },
+      "src/external/bridge/ICCIPClient.sol": {
+        "keccak256": "0x9fd4f2e55423f1ec31fc4c07b8e2b09614700ab2a4b49530317c56f2e747fe43",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4bb1a449d67ef722c1a93cea718a66809f82b3948b557897835e962c8d2226a4",
+          "dweb:/ipfs/QmXu6UKb3McnWeh43KCvvk7P99CqmbkGXKBXeWg9iUcZvr"
+        ]
+      },
+      "src/interfaces/IERC20.sol": {
+        "keccak256": "0x974a59ee45b2a6107b6dd8cd0f1de0ad878b54f1db47ebf27f697dda6145d9dc",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://da0d8ddb32da028acb692a89cb6a1ab1136c39d029871ee3d3e20b8d51c15dd6",
+          "dweb:/ipfs/QmQ2adrsKG6QyDSznRNSdWD8ceKKXnWohFWk2EjUHTMUyx"
+        ]
+      },
+      "src/periphery/PeripheryEnabler.sol": {
+        "keccak256": "0xa8f51f1ff97cef3950214abe3834308c6ce3ddef3528c3104994e3a9687532cd",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://4c35e28f8687fc8ba2d2432c3bbf7d613c711e99e00488b5af0ce26c35778204",
+          "dweb:/ipfs/QmS5dbAnZWWxdM18FwUPpou8SPpPBuhbx8959EKSpcJqhj"
+        ]
+      },
+      "src/periphery/bridge/CCIPCrossChainBridge.sol": {
+        "keccak256": "0x5a7116c6d77a2e3467a2d79084651842d3954ffc1b9b42ea31e7e3fe01de63a2",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://afbd9b77b4df63538942c1826b0b9f68021ffded14c44c3cfd22a6942c7d6fa6",
+          "dweb:/ipfs/QmRYW6xduVMxkwSx3oEpytkhun2oPKWa8ptedsoLRsB5N4"
+        ]
+      },
+      "src/periphery/interfaces/ICCIPCrossChainBridge.sol": {
+        "keccak256": "0x4a6cec1f190d30fcae8cda485b7e7b2bba821950ddc7727e6c3b122833b25bb9",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://426e19aaa71e19ab129fd7dbeafc6eb7dee1ad8c48acd2ada0cf4d734b91fb46",
+          "dweb:/ipfs/QmSw9mJ1H4YcbTsVsTJBjjZRnQLpXNtpxDfbu5oGzmqtjd"
+        ]
+      },
+      "src/periphery/interfaces/IEnabler.sol": {
+        "keccak256": "0xf3aa4c7fd7237e0cad838a16f58160b2ca7716c2b717a134e5f0ff110d87f278",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://636f3e9a5cfe13a5328a5552c7c0bc2c0d98c585b063361e3aee41837339e3ec",
+          "dweb:/ipfs/QmdCQ8rRWSRJX6uAq9Q5rRC35ScbnfBRm3UdFjsJWmKgtP"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.24+commit.e11b9ed9",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 10000,
+        "enabled": true
+      },
+      "evmVersion": "cancun",
+      "remappings": [
+        "interfaces/=src/interfaces/",
+        "modules/=src/modules/",
+        "policies/=src/policies/",
+        "libraries/=src/libraries/",
+        "test/=src/test/",
+        "test/mocks/=src/test/mocks/",
+        "test/lib/=src/test/lib/",
+        "@surl-1.0.0/=dependencies/surl-1.0.0/src/",
+        "@chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/",
+        "@chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        "dependencies/chainlink-local-0.2.5/:@chainlink/contracts-ccip/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/src/v0.8/ccip/",
+        "dependencies/chainlink-local-0.2.5/:@chainlink/contracts/=dependencies/chainlink-ccip-1.6.0/contracts/",
+        "@forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        "forge-std/=dependencies/forge-std-1.9.6/src/",
+        "@safe-utils-0.0.13/=dependencies/safe-utils-0.0.13/src/",
+        "@base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        "@clones-with-immutable-args-1.0.0/=dependencies/clones-with-immutable-args-1.0.0/src/",
+        "clones/=dependencies/clones-with-immutable-args-1.0.0/src/",
+        "@layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "layer-zero/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "@solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        "solmate/=dependencies/solmate-6.2.0/src/",
+        "@openzeppelin-4.8.0/=dependencies/@openzeppelin-contracts-4.8.0/",
+        "@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-4.8.0/",
+        "openzeppelin/=dependencies/@openzeppelin-contracts-4.8.0/",
+        "proposal-sim/=dependencies/forge-proposal-simulator-1.0.0/",
+        "dependencies/forge-proposal-simulator-1.0.0/:@addresses/=dependencies/forge-proposal-simulator-1.0.0/addresses/",
+        "dependencies/forge-proposal-simulator-1.0.0/:@utils/=dependencies/forge-proposal-simulator-1.0.0/utils/",
+        "dependencies/forge-proposal-simulator-1.0.0/:@proposals/=dependencies/forge-proposal-simulator-1.0.0/proposals/",
+        "dependencies/forge-proposal-simulator-1.0.0/:Governors/=dependencies/forge-proposal-simulator-1.0.0/Governors/",
+        "@addresses/=dependencies/forge-proposal-simulator-1.0.0/addresses/",
+        "@chainlink/contracts-ccip/=dependencies/chainlink-local-0.2.5/lib/chainlink-ccip/chains/evm/",
+        "@chainlink/contracts/=dependencies/chainlink-local-0.2.5/lib/chainlink-evm/contracts/",
+        "@chainlink/local/src/=dependencies/chainlink-local-0.2.5/src/",
+        "@examples/=dependencies/forge-proposal-simulator-1.0.0/examples/",
+        "@openzeppelin-contracts-4.8.0/=dependencies/@openzeppelin-contracts-4.8.0/",
+        "@proposals/=dependencies/forge-proposal-simulator-1.0.0/proposals/",
+        "@script/=dependencies/forge-proposal-simulator-1.0.0/script/",
+        "@test/=dependencies/forge-proposal-simulator-1.0.0/test/",
+        "@utils/=dependencies/forge-proposal-simulator-1.0.0/utils/",
+        "base58-solidity-1.0.3/=dependencies/base58-solidity-1.0.3/contracts/",
+        "chainlink-ccip-1.6.0/=dependencies/chainlink-ccip-1.6.0/",
+        "chainlink-local-0.2.5/=dependencies/chainlink-local-0.2.5/src/",
+        "clones-with-immutable-args-1.0.0/=dependencies/clones-with-immutable-args-1.0.0/src/",
+        "comp-governance/=dependencies/forge-proposal-simulator-1.0.0/lib/compound-governance/contracts/",
+        "ds-test/=dependencies/safe-utils-0.0.13/lib/solidity-stringutils/lib/ds-test/src/",
+        "forge-proposal-simulator-1.0.0/=dependencies/forge-proposal-simulator-1.0.0/",
+        "forge-std-1.9.6/=dependencies/forge-std-1.9.6/src/",
+        "layer-zero-endpoint-v1-0.0.6/=dependencies/layer-zero-endpoint-v1-0.0.6/contracts/",
+        "safe-smart-account/=dependencies/safe-utils-0.0.13/lib/safe-smart-account/",
+        "safe-utils-0.0.13/=dependencies/safe-utils-0.0.13/src/",
+        "solidity-http/=dependencies/safe-utils-0.0.13/lib/solidity-http/src/",
+        "solidity-stringutils/=dependencies/safe-utils-0.0.13/lib/solidity-stringutils/",
+        "solmate-6.2.0/=dependencies/solmate-6.2.0/src/",
+        "surl-1.0.0/=dependencies/surl-1.0.0/src/"
+      ]
+    },
+    "name": "CCIPCrossChainBridge",
+    "fullyQualifiedName": "src/periphery/bridge/CCIPCrossChainBridge.sol:CCIPCrossChainBridge"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "21035959",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-03-04T01:59:59Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0xFbf6383dC3F6010d403Ecdf12DDC1311701D143D"
+}
