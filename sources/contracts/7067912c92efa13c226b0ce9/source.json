@@ -1,0 +1,1196 @@
+{
+  "sources": {
+    "contracts/interfaces/IWETH.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\ninterface IWETH {\n    function deposit() external payable;\n    function transfer(address to, uint256 value) external returns (bool);\n    function withdraw(uint256) external;\n}"
+    },
+    "contracts/libraries/DSMath.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.16;\n\n// a library for performing various math operations\n\nlibrary DSMath {\n\n    function max(uint256 x, uint256 y) internal pure returns (uint256 z) {\n        z = x > y ? x : y;\n    }\n\n    function min(uint256 x, uint256 y) internal pure returns (uint256 z) {\n        z = x < y ? x : y;\n    }\n\n    // babylonian method (https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method)\n    function sqrt(uint256 y) internal pure returns (uint256 z) {\n        if (y > 3) {\n            z = y;\n            uint256 x = y / 2 + 1;\n            while (x < z) {\n                z = x;\n                x = (y / x + x) / 2;\n            }\n        } else if (y != 0) {\n            z = 1;\n        }\n    }\n\n    /// @dev Update pool invariant, LP tokens borrowed plus interest, interest rate index, and last block update\n    /// @param last - last value added to ema calculation\n    /// @param emaLast - last calculated ema\n    /// @param emaWeight - weight given to last value in ema calculation compared to last ema value\n    /// @return ema - result of ema calculation\n    function calcEMA(uint256 last, uint256 emaLast, uint256 emaWeight) internal pure returns(uint256) {\n        if(emaLast == 0) {\n            return last;\n        } else {\n            emaWeight = min(100, emaWeight);\n            // EMA_1 = last * weight + EMA_0 * (1 - weight)\n            return last * emaWeight / 100 + emaLast * (100 - emaWeight) / 100;\n        }\n    }\n\n    function calcSingleSideLiquidity(uint256 amount, uint256 reserve0, uint256 reserve1) internal pure returns(uint256) {\n        uint256 amount0 = amount / 2;\n        uint256 amount1 = amount0 * reserve1 / reserve0;\n        return DSMath.sqrt(amount0 * amount1);\n    }\n\n    function calcTradeLiquidity(uint256 amount0, uint256 amount1, uint256 reserve0, uint256 reserve1) internal pure returns(uint256) {\n        return max(\n            calcSingleSideLiquidity(amount0, reserve0, reserve1),\n                calcSingleSideLiquidity(amount1, reserve1, reserve0));\n    }\n}\n"
+    },
+    "contracts/DeltaSwapRouter01.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity =0.8.21;\n\nimport './libraries/DSTransferHelper.sol';\nimport './libraries/DeltaSwapLibrary.sol';\nimport './interfaces/IDeltaSwapFactory.sol';\nimport './interfaces/IDeltaSwapRouter01.sol';\nimport './interfaces/IERC20.sol';\nimport './interfaces/IWETH.sol';\n\ncontract DeltaSwapRouter01 is IDeltaSwapRouter01 {\n    address public immutable override factory;\n    address public immutable override WETH;\n\n    modifier ensure(uint256 deadline) {\n        require(deadline >= block.timestamp, 'DeltaSwapRouter: EXPIRED');\n        _;\n    }\n\n    constructor(address _factory, address _WETH) {\n        factory = _factory;\n        WETH = _WETH;\n    }\n\n    receive() external payable {\n        assert(msg.sender == WETH); // only accept ETH via fallback from the WETH contract\n    }\n\n    // **** ADD LIQUIDITY ****\n    function _addLiquidity(\n        address tokenA,\n        address tokenB,\n        uint256 amountADesired,\n        uint256 amountBDesired,\n        uint256 amountAMin,\n        uint256 amountBMin\n    ) internal virtual returns (uint256 amountA, uint256 amountB) {\n        // create the pair if it doesn't exist yet\n        if (IDeltaSwapFactory(factory).getPair(tokenA, tokenB) == address(0)) {\n            IDeltaSwapFactory(factory).createPair(tokenA, tokenB);\n        }\n        (uint256 reserveA, uint256 reserveB,) = DeltaSwapLibrary.getReserves(factory, tokenA, tokenB);\n        if (reserveA == 0 && reserveB == 0) {\n            (amountA, amountB) = (amountADesired, amountBDesired);\n        } else {\n            uint256 amountBOptimal = DeltaSwapLibrary.quote(amountADesired, reserveA, reserveB);\n            if (amountBOptimal <= amountBDesired) {\n                require(amountBOptimal >= amountBMin, 'DeltaSwapRouter: INSUFFICIENT_B_AMOUNT');\n                (amountA, amountB) = (amountADesired, amountBOptimal);\n            } else {\n                uint256 amountAOptimal = DeltaSwapLibrary.quote(amountBDesired, reserveB, reserveA);\n                assert(amountAOptimal <= amountADesired);\n                require(amountAOptimal >= amountAMin, 'DeltaSwapRouter: INSUFFICIENT_A_AMOUNT');\n                (amountA, amountB) = (amountAOptimal, amountBDesired);\n            }\n        }\n    }\n    function addLiquidity(\n        address tokenA,\n        address tokenB,\n        uint256 amountADesired,\n        uint256 amountBDesired,\n        uint256 amountAMin,\n        uint256 amountBMin,\n        address to,\n        uint256 deadline\n    ) external virtual override ensure(deadline) returns (uint256 amountA, uint256 amountB, uint256 liquidity) {\n        (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);\n        address pair = DeltaSwapLibrary.pairFor(factory, tokenA, tokenB);\n        DSTransferHelper.safeTransferFrom(tokenA, msg.sender, pair, amountA);\n        DSTransferHelper.safeTransferFrom(tokenB, msg.sender, pair, amountB);\n        liquidity = IDeltaSwapPair(pair).mint(to);\n    }\n    function addLiquidityETH(\n        address token,\n        uint256 amountTokenDesired,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline\n    ) external virtual override payable ensure(deadline) returns (uint256 amountToken, uint256 amountETH, uint256 liquidity) {\n        (amountToken, amountETH) = _addLiquidity(\n            token,\n            WETH,\n            amountTokenDesired,\n            msg.value,\n            amountTokenMin,\n            amountETHMin\n        );\n        address pair = DeltaSwapLibrary.pairFor(factory, token, WETH);\n        DSTransferHelper.safeTransferFrom(token, msg.sender, pair, amountToken);\n        IWETH(WETH).deposit{value: amountETH}();\n        assert(IWETH(WETH).transfer(pair, amountETH));\n        liquidity = IDeltaSwapPair(pair).mint(to);\n        if (msg.value > amountETH) DSTransferHelper.safeTransferETH(msg.sender, msg.value - amountETH);// refund dust eth, if any\n    }\n\n    // **** REMOVE LIQUIDITY ****\n    function removeLiquidity(\n        address tokenA,\n        address tokenB,\n        uint256 liquidity,\n        uint256 amountAMin,\n        uint256 amountBMin,\n        address to,\n        uint256 deadline\n    ) public virtual override ensure(deadline) returns (uint256 amountA, uint256 amountB) {\n        address pair = DeltaSwapLibrary.pairFor(factory, tokenA, tokenB);\n        IDeltaSwapPair(pair).transferFrom(msg.sender, pair, liquidity); // send liquidity to pair\n        (uint256 amount0, uint256 amount1) = IDeltaSwapPair(pair).burn(to);\n        (address token0,) = DeltaSwapLibrary.sortTokens(tokenA, tokenB);\n        (amountA, amountB) = tokenA == token0 ? (amount0, amount1) : (amount1, amount0);\n        require(amountA >= amountAMin, 'DeltaSwapRouter: INSUFFICIENT_A_AMOUNT');\n        require(amountB >= amountBMin, 'DeltaSwapRouter: INSUFFICIENT_B_AMOUNT');\n    }\n    function removeLiquidityETH(\n        address token,\n        uint256 liquidity,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline\n    ) public virtual override ensure(deadline) returns (uint256 amountToken, uint256 amountETH) {\n        (amountToken, amountETH) = removeLiquidity(\n            token,\n            WETH,\n            liquidity,\n            amountTokenMin,\n            amountETHMin,\n            address(this),\n            deadline\n        );\n        DSTransferHelper.safeTransfer(token, to, amountToken);\n        IWETH(WETH).withdraw(amountETH);\n        DSTransferHelper.safeTransferETH(to, amountETH);\n    }\n    function removeLiquidityWithPermit(\n        address tokenA,\n        address tokenB,\n        uint256 liquidity,\n        uint256 amountAMin,\n        uint256 amountBMin,\n        address to,\n        uint256 deadline,\n        bool approveMax, uint8 v, bytes32 r, bytes32 s\n    ) external virtual override returns (uint256 amountA, uint256 amountB) {\n        address pair = DeltaSwapLibrary.pairFor(factory, tokenA, tokenB);\n        uint256 value = approveMax ? type(uint256).max : liquidity;\n        IDeltaSwapPair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);\n        (amountA, amountB) = removeLiquidity(tokenA, tokenB, liquidity, amountAMin, amountBMin, to, deadline);\n    }\n    function removeLiquidityETHWithPermit(\n        address token,\n        uint256 liquidity,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline,\n        bool approveMax, uint8 v, bytes32 r, bytes32 s\n    ) external virtual override returns (uint256 amountToken, uint256 amountETH) {\n        address pair = DeltaSwapLibrary.pairFor(factory, token, WETH);\n        uint256 value = approveMax ? type(uint256).max : liquidity;\n        IDeltaSwapPair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);\n        (amountToken, amountETH) = removeLiquidityETH(token, liquidity, amountTokenMin, amountETHMin, to, deadline);\n    }\n\n    // **** SWAP ****\n    // requires the initial amount to have already been sent to the first pair\n    function _swap(uint256[] memory amounts, address[] memory path, address _to) internal virtual {\n        for (uint256 i; i < path.length - 1; i++) {\n            (address input, address output) = (path[i], path[i + 1]);\n            (address token0,) = DeltaSwapLibrary.sortTokens(input, output);\n            uint256 amountOut = amounts[i + 1];\n            (uint256 amount0Out, uint256 amount1Out) = input == token0 ? (uint256(0), amountOut) : (amountOut, uint256(0));\n            address to = i < path.length - 2 ? DeltaSwapLibrary.pairFor(factory, output, path[i + 2]) : _to;\n            IDeltaSwapPair(DeltaSwapLibrary.pairFor(factory, input, output)).swap(amount0Out, amount1Out, to, new bytes(0));\n        }\n    }\n    function swapExactTokensForTokens(\n        uint256 amountIn,\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external virtual override ensure(deadline) returns (uint256[] memory amounts) {\n        amounts = DeltaSwapLibrary.getAmountsOut(factory, amountIn, path);\n        require(amounts[amounts.length - 1] >= amountOutMin, 'DeltaSwapRouter: INSUFFICIENT_OUTPUT_AMOUNT');\n        DSTransferHelper.safeTransferFrom(path[0], msg.sender, DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amounts[0]);\n        _swap(amounts, path, to);\n    }\n    function swapTokensForExactTokens(\n        uint256 amountOut,\n        uint256 amountInMax,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external virtual override ensure(deadline) returns (uint256[] memory amounts) {\n        amounts = DeltaSwapLibrary.getAmountsIn(factory, amountOut, path);\n        require(amounts[0] <= amountInMax, 'DeltaSwapRouter: EXCESSIVE_INPUT_AMOUNT');\n        DSTransferHelper.safeTransferFrom(path[0], msg.sender, DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amounts[0]);\n        _swap(amounts, path, to);\n    }\n    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)\n    external\n    virtual\n    override\n    payable\n    ensure(deadline)\n    returns (uint256[] memory amounts)\n    {\n        require(path[0] == WETH, 'DeltaSwapRouter: INVALID_PATH');\n        amounts = DeltaSwapLibrary.getAmountsOut(factory, msg.value, path);\n        require(amounts[amounts.length - 1] >= amountOutMin, 'DeltaSwapRouter: INSUFFICIENT_OUTPUT_AMOUNT');\n        IWETH(WETH).deposit{value: amounts[0]}();\n        assert(IWETH(WETH).transfer(DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amounts[0]));\n        _swap(amounts, path, to);\n    }\n    function swapTokensForExactETH(uint256 amountOut, uint256 amountInMax, address[] calldata path, address to, uint256 deadline)\n    external\n    virtual\n    override\n    ensure(deadline)\n    returns (uint256[] memory amounts)\n    {\n        require(path[path.length - 1] == WETH, 'DeltaSwapRouter: INVALID_PATH');\n        amounts = DeltaSwapLibrary.getAmountsIn(factory, amountOut, path);\n        require(amounts[0] <= amountInMax, 'DeltaSwapRouter: EXCESSIVE_INPUT_AMOUNT');\n        DSTransferHelper.safeTransferFrom(path[0], msg.sender, DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amounts[0]);\n        _swap(amounts, path, address(this));\n        IWETH(WETH).withdraw(amounts[amounts.length - 1]);\n        DSTransferHelper.safeTransferETH(to, amounts[amounts.length - 1]);\n    }\n    function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)\n    external\n    virtual\n    override\n    ensure(deadline)\n    returns (uint256[] memory amounts)\n    {\n        require(path[path.length - 1] == WETH, 'DeltaSwapRouter: INVALID_PATH');\n        amounts = DeltaSwapLibrary.getAmountsOut(factory, amountIn, path);\n        require(amounts[amounts.length - 1] >= amountOutMin, 'DeltaSwapRouter: INSUFFICIENT_OUTPUT_AMOUNT');\n        DSTransferHelper.safeTransferFrom(path[0], msg.sender, DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amounts[0]);\n        _swap(amounts, path, address(this));\n        IWETH(WETH).withdraw(amounts[amounts.length - 1]);\n        DSTransferHelper.safeTransferETH(to, amounts[amounts.length - 1]);\n    }\n    function swapETHForExactTokens(uint256 amountOut, address[] calldata path, address to, uint256 deadline)\n    external\n    virtual\n    override\n    payable\n    ensure(deadline)\n    returns (uint256[] memory amounts)\n    {\n        require(path[0] == WETH, 'DeltaSwapRouter: INVALID_PATH');\n        amounts = DeltaSwapLibrary.getAmountsIn(factory, amountOut, path);\n        require(amounts[0] <= msg.value, 'DeltaSwapRouter: EXCESSIVE_INPUT_AMOUNT');\n        IWETH(WETH).deposit{value: amounts[0]}();\n        assert(IWETH(WETH).transfer(DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amounts[0]));\n        _swap(amounts, path, to);\n        if (msg.value > amounts[0]) DSTransferHelper.safeTransferETH(msg.sender, msg.value - amounts[0]);// refund dust eth, if any\n    }\n\n    // **** LIBRARY FUNCTIONS ****\n    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) public pure virtual override returns (uint256 amountB) {\n        return DeltaSwapLibrary.quote(amountA, reserveA, reserveB);\n    }\n\n    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 fee) public pure virtual override returns (uint256 amountOut) {\n        return DeltaSwapLibrary.getAmountOut(amountIn, reserveIn, reserveOut, fee);\n    }\n\n    function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut, uint256 fee) public pure virtual override returns (uint256 amountIn) {\n        return DeltaSwapLibrary.getAmountIn(amountOut, reserveIn, reserveOut, fee);\n    }\n\n    function getAmountsOut(uint256 amountIn, address[] memory path) public view virtual override returns (uint256[] memory amounts) {\n        return DeltaSwapLibrary.getAmountsOut(factory, amountIn, path);\n    }\n\n    function getAmountsIn(uint256 amountOut, address[] memory path) public view virtual override returns (uint256[] memory amounts) {\n        return DeltaSwapLibrary.getAmountsIn(factory, amountOut, path);\n    }\n}"
+    },
+    "contracts/DeltaSwapRouter02.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity =0.8.21;\n\nimport './interfaces/IDeltaSwapRouter02.sol';\nimport './DeltaSwapRouter01.sol';\n\ncontract DeltaSwapRouter02 is DeltaSwapRouter01, IDeltaSwapRouter02 {\n\n    constructor(address _factory, address _WETH) DeltaSwapRouter01(_factory, _WETH) {\n    }\n\n    // **** REMOVE LIQUIDITY (supporting fee-on-transfer tokens) ****\n    function removeLiquidityETHSupportingFeeOnTransferTokens(\n        address token,\n        uint256 liquidity,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline\n    ) public virtual override ensure(deadline) returns (uint256 amountETH) {\n        (, amountETH) = removeLiquidity(\n            token,\n            WETH,\n            liquidity,\n            amountTokenMin,\n            amountETHMin,\n            address(this),\n            deadline\n        );\n        DSTransferHelper.safeTransfer(token, to, IERC20(token).balanceOf(address(this)));\n        IWETH(WETH).withdraw(amountETH);\n        DSTransferHelper.safeTransferETH(to, amountETH);\n    }\n    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(\n        address token,\n        uint256 liquidity,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline,\n        bool approveMax, uint8 v, bytes32 r, bytes32 s\n    ) external virtual override returns (uint256 amountETH) {\n        address pair = DeltaSwapLibrary.pairFor(factory, token, WETH);\n        uint256 value = approveMax ? type(uint256).max : liquidity;\n        IDeltaSwapPair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);\n        amountETH = removeLiquidityETHSupportingFeeOnTransferTokens(\n            token, liquidity, amountTokenMin, amountETHMin, to, deadline\n        );\n    }\n    // **** SWAP (supporting fee-on-transfer tokens) ****\n    // requires the initial amount to have already been sent to the first pair\n    function _swapSupportingFeeOnTransferTokens(address[] memory path, address _to) internal virtual {\n        for (uint256 i; i < path.length - 1; i++) {\n            (address input, address output) = (path[i], path[i + 1]);\n            (address token0,) = DeltaSwapLibrary.sortTokens(input, output);\n            IDeltaSwapPair pair = IDeltaSwapPair(DeltaSwapLibrary.pairFor(factory, input, output));\n            uint256 amountInput;\n            uint256 amountOutput;\n            { // scope to avoid stack too deep errors\n                (uint256 reserve0, uint256 reserve1, ) = pair.getReserves();\n                (uint256 reserveInput, uint256 reserveOutput) = input == token0 ? (reserve0, reserve1) : (reserve1, reserve0);\n                amountInput = IERC20(input).balanceOf(address(pair)) - reserveInput;\n                uint256 fee = DeltaSwapLibrary.calcPairTradingFee(amountInput, reserveInput, reserveOutput, address(pair));\n                amountOutput = DeltaSwapLibrary.getAmountOut(amountInput, reserveInput, reserveOutput, fee);\n            }\n            (uint256 amount0Out, uint256 amount1Out) = input == token0 ? (uint256(0), amountOutput) : (amountOutput, uint256(0));\n            address to = i < path.length - 2 ? DeltaSwapLibrary.pairFor(factory, output, path[i + 2]) : _to;\n            pair.swap(amount0Out, amount1Out, to, new bytes(0));\n        }\n    }\n    function swapExactTokensForTokensSupportingFeeOnTransferTokens(\n        uint256 amountIn,\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external virtual override ensure(deadline) {\n        DSTransferHelper.safeTransferFrom(\n            path[0], msg.sender, DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amountIn\n        );\n        uint256 balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);\n        _swapSupportingFeeOnTransferTokens(path, to);\n        require(\n            IERC20(path[path.length - 1]).balanceOf(to) - balanceBefore >= amountOutMin,\n            'DeltaSwapRouter: INSUFFICIENT_OUTPUT_AMOUNT'\n        );\n    }\n    function swapExactETHForTokensSupportingFeeOnTransferTokens(\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    )\n    external\n    virtual\n    override\n    payable\n    ensure(deadline)\n    {\n        require(path[0] == WETH, 'DeltaSwapRouter: INVALID_PATH');\n        uint256 amountIn = msg.value;\n        IWETH(WETH).deposit{value: amountIn}();\n        assert(IWETH(WETH).transfer(DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amountIn));\n        uint256 balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);\n        _swapSupportingFeeOnTransferTokens(path, to);\n        require(\n            IERC20(path[path.length - 1]).balanceOf(to) - balanceBefore >= amountOutMin,\n            'DeltaSwapRouter: INSUFFICIENT_OUTPUT_AMOUNT'\n        );\n    }\n    function swapExactTokensForETHSupportingFeeOnTransferTokens(\n        uint256 amountIn,\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    )\n    external\n    virtual\n    override\n    ensure(deadline)\n    {\n        require(path[path.length - 1] == WETH, 'DeltaSwapRouter: INVALID_PATH');\n        DSTransferHelper.safeTransferFrom(\n            path[0], msg.sender, DeltaSwapLibrary.pairFor(factory, path[0], path[1]), amountIn\n        );\n        _swapSupportingFeeOnTransferTokens(path, address(this));\n        uint256 amountOut = IERC20(WETH).balanceOf(address(this));\n        require(amountOut >= amountOutMin, 'DeltaSwapRouter: INSUFFICIENT_OUTPUT_AMOUNT');\n        IWETH(WETH).withdraw(amountOut);\n        DSTransferHelper.safeTransferETH(to, amountOut);\n    }\n\n}"
+    },
+    "contracts/interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\ninterface IERC20 {\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    function name() external view returns (string memory);\n    function symbol() external view returns (string memory);\n    function decimals() external view returns (uint8);\n    function totalSupply() external view returns (uint256);\n    function balanceOf(address owner) external view returns (uint256);\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    function approve(address spender, uint256 value) external returns (bool);\n    function transfer(address to, uint256 value) external returns (bool);\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n}"
+    },
+    "contracts/interfaces/IDeltaSwapPair.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\nimport \"./IDeltaSwapERC20.sol\";\n\ninterface IDeltaSwapPair is IDeltaSwapERC20 {\n\n    event Mint(address indexed sender, uint256 amount0, uint256 amount1);\n    event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);\n    event Swap(\n        address indexed sender,\n        uint256 amount0In,\n        uint256 amount1In,\n        uint256 amount0Out,\n        uint256 amount1Out,\n        address indexed to\n    );\n    event Sync(uint112 reserve0, uint112 reserve1);\n\n    function MINIMUM_LIQUIDITY() external pure returns (uint256);\n    function factory() external view returns (address);\n    function token0() external view returns (address);\n    function token1() external view returns (address);\n    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);\n    function price0CumulativeLast() external view returns (uint256);\n    function price1CumulativeLast() external view returns (uint256);\n    function kLast() external view returns (uint256);\n\n    function mint(address to) external returns (uint256 liquidity);\n    function burn(address to) external returns (uint256 amount0, uint256 amount1);\n    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;\n    function skim(address to) external;\n    function sync() external;\n\n    function initialize(address, address) external;\n\n    function gammaPool() external view returns (address);\n    function setGammaPool(address gammaPool) external;\n\n    function getLiquidityEMA() external view returns(uint112 liquidityEMA, uint32 lastLiquidityEMABlockNumber);\n    function getLastTradeLiquidityEMA() external view returns(uint256);\n    function getTradeLiquidityEMA(uint256 tradeLiquidity) external view returns(uint256 tradeLiquidityEMA, uint256 lastTradeLiquidityEMA, uint256 tradeLiquiditySum);\n    function getTradeLiquidityEMAParams() external view returns(uint112 _tradeLiquidityEMA, uint112 _lastTradeLiquiditySum, uint32 _lastTradeBlockNumber);\n    function getLastTradeLiquiditySum(uint256 tradeLiquidity) external view returns(uint112 _tradeLiquiditySum, uint32 _lastTradeBlockNum);\n    function estimateTradingFee(uint256 tradeLiquidity) external view returns(uint256 fee);\n    function calcTradingFee(uint256 tradeLiquidity, uint256 tradeLiquidityEMA, uint256 liquidityEMA) external view returns(uint256 fee);\n}"
+    },
+    "contracts/interfaces/IDeltaSwapERC20.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\ninterface IDeltaSwapERC20 {\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    function name() external pure returns (string memory);\n    function symbol() external pure returns (string memory);\n    function decimals() external pure returns (uint8);\n    function totalSupply() external view returns (uint256);\n    function balanceOf(address owner) external view returns (uint256);\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    function approve(address spender, uint256 value) external returns (bool);\n    function transfer(address to, uint256 value) external returns (bool);\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n    function PERMIT_TYPEHASH() external pure returns (bytes32);\n    function nonces(address owner) external view returns (uint256);\n\n    function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;\n}"
+    },
+    "contracts/libraries/DSTransferHelper.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.6.0;\n\n// helper methods for interacting with ERC20 tokens and sending ETH that do not consistently return true/false\nlibrary DSTransferHelper {\n    function safeApprove(\n        address token,\n        address to,\n        uint256 value\n    ) internal {\n        // bytes4(keccak256(bytes('approve(address,uint256)')));\n        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x095ea7b3, to, value));\n        require(\n            success && (data.length == 0 || abi.decode(data, (bool))),\n            'DSTransferHelper::safeApprove: approve failed'\n        );\n    }\n\n    function safeTransfer(\n        address token,\n        address to,\n        uint256 value\n    ) internal {\n        // bytes4(keccak256(bytes('transfer(address,uint256)')));\n        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, to, value));\n        require(\n            success && (data.length == 0 || abi.decode(data, (bool))),\n            'DSTransferHelper::safeTransfer: transfer failed'\n        );\n    }\n\n    function safeTransferFrom(\n        address token,\n        address from,\n        address to,\n        uint256 value\n    ) internal {\n        // bytes4(keccak256(bytes('transferFrom(address,address,uint256)')));\n        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x23b872dd, from, to, value));\n        require(\n            success && (data.length == 0 || abi.decode(data, (bool))),\n            'DSTransferHelper::transferFrom: transferFrom failed'\n        );\n    }\n\n    function safeTransferETH(address to, uint256 value) internal {\n        (bool success, ) = to.call{value: value}(new bytes(0));\n        require(success, 'DSTransferHelper::safeTransferETH: ETH transfer failed');\n    }\n}"
+    },
+    "contracts/libraries/DeltaSwapLibrary.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\nimport '../interfaces/IDeltaSwapPair.sol';\nimport './DSMath.sol';\n\nlibrary DeltaSwapLibrary {\n\n    // returns sorted token addresses, used to handle return values from pairs sorted in this order\n    function sortTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {\n        require(tokenA != tokenB, 'DeltaSwapLibrary: IDENTICAL_ADDRESSES');\n        (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);\n        require(token0 != address(0), 'DeltaSwapLibrary: ZERO_ADDRESS');\n    }\n\n    // calculates the CREATE2 address for a pair without making any external calls\n    function pairFor(address factory, address tokenA, address tokenB) internal pure returns (address pair) {\n        (address token0, address token1) = sortTokens(tokenA, tokenB);\n        pair = address(uint160(uint256(keccak256(abi.encodePacked(\n                hex'ff',\n                factory,\n                keccak256(abi.encodePacked(token0, token1)),\n                hex'a82767a5e39a2e216962a2ebff796dcc37cd05dfd6f7a149e1f8fbb6bf487658' // init code hash\n                //hex'7f507cb8f4fb141418e455f4b99d5bd10dbabf9bcc0607d37ceee34013646a9c' // init code hash\n            )))));\n    }\n\n    // fetches and sorts the reserves for a pair\n    function getReserves(address factory, address tokenA, address tokenB) internal view returns (uint256 reserveA, uint256 reserveB, address pair) {\n        (address token0,) = sortTokens(tokenA, tokenB);\n        pair = pairFor(factory, tokenA, tokenB);\n        (uint256 reserve0, uint256 reserve1,) = IDeltaSwapPair(pair).getReserves();\n        (reserveA, reserveB) = tokenA == token0 ? (reserve0, reserve1) : (reserve1, reserve0);\n    }\n\n    // given some amount of an asset and pair reserves, returns an equivalent amount of the other asset\n    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) internal pure returns (uint256 amountB) {\n        require(amountA > 0, 'DeltaSwapLibrary: INSUFFICIENT_AMOUNT');\n        require(reserveA > 0 && reserveB > 0, 'DeltaSwapLibrary: INSUFFICIENT_LIQUIDITY');\n        amountB = amountA * reserveB / reserveA;\n    }\n\n    // given an input amount of an asset and pair reserves, returns the maximum output amount of the other asset\n    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 fee) internal pure returns (uint256 amountOut) {\n        require(amountIn > 0, 'DeltaSwapLibrary: INSUFFICIENT_INPUT_AMOUNT');\n        require(reserveIn > 0 && reserveOut > 0, 'DeltaSwapLibrary: INSUFFICIENT_LIQUIDITY');\n        uint256 amountInWithFee = amountIn * (1000 - fee);\n        uint256 numerator = amountInWithFee * reserveOut;\n        uint256 denominator = reserveIn * 1000 + amountInWithFee;\n        amountOut = numerator / denominator;\n    }\n\n    // given an output amount of an asset and pair reserves, returns a required input amount of the other asset\n    function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut, uint256 fee) internal pure returns (uint256 amountIn) {\n        require(amountOut > 0, 'DeltaSwapLibrary: INSUFFICIENT_OUTPUT_AMOUNT');\n        require(reserveIn > 0 && reserveOut > 0, 'DeltaSwapLibrary: INSUFFICIENT_LIQUIDITY');\n        uint256 numerator = reserveIn * amountOut * 1000;\n        uint256 denominator = (reserveOut - amountOut) * (1000 - fee);\n        amountIn = (numerator / denominator) + 1;\n    }\n\n    // performs chained getAmountOut calculations on any number of pairs\n    function getAmountsOut(address factory, uint256 amountIn, address[] memory path) internal view returns (uint256[] memory amounts) {\n        require(path.length >= 2, 'DeltaSwapLibrary: INVALID_PATH');\n        amounts = new uint256[](path.length);\n        amounts[0] = amountIn;\n        for (uint256 i; i < path.length - 1; i++) {\n            (uint256 reserveIn, uint256 reserveOut, address pair) = getReserves(factory, path[i], path[i + 1]);\n            uint256 fee = calcPairTradingFee(amounts[i], reserveIn, reserveOut, pair);\n            amounts[i + 1] = getAmountOut(amounts[i], reserveIn, reserveOut, fee);\n        }\n    }\n\n    // performs chained getAmountIn calculations on any number of pairs\n    function getAmountsIn(address factory, uint256 amountOut, address[] memory path) internal view returns (uint256[] memory amounts) {\n        require(path.length >= 2, 'DeltaSwapLibrary: INVALID_PATH');\n        amounts = new uint256[](path.length);\n        amounts[amounts.length - 1] = amountOut;\n        for (uint256 i = path.length - 1; i > 0; i--) {\n            (uint256 reserveIn, uint256 reserveOut, address pair) = getReserves(factory, path[i - 1], path[i]);\n            uint256 fee;\n            uint256 _fee = 3;\n            uint256 amountIn;\n            while(true) {\n                fee = _fee;\n                amountIn = getAmountIn(amounts[i], reserveIn, reserveOut, fee);\n                _fee = calcPairTradingFee(amountIn, reserveIn, reserveOut, pair);\n                if(_fee == fee) break;\n            }\n            amounts[i - 1] = amountIn;\n        }\n    }\n\n    function calcPairTradingFee(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, address pair) internal view returns(uint256 fee) {\n        uint256 tradeLiquidity = DSMath.calcTradeLiquidity(amountIn, 0, reserveIn, reserveOut);\n        fee = IDeltaSwapPair(pair).estimateTradingFee(tradeLiquidity);\n    }\n\n    function predictDeterministicAddress(\n        address implementation,\n        bytes32 salt,\n        address factory\n    ) internal pure returns (address predicted) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            let ptr := mload(0x40)\n            mstore(add(ptr, 0x38), factory)\n            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)\n            mstore(add(ptr, 0x14), implementation)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)\n            mstore(add(ptr, 0x58), salt)\n            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))\n            predicted := keccak256(add(ptr, 0x43), 0x55)\n        }\n    }\n}"
+    },
+    "contracts/interfaces/IDeltaSwapFactory.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\ninterface IDeltaSwapFactory {\n    event PairCreated(address indexed token0, address indexed token1, address pair, uint256);\n    event GammaPoolSet(address indexed pair, address gammaPool);\n\n    function feeTo() external view returns (address);\n    function feeNum() external view returns (uint16);\n    function feeToSetter() external view returns (address);\n    function gammaPoolSetter() external view returns (address);\n    function gsFactory() external view returns(address);\n    function gsProtocolId() external view returns(uint16);\n    function gsFee() external view returns(uint8);\n    function dsFee() external view returns(uint8);\n    function dsFeeThreshold() external view returns(uint8);\n\n    function getPair(address tokenA, address tokenB) external view returns (address pair);\n    function allPairs(uint256) external view returns (address pair);\n    function allPairsLength() external view returns (uint256);\n\n    function createPair(address tokenA, address tokenB) external returns (address pair);\n\n    function setFeeNum(uint16) external;\n    function setFeeTo(address) external;\n    function setFeeToSetter(address) external;\n\n    function setGSFactory(address factory) external;\n    function setGSProtocolId(uint16 protocolId) external;\n    function setGSFee(uint8 fee) external;\n    function setDSFee(uint8 fee) external;\n    function setDSFeeThreshold(uint8 feeThreshold) external;\n\n    function feeInfo() external view returns (address,uint16);\n    function dsFeeInfo() external view returns (uint8,uint8);\n\n    function setGammaPoolSetter(address) external;\n    function updateGammaPool(address tokenA, address tokenB) external;\n}"
+    },
+    "contracts/interfaces/IDeltaSwapRouter01.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.6.2;\n\ninterface IDeltaSwapRouter01 {\n    function factory() external view returns (address);\n    function WETH() external view returns (address);\n\n    function addLiquidity(\n        address tokenA,\n        address tokenB,\n        uint256 amountADesired,\n        uint256 amountBDesired,\n        uint256 amountAMin,\n        uint256 amountBMin,\n        address to,\n        uint256 deadline\n    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);\n    function addLiquidityETH(\n        address token,\n        uint256 amountTokenDesired,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline\n    ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);\n    function removeLiquidity(\n        address tokenA,\n        address tokenB,\n        uint256 liquidity,\n        uint256 amountAMin,\n        uint256 amountBMin,\n        address to,\n        uint256 deadline\n    ) external returns (uint256 amountA, uint256 amountB);\n    function removeLiquidityETH(\n        address token,\n        uint256 liquidity,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline\n    ) external returns (uint256 amountToken, uint256 amountETH);\n    function removeLiquidityWithPermit(\n        address tokenA,\n        address tokenB,\n        uint256 liquidity,\n        uint256 amountAMin,\n        uint256 amountBMin,\n        address to,\n        uint256 deadline,\n        bool approveMax, uint8 v, bytes32 r, bytes32 s\n    ) external returns (uint256 amountA, uint256 amountB);\n    function removeLiquidityETHWithPermit(\n        address token,\n        uint256 liquidity,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline,\n        bool approveMax, uint8 v, bytes32 r, bytes32 s\n    ) external returns (uint256 amountToken, uint256 amountETH);\n    function swapExactTokensForTokens(\n        uint256 amountIn,\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external returns (uint256[] memory amounts);\n    function swapTokensForExactTokens(\n        uint256 amountOut,\n        uint256 amountInMax,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external returns (uint256[] memory amounts);\n    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)\n    external\n    payable\n    returns (uint256[] memory amounts);\n    function swapTokensForExactETH(uint256 amountOut, uint256 amountInMax, address[] calldata path, address to, uint256 deadline)\n    external\n    returns (uint256[] memory amounts);\n    function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)\n    external\n    returns (uint256[] memory amounts);\n    function swapETHForExactTokens(uint256 amountOut, address[] calldata path, address to, uint256 deadline)\n    external\n    payable\n    returns (uint256[] memory amounts);\n\n    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) external pure returns (uint256 amountB);\n    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 fee) external pure returns (uint256 amountOut);\n    function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut, uint256 fee) external pure returns (uint256 amountIn);\n    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);\n    function getAmountsIn(uint256 amountOut, address[] calldata path) external view returns (uint256[] memory amounts);\n}"
+    },
+    "contracts/interfaces/IDeltaSwapRouter02.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.6.2;\n\nimport './IDeltaSwapRouter01.sol';\n\ninterface IDeltaSwapRouter02 is IDeltaSwapRouter01 {\n    function removeLiquidityETHSupportingFeeOnTransferTokens(\n        address token,\n        uint256 liquidity,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline\n    ) external returns (uint256 amountETH);\n    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(\n        address token,\n        uint256 liquidity,\n        uint256 amountTokenMin,\n        uint256 amountETHMin,\n        address to,\n        uint256 deadline,\n        bool approveMax, uint8 v, bytes32 r, bytes32 s\n    ) external returns (uint256 amountETH);\n\n    function swapExactTokensForTokensSupportingFeeOnTransferTokens(\n        uint256 amountIn,\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external;\n    function swapExactETHForTokensSupportingFeeOnTransferTokens(\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external payable;\n    function swapExactTokensForETHSupportingFeeOnTransferTokens(\n        uint256 amountIn,\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external;\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.21+commit.d9974bed"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_factory",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_WETH",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "WETH",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountADesired",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountBDesired",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountAMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountBMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "addLiquidity",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountA",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountB",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountTokenDesired",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountTokenMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountETHMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "addLiquidityETH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountToken",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountETH",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "factory",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountOut",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "reserveIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "reserveOut",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "fee",
+              "type": "uint256"
+            }
+          ],
+          "name": "getAmountIn",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountIn",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "reserveIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "reserveOut",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "fee",
+              "type": "uint256"
+            }
+          ],
+          "name": "getAmountOut",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountOut",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountOut",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            }
+          ],
+          "name": "getAmountsIn",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            }
+          ],
+          "name": "getAmountsOut",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountA",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "reserveA",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "reserveB",
+              "type": "uint256"
+            }
+          ],
+          "name": "quote",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountB",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountAMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountBMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "removeLiquidity",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountA",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountB",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountTokenMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountETHMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "removeLiquidityETH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountToken",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountETH",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountTokenMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountETHMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "removeLiquidityETHSupportingFeeOnTransferTokens",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountETH",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountTokenMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountETHMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "approveMax",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint8",
+              "name": "v",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "r",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "s",
+              "type": "bytes32"
+            }
+          ],
+          "name": "removeLiquidityETHWithPermit",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountToken",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountETH",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountTokenMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountETHMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "approveMax",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint8",
+              "name": "v",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "r",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "s",
+              "type": "bytes32"
+            }
+          ],
+          "name": "removeLiquidityETHWithPermitSupportingFeeOnTransferTokens",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountETH",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountAMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountBMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "approveMax",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint8",
+              "name": "v",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "r",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "s",
+              "type": "bytes32"
+            }
+          ],
+          "name": "removeLiquidityWithPermit",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountA",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountB",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountOut",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapETHForExactTokens",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountOutMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapExactETHForTokens",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountOutMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapExactETHForTokensSupportingFeeOnTransferTokens",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountOutMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapExactTokensForETH",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountOutMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapExactTokensForETHSupportingFeeOnTransferTokens",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountOutMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapExactTokensForTokens",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountIn",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountOutMin",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapExactTokensForTokensSupportingFeeOnTransferTokens",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountOut",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountInMax",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapTokensForExactETH",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amountOut",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amountInMax",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "path",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            }
+          ],
+          "name": "swapTokensForExactTokens",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {},
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {},
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/DeltaSwapRouter02.sol": "DeltaSwapRouter02"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":eth-gas-reporter/=eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":hardhat/=hardhat/"
+      ]
+    },
+    "sources": {
+      "contracts/DeltaSwapRouter01.sol": {
+        "keccak256": "0x211acad156b96568fe5c25450ff8c52d2e538ba32d833784a10ad1ccb8648bfe",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://6000ae871b5d0737a02c939447a52ac742c3e00ed3ad93bc148a3cc916243bed",
+          "dweb:/ipfs/QmRee8wUi4RfiSa549AANWF55j4w1sEfJPAYEYtvVREkpq"
+        ]
+      },
+      "contracts/DeltaSwapRouter02.sol": {
+        "keccak256": "0x2b57bba4b35b433162657a720d6306b7e49ad4d68391ee4b4a6d1910d819bd5e",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://27569a42b6eb8f15764416e35b805819d7298db11a0ae980e6af4edc1e910932",
+          "dweb:/ipfs/QmQ3W2P6DS2Ki1e6XJDURLWehT6wvrRGWSQJ5sfDo2mh1F"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapERC20.sol": {
+        "keccak256": "0x1bf3a0c046750fbdb2b6ec0901395beafa44932f8f155a99606ccfcecdb34a10",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://024914d4e8fb31728f2605b26c2610cf0615d78453300cc76b35b9b8d2ef609f",
+          "dweb:/ipfs/QmWW7MKqfg4MCNp7RnzaZfmQLKXDPnQcakjWJvW7wvyMW7"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapFactory.sol": {
+        "keccak256": "0x0ea24632300d4858cc24d63a11ba7d2dfaba293cbfc7945d5e21ff6add72afa2",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://fcc39f24559895dfd75381497ea25b44d510d5145a2bc69b5eebd99769f5127e",
+          "dweb:/ipfs/QmRVMNSdbFpB55Tu8GbyRjhhWw377Xy7obCcy25u9Vu8Mi"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapPair.sol": {
+        "keccak256": "0x126ce44f413793b166fbf21917519dddbf80a8c224bf93a9dfd3d0f1f8bc2ee5",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://2dc35270628a20c2357497fce32aaefd4ba6d8a230de9140f14399f83dcc0ffd",
+          "dweb:/ipfs/QmXtxat8j6WjBwWCcmfr435CXKgJssNK2oLtxvu4K21eMw"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapRouter01.sol": {
+        "keccak256": "0x1f4fbe7a4e9d7a4ae7a72b9ca59676f8fcbc4ef57a6a449ae51065633b5db47a",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://0adf90a4bdc97a9afc14b186e15dd75cca6141f9685c5bed71f1e906da1f3688",
+          "dweb:/ipfs/QmWDtHkuBha5M7WNP82rnSrh3QxiZPiikpNZnXHsuuqW1w"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapRouter02.sol": {
+        "keccak256": "0x602542b3c3c35892d4b1803d8995b16bebaccab39c2a69848848b3254f85b6b2",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://e95c140dea7da02cae84a5d2724f232cfb087ef8fc2bf027e7938b29783e5d51",
+          "dweb:/ipfs/QmXFjzDuPEkMAXaqZ74EvXgYTacD7fsxK1jARYE9QBqPFx"
+        ]
+      },
+      "contracts/interfaces/IERC20.sol": {
+        "keccak256": "0xc0a999642a4c89714af1eef102cfde9d03f8a24cf9309826086afc238edb0e67",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://e4ed9bf637d6930d4d36ce39b7896f972642b902944c9409a60183d7970c1874",
+          "dweb:/ipfs/QmXuNwgWVnVoKVnhvUsfUzVX6mcVHPZGd1L5b3oWkkY9tT"
+        ]
+      },
+      "contracts/interfaces/IWETH.sol": {
+        "keccak256": "0x8ef700dbe50d90375594e372bfac2d0d1a0e6137a3bfea91d838fd23a358e654",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://a94f00227060ef4f9ff58259a1e888b58253d2c5c0065861b4b634b24e26404b",
+          "dweb:/ipfs/QmXeA1x1LCzm2KCh8tvZ5DZ9BY6GvDtWhEqwVGDC6HTktN"
+        ]
+      },
+      "contracts/libraries/DSMath.sol": {
+        "keccak256": "0xdc42612402f014f55103c2b999be83516ecce5447ce66b7157bb67efa463ac8f",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://daee6fb29a6e0f6cfa7f90cf83b02c86d86a5aac610061fe6e2fe2b243200aac",
+          "dweb:/ipfs/QmdwhqC1j454v5ijoYMWwMUn6m3EZ6dJRVtwb3tvmQQyq4"
+        ]
+      },
+      "contracts/libraries/DSTransferHelper.sol": {
+        "keccak256": "0xc8544de8b3385a5665a5c9b89c212d5efb358e7e44bb4a490ea7df261d98c254",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://ef0734560bd19b879d0f50f2e769637bcd2180a7e067f2e884d47e96ceb6d2ad",
+          "dweb:/ipfs/QmbocnGs2n3LCEwyNurukHhRVeChGgG8j1BStKz818UgWB"
+        ]
+      },
+      "contracts/libraries/DeltaSwapLibrary.sol": {
+        "keccak256": "0x403d7b3570e071e05d274311127ca203e2d99a45b7eecbbcd3df15937713b729",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://a00b89a963cef3cd99178142fc3d9a9823627f317e1cb280977c86e9535cd6cf",
+          "dweb:/ipfs/QmdbkKgGkzF4kfxAQ8JcEZENGwCj1wezjEqx6ggdtB8ZMW"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.21+commit.d9974bed",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":eth-gas-reporter/=eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":hardhat/=hardhat/"
+      ]
+    },
+    "name": "DeltaSwapRouter02",
+    "fullyQualifiedName": "contracts/DeltaSwapRouter02.sol:DeltaSwapRouter02"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "279960",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T11:06:48Z",
+  "match": "exact_match",
+  "chainId": "42161",
+  "address": "0x5FbE219e88f6c6F214Ce6f5B1fcAa0294F31aE1b"
+}

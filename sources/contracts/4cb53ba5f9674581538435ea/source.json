@@ -1,0 +1,665 @@
+{
+  "sources": {
+    "contracts/DeltaSwapPair.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity =0.8.21;\n\nimport './libraries/DSMath.sol';\nimport './libraries/UQ112x112.sol';\nimport './interfaces/IERC20.sol';\nimport './interfaces/IDeltaSwapPair.sol';\nimport './interfaces/IDeltaSwapFactory.sol';\nimport './interfaces/IDeltaSwapCallee.sol';\nimport './DeltaSwapERC20.sol';\n\ncontract DeltaSwapPair is DeltaSwapERC20, IDeltaSwapPair {\n    using UQ112x112 for uint224;\n\n    uint256 public constant override MINIMUM_LIQUIDITY = 10**3;\n    bytes4 private constant SELECTOR = bytes4(keccak256(bytes('transfer(address,uint256)')));\n\n    address public override factory;\n    address public override token0;\n    address public override token1;\n\n    address public override gammaPool;\n\n    uint112 private liquidityEMA;\n    uint32 private lastLiquidityBlockNumber;\n\n    uint112 private tradeLiquidityEMA;     // uses single storage slot\n    uint112 private lastTradeLiquiditySum; // uses single storage slot\n    uint32 private lastTradeBlockNumber;   // uses single storage slot\n\n    uint112 private reserve0;           // uses single storage slot, accessible via getReserves\n    uint112 private reserve1;           // uses single storage slot, accessible via getReserves\n    uint32  private blockTimestampLast; // uses single storage slot, accessible via getReserves\n\n    uint256 public override price0CumulativeLast;\n    uint256 public override price1CumulativeLast;\n    uint256 public override kLast; // reserve0 * reserve1, as of immediately after the most recent liquidity event\n\n    uint256 private unlocked = 1;\n    modifier lock() {\n        require(unlocked == 1, 'DeltaSwap: LOCKED');\n        unlocked = 0;\n        _;\n        unlocked = 1;\n    }\n\n    function getReserves() public override view returns (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast) {\n        _reserve0 = reserve0;\n        _reserve1 = reserve1;\n        _blockTimestampLast = blockTimestampLast;\n    }\n\n    function _safeTransfer(address token, address to, uint256 value) private {\n        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(SELECTOR, to, value));\n        require(success && (data.length == 0 || abi.decode(data, (bool))), 'DeltaSwap: TRANSFER_FAILED');\n    }\n\n    constructor() {\n        factory = msg.sender;\n    }\n\n    // called once by the factory at time of deployment\n    function initialize(address _token0, address _token1) external override {\n        require(msg.sender == factory, 'DeltaSwap: FORBIDDEN'); // sufficient check\n        token0 = _token0;\n        token1 = _token1;\n    }\n\n    // called by the factory after deployment\n    function setGammaPool(address pool) external override {\n        require(msg.sender == factory, 'DeltaSwap: FORBIDDEN'); // sufficient check\n        gammaPool = pool;\n    }\n\n    // update reserves and, on the first call per block, price accumulators\n    function _update(uint256 balance0, uint256 balance1, uint112 _reserve0, uint112 _reserve1) private {\n        require(balance0 <= type(uint112).max && balance1 <= type(uint112).max, 'DeltaSwap: OVERFLOW');\n        uint32 blockTimestamp = uint32(block.timestamp % 2**32);\n        uint32 timeElapsed;\n        unchecked {\n            timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired\n        }\n        if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {\n            // * never overflows, and + overflow is desired\n            unchecked{\n                price0CumulativeLast += uint256(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;\n                price1CumulativeLast += uint256(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;\n            }\n        }\n        (uint112 _liquidityEMA, uint32 _lastLiquidityBlockNumber) = getLiquidityEMA(); // saves gas\n        if(block.number != _lastLiquidityBlockNumber) {\n            liquidityEMA = uint112(DSMath.calcEMA(DSMath.sqrt(balance0 * balance1), _liquidityEMA, DSMath.max(block.number - _lastLiquidityBlockNumber, 10)));\n            lastLiquidityBlockNumber = uint32(block.number);\n        }\n        reserve0 = uint112(balance0);\n        reserve1 = uint112(balance1);\n        blockTimestampLast = blockTimestamp;\n        emit Sync(reserve0, reserve1);\n    }\n\n    function _updateLiquidityTradedEMA(uint256 tradeLiquidity) internal virtual returns(uint256 _tradeLiquidityEMA) {\n        require(tradeLiquidity > 0, \"DeltaSwap: ZERO_TRADE_LIQUIDITY\");\n        uint256 blockNum = block.number;\n        uint256 tradeLiquiditySum;\n        (_tradeLiquidityEMA,,tradeLiquiditySum) = _getTradeLiquidityEMA(tradeLiquidity, blockNum);\n        lastTradeLiquiditySum = uint112(tradeLiquiditySum);\n        tradeLiquidityEMA = uint112(_tradeLiquidityEMA);\n        if(lastTradeBlockNumber != blockNum) {\n            lastTradeBlockNumber = uint32(blockNum);\n        }\n    }\n\n    function estimateTradingFee(uint256 tradeLiquidity) external virtual override view returns(uint256 fee) {\n        (uint256 _tradeLiquidityEMA,,) = _getTradeLiquidityEMA(tradeLiquidity, block.number);\n        fee = calcTradingFee(tradeLiquidity, _tradeLiquidityEMA, liquidityEMA);\n    }\n\n    function calcTradingFee(uint256 tradeLiquidity, uint256 lastLiquidityTradedEMA, uint256 lastLiquidityEMA) public virtual override view returns(uint256) {\n        (uint8 dsFee, uint8 dsFeeThreshold) = IDeltaSwapFactory(factory).dsFeeInfo();\n        if(DSMath.max(tradeLiquidity, lastLiquidityTradedEMA) >= lastLiquidityEMA * dsFeeThreshold / 1000) { // if trade >= threshold, charge fee\n            return dsFee;\n        }\n        return 0;\n    }\n\n    function getLiquidityEMA() public virtual override view returns(uint112 _liquidityEMA, uint32 _lastLiquidityBlockNumber) {\n        _liquidityEMA = liquidityEMA;\n        _lastLiquidityBlockNumber = lastLiquidityBlockNumber;\n    }\n\n    function getTradeLiquidityEMAParams() external virtual override view returns(uint112 _tradeLiquidityEMA, uint112 _lastTradeLiquiditySum, uint32 _lastTradeBlockNumber) {\n        _tradeLiquidityEMA = tradeLiquidityEMA;\n        _lastTradeLiquiditySum = lastTradeLiquiditySum;\n        _lastTradeBlockNumber = lastTradeBlockNumber;\n    }\n\n    function getTradeLiquidityEMA(uint256 tradeLiquidity) external virtual override view\n        returns(uint256 _tradeLiquidityEMA, uint256 lastTradeLiquidityEMA, uint256 tradeLiquiditySum) {\n        return _getTradeLiquidityEMA(tradeLiquidity, block.number);\n    }\n\n    function _getTradeLiquidityEMA(uint256 tradeLiquidity, uint256 blockNumber) internal virtual view\n        returns(uint256 _tradeLiquidityEMA, uint256 lastTradeLiquidityEMA, uint256 tradeLiquiditySum) {\n        uint256 blockDiff = blockNumber - lastTradeBlockNumber;\n        tradeLiquiditySum = _getLastTradeLiquiditySum(tradeLiquidity, blockDiff);\n        lastTradeLiquidityEMA = _getLastTradeLiquidityEMA(blockDiff);\n        _tradeLiquidityEMA = tradeLiquidity > 0 ? DSMath.calcEMA(tradeLiquiditySum, lastTradeLiquidityEMA, 20) : lastTradeLiquidityEMA;\n    }\n\n    function getLastTradeLiquiditySum(uint256 tradeLiquidity) external virtual override view returns(uint112 _tradeLiquiditySum, uint32 _lastTradeBlockNumber) {\n        _lastTradeBlockNumber = lastTradeBlockNumber;\n        _tradeLiquiditySum = uint112(_getLastTradeLiquiditySum(tradeLiquidity, block.number - _lastTradeBlockNumber));\n    }\n\n    function getLastTradeLiquidityEMA() external virtual override view returns(uint256) {\n        return _getLastTradeLiquidityEMA(block.number - lastLiquidityBlockNumber);\n    }\n\n    function _getLastTradeLiquiditySum(uint256 tradeLiquidity, uint256 blockDiff) internal virtual view returns(uint256) {\n        if(blockDiff > 0) {\n            return tradeLiquidity;\n        } else {\n            return lastTradeLiquiditySum + tradeLiquidity;\n        }\n    }\n\n    function _getLastTradeLiquidityEMA(uint256 blockDiff) internal virtual view returns(uint256) {\n        if(blockDiff > 50) {\n            // if no trade in 50 blocks (~10 minutes), then reset\n            return 0;\n        }\n        return tradeLiquidityEMA;\n    }\n\n    // if fee is on, mint liquidity equivalent to 1/6th of the growth in sqrt(k)\n    function _mintFee(uint112 _reserve0, uint112 _reserve1) private returns (bool feeOn) {\n        (address feeTo, uint256 feeNum) = IDeltaSwapFactory(factory).feeInfo();\n        feeOn = feeTo != address(0);\n        uint256 _kLast = kLast; // gas savings\n        if (feeOn) {\n            if (_kLast != 0) {\n                uint256 rootK = DSMath.sqrt(uint256(_reserve0) * _reserve1);\n                uint256 rootKLast = DSMath.sqrt(_kLast);\n                if (rootK > rootKLast) {\n                    uint256 numerator = totalSupply * (rootK - rootKLast);\n                    uint256 denominator = rootK * feeNum / 1000 + rootKLast;\n                    uint256 liquidity = numerator / denominator;\n                    if (liquidity > 0) _mint(feeTo, liquidity);\n                }\n            }\n        } else if (_kLast != 0) {\n            kLast = 0;\n        }\n    }\n\n    // this low-level function should be called from a contract which performs important safety checks\n    function mint(address to) external override lock returns (uint256 liquidity) {\n        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings\n        uint256 balance0 = IERC20(token0).balanceOf(address(this));\n        uint256 balance1 = IERC20(token1).balanceOf(address(this));\n        uint256 amount0 = balance0 - _reserve0;\n        uint256 amount1 = balance1 - _reserve1;\n\n        bool feeOn = _mintFee(_reserve0, _reserve1);\n        uint256 _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee\n        if (_totalSupply == 0) {\n            liquidity = DSMath.sqrt(amount0 * amount1) - MINIMUM_LIQUIDITY;\n            _mint(address(0), MINIMUM_LIQUIDITY); // permanently lock the first MINIMUM_LIQUIDITY tokens\n        } else {\n            liquidity = DSMath.min(amount0 * _totalSupply / _reserve0, amount1 * _totalSupply / _reserve1);\n        }\n        require(liquidity > 0, 'DeltaSwap: INSUFFICIENT_LIQUIDITY_MINTED');\n        _mint(to, liquidity);\n\n        _update(balance0, balance1, _reserve0, _reserve1);\n        if (feeOn) kLast = uint256(reserve0) * reserve1; // reserve0 and reserve1 are up-to-date\n        emit Mint(msg.sender, amount0, amount1);\n    }\n\n    // this low-level function should be called from a contract which performs important safety checks\n    function burn(address to) external override lock returns (uint256 amount0, uint256 amount1) {\n        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings\n        address _token0 = token0;                                // gas savings\n        address _token1 = token1;                                // gas savings\n        uint256 balance0 = IERC20(_token0).balanceOf(address(this));\n        uint256 balance1 = IERC20(_token1).balanceOf(address(this));\n        uint256 liquidity = balanceOf[address(this)];\n\n        bool feeOn = _mintFee(_reserve0, _reserve1);\n        uint256 _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee\n        amount0 = liquidity * balance0 / _totalSupply; // using balances ensures pro-rata distribution\n        amount1 = liquidity * balance1 / _totalSupply; // using balances ensures pro-rata distribution\n        require(amount0 > 0 && amount1 > 0, 'DeltaSwap: INSUFFICIENT_LIQUIDITY_BURNED');\n        _burn(address(this), liquidity);\n        _safeTransfer(_token0, to, amount0);\n        _safeTransfer(_token1, to, amount1);\n        balance0 = IERC20(_token0).balanceOf(address(this));\n        balance1 = IERC20(_token1).balanceOf(address(this));\n\n        _update(balance0, balance1, _reserve0, _reserve1);\n        if (feeOn) kLast = uint256(reserve0) * reserve1; // reserve0 and reserve1 are up-to-date\n        emit Burn(msg.sender, amount0, amount1, to);\n    }\n\n    // this low-level function should be called from a contract which performs important safety checks\n    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external override lock {\n        require(amount0Out > 0 || amount1Out > 0, 'DeltaSwap: INSUFFICIENT_OUTPUT_AMOUNT');\n        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings\n        require(amount0Out < _reserve0 && amount1Out < _reserve1, 'DeltaSwap: INSUFFICIENT_LIQUIDITY');\n\n        uint256 balance0;\n        uint256 balance1;\n        { // scope for _token{0,1}, avoids stack too deep errors\n            address _token0 = token0;\n            address _token1 = token1;\n            require(to != _token0 && to != _token1, 'DeltaSwap: INVALID_TO');\n            if (amount0Out > 0) _safeTransfer(_token0, to, amount0Out); // optimistically transfer tokens\n            if (amount1Out > 0) _safeTransfer(_token1, to, amount1Out); // optimistically transfer tokens\n            if (data.length > 0) IDeltaSwapCallee(to).deltaSwapCall(msg.sender, amount0Out, amount1Out, data);\n            balance0 = IERC20(_token0).balanceOf(address(this));\n            balance1 = IERC20(_token1).balanceOf(address(this));\n        }\n        uint256 amount0In = balance0 > _reserve0 - amount0Out ? balance0 - (_reserve0 - amount0Out) : 0;\n        uint256 amount1In = balance1 > _reserve1 - amount1Out ? balance1 - (_reserve1 - amount1Out) : 0;\n        require(amount0In > 0 || amount1In > 0, 'DeltaSwap: INSUFFICIENT_INPUT_AMOUNT');\n        { // scope for reserve{0,1}Adjusted, avoids stack too deep errors\n            uint256 fee;\n            if(msg.sender != gammaPool) {\n                uint256 tradeLiquidity = DSMath.calcTradeLiquidity(amount0In, amount1In, _reserve0, _reserve1);\n                fee = calcTradingFee(tradeLiquidity, _updateLiquidityTradedEMA(tradeLiquidity), liquidityEMA);\n            } else {\n                fee = IDeltaSwapFactory(factory).gsFee();\n            }\n            uint256 balance0Adjusted = balance0 * 1000 - amount0In * fee;\n            uint256 balance1Adjusted = balance1 * 1000 - amount1In * fee;\n            require(balance0Adjusted * balance1Adjusted >= uint256(_reserve0) * _reserve1 * (1000**2), 'DeltaSwap: K');\n        }\n\n        _update(balance0, balance1, _reserve0, _reserve1);\n        emit Swap(msg.sender, amount0In, amount1In, amount0Out, amount1Out, to);\n    }\n\n    // force balances to match reserves\n    function skim(address to) external override lock {\n        address _token0 = token0; // gas savings\n        address _token1 = token1; // gas savings\n        _safeTransfer(_token0, to, IERC20(_token0).balanceOf(address(this)) - reserve0);\n        _safeTransfer(_token1, to, IERC20(_token1).balanceOf(address(this)) - reserve1);\n    }\n\n    // force reserves to match balances\n    function sync() external override lock {\n        _update(IERC20(token0).balanceOf(address(this)), IERC20(token1).balanceOf(address(this)), reserve0, reserve1);\n    }\n}"
+    },
+    "contracts/DeltaSwapERC20.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity =0.8.21;\n\nimport './interfaces/IDeltaSwapERC20.sol';\n\ncontract DeltaSwapERC20 is IDeltaSwapERC20 {\n    string public constant override name = 'DeltaSwap V1';\n    string public constant override symbol = 'DS-V1';\n    uint8 public constant override decimals = 18;\n    uint256  public override totalSupply;\n    mapping(address => uint256) public override balanceOf;\n    mapping(address => mapping(address => uint256)) public override allowance;\n\n    bytes32 public override DOMAIN_SEPARATOR;\n    // keccak256(\"Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)\");\n    bytes32 public constant override PERMIT_TYPEHASH = 0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9;\n    mapping(address => uint256) public override nonces;\n\n    constructor() {\n        uint256 chainId;\n        assembly {\n            chainId := chainid()\n        }\n        DOMAIN_SEPARATOR = keccak256(\n            abi.encode(\n                keccak256('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'),\n                keccak256(bytes(name)),\n                keccak256(bytes('1')),\n                chainId,\n                address(this)\n            )\n        );\n    }\n\n    function _mint(address to, uint256 value) internal {\n        totalSupply = totalSupply + value;\n        balanceOf[to] = balanceOf[to] + value;\n        emit Transfer(address(0), to, value);\n    }\n\n    function _burn(address from, uint256 value) internal {\n        balanceOf[from] = balanceOf[from]- value;\n        totalSupply = totalSupply - value;\n        emit Transfer(from, address(0), value);\n    }\n\n    function _approve(address owner, address spender, uint256 value) private {\n        allowance[owner][spender] = value;\n        emit Approval(owner, spender, value);\n    }\n\n    function _transfer(address from, address to, uint256 value) private {\n        balanceOf[from] = balanceOf[from] - value;\n        balanceOf[to] = balanceOf[to] + value;\n        emit Transfer(from, to, value);\n    }\n\n    function approve(address spender, uint256 value) external override returns (bool) {\n        _approve(msg.sender, spender, value);\n        return true;\n    }\n\n    function transfer(address to, uint256 value) external override returns (bool) {\n        _transfer(msg.sender, to, value);\n        return true;\n    }\n\n    function transferFrom(address from, address to, uint256 value) external override returns (bool) {\n        if (allowance[from][msg.sender] != type(uint256).max) {\n            allowance[from][msg.sender] -= value;\n        }\n        _transfer(from, to, value);\n        return true;\n    }\n\n    function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external override {\n        require(deadline >= block.timestamp, 'DeltaSwap: EXPIRED');\n        bytes32 digest = keccak256(\n            abi.encodePacked(\n                '\\x19\\x01',\n                DOMAIN_SEPARATOR,\n                keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonces[owner]++, deadline))\n            )\n        );\n        address recoveredAddress = ecrecover(digest, v, r, s);\n        require(recoveredAddress != address(0) && recoveredAddress == owner, 'DeltaSwap: INVALID_SIGNATURE');\n        _approve(owner, spender, value);\n    }\n}"
+    },
+    "contracts/DeltaSwapFactory.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity =0.8.21;\n\nimport '@gammaswap/v1-core/contracts/libraries/AddressCalculator.sol';\n\nimport './libraries/DeltaSwapLibrary.sol';\nimport './interfaces/IDeltaSwapFactory.sol';\nimport './DeltaSwapPair.sol';\n\ncontract DeltaSwapFactory is IDeltaSwapFactory {\n    address public override feeTo;\n    uint16 public override feeNum = 5000; // GammaPool swap fee\n    address public override feeToSetter;\n    address public override gammaPoolSetter;\n    address public override gsFactory;\n\n    uint8 public override gsFee = 3; // GammaPool swap fee\n    uint8 public override dsFee = 3; // Fee on large trades\n    uint8 public override dsFeeThreshold = 20; // >2% of Liq trades pay fee\n\n    mapping(address => mapping(address => address)) public override getPair;\n    address[] public override allPairs;\n\n    uint16 public override gsProtocolId = 3;\n\n    constructor(address _feeToSetter, address _gammaPoolSetter, address _gsFactory) {\n        feeToSetter = _feeToSetter;\n        gammaPoolSetter = _gammaPoolSetter;\n        gsFactory = _gsFactory;\n    }\n\n    function allPairsLength() external override view returns (uint256) {\n        return allPairs.length;\n    }\n\n    function createPair(address tokenA, address tokenB) external override returns (address pair) {\n        require(tokenA != tokenB, 'DeltaSwap: IDENTICAL_ADDRESSES');\n        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);\n        require(token0 != address(0), 'DeltaSwap: ZERO_ADDRESS');\n        require(getPair[token0][token1] == address(0), 'DeltaSwap: PAIR_EXISTS'); // single check is sufficient\n        bytes memory bytecode = type(DeltaSwapPair).creationCode;\n        bytes32 salt = keccak256(abi.encodePacked(token0, token1));\n        assembly {\n            pair := create2(0, add(bytecode, 32), mload(bytecode), salt)\n        }\n        IDeltaSwapPair(pair).initialize(token0, token1);\n        getPair[token0][token1] = pair;\n        getPair[token1][token0] = pair; // populate mapping in the reverse direction\n        allPairs.push(pair);\n        emit PairCreated(token0, token1, pair, allPairs.length);\n\n        _setGammaPool(pair);\n    }\n\n    function setFeeNum(uint16 _feeNum) external override {\n        require(msg.sender == feeToSetter, 'DeltaSwap: FORBIDDEN');\n        feeNum = _feeNum;\n    }\n\n    function setFeeTo(address _feeTo) external override {\n        require(msg.sender == feeToSetter, 'DeltaSwap: FORBIDDEN');\n        feeTo = _feeTo;\n    }\n\n    function setFeeToSetter(address _feeToSetter) external override {\n        require(msg.sender == feeToSetter, 'DeltaSwap: FORBIDDEN');\n        feeToSetter = _feeToSetter;\n    }\n\n    function setGSFee(uint8 fee) external override {\n        require(msg.sender == feeToSetter, 'DeltaSwap: FORBIDDEN');\n        gsFee = fee;\n    }\n\n    function setDSFee(uint8 fee) external override {\n        require(msg.sender == feeToSetter, 'DeltaSwap: FORBIDDEN');\n        dsFee = fee;\n    }\n\n    function setDSFeeThreshold(uint8 feeThreshold) external override {\n        require(msg.sender == feeToSetter, 'DeltaSwap: FORBIDDEN');\n        dsFeeThreshold = feeThreshold;\n    }\n\n    function feeInfo() external override view returns (address,uint16) {\n        return(feeTo, feeNum);\n    }\n\n    function dsFeeInfo() external override view returns (uint8,uint8) {\n        return(dsFee, dsFeeThreshold);\n    }\n\n    function setGSProtocolId(uint16 protocolId) external override {\n        require(msg.sender == gammaPoolSetter, 'DeltaSwap: FORBIDDEN');\n        gsProtocolId = protocolId;\n    }\n\n    function setGSFactory(address factory) external override {\n        require(msg.sender == gammaPoolSetter, 'DeltaSwap: FORBIDDEN');\n        gsFactory = factory;\n    }\n\n    function setGammaPoolSetter(address _gammaPoolSetter) external override {\n        require(msg.sender == gammaPoolSetter, 'DeltaSwap: FORBIDDEN');\n        gammaPoolSetter = _gammaPoolSetter;\n    }\n\n    function updateGammaPool(address tokenA, address tokenB) external override {\n        require(msg.sender == gammaPoolSetter, 'DeltaSwap: FORBIDDEN');\n        _setGammaPool(getPair[tokenA][tokenB]);\n    }\n\n    function _setGammaPool(address pair) internal {\n        address gammaPool = AddressCalculator.calcAddress(gsFactory, gsProtocolId, keccak256(abi.encode(pair, gsProtocolId)));\n        IDeltaSwapPair(pair).setGammaPool(gammaPool);\n        emit GammaPoolSet(pair, gammaPool);\n    }\n}"
+    },
+    "contracts/libraries/DSMath.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.16;\n\n// a library for performing various math operations\n\nlibrary DSMath {\n\n    function max(uint256 x, uint256 y) internal pure returns (uint256 z) {\n        z = x > y ? x : y;\n    }\n\n    function min(uint256 x, uint256 y) internal pure returns (uint256 z) {\n        z = x < y ? x : y;\n    }\n\n    // babylonian method (https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method)\n    function sqrt(uint256 y) internal pure returns (uint256 z) {\n        if (y > 3) {\n            z = y;\n            uint256 x = y / 2 + 1;\n            while (x < z) {\n                z = x;\n                x = (y / x + x) / 2;\n            }\n        } else if (y != 0) {\n            z = 1;\n        }\n    }\n\n    /// @dev Update pool invariant, LP tokens borrowed plus interest, interest rate index, and last block update\n    /// @param last - last value added to ema calculation\n    /// @param emaLast - last calculated ema\n    /// @param emaWeight - weight given to last value in ema calculation compared to last ema value\n    /// @return ema - result of ema calculation\n    function calcEMA(uint256 last, uint256 emaLast, uint256 emaWeight) internal pure returns(uint256) {\n        if(emaLast == 0) {\n            return last;\n        } else {\n            emaWeight = min(100, emaWeight);\n            // EMA_1 = last * weight + EMA_0 * (1 - weight)\n            return last * emaWeight / 100 + emaLast * (100 - emaWeight) / 100;\n        }\n    }\n\n    function calcSingleSideLiquidity(uint256 amount, uint256 reserve0, uint256 reserve1) internal pure returns(uint256) {\n        uint256 amount0 = amount / 2;\n        uint256 amount1 = amount0 * reserve1 / reserve0;\n        return DSMath.sqrt(amount0 * amount1);\n    }\n\n    function calcTradeLiquidity(uint256 amount0, uint256 amount1, uint256 reserve0, uint256 reserve1) internal pure returns(uint256) {\n        return max(\n            calcSingleSideLiquidity(amount0, reserve0, reserve1),\n                calcSingleSideLiquidity(amount1, reserve1, reserve0));\n    }\n}\n"
+    },
+    "contracts/interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\ninterface IERC20 {\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    function name() external view returns (string memory);\n    function symbol() external view returns (string memory);\n    function decimals() external view returns (uint8);\n    function totalSupply() external view returns (uint256);\n    function balanceOf(address owner) external view returns (uint256);\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    function approve(address spender, uint256 value) external returns (bool);\n    function transfer(address to, uint256 value) external returns (bool);\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n}"
+    },
+    "contracts/libraries/UQ112x112.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.16;\n\n// a library for handling binary fixed point numbers (https://en.wikipedia.org/wiki/Q_(number_format))\n\n// range: [0, 2**112 - 1]\n// resolution: 1 / 2**112\n\nlibrary UQ112x112 {\n    uint224 constant Q112 = 2**112;\n\n    // encode a uint112 as a UQ112x112\n    function encode(uint112 y) internal pure returns (uint224 z) {\n        z = uint224(y) * Q112; // never overflows\n    }\n\n    // divide a UQ112x112 by a uint112, returning a UQ112x112\n    function uqdiv(uint224 x, uint112 y) internal pure returns (uint224 z) {\n        z = x / uint224(y);\n    }\n}"
+    },
+    "contracts/interfaces/IDeltaSwapPair.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\nimport \"./IDeltaSwapERC20.sol\";\n\ninterface IDeltaSwapPair is IDeltaSwapERC20 {\n\n    event Mint(address indexed sender, uint256 amount0, uint256 amount1);\n    event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);\n    event Swap(\n        address indexed sender,\n        uint256 amount0In,\n        uint256 amount1In,\n        uint256 amount0Out,\n        uint256 amount1Out,\n        address indexed to\n    );\n    event Sync(uint112 reserve0, uint112 reserve1);\n\n    function MINIMUM_LIQUIDITY() external pure returns (uint256);\n    function factory() external view returns (address);\n    function token0() external view returns (address);\n    function token1() external view returns (address);\n    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);\n    function price0CumulativeLast() external view returns (uint256);\n    function price1CumulativeLast() external view returns (uint256);\n    function kLast() external view returns (uint256);\n\n    function mint(address to) external returns (uint256 liquidity);\n    function burn(address to) external returns (uint256 amount0, uint256 amount1);\n    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;\n    function skim(address to) external;\n    function sync() external;\n\n    function initialize(address, address) external;\n\n    function gammaPool() external view returns (address);\n    function setGammaPool(address gammaPool) external;\n\n    function getLiquidityEMA() external view returns(uint112 liquidityEMA, uint32 lastLiquidityEMABlockNumber);\n    function getLastTradeLiquidityEMA() external view returns(uint256);\n    function getTradeLiquidityEMA(uint256 tradeLiquidity) external view returns(uint256 tradeLiquidityEMA, uint256 lastTradeLiquidityEMA, uint256 tradeLiquiditySum);\n    function getTradeLiquidityEMAParams() external view returns(uint112 _tradeLiquidityEMA, uint112 _lastTradeLiquiditySum, uint32 _lastTradeBlockNumber);\n    function getLastTradeLiquiditySum(uint256 tradeLiquidity) external view returns(uint112 _tradeLiquiditySum, uint32 _lastTradeBlockNum);\n    function estimateTradingFee(uint256 tradeLiquidity) external view returns(uint256 fee);\n    function calcTradingFee(uint256 tradeLiquidity, uint256 tradeLiquidityEMA, uint256 liquidityEMA) external view returns(uint256 fee);\n}"
+    },
+    "contracts/interfaces/IDeltaSwapERC20.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\ninterface IDeltaSwapERC20 {\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    function name() external pure returns (string memory);\n    function symbol() external pure returns (string memory);\n    function decimals() external pure returns (uint8);\n    function totalSupply() external view returns (uint256);\n    function balanceOf(address owner) external view returns (uint256);\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    function approve(address spender, uint256 value) external returns (bool);\n    function transfer(address to, uint256 value) external returns (bool);\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n    function PERMIT_TYPEHASH() external pure returns (bytes32);\n    function nonces(address owner) external view returns (uint256);\n\n    function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;\n}"
+    },
+    "contracts/libraries/DeltaSwapLibrary.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\nimport '../interfaces/IDeltaSwapPair.sol';\nimport './DSMath.sol';\n\nlibrary DeltaSwapLibrary {\n\n    // returns sorted token addresses, used to handle return values from pairs sorted in this order\n    function sortTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {\n        require(tokenA != tokenB, 'DeltaSwapLibrary: IDENTICAL_ADDRESSES');\n        (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);\n        require(token0 != address(0), 'DeltaSwapLibrary: ZERO_ADDRESS');\n    }\n\n    // calculates the CREATE2 address for a pair without making any external calls\n    function pairFor(address factory, address tokenA, address tokenB) internal pure returns (address pair) {\n        (address token0, address token1) = sortTokens(tokenA, tokenB);\n        pair = address(uint160(uint256(keccak256(abi.encodePacked(\n                hex'ff',\n                factory,\n                keccak256(abi.encodePacked(token0, token1)),\n                hex'a82767a5e39a2e216962a2ebff796dcc37cd05dfd6f7a149e1f8fbb6bf487658' // init code hash\n                //hex'7f507cb8f4fb141418e455f4b99d5bd10dbabf9bcc0607d37ceee34013646a9c' // init code hash\n            )))));\n    }\n\n    // fetches and sorts the reserves for a pair\n    function getReserves(address factory, address tokenA, address tokenB) internal view returns (uint256 reserveA, uint256 reserveB, address pair) {\n        (address token0,) = sortTokens(tokenA, tokenB);\n        pair = pairFor(factory, tokenA, tokenB);\n        (uint256 reserve0, uint256 reserve1,) = IDeltaSwapPair(pair).getReserves();\n        (reserveA, reserveB) = tokenA == token0 ? (reserve0, reserve1) : (reserve1, reserve0);\n    }\n\n    // given some amount of an asset and pair reserves, returns an equivalent amount of the other asset\n    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) internal pure returns (uint256 amountB) {\n        require(amountA > 0, 'DeltaSwapLibrary: INSUFFICIENT_AMOUNT');\n        require(reserveA > 0 && reserveB > 0, 'DeltaSwapLibrary: INSUFFICIENT_LIQUIDITY');\n        amountB = amountA * reserveB / reserveA;\n    }\n\n    // given an input amount of an asset and pair reserves, returns the maximum output amount of the other asset\n    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, uint256 fee) internal pure returns (uint256 amountOut) {\n        require(amountIn > 0, 'DeltaSwapLibrary: INSUFFICIENT_INPUT_AMOUNT');\n        require(reserveIn > 0 && reserveOut > 0, 'DeltaSwapLibrary: INSUFFICIENT_LIQUIDITY');\n        uint256 amountInWithFee = amountIn * (1000 - fee);\n        uint256 numerator = amountInWithFee * reserveOut;\n        uint256 denominator = reserveIn * 1000 + amountInWithFee;\n        amountOut = numerator / denominator;\n    }\n\n    // given an output amount of an asset and pair reserves, returns a required input amount of the other asset\n    function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut, uint256 fee) internal pure returns (uint256 amountIn) {\n        require(amountOut > 0, 'DeltaSwapLibrary: INSUFFICIENT_OUTPUT_AMOUNT');\n        require(reserveIn > 0 && reserveOut > 0, 'DeltaSwapLibrary: INSUFFICIENT_LIQUIDITY');\n        uint256 numerator = reserveIn * amountOut * 1000;\n        uint256 denominator = (reserveOut - amountOut) * (1000 - fee);\n        amountIn = (numerator / denominator) + 1;\n    }\n\n    // performs chained getAmountOut calculations on any number of pairs\n    function getAmountsOut(address factory, uint256 amountIn, address[] memory path) internal view returns (uint256[] memory amounts) {\n        require(path.length >= 2, 'DeltaSwapLibrary: INVALID_PATH');\n        amounts = new uint256[](path.length);\n        amounts[0] = amountIn;\n        for (uint256 i; i < path.length - 1; i++) {\n            (uint256 reserveIn, uint256 reserveOut, address pair) = getReserves(factory, path[i], path[i + 1]);\n            uint256 fee = calcPairTradingFee(amounts[i], reserveIn, reserveOut, pair);\n            amounts[i + 1] = getAmountOut(amounts[i], reserveIn, reserveOut, fee);\n        }\n    }\n\n    // performs chained getAmountIn calculations on any number of pairs\n    function getAmountsIn(address factory, uint256 amountOut, address[] memory path) internal view returns (uint256[] memory amounts) {\n        require(path.length >= 2, 'DeltaSwapLibrary: INVALID_PATH');\n        amounts = new uint256[](path.length);\n        amounts[amounts.length - 1] = amountOut;\n        for (uint256 i = path.length - 1; i > 0; i--) {\n            (uint256 reserveIn, uint256 reserveOut, address pair) = getReserves(factory, path[i - 1], path[i]);\n            uint256 fee;\n            uint256 _fee = 3;\n            uint256 amountIn;\n            while(true) {\n                fee = _fee;\n                amountIn = getAmountIn(amounts[i], reserveIn, reserveOut, fee);\n                _fee = calcPairTradingFee(amountIn, reserveIn, reserveOut, pair);\n                if(_fee == fee) break;\n            }\n            amounts[i - 1] = amountIn;\n        }\n    }\n\n    function calcPairTradingFee(uint256 amountIn, uint256 reserveIn, uint256 reserveOut, address pair) internal view returns(uint256 fee) {\n        uint256 tradeLiquidity = DSMath.calcTradeLiquidity(amountIn, 0, reserveIn, reserveOut);\n        fee = IDeltaSwapPair(pair).estimateTradingFee(tradeLiquidity);\n    }\n\n    function predictDeterministicAddress(\n        address implementation,\n        bytes32 salt,\n        address factory\n    ) internal pure returns (address predicted) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            let ptr := mload(0x40)\n            mstore(add(ptr, 0x38), factory)\n            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)\n            mstore(add(ptr, 0x14), implementation)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)\n            mstore(add(ptr, 0x58), salt)\n            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))\n            predicted := keccak256(add(ptr, 0x43), 0x55)\n        }\n    }\n}"
+    },
+    "contracts/interfaces/IDeltaSwapCallee.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\ninterface IDeltaSwapCallee {\n    function deltaSwapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external;\n}\n"
+    },
+    "contracts/interfaces/IDeltaSwapFactory.sol": {
+      "content": "// SPDX-License-Identifier: GPL-v3\npragma solidity >=0.5.0;\n\ninterface IDeltaSwapFactory {\n    event PairCreated(address indexed token0, address indexed token1, address pair, uint256);\n    event GammaPoolSet(address indexed pair, address gammaPool);\n\n    function feeTo() external view returns (address);\n    function feeNum() external view returns (uint16);\n    function feeToSetter() external view returns (address);\n    function gammaPoolSetter() external view returns (address);\n    function gsFactory() external view returns(address);\n    function gsProtocolId() external view returns(uint16);\n    function gsFee() external view returns(uint8);\n    function dsFee() external view returns(uint8);\n    function dsFeeThreshold() external view returns(uint8);\n\n    function getPair(address tokenA, address tokenB) external view returns (address pair);\n    function allPairs(uint256) external view returns (address pair);\n    function allPairsLength() external view returns (uint256);\n\n    function createPair(address tokenA, address tokenB) external returns (address pair);\n\n    function setFeeNum(uint16) external;\n    function setFeeTo(address) external;\n    function setFeeToSetter(address) external;\n\n    function setGSFactory(address factory) external;\n    function setGSProtocolId(uint16 protocolId) external;\n    function setGSFee(uint8 fee) external;\n    function setDSFee(uint8 fee) external;\n    function setDSFeeThreshold(uint8 feeThreshold) external;\n\n    function feeInfo() external view returns (address,uint16);\n    function dsFeeInfo() external view returns (uint8,uint8);\n\n    function setGammaPoolSetter(address) external;\n    function updateGammaPool(address tokenA, address tokenB) external;\n}"
+    },
+    "@gammaswap/v1-core/contracts/libraries/AddressCalculator.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity >=0.8.0;\n\nimport \"../interfaces/IGammaPoolFactory.sol\";\n\n/// @title Library used calculate the deterministic addresses used to instantiate GammaPools\n/// @author Daniel D. Alcarraz (https://github.com/0xDanr)\n/// @dev These algorithms are based on EIP-1014 (https://eips.ethereum.org/EIPS/eip-1014)\nlibrary AddressCalculator {\n\n    /// @dev calculate salt used to create deterministic address, the salt is also used as unique key identifier for the GammaPool\n    /// @param cfmm - address of CFMM the GammaPool is for\n    /// @param protocolId - protocol id of instance address the GammaPool will use (version of GammaPool for this CFMM)\n    /// @return key - key/salt used as unique identifier of GammaPool\n    function getGammaPoolKey(address cfmm, uint16 protocolId) internal pure returns(bytes32) {\n        return keccak256(abi.encode(cfmm, protocolId)); // key is hash of CFMM address and protocolId\n    }\n\n    /// @dev calculate deterministic address to instantiate GammaPool minimal beacon proxy or minimal proxy contract\n    /// @param factory - address of factory that will instantiate GammaPool proxy contract\n    /// @param protocolId - protocol id of instance address the GammaPool will use (version of this GammaPool)\n    /// @param key - salt used in address generation to assure its uniqueness\n    /// @return _address - address of GammaPool that maps to protocolId and key\n    function calcAddress(address factory, uint16 protocolId, bytes32 key) internal view returns (address) {\n        if (protocolId < 10000) {\n            return predictDeterministicAddress(IGammaPoolFactory(factory).getProtocolBeacon(protocolId), protocolId, key, factory);\n        } else {\n            return predictDeterministicAddress2(IGammaPoolFactory(factory).getProtocol(protocolId), key, factory);\n        }\n    }\n\n    /// @dev calculate a deterministic address based on init code hash\n    /// @param factory - address of factory that instantiated or will instantiate this contract\n    /// @param salt - salt used in address generation to assure its uniqueness\n    /// @param initCodeHash - init code hash of template contract which will be used to instantiate contract with deterministic address\n    /// @return _address - address of contract that maps to salt and init code hash that is created by factory contract\n    function calcAddress(address factory, bytes32 salt, bytes32 initCodeHash) internal pure returns (address) {\n        return address(uint160(uint256(keccak256(abi.encodePacked(hex\"ff\",factory,salt,initCodeHash)))));\n    }\n\n    /// @dev Compute bytecode of a minimal beacon proxy contract, excluding bytecode metadata hash\n    /// @param beacon - address of beacon of minimal beacon proxy\n    /// @param protocolId - id of protocol\n    /// @param factory - address of factory that instantiated or will instantiate this contract\n    /// @return bytecode - the calculated bytecode for minimal beacon proxy contract\n    function calcMinimalBeaconProxyBytecode(\n        address beacon,\n        uint16 protocolId,\n        address factory\n    ) internal pure returns(bytes memory) {\n        return abi.encodePacked(\n            hex\"608060405234801561001057600080fd5b5073\",\n            beacon,\n            hex\"7f\",\n            hex\"a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50\",\n            hex\"5560\",\n            protocolId < 256 ? hex\"6c\" : hex\"6d\",\n            hex\"806100566000396000f3fe\",\n            hex\"608060408190526334b1f0a960e21b8152\",\n            protocolId < 256 ? hex\"60\" : hex\"61\",\n            protocolId < 256 ? abi.encodePacked(uint8(protocolId)) : abi.encodePacked(protocolId),\n            hex\"60845260208160248173\",\n            factory,\n            hex\"5afa60\",\n            protocolId < 256 ? hex\"3a\" : hex\"3b\",\n            hex\"573d6000fd5b5060805160003681823780813683855af491503d81823e81801560\",\n            protocolId < 256 ? hex\"5b\" : hex\"5c\",\n            hex\"573d82f35b3d82fdfea164736f6c6343000815000a\"\n        );\n    }\n\n    /// @dev Computes the address of a minimal beacon proxy contract\n    /// @param protocolId - id of protocol\n    /// @param salt - salt used in address generation to assure its uniqueness\n    /// @param factory - address of factory that instantiated or will instantiate this contract\n    /// @return predicted - the calculated address\n    function predictDeterministicAddress(\n        address beacon,\n        uint16 protocolId,\n        bytes32 salt,\n        address factory\n    ) internal pure returns (address) {\n        bytes memory bytecode = calcMinimalBeaconProxyBytecode(beacon, protocolId, factory);\n\n        // Compute the hash of the initialization code.\n        bytes32 bytecodeHash = keccak256(bytecode);\n\n        // Compute the final CREATE2 address\n        bytes32 data = keccak256(abi.encodePacked(bytes1(0xff), factory, salt, bytecodeHash));\n        return address(uint160(uint256(data)));\n    }\n\n    /// @dev Computes the address of a minimal proxy contract\n    /// @param implementation - address of implementation contract of this minimal proxy contract\n    /// @param salt - salt used in address generation to assure its uniqueness\n    /// @param factory - address of factory that instantiated or will instantiate this contract\n    /// @return predicted - the calculated address\n    function predictDeterministicAddress2(\n        address implementation,\n        bytes32 salt,\n        address factory\n    ) internal pure returns (address predicted) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            let ptr := mload(0x40)\n            mstore(add(ptr, 0x38), factory)\n            mstore(add(ptr, 0x24), 0x5af43d82803e903d91602b57fd5bf3ff)\n            mstore(add(ptr, 0x14), implementation)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73)\n            mstore(add(ptr, 0x58), salt)\n            mstore(add(ptr, 0x78), keccak256(add(ptr, 0x0c), 0x37))\n            predicted := keccak256(add(ptr, 0x43), 0x55)\n        }\n    }\n}"
+    },
+    "@gammaswap/v1-core/contracts/interfaces/IGammaPoolFactory.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity >=0.8.0;\n\n/// @title Interface for factory contract to create more GammaPool contracts.\n/// @author Daniel D. Alcarraz (https://github.com/0xDanr)\n/// @dev All instantiated GammaPoolFactory contracts must implement this interface\ninterface IGammaPoolFactory {\n    /// @dev Event emitted when a new GammaPool is instantiated\n    /// @param pool - address of new pool that is created\n    /// @param cfmm - address of CFMM the GammaPool is created for\n    /// @param protocolId - id identifier of GammaPool protocol (can be thought of as version)\n    /// @param implementation - implementation address of GammaPool proxy contract. Because all GammaPools are created as proxy contracts\n    /// @param tokens - ERC20 tokens of CFMM\n    /// @param count - number of GammaPools instantiated including this contract\n    event PoolCreated(address indexed pool, address indexed cfmm, uint16 indexed protocolId, address implementation, address[] tokens, uint256 count);\n\n    /// @dev Event emitted when a GammaPool fee is updated\n    /// @param pool - address of new pool whose fee is updated (zero address is default params)\n    /// @param to - receiving address of protocol fees\n    /// @param protocolFee - protocol fee share charged from interest rate accruals\n    /// @param origFeeShare - protocol fee share charged on origination fees\n    /// @param isSet - bool flag, true use fee information, false use GammaSwap default fees\n    event FeeUpdate(address indexed pool, address indexed to, uint16 protocolFee, uint16 origFeeShare, bool isSet);\n\n    /// @dev Event emitted when a GammaPool parameters are updated\n    /// @param pool - address of GammaPool whose origination fee parameters will be updated\n    /// @param origFee - loan opening origination fee in basis points\n    /// @param extSwapFee - external swap fee in basis points, max 255 basis points = 2.55%\n    /// @param emaMultiplier - multiplier used in EMA calculation of utilization rate\n    /// @param minUtilRate1 - minimum utilization rate to calculate dynamic origination fee using exponential model\n    /// @param minUtilRate2 - minimum utilization rate to calculate dynamic origination fee using linear model\n    /// @param feeDivisor - fee divisor for calculating origination fee, based on 2^(maxUtilRate - minUtilRate1)\n    /// @param liquidationFee - liquidation fee to charge during liquidations in basis points (1 - 255 => 0.01% to 2.55%)\n    /// @param ltvThreshold - ltv threshold (1 - 255 => 0.1% to 25.5%)\n    /// @param minBorrow - minimum liquidity amount that can be borrowed or left unpaid in a loan\n    event PoolParamsUpdate(address indexed pool, uint16 origFee, uint8 extSwapFee, uint8 emaMultiplier, uint8 minUtilRate1, uint8 minUtilRate2, uint16 feeDivisor, uint8 liquidationFee, uint8 ltvThreshold, uint72 minBorrow);\n\n    /// @dev Check if protocol is restricted. Which means only owner of GammaPoolFactory is allowed to instantiate GammaPools using this protocol\n    /// @param _protocolId - id identifier of GammaPool protocol (can be thought of as version) that is being checked\n    /// @return _isRestricted - true if protocol is restricted, false otherwise\n    function isProtocolRestricted(uint16 _protocolId) external view returns(bool);\n\n    /// @dev Set a protocol to be restricted or unrestricted. That means only owner of GammaPoolFactory is allowed to instantiate GammaPools using this protocol\n    /// @param _protocolId - id identifier of GammaPool protocol (can be thought of as version) that is being restricted\n    /// @param _isRestricted - set to true for restricted, set to false for unrestricted\n    function setIsProtocolRestricted(uint16 _protocolId, bool _isRestricted) external;\n\n    /// @notice Only owner of GammaPoolFactory can call this function\n    /// @dev Add a protocol implementation to GammaPoolFactory contract. Which means GammaPoolFactory can create GammaPools with this implementation (protocol)\n    /// @param _implementation - implementation address of GammaPool proxy contract. Because all GammaPools are created as proxy contracts\n    function addProtocol(address _implementation) external;\n\n    /// @notice Only owner of GammaPoolFactory can call this function\n    /// @dev Update protocol implementation for a protocol.\n    /// @param _protocolId - id identifier of GammaPool implementation\n    /// @param _newImplementation - implementation address of GammaPool proxy contract. Because all GammaPools are created as proxy contracts\n    function updateProtocol(uint16 _protocolId, address _newImplementation) external;\n\n    /// @notice Only owner of GammaPoolFactory can call this function\n    /// @dev Removing protocol implementation from GammaPoolFactory contract. Which means GammaPoolFactory will no longer be able to create GammaPools with this implementation (protocol)\n    /// @param _protocolId - id identifier of GammaPool implementation\n    function removeProtocol(uint16 _protocolId) external;\n\n    /// @dev Get implementation address that maps to protocolId. This is the actual implementation code that a GammaPool implements for a protocolId\n    /// @param _protocolId - id identifier of GammaPool implementation (can be thought of as version)\n    /// @return _address - implementation address of GammaPool proxy contract. Because all GammaPools are created as proxy contracts\n    function getProtocol(uint16 _protocolId) external view returns (address);\n\n    /// @dev Get beacon address that maps to protocolId. This beacon contract contains the implementation address of the GammaPool proxy\n    /// @param _protocolId - id identifier of GammaPool implementation (can be thought of as version)\n    /// @return _address - address of beacon of GammaPool proxy contract. Because all GammaPools are created as proxy contracts if there is one\n    function getProtocolBeacon(uint16 _protocolId) external view returns (address);\n\n    /// @dev Instantiate a new GammaPool for a CFMM based on an existing implementation (protocolId)\n    /// @param _protocolId - id identifier of GammaPool protocol (can be thought of as version)\n    /// @param _cfmm - address of CFMM the GammaPool is created for\n    /// @param _tokens - addresses of ERC20 tokens in CFMM, used for validation during runtime of function\n    /// @param _data - custom struct containing additional information used to verify the `_cfmm`\n    /// @return _address - address of new GammaPool proxy contract that was instantiated\n    function createPool(uint16 _protocolId, address _cfmm, address[] calldata _tokens, bytes calldata _data) external returns(address);\n\n    /// @dev Mapping of bytes32 salts (key) to GammaPool addresses. The salt is predetermined and used to instantiate a GammaPool with a unique address\n    /// @param _salt - the bytes32 key that is unique to the GammaPool and therefore also used as a unique identifier of the GammaPool\n    /// @return _address - address of GammaPool that maps to bytes32 salt (key)\n    function getPool(bytes32 _salt) external view returns(address);\n\n    /// @dev Mapping of bytes32 salts (key) to GammaPool addresses. The salt is predetermined and used to instantiate a GammaPool with a unique address\n    /// @param _pool - address of GammaPool that maps to bytes32 salt (key)\n    /// @return _salt - the bytes32 key that is unique to the GammaPool and therefore also used as a unique identifier of the GammaPool\n    function getKey(address _pool) external view returns(bytes32);\n\n    /// @return count - number of GammaPools that have been instantiated through this GammaPoolFactory contract\n    function allPoolsLength() external view returns (uint256);\n\n    /// @dev Get pool fee parameters used to calculate protocol fees\n    /// @param _pool - pool address identifier\n    /// @return _to - address receiving fee\n    /// @return _protocolFee - protocol fee share charged from interest rate accruals\n    /// @return _origFeeShare - protocol fee share charged on origination fees\n    /// @return _isSet - bool flag, true use fee information, false use GammaSwap default fees\n    function getPoolFee(address _pool) external view returns (address _to, uint256 _protocolFee, uint256 _origFeeShare, bool _isSet);\n\n    /// @dev Set pool fee parameters used to calculate protocol fees\n    /// @param _pool - id identifier of GammaPool protocol (can be thought of as version)\n    /// @param _to - address receiving fee\n    /// @param _protocolFee - protocol fee share charged from interest rate accruals\n    /// @param _origFeeShare - protocol fee share charged on origination fees\n    /// @param _isSet - bool flag, true use fee information, false use GammaSwap default fees\n    function setPoolFee(address _pool, address _to, uint16 _protocolFee, uint16 _origFeeShare, bool _isSet) external;\n\n    /// @dev Call admin function in GammaPool contract\n    /// @param _pool - address of GammaPool whose admin function will be called\n    /// @param _data - custom struct containing information to execute in pool contract\n    function execute(address _pool, bytes calldata _data) external;\n\n    /// @dev Pause a GammaPool's function identified by a `_functionId`\n    /// @param _pool - address of GammaPool whose functions we will pause\n    /// @param _functionId - id of function in GammaPool we want to pause\n    /// @return _functionIds - uint256 number containing all turned on (paused) function ids\n    function pausePoolFunction(address _pool, uint8 _functionId) external returns(uint256 _functionIds) ;\n\n    /// @dev Unpause a GammaPool's function identified by a `_functionId`\n    /// @param _pool - address of GammaPool whose functions we will unpause\n    /// @param _functionId - id of function in GammaPool we want to unpause\n    /// @return _functionIds - uint256 number containing all turned on (paused) function ids\n    function unpausePoolFunction(address _pool, uint8 _functionId) external returns(uint256 _functionIds) ;\n\n    /// @return fee - protocol fee charged by GammaPool to liquidity borrowers in terms of basis points\n    function fee() external view returns(uint16);\n\n    /// @return origFeeShare - protocol fee share charged on origination fees\n    function origFeeShare() external view returns(uint16);\n\n    /// @return feeTo - address that receives protocol fees\n    function feeTo() external view returns(address);\n\n    /// @return feeToSetter - address that has the power to set protocol fees\n    function feeToSetter() external view returns(address);\n\n    /// @return feeTo - address that receives protocol fees\n    /// @return fee - protocol fee charged by GammaPool to liquidity borrowers in terms of basis points\n    /// @return origFeeShare - protocol fee share charged on origination fees\n    function feeInfo() external view returns(address,uint256,uint256);\n\n    /// @dev Get list of pools from start index to end index. If it goes over index it returns up to the max size of allPools array\n    /// @param start - start index of pools to search\n    /// @param end - end index of pools to search\n    /// @return _pools - all pools requested\n    function getPools(uint256 start, uint256 end) external view returns(address[] memory _pools);\n\n    /// @dev See {IGammaPoolFactory-setFee}\n    function setFee(uint16 _fee) external;\n\n    /// @dev See {IGammaPoolFactory-setFeeTo}\n    function setFeeTo(address _feeTo) external;\n\n    /// @dev See {IGammaPoolFactory-setOrigFeeShare}\n    function setOrigFeeShare(uint16 _origFeeShare) external;\n\n    /// @dev See {IGammaPoolFactory-setFeeToSetter}\n    function setFeeToSetter(address _feeToSetter) external;\n\n}"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.21+commit.d9974bed"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_feeToSetter",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_gammaPoolSetter",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_gsFactory",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "pair",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "gammaPool",
+              "type": "address"
+            }
+          ],
+          "name": "GammaPoolSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token0",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token1",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "pair",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "PairCreated",
+          "type": "event"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "allPairs",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "allPairsLength",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            }
+          ],
+          "name": "createPair",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "pair",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "dsFee",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "dsFeeInfo",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "dsFeeThreshold",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "feeInfo",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint16",
+              "name": "",
+              "type": "uint16"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "feeNum",
+          "outputs": [
+            {
+              "internalType": "uint16",
+              "name": "",
+              "type": "uint16"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "feeTo",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "feeToSetter",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gammaPoolSetter",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "getPair",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gsFactory",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gsFee",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gsProtocolId",
+          "outputs": [
+            {
+              "internalType": "uint16",
+              "name": "",
+              "type": "uint16"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint8",
+              "name": "fee",
+              "type": "uint8"
+            }
+          ],
+          "name": "setDSFee",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint8",
+              "name": "feeThreshold",
+              "type": "uint8"
+            }
+          ],
+          "name": "setDSFeeThreshold",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "_feeNum",
+              "type": "uint16"
+            }
+          ],
+          "name": "setFeeNum",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_feeTo",
+              "type": "address"
+            }
+          ],
+          "name": "setFeeTo",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_feeToSetter",
+              "type": "address"
+            }
+          ],
+          "name": "setFeeToSetter",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "factory",
+              "type": "address"
+            }
+          ],
+          "name": "setGSFactory",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint8",
+              "name": "fee",
+              "type": "uint8"
+            }
+          ],
+          "name": "setGSFee",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint16",
+              "name": "protocolId",
+              "type": "uint16"
+            }
+          ],
+          "name": "setGSProtocolId",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_gammaPoolSetter",
+              "type": "address"
+            }
+          ],
+          "name": "setGammaPoolSetter",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenA",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenB",
+              "type": "address"
+            }
+          ],
+          "name": "updateGammaPool",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {},
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {},
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/DeltaSwapFactory.sol": "DeltaSwapFactory"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":eth-gas-reporter/=eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":hardhat/=hardhat/"
+      ]
+    },
+    "sources": {
+      "@gammaswap/v1-core/contracts/interfaces/IGammaPoolFactory.sol": {
+        "keccak256": "0x231ce3e5b195b5c640193f20f661a97abfda1ff1371f6a7252c2204171077fa3",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://41e4a047f22964b5505a5aea467942050efd74d7ab9af76d40513552ac4503c4",
+          "dweb:/ipfs/QmS1kZCReGvgTtPZenmL8NBwt4zFi9gW8KkLyXXR4BWzij"
+        ]
+      },
+      "@gammaswap/v1-core/contracts/libraries/AddressCalculator.sol": {
+        "keccak256": "0xe5adeb92b5eee037b0c1416d7d3ff3625da4e5b35dd0885a82439fc5f22bd37b",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://94b5820d0b2e9c165d210544293ac7da3bf411a1a964d045193d9345650cd51f",
+          "dweb:/ipfs/QmeFkJhMeTJauekAqddownqFt4R8K3d3eMBykxQuimwmQi"
+        ]
+      },
+      "contracts/DeltaSwapERC20.sol": {
+        "keccak256": "0xd56a82c496463a1816392edc611ed634cf1db040f1ad04f4f68187923c323861",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://7cc5e70d118d63ce19a79c5d4c8d20c4e551763f3d30d7c0b6449536d9c3b372",
+          "dweb:/ipfs/QmZ7Fzgq1tKbs23sq3QtX3asZV819HgEeFVA9G2r5xkycn"
+        ]
+      },
+      "contracts/DeltaSwapFactory.sol": {
+        "keccak256": "0xe5bb9ccd4e6e32f364b5a03743482da7278d9a6f634e44c776298217830f7d7e",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://c68c63baa6779734aa8c842dc0b2c7f59570445840dd49481be81a3c4d7b6152",
+          "dweb:/ipfs/QmbWsBg5Chd5SzoUEZaNxXVcTQLEaG9wnyMdp2AZ6NmTjB"
+        ]
+      },
+      "contracts/DeltaSwapPair.sol": {
+        "keccak256": "0x2cc4ace06d2404a70a471211adeeb0cb1b40930d49c8b26f8e5ef21c46b8a1a7",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://1eb4c5ffb69398ff3f93e1ecd8f857bd4b86e9a9f53fa3b01a5b0458ad282be3",
+          "dweb:/ipfs/QmYftcJtitKnpKyP6yz8KLtGhH6SGF1itatDf49oShZ2xE"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapCallee.sol": {
+        "keccak256": "0xa07409e5b10064f822804d2f7cb375e48ccef55552c4a6a7c333a0059e2d6ad4",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://9a9b2febcf44ddb1b0ab8dc6070dea703f67926f66ecbd9e1712b7f8ab26a127",
+          "dweb:/ipfs/QmVmSU4tKMdLHS8p22JAFaquXarErY81H5L91CraRDFe6U"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapERC20.sol": {
+        "keccak256": "0x1bf3a0c046750fbdb2b6ec0901395beafa44932f8f155a99606ccfcecdb34a10",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://024914d4e8fb31728f2605b26c2610cf0615d78453300cc76b35b9b8d2ef609f",
+          "dweb:/ipfs/QmWW7MKqfg4MCNp7RnzaZfmQLKXDPnQcakjWJvW7wvyMW7"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapFactory.sol": {
+        "keccak256": "0x0ea24632300d4858cc24d63a11ba7d2dfaba293cbfc7945d5e21ff6add72afa2",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://fcc39f24559895dfd75381497ea25b44d510d5145a2bc69b5eebd99769f5127e",
+          "dweb:/ipfs/QmRVMNSdbFpB55Tu8GbyRjhhWw377Xy7obCcy25u9Vu8Mi"
+        ]
+      },
+      "contracts/interfaces/IDeltaSwapPair.sol": {
+        "keccak256": "0x126ce44f413793b166fbf21917519dddbf80a8c224bf93a9dfd3d0f1f8bc2ee5",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://2dc35270628a20c2357497fce32aaefd4ba6d8a230de9140f14399f83dcc0ffd",
+          "dweb:/ipfs/QmXtxat8j6WjBwWCcmfr435CXKgJssNK2oLtxvu4K21eMw"
+        ]
+      },
+      "contracts/interfaces/IERC20.sol": {
+        "keccak256": "0xc0a999642a4c89714af1eef102cfde9d03f8a24cf9309826086afc238edb0e67",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://e4ed9bf637d6930d4d36ce39b7896f972642b902944c9409a60183d7970c1874",
+          "dweb:/ipfs/QmXuNwgWVnVoKVnhvUsfUzVX6mcVHPZGd1L5b3oWkkY9tT"
+        ]
+      },
+      "contracts/libraries/DSMath.sol": {
+        "keccak256": "0xdc42612402f014f55103c2b999be83516ecce5447ce66b7157bb67efa463ac8f",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://daee6fb29a6e0f6cfa7f90cf83b02c86d86a5aac610061fe6e2fe2b243200aac",
+          "dweb:/ipfs/QmdwhqC1j454v5ijoYMWwMUn6m3EZ6dJRVtwb3tvmQQyq4"
+        ]
+      },
+      "contracts/libraries/DeltaSwapLibrary.sol": {
+        "keccak256": "0x403d7b3570e071e05d274311127ca203e2d99a45b7eecbbcd3df15937713b729",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://a00b89a963cef3cd99178142fc3d9a9823627f317e1cb280977c86e9535cd6cf",
+          "dweb:/ipfs/QmdbkKgGkzF4kfxAQ8JcEZENGwCj1wezjEqx6ggdtB8ZMW"
+        ]
+      },
+      "contracts/libraries/UQ112x112.sol": {
+        "keccak256": "0xe697aab03a0f4db6ad376596cf22f09884c1eea95b00b04b076007c4479c338e",
+        "license": "GPL-v3",
+        "urls": [
+          "bzz-raw://9f738da44a9fec7e588abcf42832b0e98c79a90fe396345cca2ea1a78d107ecc",
+          "dweb:/ipfs/Qmbg6MZ2rdkbW4aNCwi9bkTtsRQUwvnRxKaZfLWzgXHCgT"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.21+commit.d9974bed",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":eth-gas-reporter/=eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":hardhat/=hardhat/"
+      ]
+    },
+    "name": "DeltaSwapFactory",
+    "fullyQualifiedName": "contracts/DeltaSwapFactory.sol:DeltaSwapFactory"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "525812",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T11:31:47Z",
+  "match": "exact_match",
+  "chainId": "42161",
+  "address": "0xCb85E1222f715a81b8edaeB73b28182fa37cffA8"
+}

@@ -1,0 +1,562 @@
+{
+  "sources": {
+    "contracts/ITimelock.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\n/**\n * @dev Interface for interacting with a Timelock\n */\ninterface ITimelock {\n    /// @notice Event emitted when a pending admin accepts admin position\n    event NewAdmin(address indexed newAdmin);\n\n    /// @notice Event emitted when new pending admin is set by the timelock\n    event NewPendingAdmin(address indexed newPendingAdmin);\n\n    /// @notice Event emitted when Timelock sets new delay value\n    event NewDelay(uint indexed newDelay);\n\n    /// @notice Event emitted when admin cancels an enqueued transaction\n    event CancelTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature,  bytes data, uint eta);\n\n    /// @notice Event emitted when admin executes an enqueued transaction\n    event ExecuteTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature,  bytes data, uint eta);\n\n    /// @notice Event emitted when admin enqueues a transaction\n    event QueueTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature, bytes data, uint eta);\n\n    /// @notice The length of time, once the delay has passed, in which a transaction can be executed before it becomes stale\n    function GRACE_PERIOD() virtual external view returns (uint);\n\n    /// @notice The minimum value that the `delay` variable can be set to\n    function MINIMUM_DELAY() virtual external view returns (uint);\n\n    /// @notice The maximum value that the `delay` variable can be set to\n    function MAXIMUM_DELAY() virtual external view returns (uint);\n\n    /// @notice Address that has admin privileges\n    function admin() virtual external view returns (address);\n\n    /// @notice The address that may become the new admin by calling `acceptAdmin()`\n    function pendingAdmin() virtual external view returns (address);\n\n    /**\n     * @notice Set the pending admin\n     * @param pendingAdmin_ New pending admin address\n     */\n    function setPendingAdmin(address pendingAdmin_) virtual external;\n\n    /**\n     * @notice Accept the position of admin (if caller is the current pendingAdmin)\n     */\n    function acceptAdmin() virtual external;\n\n    /// @notice Duration that a transaction must be queued before it can be executed\n    function delay() virtual external view returns (uint);\n\n    /**\n     * @notice Set the delay value\n     * @param delay New delay value\n     */\n    function setDelay(uint delay) virtual external;\n\n    /// @notice Mapping of transaction hashes to whether that transaction is currently enqueued\n    function queuedTransactions(bytes32 txHash) virtual external returns (bool);\n\n    /**\n     * @notice Enque a transaction\n     * @param target Address that the transaction is targeted at\n     * @param value Value to send to target address\n     * @param signature Function signature to call on target address\n     * @param data Calldata for function called on target address\n     * @param eta Timestamp of when the transaction can be executed\n     * @return txHash of the enqueued transaction\n     */\n    function queueTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) virtual external returns (bytes32);\n\n    /**\n     * @notice Cancel an enqueued transaction\n     * @param target Address that the transaction is targeted at\n     * @param value Value of the transaction to cancel\n     * @param signature Function signature of the transaction to cancel\n     * @param data Calldata for the transaction to cancel\n     * @param eta Timestamp of the transaction to cancel\n     */\n    function cancelTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) virtual external;\n\n    /**\n     * @notice Execute an enqueued transaction\n     * @param target Target address of the transaction to execute\n     * @param value Value of the transaction to execute\n     * @param signature Function signature of the transaction to execute\n     * @param data Calldata for the transaction to execute\n     * @param eta Timestamp of the transaction to execute\n     * @return bytes returned from executing transaction\n     */\n    function executeTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) virtual external payable returns (bytes memory);\n}\n"
+    },
+    "contracts/bridges/BaseBridgeReceiver.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\nimport \"../ITimelock.sol\";\n\ncontract BaseBridgeReceiver {\n    /** Custom errors **/\n    error AlreadyInitialized();\n    error BadData();\n    error InvalidProposalId();\n    error InvalidTimelockAdmin();\n    error ProposalNotExecutable();\n    error TransactionAlreadyQueued();\n    error Unauthorized();\n\n    /** Events **/\n    event Initialized(address indexed govTimelock, address indexed localTimelock);\n    event ProposalCreated(address indexed rootMessageSender, uint id, address[] targets, uint[] values, string[] signatures, bytes[] calldatas, uint eta);\n    event ProposalExecuted(uint indexed id);\n\n    /** Public variables **/\n\n    /// @notice Address of the governing contract that this bridge receiver expects to\n    ///  receive messages from; likely an address from another chain (e.g. mainnet)\n    address public govTimelock;\n\n    /// @notice Address of the timelock on this chain that the bridge receiver\n    /// will send messages to\n    address public localTimelock;\n\n    /// @notice Whether contract has been initialized\n    bool public initialized;\n\n    /// @notice Total count of proposals generated\n    uint public proposalCount;\n\n    struct Proposal {\n        uint id;\n        address[] targets;\n        uint[] values;\n        string[] signatures;\n        bytes[] calldatas;\n        uint eta;\n        bool executed;\n    }\n\n    /// @notice Mapping of proposal ids to their full proposal data\n    mapping (uint => Proposal) public proposals;\n\n    enum ProposalState {\n        Queued,\n        Expired,\n        Executed\n    }\n\n    /**\n     * @notice Initialize the contract\n     * @param _govTimelock Address of the governing contract that this contract\n     * will receive messages from (likely on another chain)\n     * @param _localTimelock Address of the timelock contract that this contract\n     * will send messages to\n     */\n    function initialize(address _govTimelock, address _localTimelock) external {\n        if (initialized) revert AlreadyInitialized();\n        if (ITimelock(_localTimelock).admin() != address(this)) revert InvalidTimelockAdmin();\n        govTimelock = _govTimelock;\n        localTimelock = _localTimelock;\n        initialized = true;\n        emit Initialized(_govTimelock, _localTimelock);\n    }\n\n    /**\n     * @notice Process a message sent from the governing timelock (across a bridge)\n     * @param rootMessageSender Address of the contract that sent the bridged message\n     * @param data ABI-encoded bytes containing the transactions to be queued on the local timelock\n     */\n    function processMessage(\n        address rootMessageSender,\n        bytes calldata data\n    ) internal {\n        if (rootMessageSender != govTimelock) revert Unauthorized();\n\n        address[] memory targets;\n        uint256[] memory values;\n        string[] memory signatures;\n        bytes[] memory calldatas;\n\n        (targets, values, signatures, calldatas) = abi.decode(\n            data,\n            (address[], uint256[], string[], bytes[])\n        );\n\n        if (values.length != targets.length) revert BadData();\n        if (signatures.length != targets.length) revert BadData();\n        if (calldatas.length != targets.length) revert BadData();\n\n        uint delay = ITimelock(localTimelock).delay();\n        uint eta = block.timestamp + delay;\n\n        for (uint i = 0; i < targets.length; i++) {\n            if (ITimelock(localTimelock).queuedTransactions(keccak256(abi.encode(targets[i], values[i], signatures[i], calldatas[i], eta)))) revert TransactionAlreadyQueued();\n            ITimelock(localTimelock).queueTransaction(targets[i], values[i], signatures[i], calldatas[i], eta);\n        }\n\n        proposalCount++;\n        Proposal memory proposal = Proposal({\n            id: proposalCount,\n            targets: targets,\n            values: values,\n            signatures: signatures,\n            calldatas: calldatas,\n            eta: eta,\n            executed: false\n        });\n\n        proposals[proposal.id] = proposal;\n        emit ProposalCreated(rootMessageSender, proposal.id, targets, values, signatures, calldatas, eta);\n    }\n\n    /**\n     * @notice Execute a queued proposal\n     * @param proposalId The id of the proposal to execute\n     */\n    function executeProposal(uint proposalId) external {\n        if (state(proposalId) != ProposalState.Queued) revert ProposalNotExecutable();\n        Proposal storage proposal = proposals[proposalId];\n        proposal.executed = true;\n        for (uint i = 0; i < proposal.targets.length; i++) {\n            ITimelock(localTimelock).executeTransaction(proposal.targets[i], proposal.values[i], proposal.signatures[i], proposal.calldatas[i], proposal.eta);\n        }\n        emit ProposalExecuted(proposalId);\n    }\n\n    /**\n     * @notice Get the state of a proposal\n     * @param proposalId Id of the proposal\n     * @return The state of the given proposal (queued, expired or executed)\n     */\n    function state(uint proposalId) public view returns (ProposalState) {\n        if (proposalId > proposalCount || proposalId == 0) revert InvalidProposalId();\n        Proposal memory proposal = proposals[proposalId];\n        if (proposal.executed) {\n            return ProposalState.Executed;\n        } else if (block.timestamp > (proposal.eta + ITimelock(localTimelock).GRACE_PERIOD())) {\n            return ProposalState.Expired;\n        } else {\n            return ProposalState.Queued;\n        }\n    }\n}"
+    },
+    "contracts/bridges/polygon/IFxMessageProcessor.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\n// IFxMessageProcessor represents interface to process message\ninterface IFxMessageProcessor {\n    function processMessageFromRoot(\n        uint256 stateId,\n        address rootMessageSender,\n        bytes calldata data\n    ) external;\n}"
+    },
+    "contracts/bridges/polygon/PolygonBridgeReceiver.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\nimport \"./IFxMessageProcessor.sol\";\nimport \"../BaseBridgeReceiver.sol\";\n\ncontract PolygonBridgeReceiver is IFxMessageProcessor, BaseBridgeReceiver {\n    error InvalidChild();\n\n    event NewFxChild(address indexed oldFxChild, address indexed newFxChild);\n\n    /// @notice Address of Polygon's bridged message receiver\n    address public fxChild;\n\n    /**\n     * @notice Construct a new PolygonBridgeReceiver instance\n     * @param _fxChild Address of Polygon bridged message receiver\n     **/\n    constructor(address _fxChild) {\n        fxChild = _fxChild;\n    }\n\n    /**\n     * @notice Update the fxChild address\n     * @param newFxChild New value for fxAddress\n     */\n    function changeFxChild(address newFxChild) public {\n        if (msg.sender != localTimelock) revert Unauthorized();\n        address oldFxChild = fxChild;\n        fxChild = newFxChild;\n        emit NewFxChild(oldFxChild, newFxChild);\n    }\n\n    /**\n     * @notice Receive bridged message and enqueue in the Timelock\n     * @param stateId Value provided by fxChild when function is called; ignored\n     * @param rootMessageSender Mainnet address that initiated the bridged message\n     * @param data ABI-encoded data of the bridged message\n     */\n    function processMessageFromRoot(\n        uint256 stateId,\n        address rootMessageSender,\n        bytes calldata data\n    ) public override {\n        if (msg.sender != fxChild) revert InvalidChild();\n        processMessage(rootMessageSender, data);\n    }\n}"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.15+commit.e14f2714"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_fxChild",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "AlreadyInitialized",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "BadData",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidChild",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidProposalId",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidTimelockAdmin",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ProposalNotExecutable",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TransactionAlreadyQueued",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Unauthorized",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "govTimelock",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "localTimelock",
+              "type": "address"
+            }
+          ],
+          "name": "Initialized",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "oldFxChild",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newFxChild",
+              "type": "address"
+            }
+          ],
+          "name": "NewFxChild",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rootMessageSender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "address[]",
+              "name": "targets",
+              "type": "address[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "values",
+              "type": "uint256[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "string[]",
+              "name": "signatures",
+              "type": "string[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes[]",
+              "name": "calldatas",
+              "type": "bytes[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "eta",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalCreated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalExecuted",
+          "type": "event"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newFxChild",
+              "type": "address"
+            }
+          ],
+          "name": "changeFxChild",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "executeProposal",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "fxChild",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "govTimelock",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_govTimelock",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_localTimelock",
+              "type": "address"
+            }
+          ],
+          "name": "initialize",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "initialized",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "localTimelock",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "stateId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "rootMessageSender",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "processMessageFromRoot",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "proposalCount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "proposals",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "eta",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "executed",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "state",
+          "outputs": [
+            {
+              "internalType": "enum BaseBridgeReceiver.ProposalState",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "changeFxChild(address)": {
+            "params": {
+              "newFxChild": "New value for fxAddress"
+            }
+          },
+          "constructor": {
+            "params": {
+              "_fxChild": "Address of Polygon bridged message receiver*"
+            }
+          },
+          "executeProposal(uint256)": {
+            "params": {
+              "proposalId": "The id of the proposal to execute"
+            }
+          },
+          "initialize(address,address)": {
+            "params": {
+              "_govTimelock": "Address of the governing contract that this contract will receive messages from (likely on another chain)",
+              "_localTimelock": "Address of the timelock contract that this contract will send messages to"
+            }
+          },
+          "processMessageFromRoot(uint256,address,bytes)": {
+            "params": {
+              "data": "ABI-encoded data of the bridged message",
+              "rootMessageSender": "Mainnet address that initiated the bridged message",
+              "stateId": "Value provided by fxChild when function is called; ignored"
+            }
+          },
+          "state(uint256)": {
+            "params": {
+              "proposalId": "Id of the proposal"
+            },
+            "returns": {
+              "_0": "The state of the given proposal (queued, expired or executed)"
+            }
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "AlreadyInitialized()": [
+            {
+              "notice": "Custom errors *"
+            }
+          ]
+        },
+        "events": {
+          "Initialized(address,address)": {
+            "notice": "Events *"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "changeFxChild(address)": {
+            "notice": "Update the fxChild address"
+          },
+          "constructor": {
+            "notice": "Construct a new PolygonBridgeReceiver instance"
+          },
+          "executeProposal(uint256)": {
+            "notice": "Execute a queued proposal"
+          },
+          "fxChild()": {
+            "notice": "Address of Polygon's bridged message receiver"
+          },
+          "govTimelock()": {
+            "notice": "Address of the governing contract that this bridge receiver expects to  receive messages from; likely an address from another chain (e.g. mainnet)"
+          },
+          "initialize(address,address)": {
+            "notice": "Initialize the contract"
+          },
+          "initialized()": {
+            "notice": "Whether contract has been initialized"
+          },
+          "localTimelock()": {
+            "notice": "Address of the timelock on this chain that the bridge receiver will send messages to"
+          },
+          "processMessageFromRoot(uint256,address,bytes)": {
+            "notice": "Receive bridged message and enqueue in the Timelock"
+          },
+          "proposalCount()": {
+            "notice": "Total count of proposals generated"
+          },
+          "proposals(uint256)": {
+            "notice": "Mapping of proposal ids to their full proposal data"
+          },
+          "state(uint256)": {
+            "notice": "Get the state of a proposal"
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/bridges/polygon/PolygonBridgeReceiver.sol": "PolygonBridgeReceiver"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "inliner": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": true,
+          "yulDetails": {
+            "optimizerSteps": "dhfoDgvulfnTUtnIf [xa[r]scLM cCTUtTOntnfDIul Lcul Vcul [j] Tpeul xa[rul] xa[r]cL gvif CTUca[r]LsTOtfDnca[r]Iulc] jmul[jul] VcTOcul jmul",
+            "stackAllocation": true
+          }
+        },
+        "runs": 1
+      },
+      "remappings": [],
+      "viaIR": true
+    },
+    "sources": {
+      "contracts/ITimelock.sol": {
+        "keccak256": "0x42b2e0fc37eed207eebf011cb8aa8006f1f75451540ea681d24e9b9a20594165",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://ff9ddcf38543c7a77c142fa49b6ff1ce32fb88d3bea17fea29c64de211a73dce",
+          "dweb:/ipfs/QmSef1fHRbgomFzpLG9mpGrDkaYEVsDjJWUXTbsqtPf5h6"
+        ]
+      },
+      "contracts/bridges/BaseBridgeReceiver.sol": {
+        "keccak256": "0x088d8bbe0ee6830ff8fb20ce2989b1299b134775b2b69e72856df9aa0eee3018",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://731134f9ab2a5e7da668eb894b0ffe3061cd5a4350cc7380762686b638883974",
+          "dweb:/ipfs/QmWDgSHMrcfwbNxi8FHHBKm1cGyt3ZcP1wYyu33k2wh2tu"
+        ]
+      },
+      "contracts/bridges/polygon/IFxMessageProcessor.sol": {
+        "keccak256": "0x2ddac9b3c5a4c0d036530e7bc61cd3f99810b6bda51d1c04fba537c3feb801f2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://10dd65490e66932c85a648df21944cde6c177258876a5b489bf93e256aa8aa78",
+          "dweb:/ipfs/QmaY9HjbpwPgwrjB6xMid49rmysLWEK4TJawAXRvdhCieJ"
+        ]
+      },
+      "contracts/bridges/polygon/PolygonBridgeReceiver.sol": {
+        "keccak256": "0xfb9c69954338919a2bdab7a2b18be72717bfc09b3e10353b89f50c7943be736d",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://c1f6961b3b2442c249493c7f8b6a544c62b7370e35e86415ba731a590577f0d6",
+          "dweb:/ipfs/QmUYTDwaBrHPuRvXfBKdfFLPPobS6NavkrjoMxYPcNeMey"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.15+commit.e14f2714",
+    "compilerSettings": {
+      "viaIR": true,
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 1,
+        "details": {
+          "cse": true,
+          "yul": true,
+          "inliner": true,
+          "peephole": true,
+          "yulDetails": {
+            "optimizerSteps": "dhfoDgvulfnTUtnIf [xa[r]scLM cCTUtTOntnfDIul Lcul Vcul [j] Tpeul xa[rul] xa[r]cL gvif CTUca[r]LsTOtfDnca[r]Iulc] jmul[jul] VcTOcul jmul",
+            "stackAllocation": true
+          },
+          "deduplicate": true,
+          "orderLiterals": true,
+          "jumpdestRemover": true,
+          "constantOptimizer": true
+        }
+      },
+      "evmVersion": "london",
+      "remappings": []
+    },
+    "name": "PolygonBridgeReceiver",
+    "fullyQualifiedName": "contracts/bridges/polygon/PolygonBridgeReceiver.sol:PolygonBridgeReceiver"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "5382183",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-09-17T14:12:39Z",
+  "match": "exact_match",
+  "chainId": "137",
+  "address": "0x18281dfC4d00905DA1aaA6731414EABa843c468A"
+}
