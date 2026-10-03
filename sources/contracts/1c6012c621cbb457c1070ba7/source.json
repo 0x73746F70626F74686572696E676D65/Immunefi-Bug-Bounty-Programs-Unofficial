@@ -1,0 +1,815 @@
+{
+  "sources": {
+    "contracts/Governed.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.16;\n\n/**\n * @title Graph Governance contract\n * @dev Allows a contract to be owned and controlled by the 'governor'\n */\ncontract Governed {\n    // -- State --\n\n    // The address of the governor\n    address public governor;\n    // The address of the pending governor\n    address public pendingGovernor;\n\n    // -- Events --\n\n    // Emit when the pendingGovernor state variable is updated\n    event NewPendingOwnership(address indexed from, address indexed to);\n    // Emit when the governor state variable is updated\n    event NewOwnership(address indexed from, address indexed to);\n\n    /**\n     * @dev Check if the caller is the governor.\n     */\n    modifier onlyGovernor() {\n        require(msg.sender == governor, \"Only Governor can call\");\n        _;\n    }\n\n    /**\n     * @dev Initialize the governor with the _initGovernor param.\n     * @param _initGovernor Governor address\n     */\n    constructor(address _initGovernor) {\n        require(_initGovernor != address(0), \"Governor must not be 0\");\n        governor = _initGovernor;\n    }\n\n    /**\n     * @dev Admin function to begin change of governor. The `_newGovernor` must call\n     * `acceptOwnership` to finalize the transfer.\n     * @param _newGovernor Address of new `governor`\n     */\n    function transferOwnership(address _newGovernor) external onlyGovernor {\n        require(_newGovernor != address(0), \"Governor must be set\");\n\n        address oldPendingGovernor = pendingGovernor;\n        pendingGovernor = _newGovernor;\n\n        emit NewPendingOwnership(oldPendingGovernor, pendingGovernor);\n    }\n\n    /**\n     * @dev Admin function for pending governor to accept role and update governor.\n     * This function must called by the pending governor.\n     */\n    function acceptOwnership() external {\n        require(pendingGovernor != address(0) && msg.sender == pendingGovernor, \"Caller must be pending governor\");\n\n        address oldGovernor = governor;\n        address oldPendingGovernor = pendingGovernor;\n\n        governor = pendingGovernor;\n        pendingGovernor = address(0);\n\n        emit NewOwnership(oldGovernor, governor);\n        emit NewPendingOwnership(oldPendingGovernor, pendingGovernor);\n    }\n}\n"
+    },
+    "contracts/IBilling.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.16;\n\ninterface IBilling {\n    /**\n     * @dev Set or unset an address as an allowed Collector\n     * @param _collector  Collector address\n     * @param _enabled True to set the _collector address as a Collector, false to remove it\n     */\n    function setCollector(address _collector, bool _enabled) external; // onlyGovernor\n\n    /**\n     * @dev Sets the L2 token gateway address\n     * @param _l2TokenGateway New address for the L2 token gateway\n     */\n    function setL2TokenGateway(address _l2TokenGateway) external;\n\n    /**\n     * @dev Sets the L1 Billing Connector address\n     * @param _l1BillingConnector New address for the L1 BillingConnector (without any aliasing!)\n     */\n    function setL1BillingConnector(address _l1BillingConnector) external;\n\n    /**\n     * @dev Add tokens into the billing contract\n     * @param _amount  Amount of tokens to add\n     */\n    function add(uint256 _amount) external;\n\n    /**\n     * @dev Add tokens into the billing contract for any user\n     * @param _to  Address that tokens are being added to\n     * @param _amount  Amount of tokens to add\n     */\n    function addTo(address _to, uint256 _amount) external;\n\n    /**\n     * @dev Receive tokens with a callhook from the Arbitrum GRT bridge\n     * Expects an `address user` in the encoded _data.\n     * @param _from Token sender in L1\n     * @param _amount Amount of tokens that were transferred\n     * @param _data ABI-encoded callhook data: contains address that tokens are being added to\n     */\n    function onTokenTransfer(\n        address _from,\n        uint256 _amount,\n        bytes calldata _data\n    ) external;\n\n    /**\n     * @dev Remove tokens from the billing contract, from L1\n     * This can only be called from the BillingConnector on L1.\n     * @param _from  Address from which the tokens are removed\n     * @param _to Address to send the tokens\n     * @param _amount  Amount of tokens to remove\n     */\n    function removeFromL1(\n        address _from,\n        address _to,\n        uint256 _amount\n    ) external;\n\n    /**\n     * @dev Add tokens into the billing contract in bulk\n     * Ensure graphToken.approve() is called on the billing contract first\n     * @param _to  Array of addresses where to add tokens\n     * @param _amount  Array of amount of tokens to add to each account\n     */\n    function addToMany(address[] calldata _to, uint256[] calldata _amount) external;\n\n    /**\n     * @dev Remove tokens from the billing contract\n     * Tokens will be removed from the sender's balance\n     * @param _to  Address that tokens are being moved to\n     * @param _amount  Amount of tokens to remove\n     */\n    function remove(address _to, uint256 _amount) external;\n\n    /**\n     * @dev Collector pulls tokens from the billing contract\n     * @param _user  Address that tokens are being pulled from\n     * @param _amount  Amount of tokens to pull\n     * @param _to Destination to send pulled tokens\n     */\n    function pull(\n        address _user,\n        uint256 _amount,\n        address _to\n    ) external;\n\n    /**\n     * @dev Collector pulls tokens from many users in the billing contract\n     * @param _users  Addresses that tokens are being pulled from\n     * @param _amounts  Amounts of tokens to pull from each user\n     * @param _to Destination to send pulled tokens\n     */\n    function pullMany(\n        address[] calldata _users,\n        uint256[] calldata _amounts,\n        address _to\n    ) external;\n}\n"
+    },
+    "contracts/Rescuable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.16;\n\nimport { IERC20 } from \"@openzeppelin/contracts/token/ERC20/IERC20.sol\";\n\n/**\n * @title Rescuable contract\n * @dev Allows a contract to have a function to rescue tokens sent by mistake.\n * The contract must implement the external rescueTokens function or similar,\n * that calls this contract's _rescueTokens.\n */\ncontract Rescuable {\n    /**\n     * @dev Tokens rescued by the permissioned user\n     */\n    event TokensRescued(address indexed to, address indexed token, uint256 amount);\n\n    /**\n     * @dev Allows a permissioned user to rescue any ERC20 tokens sent to this contract by accident\n     * @param _to  Destination address to send the tokens\n     * @param _token  Token address of the token that was accidentally sent to the contract\n     * @param _amount  Amount of tokens to pull\n     */\n    function _rescueTokens(\n        address _to,\n        address _token,\n        uint256 _amount\n    ) internal {\n        require(_to != address(0), \"Cannot send to address(0)\");\n        require(_amount != 0, \"Cannot rescue 0 tokens\");\n        IERC20 token = IERC20(_token);\n        require(token.transfer(_to, _amount), \"Rescue tokens failed\");\n        emit TokensRescued(_to, _token, _amount);\n    }\n}\n"
+    },
+    "contracts/arbitrum/IInbox.sol": {
+      "content": "// SPDX-License-Identifier: Apache-2.0\n\n/*\n * Copyright 2021, Offchain Labs, Inc.\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *    http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n *\n * Originally copied from:\n * https://github.com/OffchainLabs/arbitrum/tree/e3a6307ad8a2dc2cad35728a2a9908cfd8dd8ef9/packages/arb-bridge-eth\n *\n * MODIFIED from Offchain Labs' implementation:\n * - Changed solidity version to 0.8.16 (pablo@edgeandnode.com)\n *\n */\n\npragma solidity ^0.8.16;\n\nimport \"./IBridge.sol\";\nimport \"./IMessageProvider.sol\";\n\ninterface IInbox is IMessageProvider {\n    function sendL2Message(bytes calldata messageData) external returns (uint256);\n\n    function sendUnsignedTransaction(\n        uint256 maxGas,\n        uint256 gasPriceBid,\n        uint256 nonce,\n        address destAddr,\n        uint256 amount,\n        bytes calldata data\n    ) external returns (uint256);\n\n    function sendContractTransaction(\n        uint256 maxGas,\n        uint256 gasPriceBid,\n        address destAddr,\n        uint256 amount,\n        bytes calldata data\n    ) external returns (uint256);\n\n    function sendL1FundedUnsignedTransaction(\n        uint256 maxGas,\n        uint256 gasPriceBid,\n        uint256 nonce,\n        address destAddr,\n        bytes calldata data\n    ) external payable returns (uint256);\n\n    function sendL1FundedContractTransaction(\n        uint256 maxGas,\n        uint256 gasPriceBid,\n        address destAddr,\n        bytes calldata data\n    ) external payable returns (uint256);\n\n    function createRetryableTicket(\n        address destAddr,\n        uint256 arbTxCallValue,\n        uint256 maxSubmissionCost,\n        address submissionRefundAddress,\n        address valueRefundAddress,\n        uint256 maxGas,\n        uint256 gasPriceBid,\n        bytes calldata data\n    ) external payable returns (uint256);\n\n    function depositEth(uint256 maxSubmissionCost) external payable returns (uint256);\n\n    function bridge() external view returns (IBridge);\n\n    function pauseCreateRetryables() external;\n\n    function unpauseCreateRetryables() external;\n\n    function startRewriteAddress() external;\n\n    function stopRewriteAddress() external;\n}\n"
+    },
+    "contracts/BillingConnector.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.16;\n\nimport { IERC20 } from \"@openzeppelin/contracts/token/ERC20/IERC20.sol\";\nimport { IBilling } from \"./IBilling.sol\";\nimport { IBillingConnector } from \"./IBillingConnector.sol\";\nimport { Governed } from \"./Governed.sol\";\nimport { ITokenGateway } from \"arb-bridge-peripherals/contracts/tokenbridge/libraries/gateway/ITokenGateway.sol\";\nimport { Rescuable } from \"./Rescuable.sol\";\nimport { IERC20WithPermit } from \"./IERC20WithPermit.sol\";\nimport { L1ArbitrumMessenger } from \"./arbitrum/L1ArbitrumMessenger.sol\";\n\n/**\n * @title Billing Connector Contract\n * @dev The billing contract allows for Graph Tokens to be added by a user. The\n * tokens are immediately sent to the Billing contract on L2 (Arbitrum)\n * through the GRT token bridge.\n */\ncontract BillingConnector is IBillingConnector, Governed, Rescuable, L1ArbitrumMessenger {\n    // -- State --\n    // The contract for interacting with The Graph Token\n    IERC20 private immutable graphToken;\n    // The L1 Token Gateway through which tokens are sent to L2\n    ITokenGateway public l1TokenGateway;\n    // The Billing contract in L2 to which we send tokens\n    address public l2Billing;\n    // The Arbitrum Delayed Inbox address\n    address public inbox;\n\n    /**\n     * @dev Address of the L1 token gateway was updated\n     */\n    event L1TokenGatewayUpdated(address l1TokenGateway);\n    /**\n     * @dev Address of the L2 Billing contract was updated\n     */\n    event L2BillingUpdated(address l2Billing);\n    /**\n     * @dev Address of the Arbitrum Inbox contract was updated\n     */\n    event ArbitrumInboxUpdated(address inbox);\n    /**\n     * @dev Tokens sent to the Billing contract on L2\n     */\n    event TokensSentToL2(address indexed _from, address indexed _to, uint256 _amount);\n    /**\n     * @dev Request sent to the Billing contract on L2 to remove tokens from the balance\n     */\n    event RemovalRequestSentToL2(address indexed _from, address indexed _to, uint256 _amount);\n\n    /**\n     * @notice Constructor function for BillingConnector\n     * @param _l1TokenGateway   L1GraphTokenGateway address\n     * @param _l2Billing Address of the Billing contract on L2\n     * @param _token     Graph Token address\n     * @param _governor  Governor address\n     * @param _inbox Arbitrum Delayed Inbox address\n     */\n    constructor(\n        address _l1TokenGateway,\n        address _l2Billing,\n        IERC20 _token,\n        address _governor,\n        address _inbox\n    ) Governed(_governor) {\n        _setL1TokenGateway(_l1TokenGateway);\n        _setL2Billing(_l2Billing);\n        _setArbitrumInbox(_inbox);\n        graphToken = _token;\n    }\n\n    /**\n     * @notice Sets the L1 token gateway address\n     * @param _l1TokenGateway New address for the L1 token gateway\n     */\n    function setL1TokenGateway(address _l1TokenGateway) external override onlyGovernor {\n        _setL1TokenGateway(_l1TokenGateway);\n    }\n\n    /**\n     * @notice Sets the L2 Billing address\n     * @param _l2Billing New address for the L2 Billing contract\n     */\n    function setL2Billing(address _l2Billing) external override onlyGovernor {\n        _setL2Billing(_l2Billing);\n    }\n\n    /**\n     * @notice Sets the Arbitrum Delayed Inbox address\n     * @param _inbox New address for the Arbitrum Delayed Inbox\n     */\n    function setArbitrumInbox(address _inbox) external override onlyGovernor {\n        _setArbitrumInbox(_inbox);\n    }\n\n    /**\n     * @notice Add tokens into the billing contract on L2, for any user\n     * @dev Ensure graphToken.approve() is called for the BillingConnector contract first\n     * @param _to  Address that tokens are being added to\n     * @param _amount  Amount of tokens to add\n     * @param _maxGas Max gas for the L2 retryable ticket execution\n     * @param _gasPriceBid Gas price for the L2 retryable ticket execution\n     * @param _maxSubmissionCost Max submission price for the L2 retryable ticket\n     */\n    function addToL2(\n        address _to,\n        uint256 _amount,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        uint256 _maxSubmissionCost\n    ) external payable override {\n        require(_amount != 0, \"Must add more than 0\");\n        require(_to != address(0), \"destination != 0\");\n        _addToL2(msg.sender, _to, _amount, _maxGas, _gasPriceBid, _maxSubmissionCost);\n    }\n\n    /**\n     * @notice Remove tokens from the billing contract on L2, sending the tokens\n     * to an L2 address\n     * @dev Useful when the tokens are in the balance for an address\n     * that doesn't exist in L2.\n     * Keep in mind there's no guarantee that the transaction will succeed in L2,\n     * e.g. if the sender doesn't actually have enough balance there.\n     * @param _to  L2 address to which the tokens (and any surplus ETH) will be sent\n     * @param _amount  Amount of tokens to remove\n     * @param _maxGas Max gas for the L2 retryable ticket execution\n     * @param _gasPriceBid Gas price for the L2 retryable ticket execution\n     * @param _maxSubmissionCost Max submission price for the L2 retryable ticket\n     */\n    function removeOnL2(\n        address _to,\n        uint256 _amount,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        uint256 _maxSubmissionCost\n    ) external payable override {\n        require(_amount != 0, \"Must remove more than 0\");\n        require(_to != address(0), \"destination != 0\");\n        // Callers of this function should generally be L1 contracts\n        // (e.g. multisigs) that don't exist in L2, so the destination\n        // must be some other address.\n        require(_to != msg.sender, \"destination != sender\");\n\n        bytes memory l2Calldata = abi.encodeWithSelector(IBilling.removeFromL1.selector, msg.sender, _to, _amount);\n\n        // The bridge will validate msg.value and submission cost later, but at least fail early\n        // if no submission cost is supplied.\n        require(_maxSubmissionCost != 0, \"Submission cost must be > 0\");\n        L2GasParams memory gasParams = L2GasParams(_maxSubmissionCost, _maxGas, _gasPriceBid);\n\n        sendTxToL2(inbox, l2Billing, _to, msg.value, 0, gasParams, l2Calldata);\n        emit RemovalRequestSentToL2(msg.sender, _to, _amount);\n    }\n\n    /**\n     * @notice Add tokens into the billing contract on L2 using a signed permit\n     * @dev _user must be the msg.sender\n     * @param _user Address of the current owner of the tokens, that will also be the destination in L2\n     * @param _amount  Amount of tokens to add\n     * @param _maxGas Max gas for the L2 retryable ticket execution\n     * @param _gasPriceBid Gas price for the L2 retryable ticket execution\n     * @param _maxSubmissionCost Max submission price for the L2 retryable ticket\n     * @param _deadline Expiration time of the signed permit\n     * @param _v Signature recovery id\n     * @param _r Signature r value\n     * @param _s Signature s value\n     */\n    function addToL2WithPermit(\n        address _user,\n        uint256 _amount,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        uint256 _maxSubmissionCost,\n        uint256 _deadline,\n        uint8 _v,\n        bytes32 _r,\n        bytes32 _s\n    ) external payable override {\n        require(_amount != 0, \"Must add more than 0\");\n        require(_user != address(0), \"destination != 0\");\n        require(_user == msg.sender, \"Only tokens owner can call\");\n        _permit(_user, address(this), _amount, _deadline, _v, _r, _s);\n        _addToL2(_user, _user, _amount, _maxGas, _gasPriceBid, _maxSubmissionCost);\n    }\n\n    /**\n     * @notice Allows the Governor to rescue any ERC20 tokens sent to this contract by accident\n     * @param _to  Destination address to send the tokens\n     * @param _token  Token address of the token that was accidentally sent to the contract\n     * @param _amount  Amount of tokens to pull\n     */\n    function rescueTokens(\n        address _to,\n        address _token,\n        uint256 _amount\n    ) external override onlyGovernor {\n        _rescueTokens(_to, _token, _amount);\n    }\n\n    /**\n     * @dev Add tokens into the billing contract on L2, for any user\n     * Ensure graphToken.approve() or graphToken.permit() is called for the BillingConnector contract first\n     * @param _owner Address of the current owner of the tokens\n     * @param _to  Address that tokens are being added to\n     * @param _amount  Amount of tokens to add\n     * @param _maxGas Max gas for the L2 retryable ticket execution\n     * @param _gasPriceBid Gas price for the L2 retryable ticket execution\n     * @param _maxSubmissionCost Max submission price for the L2 retryable ticket\n     */\n    function _addToL2(\n        address _owner,\n        address _to,\n        uint256 _amount,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        uint256 _maxSubmissionCost\n    ) internal {\n        graphToken.transferFrom(_owner, address(this), _amount);\n\n        bytes memory extraData = abi.encode(_to);\n        bytes memory data = abi.encode(_maxSubmissionCost, extraData);\n\n        graphToken.approve(address(l1TokenGateway), _amount);\n        l1TokenGateway.outboundTransfer{ value: msg.value }(\n            address(graphToken),\n            l2Billing,\n            _amount,\n            _maxGas,\n            _gasPriceBid,\n            data\n        );\n\n        emit TokensSentToL2(_owner, _to, _amount);\n    }\n\n    /**\n     * @dev Sets the L1 token gateway address\n     * @param _l1TokenGateway New address for the L1 token gateway\n     */\n    function _setL1TokenGateway(address _l1TokenGateway) internal {\n        require(_l1TokenGateway != address(0), \"L1 Token Gateway cannot be 0\");\n        l1TokenGateway = ITokenGateway(_l1TokenGateway);\n        emit L1TokenGatewayUpdated(_l1TokenGateway);\n    }\n\n    /**\n     * @dev Sets the L2 Billing address\n     * @param _l2Billing New address for the L2 Billing contract\n     */\n    function _setL2Billing(address _l2Billing) internal {\n        require(_l2Billing != address(0), \"L2 Billing cannot be zero\");\n        l2Billing = _l2Billing;\n        emit L2BillingUpdated(_l2Billing);\n    }\n\n    /**\n     * @dev Sets the Arbitrum Delayed Inbox address\n     * @param _inbox New address for the Arbitrum Delayed Inbox\n     */\n    function _setArbitrumInbox(address _inbox) internal {\n        require(_inbox != address(0), \"Arbitrum Inbox cannot be zero\");\n        inbox = _inbox;\n        emit ArbitrumInboxUpdated(_inbox);\n    }\n\n    /**\n     * @dev Approve token allowance by validating a message signed by the holder, if permit\n     * fails check for existing allowance before reverting transaction.\n     * @param _owner Address of the token holder\n     * @param _spender Address of the approved spender\n     * @param _value Amount of tokens to approve the spender\n     * @param _deadline Expiration time of the signed permit (if zero, the permit will never expire, so use with caution)\n     * @param _v Signature recovery id\n     * @param _r Signature r value\n     * @param _s Signature s value\n     */\n    function _permit(\n        address _owner,\n        address _spender,\n        uint256 _value,\n        uint256 _deadline,\n        uint8 _v,\n        bytes32 _r,\n        bytes32 _s\n    ) internal {\n        IERC20WithPermit token = IERC20WithPermit(address(graphToken));\n        // Try permit() before allowance check to advance nonce if possible\n        try token.permit(_owner, _spender, _value, _deadline, _v, _r, _s) {\n            return;\n        } catch Error(string memory reason) {\n            // Check for existing allowance before reverting\n            if (token.allowance(_owner, _spender) >= _value) {\n                return;\n            }\n\n            revert(reason);\n        }\n    }\n}\n"
+    },
+    "contracts/IERC20WithPermit.sol": {
+      "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.8.16;\n\nimport { IERC20 } from \"@openzeppelin/contracts/token/ERC20/IERC20.sol\";\n\n/**\n * @title ERC20 with Permit interface\n * @dev This is an ERC20 interface with an additional permit() function\n * that allows approving a user to move tokens using a signed permit.\n * The GraphToken contract implements this function.\n */\ninterface IERC20WithPermit is IERC20 {\n    /**\n     * @dev Approve token allowance by validating a message signed by the holder.\n     * @param _owner Address of the token holder\n     * @param _spender Address of the approved spender\n     * @param _value Amount of tokens to approve the spender\n     * @param _deadline Expiration time of the signed permit (if zero, the permit will never expire, so use with caution)\n     * @param _v Signature recovery id\n     * @param _r Signature r value\n     * @param _s Signature s value\n     */\n    function permit(\n        address _owner,\n        address _spender,\n        uint256 _value,\n        uint256 _deadline,\n        uint8 _v,\n        bytes32 _r,\n        bytes32 _s\n    ) external;\n}\n"
+    },
+    "contracts/arbitrum/IBridge.sol": {
+      "content": "// SPDX-License-Identifier: Apache-2.0\n\n/*\n * Copyright 2021, Offchain Labs, Inc.\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *    http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n *\n * Originally copied from:\n * https://github.com/OffchainLabs/arbitrum/tree/e3a6307ad8a2dc2cad35728a2a9908cfd8dd8ef9/packages/arb-bridge-eth\n *\n * MODIFIED from Offchain Labs' implementation:\n * - Changed solidity version to 0.8.16 (pablo@edgeandnode.com)\n *\n */\n\npragma solidity ^0.8.16;\n\ninterface IBridge {\n    event MessageDelivered(\n        uint256 indexed messageIndex,\n        bytes32 indexed beforeInboxAcc,\n        address inbox,\n        uint8 kind,\n        address sender,\n        bytes32 messageDataHash\n    );\n\n    event BridgeCallTriggered(address indexed outbox, address indexed destAddr, uint256 amount, bytes data);\n\n    event InboxToggle(address indexed inbox, bool enabled);\n\n    event OutboxToggle(address indexed outbox, bool enabled);\n\n    function deliverMessageToInbox(\n        uint8 kind,\n        address sender,\n        bytes32 messageDataHash\n    ) external payable returns (uint256);\n\n    function executeCall(\n        address destAddr,\n        uint256 amount,\n        bytes calldata data\n    ) external returns (bool success, bytes memory returnData);\n\n    // These are only callable by the admin\n    function setInbox(address inbox, bool enabled) external;\n\n    function setOutbox(address inbox, bool enabled) external;\n\n    // View functions\n\n    function activeOutbox() external view returns (address);\n\n    function allowedInboxes(address inbox) external view returns (bool);\n\n    function allowedOutboxes(address outbox) external view returns (bool);\n\n    function inboxAccs(uint256 index) external view returns (bytes32);\n\n    function messageCount() external view returns (uint256);\n}\n"
+    },
+    "contracts/arbitrum/IOutbox.sol": {
+      "content": "// SPDX-License-Identifier: Apache-2.0\n\n/*\n * Copyright 2021, Offchain Labs, Inc.\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *    http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n *\n * Originally copied from:\n * https://github.com/OffchainLabs/arbitrum/tree/e3a6307ad8a2dc2cad35728a2a9908cfd8dd8ef9/packages/arb-bridge-eth\n *\n * MODIFIED from Offchain Labs' implementation:\n * - Changed solidity version to 0.8.16 (pablo@edgeandnode.com)\n *\n */\n\npragma solidity ^0.8.16;\n\ninterface IOutbox {\n    event OutboxEntryCreated(\n        uint256 indexed batchNum,\n        uint256 outboxEntryIndex,\n        bytes32 outputRoot,\n        uint256 numInBatch\n    );\n    event OutBoxTransactionExecuted(\n        address indexed destAddr,\n        address indexed l2Sender,\n        uint256 indexed outboxEntryIndex,\n        uint256 transactionIndex\n    );\n\n    function l2ToL1Sender() external view returns (address);\n\n    function l2ToL1Block() external view returns (uint256);\n\n    function l2ToL1EthBlock() external view returns (uint256);\n\n    function l2ToL1Timestamp() external view returns (uint256);\n\n    function l2ToL1BatchNum() external view returns (uint256);\n\n    function l2ToL1OutputId() external view returns (bytes32);\n\n    function processOutgoingMessages(bytes calldata sendsData, uint256[] calldata sendLengths) external;\n\n    function outboxEntryExists(uint256 batchNum) external view returns (bool);\n}\n"
+    },
+    "contracts/IBillingConnector.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n\npragma solidity ^0.8.16;\n\ninterface IBillingConnector {\n    /**\n     * @dev Sets the L1 token gateway address\n     * @param _l1TokenGateway New address for the L1 token gateway\n     */\n    function setL1TokenGateway(address _l1TokenGateway) external;\n\n    /**\n     * @dev Sets the L2 Billing address\n     * @param _l2Billing New address for the L2 Billing contract\n     */\n    function setL2Billing(address _l2Billing) external;\n\n    /**\n     * @dev Sets the Arbitrum Delayed Inbox address\n     * @param _inbox New address for the L2 Billing contract\n     */\n    function setArbitrumInbox(address _inbox) external;\n\n    /**\n     * @dev Add tokens into the billing contract on L2, for any user\n     * Ensure graphToken.approve() is called for the BillingConnector contract first\n     * @param _to  Address that tokens are being added to\n     * @param _amount  Amount of tokens to add\n     * @param _maxGas Max gas for the L2 retryable ticket execution\n     * @param _gasPriceBid Gas price for the L2 retryable ticket execution\n     * @param _maxSubmissionCost Max submission price for the L2 retryable ticket\n     */\n    function addToL2(\n        address _to,\n        uint256 _amount,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        uint256 _maxSubmissionCost\n    ) external payable;\n\n    /**\n     * @dev Remove tokens from the billing contract on L2, sending the tokens\n     * to an L2 address. Useful when the tokens are in the balance for an address\n     * that doesn't exist in L2.\n     * @param _to  L2 address to which the tokens will be sent\n     * @param _amount  Amount of tokens to remove\n     * @param _maxGas Max gas for the L2 retryable ticket execution\n     * @param _gasPriceBid Gas price for the L2 retryable ticket execution\n     * @param _maxSubmissionCost Max submission price for the L2 retryable ticket\n     */\n    function removeOnL2(\n        address _to,\n        uint256 _amount,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        uint256 _maxSubmissionCost\n    ) external payable;\n\n    /**\n     * @dev Add tokens into the billing contract on L2, for any user, using a signed permit\n     * @param _user Address of the current owner of the tokens, that will also be the destination in L2\n     * @param _amount  Amount of tokens to add\n     * @param _maxGas Max gas for the L2 retryable ticket execution\n     * @param _gasPriceBid Gas price for the L2 retryable ticket execution\n     * @param _maxSubmissionCost Max submission price for the L2 retryable ticket\n     * @param _deadline Expiration time of the signed permit\n     * @param _v Signature recovery id\n     * @param _r Signature r value\n     * @param _s Signature s value\n     */\n    function addToL2WithPermit(\n        address _user,\n        uint256 _amount,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        uint256 _maxSubmissionCost,\n        uint256 _deadline,\n        uint8 _v,\n        bytes32 _r,\n        bytes32 _s\n    ) external payable;\n\n    /**\n     * @dev Allows the Governor to rescue any ERC20 tokens sent to this contract by accident\n     * @param _to  Destination address to send the tokens\n     * @param _token  Token address of the token that was accidentally sent to the contract\n     * @param _amount  Amount of tokens to pull\n     */\n    function rescueTokens(\n        address _to,\n        address _token,\n        uint256 _amount\n    ) external;\n}\n"
+    },
+    "contracts/arbitrum/IMessageProvider.sol": {
+      "content": "// SPDX-License-Identifier: Apache-2.0\n\n/*\n * Copyright 2021, Offchain Labs, Inc.\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *    http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n *\n * Originally copied from:\n * https://github.com/OffchainLabs/arbitrum/tree/e3a6307ad8a2dc2cad35728a2a9908cfd8dd8ef9/packages/arb-bridge-eth\n *\n * MODIFIED from Offchain Labs' implementation:\n * - Changed solidity version to 0.8.16 (pablo@edgeandnode.com)\n *\n */\n\npragma solidity ^0.8.16;\n\ninterface IMessageProvider {\n    event InboxMessageDelivered(uint256 indexed messageNum, bytes data);\n\n    event InboxMessageDeliveredFromOrigin(uint256 indexed messageNum);\n}\n"
+    },
+    "contracts/arbitrum/L1ArbitrumMessenger.sol": {
+      "content": "// SPDX-License-Identifier: Apache-2.0\n\n/*\n * Copyright 2020, Offchain Labs, Inc.\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *    http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n *\n * Originally copied from:\n * https://github.com/OffchainLabs/arbitrum/tree/e3a6307ad8a2dc2cad35728a2a9908cfd8dd8ef9/packages/arb-bridge-peripherals\n *\n * MODIFIED from Offchain Labs' implementation:\n * - Changed solidity version to 0.8.16 (pablo@edgeandnode.com)\n *\n */\n\npragma solidity ^0.8.16;\n\nimport \"./IInbox.sol\";\nimport \"./IOutbox.sol\";\n\n/// @notice L1 utility contract to assist with L1 <=> L2 interactions\n/// @dev this is an abstract contract instead of library so the functions can be easily overriden when testing\nabstract contract L1ArbitrumMessenger {\n    event TxToL2(address indexed _from, address indexed _to, uint256 indexed _seqNum, bytes _data);\n\n    struct L2GasParams {\n        uint256 _maxSubmissionCost;\n        uint256 _maxGas;\n        uint256 _gasPriceBid;\n    }\n\n    function sendTxToL2(\n        address _inbox,\n        address _to,\n        address _user,\n        uint256 _l1CallValue,\n        uint256 _l2CallValue,\n        L2GasParams memory _l2GasParams,\n        bytes memory _data\n    ) internal virtual returns (uint256) {\n        // alternative function entry point when struggling with the stack size\n        return\n            sendTxToL2(\n                _inbox,\n                _to,\n                _user,\n                _l1CallValue,\n                _l2CallValue,\n                _l2GasParams._maxSubmissionCost,\n                _l2GasParams._maxGas,\n                _l2GasParams._gasPriceBid,\n                _data\n            );\n    }\n\n    function sendTxToL2(\n        address _inbox,\n        address _to,\n        address _user,\n        uint256 _l1CallValue,\n        uint256 _l2CallValue,\n        uint256 _maxSubmissionCost,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        bytes memory _data\n    ) internal virtual returns (uint256) {\n        uint256 seqNum = IInbox(_inbox).createRetryableTicket{ value: _l1CallValue }(\n            _to,\n            _l2CallValue,\n            _maxSubmissionCost,\n            _user,\n            _user,\n            _maxGas,\n            _gasPriceBid,\n            _data\n        );\n        emit TxToL2(_user, _to, seqNum, _data);\n        return seqNum;\n    }\n\n    function getBridge(address _inbox) internal view virtual returns (IBridge) {\n        return IInbox(_inbox).bridge();\n    }\n\n    /// @dev the l2ToL1Sender behaves as the tx.origin, the msg.sender should be validated to protect against reentrancies\n    function getL2ToL1Sender(address _inbox) internal view virtual returns (address) {\n        IOutbox outbox = IOutbox(getBridge(_inbox).activeOutbox());\n        address l2ToL1Sender = outbox.l2ToL1Sender();\n\n        require(l2ToL1Sender != address(0), \"NO_SENDER\");\n        return l2ToL1Sender;\n    }\n}\n"
+    },
+    "@openzeppelin/contracts/token/ERC20/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `to`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `from` to `to` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) external returns (bool);\n}\n"
+    },
+    "arb-bridge-peripherals/contracts/tokenbridge/libraries/gateway/ITokenGateway.sol": {
+      "content": "// SPDX-License-Identifier: Apache-2.0\n\n/*\n * Copyright 2020, Offchain Labs, Inc.\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *    http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n */\n\n// solhint-disable-next-line compiler-version\npragma solidity >=0.6.9 <0.9.0;\n\ninterface ITokenGateway {\n    /// @notice event deprecated in favor of DepositInitiated and WithdrawalInitiated\n    // event OutboundTransferInitiated(\n    //     address token,\n    //     address indexed _from,\n    //     address indexed _to,\n    //     uint256 indexed _transferId,\n    //     uint256 _amount,\n    //     bytes _data\n    // );\n\n    /// @notice event deprecated in favor of DepositFinalized and WithdrawalFinalized\n    // event InboundTransferFinalized(\n    //     address token,\n    //     address indexed _from,\n    //     address indexed _to,\n    //     uint256 indexed _transferId,\n    //     uint256 _amount,\n    //     bytes _data\n    // );\n\n    function outboundTransfer(\n        address _token,\n        address _to,\n        uint256 _amount,\n        uint256 _maxGas,\n        uint256 _gasPriceBid,\n        bytes calldata _data\n    ) external payable returns (bytes memory);\n\n    function finalizeInboundTransfer(\n        address _token,\n        address _from,\n        address _to,\n        uint256 _amount,\n        bytes calldata _data\n    ) external payable;\n\n    /**\n     * @notice Calculate the address used when bridging an ERC20 token\n     * @dev the L1 and L2 address oracles may not always be in sync.\n     * For example, a custom token may have been registered but not deploy or the contract self destructed.\n     * @param l1ERC20 address of L1 token\n     * @return L2 address of a bridged ERC20 token\n     */\n    function calculateL2TokenAddress(address l1ERC20) external view returns (address);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.16+commit.07a7930e"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_l1TokenGateway",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_l2Billing",
+              "type": "address"
+            },
+            {
+              "internalType": "contract IERC20",
+              "name": "_token",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_governor",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_inbox",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "inbox",
+              "type": "address"
+            }
+          ],
+          "name": "ArbitrumInboxUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "l1TokenGateway",
+              "type": "address"
+            }
+          ],
+          "name": "L1TokenGatewayUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "l2Billing",
+              "type": "address"
+            }
+          ],
+          "name": "L2BillingUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "from",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            }
+          ],
+          "name": "NewOwnership",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "from",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            }
+          ],
+          "name": "NewPendingOwnership",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_from",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_to",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "RemovalRequestSentToL2",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokensRescued",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_from",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_to",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "_amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokensSentToL2",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_from",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_to",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "_seqNum",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "_data",
+              "type": "bytes"
+            }
+          ],
+          "name": "TxToL2",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "acceptOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxGas",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_gasPriceBid",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxSubmissionCost",
+              "type": "uint256"
+            }
+          ],
+          "name": "addToL2",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_user",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxGas",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_gasPriceBid",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxSubmissionCost",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_deadline",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint8",
+              "name": "_v",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "_r",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "_s",
+              "type": "bytes32"
+            }
+          ],
+          "name": "addToL2WithPermit",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "governor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "inbox",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "l1TokenGateway",
+          "outputs": [
+            {
+              "internalType": "contract ITokenGateway",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "l2Billing",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pendingGovernor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxGas",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_gasPriceBid",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxSubmissionCost",
+              "type": "uint256"
+            }
+          ],
+          "name": "removeOnL2",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_to",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "rescueTokens",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_inbox",
+              "type": "address"
+            }
+          ],
+          "name": "setArbitrumInbox",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_l1TokenGateway",
+              "type": "address"
+            }
+          ],
+          "name": "setL1TokenGateway",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_l2Billing",
+              "type": "address"
+            }
+          ],
+          "name": "setL2Billing",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_newGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "transferOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "details": "The billing contract allows for Graph Tokens to be added by a user. The tokens are immediately sent to the Billing contract on L2 (Arbitrum) through the GRT token bridge.",
+        "events": {
+          "ArbitrumInboxUpdated(address)": {
+            "details": "Address of the Arbitrum Inbox contract was updated"
+          },
+          "L1TokenGatewayUpdated(address)": {
+            "details": "Address of the L1 token gateway was updated"
+          },
+          "L2BillingUpdated(address)": {
+            "details": "Address of the L2 Billing contract was updated"
+          },
+          "RemovalRequestSentToL2(address,address,uint256)": {
+            "details": "Request sent to the Billing contract on L2 to remove tokens from the balance"
+          },
+          "TokensSentToL2(address,address,uint256)": {
+            "details": "Tokens sent to the Billing contract on L2"
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "acceptOwnership()": {
+            "details": "Admin function for pending governor to accept role and update governor. This function must called by the pending governor."
+          },
+          "addToL2(address,uint256,uint256,uint256,uint256)": {
+            "details": "Ensure graphToken.approve() is called for the BillingConnector contract first",
+            "params": {
+              "_amount": "Amount of tokens to add",
+              "_gasPriceBid": "Gas price for the L2 retryable ticket execution",
+              "_maxGas": "Max gas for the L2 retryable ticket execution",
+              "_maxSubmissionCost": "Max submission price for the L2 retryable ticket",
+              "_to": "Address that tokens are being added to"
+            }
+          },
+          "addToL2WithPermit(address,uint256,uint256,uint256,uint256,uint256,uint8,bytes32,bytes32)": {
+            "details": "_user must be the msg.sender",
+            "params": {
+              "_amount": "Amount of tokens to add",
+              "_deadline": "Expiration time of the signed permit",
+              "_gasPriceBid": "Gas price for the L2 retryable ticket execution",
+              "_maxGas": "Max gas for the L2 retryable ticket execution",
+              "_maxSubmissionCost": "Max submission price for the L2 retryable ticket",
+              "_r": "Signature r value",
+              "_s": "Signature s value",
+              "_user": "Address of the current owner of the tokens, that will also be the destination in L2",
+              "_v": "Signature recovery id"
+            }
+          },
+          "constructor": {
+            "params": {
+              "_governor": "Governor address",
+              "_inbox": "Arbitrum Delayed Inbox address",
+              "_l1TokenGateway": "L1GraphTokenGateway address",
+              "_l2Billing": "Address of the Billing contract on L2",
+              "_token": "Graph Token address"
+            }
+          },
+          "removeOnL2(address,uint256,uint256,uint256,uint256)": {
+            "details": "Useful when the tokens are in the balance for an address that doesn't exist in L2. Keep in mind there's no guarantee that the transaction will succeed in L2, e.g. if the sender doesn't actually have enough balance there.",
+            "params": {
+              "_amount": "Amount of tokens to remove",
+              "_gasPriceBid": "Gas price for the L2 retryable ticket execution",
+              "_maxGas": "Max gas for the L2 retryable ticket execution",
+              "_maxSubmissionCost": "Max submission price for the L2 retryable ticket",
+              "_to": "L2 address to which the tokens (and any surplus ETH) will be sent"
+            }
+          },
+          "rescueTokens(address,address,uint256)": {
+            "params": {
+              "_amount": "Amount of tokens to pull",
+              "_to": "Destination address to send the tokens",
+              "_token": "Token address of the token that was accidentally sent to the contract"
+            }
+          },
+          "setArbitrumInbox(address)": {
+            "params": {
+              "_inbox": "New address for the Arbitrum Delayed Inbox"
+            }
+          },
+          "setL1TokenGateway(address)": {
+            "params": {
+              "_l1TokenGateway": "New address for the L1 token gateway"
+            }
+          },
+          "setL2Billing(address)": {
+            "params": {
+              "_l2Billing": "New address for the L2 Billing contract"
+            }
+          },
+          "transferOwnership(address)": {
+            "details": "Admin function to begin change of governor. The `_newGovernor` must call `acceptOwnership` to finalize the transfer.",
+            "params": {
+              "_newGovernor": "Address of new `governor`"
+            }
+          }
+        },
+        "title": "Billing Connector Contract",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "addToL2(address,uint256,uint256,uint256,uint256)": {
+            "notice": "Add tokens into the billing contract on L2, for any user"
+          },
+          "addToL2WithPermit(address,uint256,uint256,uint256,uint256,uint256,uint8,bytes32,bytes32)": {
+            "notice": "Add tokens into the billing contract on L2 using a signed permit"
+          },
+          "constructor": {
+            "notice": "Constructor function for BillingConnector"
+          },
+          "removeOnL2(address,uint256,uint256,uint256,uint256)": {
+            "notice": "Remove tokens from the billing contract on L2, sending the tokens to an L2 address"
+          },
+          "rescueTokens(address,address,uint256)": {
+            "notice": "Allows the Governor to rescue any ERC20 tokens sent to this contract by accident"
+          },
+          "setArbitrumInbox(address)": {
+            "notice": "Sets the Arbitrum Delayed Inbox address"
+          },
+          "setL1TokenGateway(address)": {
+            "notice": "Sets the L1 token gateway address"
+          },
+          "setL2Billing(address)": {
+            "notice": "Sets the L2 Billing address"
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/BillingConnector.sol": "BillingConnector"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": []
+    },
+    "sources": {
+      "@openzeppelin/contracts/token/ERC20/IERC20.sol": {
+        "keccak256": "0x9750c6b834f7b43000631af5cc30001c5f547b3ceb3635488f140f60e897ea6b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5a7d5b1ef5d8d5889ad2ed89d8619c09383b80b72ab226e0fe7bde1636481e34",
+          "dweb:/ipfs/QmebXWgtEfumQGBdVeM6c71McLixYXQP5Bk6kKXuoY4Bmr"
+        ]
+      },
+      "arb-bridge-peripherals/contracts/tokenbridge/libraries/gateway/ITokenGateway.sol": {
+        "keccak256": "0x7f42a524c23dc8b23ed34e8d1b2f462a0d8af89575ff144492af9aa31ddd9ebe",
+        "license": "Apache-2.0",
+        "urls": [
+          "bzz-raw://e0952f7f49d29c3f1af84d1be8c557e9262ad5f667d8c38033f53083e5a4759a",
+          "dweb:/ipfs/QmWhKQob8GKi3ED3zhm6u9A4vMFTMazkmxTcZ7CDUEYv7k"
+        ]
+      },
+      "contracts/BillingConnector.sol": {
+        "keccak256": "0xa606d666ca98610310df76828bb502902e81a97ca7fefd982e90bc372a343d0e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://731cc80cf77b0ab89c7ce8b658378f0b4f94f2e940275cd6e9ac9c10b45c18d0",
+          "dweb:/ipfs/QmUtqJdRJ4rRRQr2yqa1AwCwQVh3SxRjLBkyfbJgsVim2c"
+        ]
+      },
+      "contracts/Governed.sol": {
+        "keccak256": "0x65afd36cc5d3bfa05c2fff6df1a3e9ff871b260ddcb1c71cf2976e7bbda93854",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://69877017d79bdcd330369e41dffa13c7e5be6a539bd061688ff850574cf26f23",
+          "dweb:/ipfs/QmUiE1eZsTH6Kf9jPW1a91zVditr84LqwCwiJh5FUUndG2"
+        ]
+      },
+      "contracts/IBilling.sol": {
+        "keccak256": "0xb0bda5eec7819e572adf191903376a7c63acd35767e8ae45d7a826060e6532b3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4dc9835e638f6f7fe48297896d7affce0be9498aed63746a731f4d5fd5776a69",
+          "dweb:/ipfs/QmeXc4kTA7yNyZAqSbZjuuMsuTD9Y6yT5LWQsZ8ddNmJ5t"
+        ]
+      },
+      "contracts/IBillingConnector.sol": {
+        "keccak256": "0x2dbb242e33e21c736f74f3abd17a40d62e0adbd1d593784b60ccb74fdfaf536f",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://a768e8252d83b3d47778b3ebff6a7c8dd5ac5eda0ef4c31e57d9a75326b91aab",
+          "dweb:/ipfs/QmUEQw2yADGc2qnPbSr6TY8YuMSiyzoTjz9s1gJWWzdwJC"
+        ]
+      },
+      "contracts/IERC20WithPermit.sol": {
+        "keccak256": "0x1ceaf2e359b37072ce38dc9947ac9f790f8feffe44d8b562178932a755e1f1db",
+        "license": "GPL-2.0-or-later",
+        "urls": [
+          "bzz-raw://89d0dcfa8bdcec661a89d5d17a477b457f8c654b43f1ac6986ec875b48c31b14",
+          "dweb:/ipfs/QmdRqWq1JFBecq9gAFn3wjKrtNpg8S34AvdMVBAHFKKmAw"
+        ]
+      },
+      "contracts/Rescuable.sol": {
+        "keccak256": "0x3a1fc8c15282c23610c76d414e88b79bb0fc689134f71a7014e4ea608abfc909",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://01e1f0683f27b5917e51a4f9885279e3fefc008b4237e3d0bac48e13d73447be",
+          "dweb:/ipfs/QmZRLChfmPivzd8aTjZGmevhUR3W6e7CXnQRRBYveyf4gG"
+        ]
+      },
+      "contracts/arbitrum/IBridge.sol": {
+        "keccak256": "0x257166060eb545cf02ce8ac432f1987fe0e85260440dd9106070d791d650891f",
+        "license": "Apache-2.0",
+        "urls": [
+          "bzz-raw://86eb2bb233eb7a7f937c36f73e020441cfcba8916781aa96bed9f9c1f1b55b63",
+          "dweb:/ipfs/QmPDgiGMXGiFhmeAh3PVa8n37KBsEk1k2LkYYCK2pfAmE7"
+        ]
+      },
+      "contracts/arbitrum/IInbox.sol": {
+        "keccak256": "0xb3e634048394a58ce649d52addd8e5c558d4ef11f1f6a2366ef381e0319d9866",
+        "license": "Apache-2.0",
+        "urls": [
+          "bzz-raw://f74059b587029402ef0f579c4c76a59ab470a5635384b0bc4a2964a70520ba73",
+          "dweb:/ipfs/QmTq21RRQSgqr384eNA3oL9oM8twW31fZNHXoVdBPHQmMN"
+        ]
+      },
+      "contracts/arbitrum/IMessageProvider.sol": {
+        "keccak256": "0x9ae427e316e4a7c450069e6badf05b3ff89033db762d7535ac1cd5ece9ba4238",
+        "license": "Apache-2.0",
+        "urls": [
+          "bzz-raw://ff9a006765a8a3817ea34293e4f431f0c8e8e27beda7da8226b755f4dbadefb7",
+          "dweb:/ipfs/QmYH9tUFWDa2zFMLBbVfC8RvX6a3pz3HRRiDTPscfhgWny"
+        ]
+      },
+      "contracts/arbitrum/IOutbox.sol": {
+        "keccak256": "0x584e9479c39a4d33c99980ec90449e9d5f260e60bd2f799c5b87f0f226f03612",
+        "license": "Apache-2.0",
+        "urls": [
+          "bzz-raw://391deff703a8105cb9670c7f1ffd60b9df3a3f5da929312d81f312e0b4c20e3f",
+          "dweb:/ipfs/QmR7Zow8t4P5fVUFSKhtLhtdAfj46d39DQhhgMeisZhuH2"
+        ]
+      },
+      "contracts/arbitrum/L1ArbitrumMessenger.sol": {
+        "keccak256": "0x505b14d637a0340f4b0e9be06dfee15a6a795c3da27ddf1dc16b75cc4a3348ff",
+        "license": "Apache-2.0",
+        "urls": [
+          "bzz-raw://1f2348782c1f0be810f4d502e0a9cdd12d61ca3c8d687a349ce8717828f5b32f",
+          "dweb:/ipfs/Qmco3Ecjj2LC1epXs2kGg8GRfsA98ZFDKnF7ZwY8bkujD5"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.16+commit.07a7930e",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": []
+    },
+    "name": "BillingConnector",
+    "fullyQualifiedName": "contracts/BillingConnector.sol:BillingConnector"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "2023727",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T14:24:29Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0x8017B9AF3F199CC6b08A48DA3859410F20bbea72"
+}

@@ -1,0 +1,591 @@
+{
+  "sources": {
+    "contracts/governance/Governed.sol": {
+      "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.7.6;\n\n/**\n * @title Graph Governance contract\n * @dev All contracts that will be owned by a Governor entity should extend this contract.\n */\nabstract contract Governed {\n    // -- State --\n\n    /// Address of the governor\n    address public governor;\n    /// Address of the new governor that is pending acceptance\n    address public pendingGovernor;\n\n    // -- Events --\n\n    /// Emitted when a new owner/governor has been set, but is pending acceptance\n    event NewPendingOwnership(address indexed from, address indexed to);\n    /// Emitted when a new owner/governor has accepted their role\n    event NewOwnership(address indexed from, address indexed to);\n\n    /**\n     * @dev Check if the caller is the governor.\n     */\n    modifier onlyGovernor() {\n        require(msg.sender == governor, \"Only Governor can call\");\n        _;\n    }\n\n    /**\n     * @dev Initialize the governor for this contract\n     * @param _initGovernor Address of the governor\n     */\n    function _initialize(address _initGovernor) internal {\n        governor = _initGovernor;\n    }\n\n    /**\n     * @notice Admin function to begin change of governor. The `_newGovernor` must call\n     * `acceptOwnership` to finalize the transfer.\n     * @param _newGovernor Address of new `governor`\n     */\n    function transferOwnership(address _newGovernor) external onlyGovernor {\n        require(_newGovernor != address(0), \"Governor must be set\");\n\n        address oldPendingGovernor = pendingGovernor;\n        pendingGovernor = _newGovernor;\n\n        emit NewPendingOwnership(oldPendingGovernor, pendingGovernor);\n    }\n\n    /**\n     * @notice Admin function for pending governor to accept role and update governor.\n     * This function must called by the pending governor.\n     */\n    function acceptOwnership() external {\n        address oldPendingGovernor = pendingGovernor;\n\n        require(\n            oldPendingGovernor != address(0) && msg.sender == oldPendingGovernor,\n            \"Caller must be pending governor\"\n        );\n\n        address oldGovernor = governor;\n\n        governor = oldPendingGovernor;\n        pendingGovernor = address(0);\n\n        emit NewOwnership(oldGovernor, governor);\n        emit NewPendingOwnership(oldPendingGovernor, pendingGovernor);\n    }\n}\n"
+    },
+    "contracts/governance/IManaged.sol": {
+      "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.7.6;\n\ninterface IManaged {\n    function setController(address _controller) external;\n}\n"
+    },
+    "contracts/governance/Pausable.sol": {
+      "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.7.6;\n\nabstract contract Pausable {\n    /**\n     * @dev \"Partial paused\" pauses exit and enter functions for GRT, but not internal\n     * functions, such as allocating\n     */\n    bool internal _partialPaused;\n    /**\n     * @dev Paused will pause all major protocol functions\n     */\n    bool internal _paused;\n\n    /// Timestamp for the last time the partial pause was set\n    uint256 public lastPausePartialTime;\n    /// Timestamp for the last time the full pause was set\n    uint256 public lastPauseTime;\n\n    /// Pause guardian is a separate entity from the governor that can\n    /// pause and unpause the protocol, fully or partially\n    address public pauseGuardian;\n\n    /// Emitted when the partial pause state changed\n    event PartialPauseChanged(bool isPaused);\n    /// Emitted when the full pause state changed\n    event PauseChanged(bool isPaused);\n    /// Emitted when the pause guardian is changed\n    event NewPauseGuardian(address indexed oldPauseGuardian, address indexed pauseGuardian);\n\n    /**\n     * @dev Change the partial paused state of the contract\n     * @param _toPause New value for the partial pause state (true means the contracts will be partially paused)\n     */\n    function _setPartialPaused(bool _toPause) internal {\n        if (_toPause == _partialPaused) {\n            return;\n        }\n        _partialPaused = _toPause;\n        if (_partialPaused) {\n            lastPausePartialTime = block.timestamp;\n        }\n        emit PartialPauseChanged(_partialPaused);\n    }\n\n    /**\n     * @dev Change the paused state of the contract\n     * @param _toPause New value for the pause state (true means the contracts will be paused)\n     */\n    function _setPaused(bool _toPause) internal {\n        if (_toPause == _paused) {\n            return;\n        }\n        _paused = _toPause;\n        if (_paused) {\n            lastPauseTime = block.timestamp;\n        }\n        emit PauseChanged(_paused);\n    }\n\n    /**\n     * @dev Change the Pause Guardian\n     * @param newPauseGuardian The address of the new Pause Guardian\n     */\n    function _setPauseGuardian(address newPauseGuardian) internal {\n        address oldPauseGuardian = pauseGuardian;\n        pauseGuardian = newPauseGuardian;\n        emit NewPauseGuardian(oldPauseGuardian, pauseGuardian);\n    }\n}\n"
+    },
+    "contracts/governance/Controller.sol": {
+      "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.7.6;\n\nimport { IController } from \"./IController.sol\";\nimport { IManaged } from \"./IManaged.sol\";\nimport { Governed } from \"./Governed.sol\";\nimport { Pausable } from \"./Pausable.sol\";\n\n/**\n * @title Graph Controller contract\n * @dev Controller is a registry of contracts for convenience. Inspired by Livepeer:\n * https://github.com/livepeer/protocol/blob/streamflow/contracts/Controller.sol\n */\ncontract Controller is Governed, Pausable, IController {\n    /// @dev Track contract ids to contract proxy address\n    mapping(bytes32 => address) private _registry;\n\n    /// Emitted when the proxy address for a protocol contract has been set\n    event SetContractProxy(bytes32 indexed id, address contractAddress);\n\n    /**\n     * @notice Controller contract constructor.\n     */\n    constructor() {\n        Governed._initialize(msg.sender);\n\n        _setPaused(true);\n    }\n\n    /**\n     * @dev Check if the caller is the governor or pause guardian.\n     */\n    modifier onlyGovernorOrGuardian() {\n        require(\n            msg.sender == governor || msg.sender == pauseGuardian,\n            \"Only Governor or Guardian can call\"\n        );\n        _;\n    }\n\n    /**\n     * @notice Getter to access governor\n     */\n    function getGovernor() external view override returns (address) {\n        return governor;\n    }\n\n    // -- Registry --\n\n    /**\n     * @notice Register contract id and mapped address\n     * @param _id Contract id (keccak256 hash of contract name)\n     * @param _contractAddress Contract address\n     */\n    function setContractProxy(bytes32 _id, address _contractAddress)\n        external\n        override\n        onlyGovernor\n    {\n        require(_contractAddress != address(0), \"Contract address must be set\");\n        _registry[_id] = _contractAddress;\n        emit SetContractProxy(_id, _contractAddress);\n    }\n\n    /**\n     * @notice Unregister a contract address\n     * @param _id Contract id (keccak256 hash of contract name)\n     */\n    function unsetContractProxy(bytes32 _id) external override onlyGovernor {\n        _registry[_id] = address(0);\n        emit SetContractProxy(_id, address(0));\n    }\n\n    /**\n     * @notice Get contract proxy address by its id\n     * @param _id Contract id\n     * @return Address of the proxy contract for the provided id\n     */\n    function getContractProxy(bytes32 _id) external view override returns (address) {\n        return _registry[_id];\n    }\n\n    /**\n     * @notice Update contract's controller\n     * @param _id Contract id (keccak256 hash of contract name)\n     * @param _controller Controller address\n     */\n    function updateController(bytes32 _id, address _controller) external override onlyGovernor {\n        require(_controller != address(0), \"Controller must be set\");\n        return IManaged(_registry[_id]).setController(_controller);\n    }\n\n    // -- Pausing --\n\n    /**\n     * @notice Change the partial paused state of the contract\n     * Partial pause is intended as a partial pause of the protocol\n     * @param _toPause True if the contracts should be (partially) paused, false otherwise\n     */\n    function setPartialPaused(bool _toPause) external override onlyGovernorOrGuardian {\n        _setPartialPaused(_toPause);\n    }\n\n    /**\n     * @notice Change the paused state of the contract\n     * Full pause most of protocol functions\n     * @param _toPause True if the contracts should be paused, false otherwise\n     */\n    function setPaused(bool _toPause) external override onlyGovernorOrGuardian {\n        _setPaused(_toPause);\n    }\n\n    /**\n     * @notice Change the Pause Guardian\n     * @param _newPauseGuardian The address of the new Pause Guardian\n     */\n    function setPauseGuardian(address _newPauseGuardian) external override onlyGovernor {\n        require(_newPauseGuardian != address(0), \"PauseGuardian must be set\");\n        _setPauseGuardian(_newPauseGuardian);\n    }\n\n    /**\n     * @notice Getter to access paused\n     * @return True if the contracts are paused, false otherwise\n     */\n    function paused() external view override returns (bool) {\n        return _paused;\n    }\n\n    /**\n     * @notice Getter to access partial pause status\n     * @return True if the contracts are partially paused, false otherwise\n     */\n    function partialPaused() external view override returns (bool) {\n        return _partialPaused;\n    }\n}\n"
+    },
+    "contracts/governance/IController.sol": {
+      "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity >=0.6.12 <0.8.0;\n\ninterface IController {\n    function getGovernor() external view returns (address);\n\n    // -- Registry --\n\n    function setContractProxy(bytes32 _id, address _contractAddress) external;\n\n    function unsetContractProxy(bytes32 _id) external;\n\n    function updateController(bytes32 _id, address _controller) external;\n\n    function getContractProxy(bytes32 _id) external view returns (address);\n\n    // -- Pausing --\n\n    function setPartialPaused(bool _partialPaused) external;\n\n    function setPaused(bool _paused) external;\n\n    function setPauseGuardian(address _newPauseGuardian) external;\n\n    function paused() external view returns (bool);\n\n    function partialPaused() external view returns (bool);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.7.6+commit.7338295f"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "from",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            }
+          ],
+          "name": "NewOwnership",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "oldPauseGuardian",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "pauseGuardian",
+              "type": "address"
+            }
+          ],
+          "name": "NewPauseGuardian",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "from",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            }
+          ],
+          "name": "NewPendingOwnership",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "isPaused",
+              "type": "bool"
+            }
+          ],
+          "name": "PartialPauseChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "isPaused",
+              "type": "bool"
+            }
+          ],
+          "name": "PauseChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "id",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "contractAddress",
+              "type": "address"
+            }
+          ],
+          "name": "SetContractProxy",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "acceptOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getContractProxy",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getGovernor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "governor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lastPausePartialTime",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lastPauseTime",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "partialPaused",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pauseGuardian",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "paused",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pendingGovernor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "_contractAddress",
+              "type": "address"
+            }
+          ],
+          "name": "setContractProxy",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bool",
+              "name": "_toPause",
+              "type": "bool"
+            }
+          ],
+          "name": "setPartialPaused",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_newPauseGuardian",
+              "type": "address"
+            }
+          ],
+          "name": "setPauseGuardian",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bool",
+              "name": "_toPause",
+              "type": "bool"
+            }
+          ],
+          "name": "setPaused",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_newGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "transferOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            }
+          ],
+          "name": "unsetContractProxy",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "_id",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "_controller",
+              "type": "address"
+            }
+          ],
+          "name": "updateController",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "details": "Controller is a registry of contracts for convenience. Inspired by Livepeer: https://github.com/livepeer/protocol/blob/streamflow/contracts/Controller.sol",
+        "kind": "dev",
+        "methods": {
+          "getContractProxy(bytes32)": {
+            "params": {
+              "_id": "Contract id"
+            },
+            "returns": {
+              "_0": "Address of the proxy contract for the provided id"
+            }
+          },
+          "partialPaused()": {
+            "returns": {
+              "_0": "True if the contracts are partially paused, false otherwise"
+            }
+          },
+          "paused()": {
+            "returns": {
+              "_0": "True if the contracts are paused, false otherwise"
+            }
+          },
+          "setContractProxy(bytes32,address)": {
+            "params": {
+              "_contractAddress": "Contract address",
+              "_id": "Contract id (keccak256 hash of contract name)"
+            }
+          },
+          "setPartialPaused(bool)": {
+            "params": {
+              "_toPause": "True if the contracts should be (partially) paused, false otherwise"
+            }
+          },
+          "setPauseGuardian(address)": {
+            "params": {
+              "_newPauseGuardian": "The address of the new Pause Guardian"
+            }
+          },
+          "setPaused(bool)": {
+            "params": {
+              "_toPause": "True if the contracts should be paused, false otherwise"
+            }
+          },
+          "transferOwnership(address)": {
+            "params": {
+              "_newGovernor": "Address of new `governor`"
+            }
+          },
+          "unsetContractProxy(bytes32)": {
+            "params": {
+              "_id": "Contract id (keccak256 hash of contract name)"
+            }
+          },
+          "updateController(bytes32,address)": {
+            "params": {
+              "_controller": "Controller address",
+              "_id": "Contract id (keccak256 hash of contract name)"
+            }
+          }
+        },
+        "stateVariables": {
+          "_registry": {
+            "details": "Track contract ids to contract proxy address"
+          }
+        },
+        "title": "Graph Controller contract",
+        "version": 1
+      },
+      "userdoc": {
+        "events": {
+          "NewOwnership(address,address)": {
+            "notice": "Emitted when a new owner/governor has accepted their role"
+          },
+          "NewPauseGuardian(address,address)": {
+            "notice": "Emitted when the pause guardian is changed"
+          },
+          "NewPendingOwnership(address,address)": {
+            "notice": "Emitted when a new owner/governor has been set, but is pending acceptance"
+          },
+          "PartialPauseChanged(bool)": {
+            "notice": "Emitted when the partial pause state changed"
+          },
+          "PauseChanged(bool)": {
+            "notice": "Emitted when the full pause state changed"
+          },
+          "SetContractProxy(bytes32,address)": {
+            "notice": "Emitted when the proxy address for a protocol contract has been set"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "acceptOwnership()": {
+            "notice": "Admin function for pending governor to accept role and update governor. This function must called by the pending governor."
+          },
+          "constructor": {
+            "notice": "Controller contract constructor."
+          },
+          "getContractProxy(bytes32)": {
+            "notice": "Get contract proxy address by its id"
+          },
+          "getGovernor()": {
+            "notice": "Getter to access governor"
+          },
+          "governor()": {
+            "notice": "Address of the governor"
+          },
+          "lastPausePartialTime()": {
+            "notice": "Timestamp for the last time the partial pause was set"
+          },
+          "lastPauseTime()": {
+            "notice": "Timestamp for the last time the full pause was set"
+          },
+          "partialPaused()": {
+            "notice": "Getter to access partial pause status"
+          },
+          "pauseGuardian()": {
+            "notice": "Pause guardian is a separate entity from the governor that can pause and unpause the protocol, fully or partially"
+          },
+          "paused()": {
+            "notice": "Getter to access paused"
+          },
+          "pendingGovernor()": {
+            "notice": "Address of the new governor that is pending acceptance"
+          },
+          "setContractProxy(bytes32,address)": {
+            "notice": "Register contract id and mapped address"
+          },
+          "setPartialPaused(bool)": {
+            "notice": "Change the partial paused state of the contract Partial pause is intended as a partial pause of the protocol"
+          },
+          "setPauseGuardian(address)": {
+            "notice": "Change the Pause Guardian"
+          },
+          "setPaused(bool)": {
+            "notice": "Change the paused state of the contract Full pause most of protocol functions"
+          },
+          "transferOwnership(address)": {
+            "notice": "Admin function to begin change of governor. The `_newGovernor` must call `acceptOwnership` to finalize the transfer."
+          },
+          "unsetContractProxy(bytes32)": {
+            "notice": "Unregister a contract address"
+          },
+          "updateController(bytes32,address)": {
+            "notice": "Update contract's controller"
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/governance/Controller.sol": "Controller"
+      },
+      "evmVersion": "istanbul",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/governance/Controller.sol": {
+        "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.7.6;\n\nimport { IController } from \"./IController.sol\";\nimport { IManaged } from \"./IManaged.sol\";\nimport { Governed } from \"./Governed.sol\";\nimport { Pausable } from \"./Pausable.sol\";\n\n/**\n * @title Graph Controller contract\n * @dev Controller is a registry of contracts for convenience. Inspired by Livepeer:\n * https://github.com/livepeer/protocol/blob/streamflow/contracts/Controller.sol\n */\ncontract Controller is Governed, Pausable, IController {\n    /// @dev Track contract ids to contract proxy address\n    mapping(bytes32 => address) private _registry;\n\n    /// Emitted when the proxy address for a protocol contract has been set\n    event SetContractProxy(bytes32 indexed id, address contractAddress);\n\n    /**\n     * @notice Controller contract constructor.\n     */\n    constructor() {\n        Governed._initialize(msg.sender);\n\n        _setPaused(true);\n    }\n\n    /**\n     * @dev Check if the caller is the governor or pause guardian.\n     */\n    modifier onlyGovernorOrGuardian() {\n        require(\n            msg.sender == governor || msg.sender == pauseGuardian,\n            \"Only Governor or Guardian can call\"\n        );\n        _;\n    }\n\n    /**\n     * @notice Getter to access governor\n     */\n    function getGovernor() external view override returns (address) {\n        return governor;\n    }\n\n    // -- Registry --\n\n    /**\n     * @notice Register contract id and mapped address\n     * @param _id Contract id (keccak256 hash of contract name)\n     * @param _contractAddress Contract address\n     */\n    function setContractProxy(bytes32 _id, address _contractAddress)\n        external\n        override\n        onlyGovernor\n    {\n        require(_contractAddress != address(0), \"Contract address must be set\");\n        _registry[_id] = _contractAddress;\n        emit SetContractProxy(_id, _contractAddress);\n    }\n\n    /**\n     * @notice Unregister a contract address\n     * @param _id Contract id (keccak256 hash of contract name)\n     */\n    function unsetContractProxy(bytes32 _id) external override onlyGovernor {\n        _registry[_id] = address(0);\n        emit SetContractProxy(_id, address(0));\n    }\n\n    /**\n     * @notice Get contract proxy address by its id\n     * @param _id Contract id\n     * @return Address of the proxy contract for the provided id\n     */\n    function getContractProxy(bytes32 _id) external view override returns (address) {\n        return _registry[_id];\n    }\n\n    /**\n     * @notice Update contract's controller\n     * @param _id Contract id (keccak256 hash of contract name)\n     * @param _controller Controller address\n     */\n    function updateController(bytes32 _id, address _controller) external override onlyGovernor {\n        require(_controller != address(0), \"Controller must be set\");\n        return IManaged(_registry[_id]).setController(_controller);\n    }\n\n    // -- Pausing --\n\n    /**\n     * @notice Change the partial paused state of the contract\n     * Partial pause is intended as a partial pause of the protocol\n     * @param _toPause True if the contracts should be (partially) paused, false otherwise\n     */\n    function setPartialPaused(bool _toPause) external override onlyGovernorOrGuardian {\n        _setPartialPaused(_toPause);\n    }\n\n    /**\n     * @notice Change the paused state of the contract\n     * Full pause most of protocol functions\n     * @param _toPause True if the contracts should be paused, false otherwise\n     */\n    function setPaused(bool _toPause) external override onlyGovernorOrGuardian {\n        _setPaused(_toPause);\n    }\n\n    /**\n     * @notice Change the Pause Guardian\n     * @param _newPauseGuardian The address of the new Pause Guardian\n     */\n    function setPauseGuardian(address _newPauseGuardian) external override onlyGovernor {\n        require(_newPauseGuardian != address(0), \"PauseGuardian must be set\");\n        _setPauseGuardian(_newPauseGuardian);\n    }\n\n    /**\n     * @notice Getter to access paused\n     * @return True if the contracts are paused, false otherwise\n     */\n    function paused() external view override returns (bool) {\n        return _paused;\n    }\n\n    /**\n     * @notice Getter to access partial pause status\n     * @return True if the contracts are partially paused, false otherwise\n     */\n    function partialPaused() external view override returns (bool) {\n        return _partialPaused;\n    }\n}\n",
+        "keccak256": "0xb384f6074f6a975a21144a3c899763598850652c111e16dfb5a5f0aa3438cbb4",
+        "license": "GPL-2.0-or-later"
+      },
+      "contracts/governance/Governed.sol": {
+        "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.7.6;\n\n/**\n * @title Graph Governance contract\n * @dev All contracts that will be owned by a Governor entity should extend this contract.\n */\nabstract contract Governed {\n    // -- State --\n\n    /// Address of the governor\n    address public governor;\n    /// Address of the new governor that is pending acceptance\n    address public pendingGovernor;\n\n    // -- Events --\n\n    /// Emitted when a new owner/governor has been set, but is pending acceptance\n    event NewPendingOwnership(address indexed from, address indexed to);\n    /// Emitted when a new owner/governor has accepted their role\n    event NewOwnership(address indexed from, address indexed to);\n\n    /**\n     * @dev Check if the caller is the governor.\n     */\n    modifier onlyGovernor() {\n        require(msg.sender == governor, \"Only Governor can call\");\n        _;\n    }\n\n    /**\n     * @dev Initialize the governor for this contract\n     * @param _initGovernor Address of the governor\n     */\n    function _initialize(address _initGovernor) internal {\n        governor = _initGovernor;\n    }\n\n    /**\n     * @notice Admin function to begin change of governor. The `_newGovernor` must call\n     * `acceptOwnership` to finalize the transfer.\n     * @param _newGovernor Address of new `governor`\n     */\n    function transferOwnership(address _newGovernor) external onlyGovernor {\n        require(_newGovernor != address(0), \"Governor must be set\");\n\n        address oldPendingGovernor = pendingGovernor;\n        pendingGovernor = _newGovernor;\n\n        emit NewPendingOwnership(oldPendingGovernor, pendingGovernor);\n    }\n\n    /**\n     * @notice Admin function for pending governor to accept role and update governor.\n     * This function must called by the pending governor.\n     */\n    function acceptOwnership() external {\n        address oldPendingGovernor = pendingGovernor;\n\n        require(\n            oldPendingGovernor != address(0) && msg.sender == oldPendingGovernor,\n            \"Caller must be pending governor\"\n        );\n\n        address oldGovernor = governor;\n\n        governor = oldPendingGovernor;\n        pendingGovernor = address(0);\n\n        emit NewOwnership(oldGovernor, governor);\n        emit NewPendingOwnership(oldPendingGovernor, pendingGovernor);\n    }\n}\n",
+        "keccak256": "0xef67998b2a12dd7bcc0c10ad0feef65ae0cce7f04948d52a2e095f1db6195845",
+        "license": "GPL-2.0-or-later"
+      },
+      "contracts/governance/IController.sol": {
+        "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity >=0.6.12 <0.8.0;\n\ninterface IController {\n    function getGovernor() external view returns (address);\n\n    // -- Registry --\n\n    function setContractProxy(bytes32 _id, address _contractAddress) external;\n\n    function unsetContractProxy(bytes32 _id) external;\n\n    function updateController(bytes32 _id, address _controller) external;\n\n    function getContractProxy(bytes32 _id) external view returns (address);\n\n    // -- Pausing --\n\n    function setPartialPaused(bool _partialPaused) external;\n\n    function setPaused(bool _paused) external;\n\n    function setPauseGuardian(address _newPauseGuardian) external;\n\n    function paused() external view returns (bool);\n\n    function partialPaused() external view returns (bool);\n}\n",
+        "keccak256": "0xd3deebac0de8b82fad14a4ce278e6915afa38899053fae1f9c3841ddae5ee49a",
+        "license": "GPL-2.0-or-later"
+      },
+      "contracts/governance/IManaged.sol": {
+        "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.7.6;\n\ninterface IManaged {\n    function setController(address _controller) external;\n}\n",
+        "keccak256": "0xb7f8752b0cbed887621d85ef42de1072ab14e44beca1747327c378b7af05f5a4",
+        "license": "GPL-2.0-or-later"
+      },
+      "contracts/governance/Pausable.sol": {
+        "content": "// SPDX-License-Identifier: GPL-2.0-or-later\n\npragma solidity ^0.7.6;\n\nabstract contract Pausable {\n    /**\n     * @dev \"Partial paused\" pauses exit and enter functions for GRT, but not internal\n     * functions, such as allocating\n     */\n    bool internal _partialPaused;\n    /**\n     * @dev Paused will pause all major protocol functions\n     */\n    bool internal _paused;\n\n    /// Timestamp for the last time the partial pause was set\n    uint256 public lastPausePartialTime;\n    /// Timestamp for the last time the full pause was set\n    uint256 public lastPauseTime;\n\n    /// Pause guardian is a separate entity from the governor that can\n    /// pause and unpause the protocol, fully or partially\n    address public pauseGuardian;\n\n    /// Emitted when the partial pause state changed\n    event PartialPauseChanged(bool isPaused);\n    /// Emitted when the full pause state changed\n    event PauseChanged(bool isPaused);\n    /// Emitted when the pause guardian is changed\n    event NewPauseGuardian(address indexed oldPauseGuardian, address indexed pauseGuardian);\n\n    /**\n     * @dev Change the partial paused state of the contract\n     * @param _toPause New value for the partial pause state (true means the contracts will be partially paused)\n     */\n    function _setPartialPaused(bool _toPause) internal {\n        if (_toPause == _partialPaused) {\n            return;\n        }\n        _partialPaused = _toPause;\n        if (_partialPaused) {\n            lastPausePartialTime = block.timestamp;\n        }\n        emit PartialPauseChanged(_partialPaused);\n    }\n\n    /**\n     * @dev Change the paused state of the contract\n     * @param _toPause New value for the pause state (true means the contracts will be paused)\n     */\n    function _setPaused(bool _toPause) internal {\n        if (_toPause == _paused) {\n            return;\n        }\n        _paused = _toPause;\n        if (_paused) {\n            lastPauseTime = block.timestamp;\n        }\n        emit PauseChanged(_paused);\n    }\n\n    /**\n     * @dev Change the Pause Guardian\n     * @param newPauseGuardian The address of the new Pause Guardian\n     */\n    function _setPauseGuardian(address newPauseGuardian) internal {\n        address oldPauseGuardian = pauseGuardian;\n        pauseGuardian = newPauseGuardian;\n        emit NewPauseGuardian(oldPauseGuardian, pauseGuardian);\n    }\n}\n",
+        "keccak256": "0x779f5f43528263a8d016d0c651c9687dfafd371363a2ecee24ee5a4ba8e5c3a4",
+        "license": "GPL-2.0-or-later"
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.7.6+commit.7338295f",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "istanbul",
+      "remappings": []
+    },
+    "name": "Controller",
+    "fullyQualifiedName": "contracts/governance/Controller.sol:Controller"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "80466",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T10:43:13Z",
+  "match": "exact_match",
+  "chainId": "42161",
+  "address": "0x0a8491544221dd212964fbb96487467291b2C97e"
+}
