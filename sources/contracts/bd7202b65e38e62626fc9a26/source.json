@@ -1,0 +1,803 @@
+{
+  "sources": {
+    "src/coupons/CollectionDiscountCoupon.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {MerkleProof} from \"@openzeppelin/contracts/utils/cryptography/MerkleProof.sol\";\n\nimport {CouponTypes} from \"src/coupons/CouponTypes.sol\";\nimport {MarketplaceTypes} from \"src/marketplace/MarketplaceTypes.sol\";\nimport {ICollection} from \"src/marketplace/interfaces/ICollection.sol\";\nimport {DecentralandMarketplacePolygonAssetTypes} from \"src/marketplace/DecentralandMarketplacePolygonAssetTypes.sol\";\nimport {ICoupon} from \"src/coupons/interfaces/ICoupon.sol\";\n\n/// @notice Coupon that allows creators to apply discounts to Trades involving their Collections.\ncontract CollectionDiscountCoupon is ICoupon, DecentralandMarketplacePolygonAssetTypes, CouponTypes, MarketplaceTypes {\n    uint256 public constant DISCOUNT_TYPE_RATE = 1;\n    uint256 public constant DISCOUNT_TYPE_FLAT = 2;\n\n    /// @notice Schema Discount.\n    /// @param discountType The type of discount to apply. DISCOUNT_TYPE_RATE for percentage discounts and DISCOUNT_TYPE_FLAT for fixed discounts.\n    /// @param discount The value used to apply the discount. If discountType is DISCOUNT_TYPE_RATE, this value should be a percentage (e.g. 500_000 for 50% off). If discountType is DISCOUNT_TYPE_FLAT, this value should be the fixed discount amount.\n    /// @param root The Merkle root of all the Collections that this Coupon will be valid for.\n    struct CollectionDiscountCouponData {\n        uint256 discountType;\n        uint256 discount;\n        bytes32 root;\n    }\n\n    /// @notice Schema of the data expected from the caller.\n    /// @param proofs The Merkle proofs to validate that the collection items being traded are valid for the discount.\n    struct CollectionDiscountCouponCallerData {\n        bytes32[][] proofs;\n    }\n\n    error InvalidReceivedLength();\n    error InvalidSentLength();\n    error InvalidProof(uint256 _index);\n    error SignerIsNotTheCreator(uint256 _index);\n    error InvalidDiscountType();\n    error UnsupportedSentAssetType(uint256 _index);\n    error UnsupportedReceivedAssetType(uint256 _index);\n\n    /// @notice Applies the discount to the received items of the Trade.\n    /// @param _trade The Trade to apply the discount to.\n    /// @param _coupon The Coupon to apply.\n    /// @return - The Trade with the discount applied.\n    function applyCoupon(MarketplaceTypes.Trade memory _trade, CouponTypes.Coupon calldata _coupon)\n        external\n        view\n        returns (MarketplaceTypes.Trade memory)\n    {\n        CollectionDiscountCouponData memory data = abi.decode(_coupon.data, (CollectionDiscountCouponData));\n        CollectionDiscountCouponCallerData memory callerData = abi.decode(_coupon.callerData, (CollectionDiscountCouponCallerData));\n\n        // The coupon should not be applicable if there are no received ERC20 assets to be applied on.\n        if (_trade.received.length == 0) {\n            revert InvalidReceivedLength();\n        }\n\n        // The coupon should not be applicable if there are no sent Collection items.\n        if (_trade.sent.length == 0) {\n            revert InvalidSentLength();\n        }\n\n        // For each collection item being traded, a proof in the same index will be used to validate that the collection of that item is valid for the discount.\n        for (uint256 i = 0; i < _trade.sent.length; i++) {\n            Asset memory asset = _trade.sent[i];\n\n            if (asset.assetType != ASSET_TYPE_COLLECTION_ITEM) {\n                revert UnsupportedSentAssetType(i);\n            }\n\n            address collectionAddress = asset.contractAddress;\n\n            if (ICollection(collectionAddress).creator() != _trade.signer) {\n                revert SignerIsNotTheCreator(i);\n            }\n\n            if (!MerkleProof.verify(callerData.proofs[i], data.root, keccak256(bytes.concat(keccak256(abi.encode(address(collectionAddress))))))) {\n                revert InvalidProof(i);\n            }\n        }\n\n        // Every received asset must be an ERC20 or USD_PEGGED_MANA.\n        // The discount will be applied to each one of them.\n        // Keep in mind that if you provide a flat discount, the discount will be applied to each one.\n        for (uint256 i = 0; i < _trade.received.length; i++) {\n            uint256 assetType = _trade.received[i].assetType;\n\n            if (assetType != ASSET_TYPE_ERC20 && assetType != ASSET_TYPE_USD_PEGGED_MANA) {\n                revert UnsupportedReceivedAssetType(i);\n            }\n\n            uint256 originalPrice = _trade.received[i].value;\n\n            if (data.discountType == DISCOUNT_TYPE_RATE) {\n                _trade.received[i].value = originalPrice - originalPrice * data.discount / 1_000_000;\n            } else if (data.discountType == DISCOUNT_TYPE_FLAT) {\n                _trade.received[i].value = originalPrice - data.discount;\n            } else {\n                revert InvalidDiscountType();\n            }\n        }\n\n        return _trade;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/MerkleProof.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev These functions deal with verification of Merkle Tree proofs.\n *\n * The tree and the proofs can be generated using our\n * https://github.com/OpenZeppelin/merkle-tree[JavaScript library].\n * You will find a quickstart guide in the readme.\n *\n * WARNING: You should avoid using leaf values that are 64 bytes long prior to\n * hashing, or use a hash function other than keccak256 for hashing leaves.\n * This is because the concatenation of a sorted pair of internal nodes in\n * the Merkle tree could be reinterpreted as a leaf value.\n * OpenZeppelin's JavaScript library generates Merkle trees that are safe\n * against this attack out of the box.\n */\nlibrary MerkleProof {\n    /**\n     *@dev The multiproof provided is not valid.\n     */\n    error MerkleProofInvalidMultiproof();\n\n    /**\n     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree\n     * defined by `root`. For this, a `proof` must be provided, containing\n     * sibling hashes on the branch from the leaf to the root of the tree. Each\n     * pair of leaves and each pair of pre-images are assumed to be sorted.\n     */\n    function verify(bytes32[] memory proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {\n        return processProof(proof, leaf) == root;\n    }\n\n    /**\n     * @dev Calldata version of {verify}\n     */\n    function verifyCalldata(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {\n        return processProofCalldata(proof, leaf) == root;\n    }\n\n    /**\n     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up\n     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt\n     * hash matches the root of the tree. When processing the proof, the pairs\n     * of leafs & pre-images are assumed to be sorted.\n     */\n    function processProof(bytes32[] memory proof, bytes32 leaf) internal pure returns (bytes32) {\n        bytes32 computedHash = leaf;\n        for (uint256 i = 0; i < proof.length; i++) {\n            computedHash = _hashPair(computedHash, proof[i]);\n        }\n        return computedHash;\n    }\n\n    /**\n     * @dev Calldata version of {processProof}\n     */\n    function processProofCalldata(bytes32[] calldata proof, bytes32 leaf) internal pure returns (bytes32) {\n        bytes32 computedHash = leaf;\n        for (uint256 i = 0; i < proof.length; i++) {\n            computedHash = _hashPair(computedHash, proof[i]);\n        }\n        return computedHash;\n    }\n\n    /**\n     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by\n     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     */\n    function multiProofVerify(\n        bytes32[] memory proof,\n        bool[] memory proofFlags,\n        bytes32 root,\n        bytes32[] memory leaves\n    ) internal pure returns (bool) {\n        return processMultiProof(proof, proofFlags, leaves) == root;\n    }\n\n    /**\n     * @dev Calldata version of {multiProofVerify}\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     */\n    function multiProofVerifyCalldata(\n        bytes32[] calldata proof,\n        bool[] calldata proofFlags,\n        bytes32 root,\n        bytes32[] memory leaves\n    ) internal pure returns (bool) {\n        return processMultiProofCalldata(proof, proofFlags, leaves) == root;\n    }\n\n    /**\n     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction\n     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another\n     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false\n     * respectively.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree\n     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the\n     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).\n     */\n    function processMultiProof(\n        bytes32[] memory proof,\n        bool[] memory proofFlags,\n        bytes32[] memory leaves\n    ) internal pure returns (bytes32 merkleRoot) {\n        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by\n        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the\n        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of\n        // the Merkle tree.\n        uint256 leavesLen = leaves.length;\n        uint256 proofLen = proof.length;\n        uint256 totalHashes = proofFlags.length;\n\n        // Check proof validity.\n        if (leavesLen + proofLen != totalHashes + 1) {\n            revert MerkleProofInvalidMultiproof();\n        }\n\n        // The xxxPos values are \"pointers\" to the next value to consume in each array. All accesses are done using\n        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's \"pop\".\n        bytes32[] memory hashes = new bytes32[](totalHashes);\n        uint256 leafPos = 0;\n        uint256 hashPos = 0;\n        uint256 proofPos = 0;\n        // At each step, we compute the next hash using two values:\n        // - a value from the \"main queue\". If not all leaves have been consumed, we get the next leaf, otherwise we\n        //   get the next hash.\n        // - depending on the flag, either another value from the \"main queue\" (merging branches) or an element from the\n        //   `proof` array.\n        for (uint256 i = 0; i < totalHashes; i++) {\n            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];\n            bytes32 b = proofFlags[i]\n                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])\n                : proof[proofPos++];\n            hashes[i] = _hashPair(a, b);\n        }\n\n        if (totalHashes > 0) {\n            if (proofPos != proofLen) {\n                revert MerkleProofInvalidMultiproof();\n            }\n            unchecked {\n                return hashes[totalHashes - 1];\n            }\n        } else if (leavesLen > 0) {\n            return leaves[0];\n        } else {\n            return proof[0];\n        }\n    }\n\n    /**\n     * @dev Calldata version of {processMultiProof}.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     */\n    function processMultiProofCalldata(\n        bytes32[] calldata proof,\n        bool[] calldata proofFlags,\n        bytes32[] memory leaves\n    ) internal pure returns (bytes32 merkleRoot) {\n        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by\n        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the\n        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of\n        // the Merkle tree.\n        uint256 leavesLen = leaves.length;\n        uint256 proofLen = proof.length;\n        uint256 totalHashes = proofFlags.length;\n\n        // Check proof validity.\n        if (leavesLen + proofLen != totalHashes + 1) {\n            revert MerkleProofInvalidMultiproof();\n        }\n\n        // The xxxPos values are \"pointers\" to the next value to consume in each array. All accesses are done using\n        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's \"pop\".\n        bytes32[] memory hashes = new bytes32[](totalHashes);\n        uint256 leafPos = 0;\n        uint256 hashPos = 0;\n        uint256 proofPos = 0;\n        // At each step, we compute the next hash using two values:\n        // - a value from the \"main queue\". If not all leaves have been consumed, we get the next leaf, otherwise we\n        //   get the next hash.\n        // - depending on the flag, either another value from the \"main queue\" (merging branches) or an element from the\n        //   `proof` array.\n        for (uint256 i = 0; i < totalHashes; i++) {\n            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];\n            bytes32 b = proofFlags[i]\n                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])\n                : proof[proofPos++];\n            hashes[i] = _hashPair(a, b);\n        }\n\n        if (totalHashes > 0) {\n            if (proofPos != proofLen) {\n                revert MerkleProofInvalidMultiproof();\n            }\n            unchecked {\n                return hashes[totalHashes - 1];\n            }\n        } else if (leavesLen > 0) {\n            return leaves[0];\n        } else {\n            return proof[0];\n        }\n    }\n\n    /**\n     * @dev Sorts the pair (a, b) and hashes the result.\n     */\n    function _hashPair(bytes32 a, bytes32 b) private pure returns (bytes32) {\n        return a < b ? _efficientHash(a, b) : _efficientHash(b, a);\n    }\n\n    /**\n     * @dev Implementation of keccak256(abi.encode(a, b)) that doesn't allocate or expand memory.\n     */\n    function _efficientHash(bytes32 a, bytes32 b) private pure returns (bytes32 value) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            mstore(0x00, a)\n            mstore(0x20, b)\n            value := keccak256(0x00, 0x40)\n        }\n    }\n}\n"
+    },
+    "src/coupons/CouponTypes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {CommonTypes} from \"src/common/CommonTypes.sol\";\n\n/// @notice Types used by the Coupons.\nabstract contract CouponTypes is CommonTypes {\n    /// @notice Schema for the Coupon type.\n    /// @param signature Signature of the coupon.\n    /// @param checks Values to be verified before applying the coupon.\n    /// @param couponAddress Address of the Coupon contract to be used.\n    /// @param data Data to be used by the Coupon contract.\n    /// @param callerData Data sent by the caller to be used by the Coupon contract.\n    struct Coupon {\n        bytes signature;\n        Checks checks;\n        address couponAddress;\n        bytes data;\n        bytes callerData;\n    }\n}\n"
+    },
+    "src/marketplace/MarketplaceTypes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {CommonTypes} from \"src/common/CommonTypes.sol\";\n\n/// @notice Types used by the Marketplace.\nabstract contract MarketplaceTypes is CommonTypes {\n    /// @notice Schema for the Asset type.\n    /// This represents any kind of asset that will be traded.\n    /// @param assetType Type of the asset. Used to know how to handle it.\n    /// @param contractAddress Address of the contract of the asset.\n    /// @param value Value of the asset. The amount for ERC20s, the ID for ERC721s, etc.\n    /// @param beneficiary Address that will receive the asset. If empty, depending if the asset is sent or received, the beneficiary will be the signer or the caller.\n    /// In the case of sent assets, the beneficiary is not validated in the signature. This is to allow the caller to determine which address will receive the asset.\n    /// @param extra Extra data that can be used to store additional information. \n    struct Asset {\n        uint256 assetType;\n        address contractAddress;\n        uint256 value;\n        address beneficiary;\n        bytes extra;\n    }\n\n    /// @notice Schema for the Trade type.\n    /// This represents a signed Trade that indicates the terms of the Trade, as well as the assets involved.\n    /// @param signer Address of the signer of the Trade.\n    /// @param signature Signature of the Trade.\n    /// @param checks Checks to be performed before executing the Trade.\n    /// @param sent Assets that will be sent to the caller in the Trade.\n    /// @param received Assets that will be received by the signer in the Trade.\n    struct Trade {\n        address signer;\n        bytes signature;\n        Checks checks;\n        Asset[] sent;\n        Asset[] received;\n    }\n}\n"
+    },
+    "src/marketplace/interfaces/ICollection.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {IERC721} from \"@openzeppelin/contracts/interfaces/IERC721.sol\";\n\n/// @notice Interface for the Collection contract.\ninterface ICollection is IERC721 {\n    function issueTokens(address[] calldata _beneficiaries, uint256[] calldata _itemIds) external;\n\n    function creator() external view returns (address);\n\n    function items(uint256 _itemId) external view returns (string memory, uint256, uint256, uint256, address, string memory, string memory);\n\n    function transferCreatorship(address _newCreator) external;\n\n    function setMinters(address[] calldata _minters, bool[] calldata _values) external;\n}\n"
+    },
+    "src/marketplace/DecentralandMarketplacePolygonAssetTypes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {DecentralandMarketplaceEthereumAssetTypes} from \"src/marketplace/DecentralandMarketplaceEthereumAssetTypes.sol\";\n\n/// @notice Asset types for the Decentraland Marketplace on Polygon.\nabstract contract DecentralandMarketplacePolygonAssetTypes is DecentralandMarketplaceEthereumAssetTypes {\n    uint256 public constant ASSET_TYPE_COLLECTION_ITEM = 4;\n}\n"
+    },
+    "src/coupons/interfaces/ICoupon.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {CouponTypes} from \"src/coupons/CouponTypes.sol\";\nimport {MarketplaceTypes} from \"src/marketplace/MarketplaceTypes.sol\";\n\n/// @notice Interface for the Coupon contract.\ninterface ICoupon {\n    function applyCoupon(MarketplaceTypes.Trade calldata _trade, CouponTypes.Coupon calldata _coupon) external view returns (MarketplaceTypes.Trade memory);\n}\n"
+    },
+    "src/common/CommonTypes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\n/// @notice Types used by many contracts in this project.\nabstract contract CommonTypes {\n    /// @notice Schema of an external check.\n    /// This is used to verify that certain external requirements are met.\n    /// @param contractAddress The address of the contract to call.\n    /// @param selector The selector of the function to call.\n    /// @param value The value to pass to the function.\n    /// @param required If the check is required or not.\n    struct ExternalCheck {\n        address contractAddress;\n        bytes4 selector;\n        bytes value;\n        bool required;\n    }\n\n    /// @notice Schema of a check.\n    /// This is used to verify that certain requirements are met.\n    /// @param uses The number of times the signature can be used.\n    /// @param expiration The expiration date of the signature.\n    /// @param effective The effective date of the signature.\n    /// @param salt A value used to make the signature unique.\n    /// @param contractSignatureIndex The contract signature index required to validate the signature.\n    /// @param signerSignatureIndex The signer signature index required to validate the signature.\n    /// @param allowedRoot The Merkle Root of the allowed addresses. If empty, no check is performed.\n    /// @param allowedProof The Merkle Proof that validates that the caller is allowed. Is not validated in the signature given that it is data used by the caller.\n    /// @param externalChecks The external checks to verify.\n    struct Checks {\n        uint256 uses;\n        uint256 expiration;\n        uint256 effective;\n        bytes32 salt;\n        uint256 contractSignatureIndex;\n        uint256 signerSignatureIndex;\n        bytes32 allowedRoot;\n        bytes32[] allowedProof;\n        ExternalCheck[] externalChecks;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/interfaces/IERC721.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/IERC721.sol)\n\npragma solidity ^0.8.20;\n\nimport {IERC721} from \"../token/ERC721/IERC721.sol\";\n"
+    },
+    "src/marketplace/DecentralandMarketplaceEthereumAssetTypes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\n/// @notice Asset types for the Decentraland Marketplace on Ethereum.\nabstract contract DecentralandMarketplaceEthereumAssetTypes {\n    uint256 public constant ASSET_TYPE_ERC20 = 1;\n    uint256 public constant ASSET_TYPE_USD_PEGGED_MANA = 2;\n    uint256 public constant ASSET_TYPE_ERC721 = 3;\n\n    error UnsupportedAssetType(uint256 _assetType);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (token/ERC721/IERC721.sol)\n\npragma solidity ^0.8.20;\n\nimport {IERC165} from \"../../utils/introspection/IERC165.sol\";\n\n/**\n * @dev Required interface of an ERC721 compliant contract.\n */\ninterface IERC721 is IERC165 {\n    /**\n     * @dev Emitted when `tokenId` token is transferred from `from` to `to`.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 indexed tokenId);\n\n    /**\n     * @dev Emitted when `owner` enables `approved` to manage the `tokenId` token.\n     */\n    event Approval(address indexed owner, address indexed approved, uint256 indexed tokenId);\n\n    /**\n     * @dev Emitted when `owner` enables or disables (`approved`) `operator` to manage all of its assets.\n     */\n    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);\n\n    /**\n     * @dev Returns the number of tokens in ``owner``'s account.\n     */\n    function balanceOf(address owner) external view returns (uint256 balance);\n\n    /**\n     * @dev Returns the owner of the `tokenId` token.\n     *\n     * Requirements:\n     *\n     * - `tokenId` must exist.\n     */\n    function ownerOf(uint256 tokenId) external view returns (address owner);\n\n    /**\n     * @dev Safely transfers `tokenId` token from `from` to `to`.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must exist and be owned by `from`.\n     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.\n     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon\n     *   a safe transfer.\n     *\n     * Emits a {Transfer} event.\n     */\n    function safeTransferFrom(address from, address to, uint256 tokenId, bytes calldata data) external;\n\n    /**\n     * @dev Safely transfers `tokenId` token from `from` to `to`, checking first that contract recipients\n     * are aware of the ERC721 protocol to prevent tokens from being forever locked.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must exist and be owned by `from`.\n     * - If the caller is not `from`, it must have been allowed to move this token by either {approve} or\n     *   {setApprovalForAll}.\n     * - If `to` refers to a smart contract, it must implement {IERC721Receiver-onERC721Received}, which is called upon\n     *   a safe transfer.\n     *\n     * Emits a {Transfer} event.\n     */\n    function safeTransferFrom(address from, address to, uint256 tokenId) external;\n\n    /**\n     * @dev Transfers `tokenId` token from `from` to `to`.\n     *\n     * WARNING: Note that the caller is responsible to confirm that the recipient is capable of receiving ERC721\n     * or else they may be permanently lost. Usage of {safeTransferFrom} prevents loss, though the caller must\n     * understand this adds an external call which potentially creates a reentrancy vulnerability.\n     *\n     * Requirements:\n     *\n     * - `from` cannot be the zero address.\n     * - `to` cannot be the zero address.\n     * - `tokenId` token must be owned by `from`.\n     * - If the caller is not `from`, it must be approved to move this token by either {approve} or {setApprovalForAll}.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(address from, address to, uint256 tokenId) external;\n\n    /**\n     * @dev Gives permission to `to` to transfer `tokenId` token to another account.\n     * The approval is cleared when the token is transferred.\n     *\n     * Only a single account can be approved at a time, so approving the zero address clears previous approvals.\n     *\n     * Requirements:\n     *\n     * - The caller must own the token or be an approved operator.\n     * - `tokenId` must exist.\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address to, uint256 tokenId) external;\n\n    /**\n     * @dev Approve or remove `operator` as an operator for the caller.\n     * Operators can call {transferFrom} or {safeTransferFrom} for any token owned by the caller.\n     *\n     * Requirements:\n     *\n     * - The `operator` cannot be the address zero.\n     *\n     * Emits an {ApprovalForAll} event.\n     */\n    function setApprovalForAll(address operator, bool approved) external;\n\n    /**\n     * @dev Returns the account approved for `tokenId` token.\n     *\n     * Requirements:\n     *\n     * - `tokenId` must exist.\n     */\n    function getApproved(uint256 tokenId) external view returns (address operator);\n\n    /**\n     * @dev Returns if the `operator` is allowed to manage all of the assets of `owner`.\n     *\n     * See {setApprovalForAll}\n     */\n    function isApprovedForAll(address owner, address operator) external view returns (bool);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n    /**\n     * @dev Returns true if this contract implements the interface defined by\n     * `interfaceId`. See the corresponding\n     * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n     * to learn more about how these ids are created.\n     *\n     * This function call must use less than 30 000 gas.\n     */\n    function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.20+commit.a1b79de6"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [],
+          "name": "InvalidDiscountType",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_index",
+              "type": "uint256"
+            }
+          ],
+          "name": "InvalidProof",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidReceivedLength",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidSentLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_index",
+              "type": "uint256"
+            }
+          ],
+          "name": "SignerIsNotTheCreator",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_assetType",
+              "type": "uint256"
+            }
+          ],
+          "name": "UnsupportedAssetType",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_index",
+              "type": "uint256"
+            }
+          ],
+          "name": "UnsupportedReceivedAssetType",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_index",
+              "type": "uint256"
+            }
+          ],
+          "name": "UnsupportedSentAssetType",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ASSET_TYPE_COLLECTION_ITEM",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ASSET_TYPE_ERC20",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ASSET_TYPE_ERC721",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ASSET_TYPE_USD_PEGGED_MANA",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DISCOUNT_TYPE_FLAT",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DISCOUNT_TYPE_RATE",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "signer",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "signature",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "uses",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "expiration",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "effective",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "salt",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "contractSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "signerSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "allowedRoot",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "bytes32[]",
+                      "name": "allowedProof",
+                      "type": "bytes32[]"
+                    },
+                    {
+                      "components": [
+                        {
+                          "internalType": "address",
+                          "name": "contractAddress",
+                          "type": "address"
+                        },
+                        {
+                          "internalType": "bytes4",
+                          "name": "selector",
+                          "type": "bytes4"
+                        },
+                        {
+                          "internalType": "bytes",
+                          "name": "value",
+                          "type": "bytes"
+                        },
+                        {
+                          "internalType": "bool",
+                          "name": "required",
+                          "type": "bool"
+                        }
+                      ],
+                      "internalType": "struct CommonTypes.ExternalCheck[]",
+                      "name": "externalChecks",
+                      "type": "tuple[]"
+                    }
+                  ],
+                  "internalType": "struct CommonTypes.Checks",
+                  "name": "checks",
+                  "type": "tuple"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "assetType",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "contractAddress",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "beneficiary",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "extra",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct MarketplaceTypes.Asset[]",
+                  "name": "sent",
+                  "type": "tuple[]"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "assetType",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "contractAddress",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "beneficiary",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "extra",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct MarketplaceTypes.Asset[]",
+                  "name": "received",
+                  "type": "tuple[]"
+                }
+              ],
+              "internalType": "struct MarketplaceTypes.Trade",
+              "name": "_trade",
+              "type": "tuple"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "bytes",
+                  "name": "signature",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "uses",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "expiration",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "effective",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "salt",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "contractSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "signerSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "allowedRoot",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "bytes32[]",
+                      "name": "allowedProof",
+                      "type": "bytes32[]"
+                    },
+                    {
+                      "components": [
+                        {
+                          "internalType": "address",
+                          "name": "contractAddress",
+                          "type": "address"
+                        },
+                        {
+                          "internalType": "bytes4",
+                          "name": "selector",
+                          "type": "bytes4"
+                        },
+                        {
+                          "internalType": "bytes",
+                          "name": "value",
+                          "type": "bytes"
+                        },
+                        {
+                          "internalType": "bool",
+                          "name": "required",
+                          "type": "bool"
+                        }
+                      ],
+                      "internalType": "struct CommonTypes.ExternalCheck[]",
+                      "name": "externalChecks",
+                      "type": "tuple[]"
+                    }
+                  ],
+                  "internalType": "struct CommonTypes.Checks",
+                  "name": "checks",
+                  "type": "tuple"
+                },
+                {
+                  "internalType": "address",
+                  "name": "couponAddress",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "callerData",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct CouponTypes.Coupon",
+              "name": "_coupon",
+              "type": "tuple"
+            }
+          ],
+          "name": "applyCoupon",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "signer",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "signature",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "uses",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "expiration",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "effective",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "salt",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "contractSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "signerSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "allowedRoot",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "bytes32[]",
+                      "name": "allowedProof",
+                      "type": "bytes32[]"
+                    },
+                    {
+                      "components": [
+                        {
+                          "internalType": "address",
+                          "name": "contractAddress",
+                          "type": "address"
+                        },
+                        {
+                          "internalType": "bytes4",
+                          "name": "selector",
+                          "type": "bytes4"
+                        },
+                        {
+                          "internalType": "bytes",
+                          "name": "value",
+                          "type": "bytes"
+                        },
+                        {
+                          "internalType": "bool",
+                          "name": "required",
+                          "type": "bool"
+                        }
+                      ],
+                      "internalType": "struct CommonTypes.ExternalCheck[]",
+                      "name": "externalChecks",
+                      "type": "tuple[]"
+                    }
+                  ],
+                  "internalType": "struct CommonTypes.Checks",
+                  "name": "checks",
+                  "type": "tuple"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "assetType",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "contractAddress",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "beneficiary",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "extra",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct MarketplaceTypes.Asset[]",
+                  "name": "sent",
+                  "type": "tuple[]"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "assetType",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "contractAddress",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "beneficiary",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "extra",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct MarketplaceTypes.Asset[]",
+                  "name": "received",
+                  "type": "tuple[]"
+                }
+              ],
+              "internalType": "struct MarketplaceTypes.Trade",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "applyCoupon((address,bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),(uint256,address,uint256,address,bytes)[],(uint256,address,uint256,address,bytes)[]),(bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),address,bytes,bytes))": {
+            "params": {
+              "_coupon": "The Coupon to apply.",
+              "_trade": "The Trade to apply the discount to."
+            },
+            "returns": {
+              "_0": "- The Trade with the discount applied."
+            }
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "applyCoupon((address,bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),(uint256,address,uint256,address,bytes)[],(uint256,address,uint256,address,bytes)[]),(bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),address,bytes,bytes))": {
+            "notice": "Applies the discount to the received items of the Trade."
+          }
+        },
+        "notice": "Coupon that allows creators to apply discounts to Trades involving their Collections.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/coupons/CollectionDiscountCoupon.sol": "CollectionDiscountCoupon"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+        ":ds-test/=lib/openzeppelin-contracts/lib/forge-std/lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/"
+      ]
+    },
+    "sources": {
+      "lib/openzeppelin-contracts/contracts/interfaces/IERC721.sol": {
+        "keccak256": "0xc4d7ebf63eb2f6bf3fee1b6c0ee775efa9f31b4843a5511d07eea147e212932d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://01c66a2fad66bc710db7510419a7eee569b40b67cd9f01b70a3fc90d6f76c03b",
+          "dweb:/ipfs/QmT1CjJZq4eTNA4nu8E9ZrWfaZu6ReUsDbjcK8DbEFqwx5"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol": {
+        "keccak256": "0x5ef46daa3b58ef2702279d514780316efaa952915ee1aa3396f041ee2982b0b4",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2f8f2a76e23b02fc69e8cd24c3cb47da6c7af3a2d6c3a382f8ac25c6e094ade7",
+          "dweb:/ipfs/QmPV4ZS4tPVv4mTCf9ejyZ1ai57EEibDRj7mN2ARDCLV5n"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol": {
+        "keccak256": "0x6400c4bee15052e043e5d10315135972529bd1c8012f43da494dc6b4f4661058",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://da5d3d47d35af4373743a559ea4b9b7ecfe4bab6f0703f410c1e59959b7966ac",
+          "dweb:/ipfs/QmTHdoghh4WLu4yURjGEgRk162pcwwdsG52MPGa12GqnGR"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol": {
+        "keccak256": "0x4296879f55019b23e135000eb36896057e7101fb7fb859c5ef690cf14643757b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://87b3541437c8c443ccd36795e56a338ed12855eec17f8da624511b8d1a7e14df",
+          "dweb:/ipfs/QmeJQCtZrQjtJLr6u7ZHWeH3pBnjtLWzvRrKViAi7UZqxL"
+        ]
+      },
+      "src/common/CommonTypes.sol": {
+        "keccak256": "0x4f88ccd845b74ef49f133a8e6392f264280d11a34c6554adef3405506a0507f0",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://00d256911483f993b7d5461e7efc637c61115f87496910cf70955a67aa20dd2b",
+          "dweb:/ipfs/QmcnBadeFYuHDCewQ9wZzvJPzcdzm46vKK5MEhrn3T2v5D"
+        ]
+      },
+      "src/coupons/CollectionDiscountCoupon.sol": {
+        "keccak256": "0xb5bf1630a1dc6d35274cea99264490007ceaa7b9442137e349f5964948f8029d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7cfa3b785bee744a89d0bf1923316a10bb3a2d4bcdaf2a8a8537217e5b1e0457",
+          "dweb:/ipfs/QmVSKVFC9nUCguKJVBfoNWM4HcxVKGj4P3BgDP8iSD8q98"
+        ]
+      },
+      "src/coupons/CouponTypes.sol": {
+        "keccak256": "0x12eddc3a00fd422b3ff10bcb242ad0293cd45293ce734b008a358d39ff5c5984",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://274085cd93d49a0d88e97be50b743e525aee50bf0d3b347f88bbb7abf7356c46",
+          "dweb:/ipfs/QmTqkpoTLpTDMYTtNtNpV9sVdUVQEa7cnoBHimbJE3kuCR"
+        ]
+      },
+      "src/coupons/interfaces/ICoupon.sol": {
+        "keccak256": "0xe88754aa919781224c5c26fb0258634a6e4612b82cc1684385ed03edda58fec3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://311467ef59245ebc0915bfd9be6badcab4373721bc03366373e108695e40bde0",
+          "dweb:/ipfs/QmXq4bCD7bvehCfjir5qDpyV4rMRqKqNgaCakQs992Y3E6"
+        ]
+      },
+      "src/marketplace/DecentralandMarketplaceEthereumAssetTypes.sol": {
+        "keccak256": "0xdc2e391dde482df2eef0558a6bd1bf94098e8c458c33a81f07e85b25791e38ef",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ef0789ec19f655d5cc91effff8cc1c437b4cd40fd14426e42e575986c2b5f339",
+          "dweb:/ipfs/QmWmKgHqTDnxVs46C6wuANwmz1t2UWYuexUUWed5iqsAQr"
+        ]
+      },
+      "src/marketplace/DecentralandMarketplacePolygonAssetTypes.sol": {
+        "keccak256": "0xf3cddf3a208f144835a4c9051d3466553c1e18b8b274dff64ee014fe23c88e91",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0c9fa954026d5b684d8473676d85c008b5d9ce0b4ec6d0a7b367fb7aea7ed87b",
+          "dweb:/ipfs/QmVSyAVn8oXkHRD5sn9Z45fCt2MC6ZjEEV2qtvAYeVakU1"
+        ]
+      },
+      "src/marketplace/MarketplaceTypes.sol": {
+        "keccak256": "0x20e212e02791bdb538436302149488e402e43689809dd57e9294a0a5966acb0d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://23ba465ca85c0fff876e6e091f72a8d02b75ff490f378ea0f936eefe4260f75d",
+          "dweb:/ipfs/QmVAWPwhjTCTYeZN3LUuwH4HiaFfxiBvKfmg9T9iVHwRDK"
+        ]
+      },
+      "src/marketplace/interfaces/ICollection.sol": {
+        "keccak256": "0x0b0273e2ca8fc117d1138f51420970392fe8266175f13c4047f4ced04ab8ab34",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e80fac09bd36cf0394a92b8286b95aa6b11bdd68d9df6cfaea6964f48e17eb82",
+          "dweb:/ipfs/QmZjhJ5ZzFUybC9W584WhViPgaUPC4U2E326w6HwdQGMKE"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.20+commit.a1b79de6",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+        "ds-test/=lib/openzeppelin-contracts/lib/forge-std/lib/ds-test/src/",
+        "erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        "forge-std/=lib/forge-std/src/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/"
+      ]
+    },
+    "name": "CollectionDiscountCoupon",
+    "fullyQualifiedName": "src/coupons/CollectionDiscountCoupon.sol:CollectionDiscountCoupon"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "14265415",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-01-21T00:12:21Z",
+  "match": "exact_match",
+  "chainId": "137",
+  "address": "0xc914507fE297b2dddd1232Ac3A8903F1c125e794"
+}

@@ -1,0 +1,1492 @@
+{
+  "sources": {
+    "lib/openzeppelin-contracts/contracts/access/Ownable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\n\npragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\n/**\n * @dev Contract module which provides a basic access control mechanism, where\n * there is an account (an owner) that can be granted exclusive access to\n * specific functions.\n *\n * The initial owner is set to the address provided by the deployer. This can\n * later be changed with {transferOwnership}.\n *\n * This module is used through inheritance. It will make available the modifier\n * `onlyOwner`, which can be applied to your functions to restrict their use to\n * the owner.\n */\nabstract contract Ownable is Context {\n    address private _owner;\n\n    /**\n     * @dev The caller account is not authorized to perform an operation.\n     */\n    error OwnableUnauthorizedAccount(address account);\n\n    /**\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\n     */\n    error OwnableInvalidOwner(address owner);\n\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\n\n    /**\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\n     */\n    constructor(address initialOwner) {\n        if (initialOwner == address(0)) {\n            revert OwnableInvalidOwner(address(0));\n        }\n        _transferOwnership(initialOwner);\n    }\n\n    /**\n     * @dev Throws if called by any account other than the owner.\n     */\n    modifier onlyOwner() {\n        _checkOwner();\n        _;\n    }\n\n    /**\n     * @dev Returns the address of the current owner.\n     */\n    function owner() public view virtual returns (address) {\n        return _owner;\n    }\n\n    /**\n     * @dev Throws if the sender is not the owner.\n     */\n    function _checkOwner() internal view virtual {\n        if (owner() != _msgSender()) {\n            revert OwnableUnauthorizedAccount(_msgSender());\n        }\n    }\n\n    /**\n     * @dev Leaves the contract without owner. It will not be possible to call\n     * `onlyOwner` functions. Can only be called by the current owner.\n     *\n     * NOTE: Renouncing ownership will leave the contract without an owner,\n     * thereby disabling any functionality that is only available to the owner.\n     */\n    function renounceOwnership() public virtual onlyOwner {\n        _transferOwnership(address(0));\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Can only be called by the current owner.\n     */\n    function transferOwnership(address newOwner) public virtual onlyOwner {\n        if (newOwner == address(0)) {\n            revert OwnableInvalidOwner(address(0));\n        }\n        _transferOwnership(newOwner);\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Internal function without access restriction.\n     */\n    function _transferOwnership(address newOwner) internal virtual {\n        address oldOwner = _owner;\n        _owner = newOwner;\n        emit OwnershipTransferred(oldOwner, newOwner);\n    }\n}\n"
+    },
+    "src/coupons/CouponManager.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {Ownable} from \"@openzeppelin/contracts/access/Ownable.sol\";\n\nimport {Verifications} from \"src/common/Verifications.sol\";\nimport {EIP712} from \"src/common/EIP712.sol\";\nimport {ICoupon} from \"src/coupons/interfaces/ICoupon.sol\";\nimport {CouponTypesHashing} from \"src/coupons/CouponTypesHashing.sol\";\nimport {MarketplaceTypes} from \"src/marketplace/MarketplaceTypes.sol\";\n\n/// @notice Contract that allows applying Coupons to Trades.\n/// It holds the logic to control which Coupons are allowed to be applied.\n/// It also manages the Coupon signatures and their uses. This is useful to be able to add or remove new Coupons while still using the same EIP712 domain.\ncontract CouponManager is Verifications, CouponTypesHashing, MarketplaceTypes {\n    /// @notice The address of the Marketplace that will be able to apply Coupons.\n    /// Only this address will be able to apply Coupons.\n    address public marketplace;\n\n    /// @notice Mapping of the allowed Coupon contracts.\n    /// If a Coupon is not in this mapping, it will not be allowed to be applied.\n    mapping(address => bool) public allowedCoupons;\n\n    event MarketplaceUpdated(address indexed _caller, address indexed _marketplace);\n    event AllowedCouponsUpdated(address indexed _caller, address indexed _coupon, bool _value);\n    event CouponApplied(address indexed _caller, bytes32 indexed _tradeSignature, bytes32 indexed _couponSignature, Coupon _coupon);\n\n    error LengthMissmatch();\n    error UnauthorizedCaller(address _caller);\n    error CouponNotAllowed(address _coupon);\n\n    /// @param _marketplace The address of the Marketplace that will be able to apply Coupons.\n    /// @param _owner The owner of the contract.\n    /// @param _allowedCoupons The initial list of allowed Coupons.\n    constructor(address _marketplace, address _owner, address[] memory _allowedCoupons) EIP712(\"CouponManager\", \"1.0.0\") Ownable(_owner) {\n        _updateMarketplace(_marketplace);\n\n        for (uint256 i = 0; i < _allowedCoupons.length; i++) {\n            _updateAllowedCoupons(_allowedCoupons[i], true);\n        }\n    }\n\n    /// @notice Updates the address of the Marketplace that will be able to apply Coupons.\n    function updateMarketplace(address _marketplace) external onlyOwner {\n        _updateMarketplace(_marketplace);\n    }\n\n    /// @notice Updates the list of allowed Coupons.\n    function updateAllowedCoupons(address[] calldata _coupons, bool[] calldata _values) external onlyOwner {\n        if (_coupons.length != _values.length) {\n            revert LengthMissmatch();\n        }\n\n        for (uint256 i = 0; i < _coupons.length; i++) {\n            _updateAllowedCoupons(_coupons[i], _values[i]);\n        }\n    }\n\n    /// @notice Revokes the signatures of all provided coupons.\n    /// The caller must be the signer of those coupons.\n    /// @param _coupons The list of coupon signatures to be canceled.\n    function cancelSignature(Coupon[] calldata _coupons) external {\n        address caller = _msgSender();\n\n        for (uint256 i = 0; i < _coupons.length; i++) {\n            Coupon calldata coupon = _coupons[i];\n\n            _cancelSignature(keccak256(coupon.signature), caller);\n        }\n    }\n\n    /// @notice Applies a Coupon to a Trade.\n    /// @param _trade The Trade to apply the Coupon to.\n    /// @param _coupon The Coupon to apply.\n    /// @return The Trade with the Coupon applied.\n    function applyCoupon(Trade calldata _trade, Coupon calldata _coupon) external returns (Trade memory) {\n        address caller = _msgSender();\n\n        // Only the marketplace is allowed to apply Coupons.\n        if (caller != marketplace) {\n            revert UnauthorizedCaller(caller);\n        }\n\n        address couponAddress = _coupon.couponAddress;\n\n        // Fails if the coupon has not been allowed.\n        if (!allowedCoupons[couponAddress]) {\n            revert CouponNotAllowed(couponAddress);\n        }\n\n        address signer = _trade.signer;\n        bytes32 hashedCouponSignature = keccak256(_coupon.signature);\n        bytes32 hashedTradeSignature = keccak256(_trade.signature);\n        bytes32 hashedCouponSignatureWithSigner = keccak256(abi.encode(signer, hashedCouponSignature));\n        uint256 currentSignatureUses = signatureUses[hashedCouponSignatureWithSigner];\n\n        // Verify that the check values provided in the Coupon are correct.\n        _verifyChecks(_coupon.checks, hashedCouponSignatureWithSigner, currentSignatureUses, signer, caller);\n        // Verify that the Coupon signature is valid.\n        _verifyCouponSignature(_coupon, signer);\n\n        emit CouponApplied(caller, hashedTradeSignature, hashedCouponSignature, _coupon);\n\n        // Increase the amount of uses of the Coupon signature.\n        signatureUses[hashedCouponSignatureWithSigner]++;\n\n        // Apply the Coupon and return the modified Trade.\n        return ICoupon(couponAddress).applyCoupon(_trade, _coupon);\n    }\n\n    function _verifyCouponSignature(Coupon calldata _coupon, address _signer) private view {\n        _verifySignature(_hashCoupon(_coupon), _coupon.signature, _signer);\n    }\n\n    function _updateMarketplace(address _marketplace) private {\n        marketplace = _marketplace;\n\n        emit MarketplaceUpdated(_msgSender(), _marketplace);\n    }\n\n    function _updateAllowedCoupons(address _coupon, bool _value) private {\n        allowedCoupons[_coupon] = _value;\n\n        emit AllowedCouponsUpdated(_msgSender(), _coupon, _value);\n    }\n}\n"
+    },
+    "src/common/Verifications.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {MerkleProof} from \"@openzeppelin/contracts/utils/cryptography/MerkleProof.sol\";\n\nimport {Signatures} from \"src/common/Signatures.sol\";\nimport {CommonTypes} from \"src/common/CommonTypes.sol\";\n\n/// @notice Contract that provides a function to verify Checks.\nabstract contract Verifications is Signatures, CommonTypes {\n    /// bytes4(keccak256(\"balanceOf(address)\"))\n    bytes4 private constant BALANCE_OF_SELECTOR = 0x70a08231;\n\n    /// bytes4(keccak256(\"ownerOf(uint256)\"))\n    bytes4 private constant OWNER_OF_SELECTOR = 0x6352211e;\n\n    error UsingCancelledSignature();\n    error SignatureOveruse();\n    error NotEffective();\n    error InvalidContractSignatureIndex();\n    error InvalidSignerSignatureIndex();\n    error Expired();\n    error NotAllowed();\n    error ExternalChecksFailed();\n\n    /// @dev Verifies that the Check values are correct and that the signature has not been canceled or overused.\n    /// @param _checks The Checks to verify.\n    /// @param _hashedSignatureWithSigner The hash of the signature with the signer.\n    /// @param _currentSignatureUses The number of times the signature has been used.\n    /// @param _signer The address that created the signature.\n    /// @param _caller The address that sent the transaction.\n    function _verifyChecks(Checks calldata _checks, bytes32 _hashedSignatureWithSigner, uint256 _currentSignatureUses, address _signer, address _caller)\n        internal\n        view\n    {\n        if (cancelledSignatures[_hashedSignatureWithSigner]) {\n            revert UsingCancelledSignature();\n        }\n\n        if (_currentSignatureUses >= _checks.uses) {\n            revert SignatureOveruse();\n        }\n\n        if (_checks.effective > block.timestamp) {\n            revert NotEffective();\n        }\n\n        if (contractSignatureIndex != _checks.contractSignatureIndex) {\n            revert InvalidContractSignatureIndex();\n        }\n\n        if (signerSignatureIndex[_signer] != _checks.signerSignatureIndex) {\n            revert InvalidSignerSignatureIndex();\n        }\n\n        if (_checks.expiration < block.timestamp) {\n            revert Expired();\n        }\n\n        if (_checks.allowedRoot != 0) {\n            _verifyAllowed(_checks.allowedRoot, _checks.allowedProof, _caller);\n        }\n\n        if (_checks.externalChecks.length > 0) {\n            _verifyExternalChecks(_checks.externalChecks, _caller);\n        }\n    }\n\n    /// @dev Verifies that the provided caller is allowed.\n    /// @param _allowedRoot The Merkle Root of the allowed addresses.\n    /// @param _allowedProof The Merkle Proof that validates that the caller is allowed.\n    /// @param _caller The address that sent the transaction.\n    function _verifyAllowed(bytes32 _allowedRoot, bytes32[] calldata _allowedProof, address _caller) private pure {\n        if (!MerkleProof.verify(_allowedProof, _allowedRoot, keccak256(bytes.concat(keccak256(abi.encode(address(_caller))))))) {\n            revert NotAllowed();\n        }\n    }\n\n    /// @dev Verifies that the external checks are met.\n    /// @param _externalChecks The external checks to verify.\n    /// @param _caller The address that sent the transaction.\n    ///\n    /// External checks can be defined as required or optional. If any required check fails, the function will revert.\n    /// Regarding optional checks, it only makes sense when there are more than one. If there is only one optional check, even if there are other required checks, it will be treated as required.\n    /// For example:\n    /// - 1 optional check === 1 required check.\n    /// - 1 required check + 1 optional check === 2 required checks.\n    ///\n    /// If the selector is `balanceOf`, it will be checked that the balance is greater than or equal to the `value`.\n    /// If the selector is `ownerOf`, it will be checked that the owner of `value` is the caller.\n    /// Otherwise, the function will call the selector with the caller and value, and expect it to return true.\n    function _verifyExternalChecks(ExternalCheck[] calldata _externalChecks, address _caller) private view {\n        bool hasOptionalChecks = false;\n        bool hasPassingOptionalCheck = false;\n\n        for (uint256 i = 0; i < _externalChecks.length; i++) {\n            ExternalCheck calldata externalCheck = _externalChecks[i];\n\n            bool isRequiredCheck = externalCheck.required;\n\n            if (!isRequiredCheck && hasPassingOptionalCheck) {\n                // If there is already a passing optional check, there is no need to evaluate the others.\n                continue;\n            }\n\n            bytes4 selector = externalCheck.selector;\n\n            bytes memory functionData;\n\n            if (selector == BALANCE_OF_SELECTOR) {\n                // balanceOf(address _user)\n                functionData = abi.encodeWithSelector(selector, _caller);\n            } else if (selector == OWNER_OF_SELECTOR) {\n                // ownerOf(uint256 _tokenId)\n                functionData = abi.encodeWithSelector(selector, abi.decode(externalCheck.value, (uint256)));\n            } else {\n                // custom(address _user, bytes _value)\n                functionData = abi.encodeWithSelector(selector, _caller, externalCheck.value);\n            }\n\n            // Call the external contract to check the condition.\n            (bool success, bytes memory data) = externalCheck.contractAddress.staticcall(functionData);\n\n            if (!success) {\n                // Do nothing here, an unsuccessful call will be treated as a failed check later.\n            } else if (selector == BALANCE_OF_SELECTOR) {\n                // Check that the returned balance is >= the provided value.\n                success = abi.decode(data, (uint256)) >= abi.decode(externalCheck.value, (uint256));\n            } else if (selector == OWNER_OF_SELECTOR) {\n                // Check that the owner of the nft is the caller.\n                success = abi.decode(data, (address)) == _caller;\n            } else {\n                // Check that the custom function returned true.\n                success = abi.decode(data, (bool));\n            }\n\n            // There is no need to proceed if a required check fails.\n            if (!success && isRequiredCheck) {\n                revert ExternalChecksFailed();\n            }\n\n            if (!isRequiredCheck) {\n                // Track that there is at least one optional check.\n                hasOptionalChecks = true;\n\n                if (success) {\n                    // Track that there is at least one passing optional check.\n                    hasPassingOptionalCheck = true;\n                }\n            }\n        }\n\n        // Fails if there were optional checks and none of them passed.\n        if (hasOptionalChecks && !hasPassingOptionalCheck) {\n            revert ExternalChecksFailed();\n        }\n    }\n}\n"
+    },
+    "src/common/EIP712.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/EIP712.sol)\n\npragma solidity 0.8.20;\n\nimport {MessageHashUtils} from \"@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol\";\nimport {ShortStrings, ShortString} from \"@openzeppelin/contracts/utils/ShortStrings.sol\";\n\n/**\n * @dev Modified implementation of OpenZeppelin's EIP712 to address specific requirements.\n *\n * The original implementation can be found at:\n * https://github.com/OpenZeppelin/openzeppelin-contracts/blob/dbb6104ce834628e473d2173bbc9d47f81a9eec3/contracts/utils/cryptography/EIP712.sol\n *\n * Changes from the OZ implementation include:\n * 1. The TYPE_HASH no longer includes the chain ID. This modification allows users to sign messages for a different\n *    blockchain than the one where the contract is deployed. To prevent replay attacks, the target chain ID is\n *    specified in the `salt` parameter. This approach enhances user experience by eliminating the need for users\n *    to switch chains just to sign messages.\n * 2. Removed the IERC5267 interface and the associated eip712Domain function. The reason for this removal is that\n *    the EIP712 domain structure in these contracts does not conform to the IERC5267 standard.\n *\n * All comments found underneath are from the original implementation.\n *\n * @dev https://eips.ethereum.org/EIPS/eip-712[EIP 712] is a standard for hashing and signing of typed structured data.\n *\n * The encoding scheme specified in the EIP requires a domain separator and a hash of the typed structured data, whose\n * encoding is very generic and therefore its implementation in Solidity is not feasible, thus this contract\n * does not implement the encoding itself. Protocols need to implement the type-specific encoding they need in order to\n * produce the hash of their typed data using a combination of `abi.encode` and `keccak256`.\n *\n * This contract implements the EIP 712 domain separator ({_domainSeparatorV4}) that is used as part of the encoding\n * scheme, and the final step of the encoding to obtain the message digest that is then signed via ECDSA\n * ({_hashTypedDataV4}).\n *\n * The implementation of the domain separator was designed to be as efficient as possible while still properly updating\n * the chain id to protect against replay attacks on an eventual fork of the chain.\n *\n * NOTE: This contract implements the version of the encoding known as \"v4\", as implemented by the JSON RPC method\n * https://docs.metamask.io/guide/signing-data.html[`eth_signTypedDataV4` in MetaMask].\n *\n * NOTE: In the upgradeable version of this contract, the cached values will correspond to the address, and the domain\n * separator of the implementation contract. This will cause the {_domainSeparatorV4} function to always rebuild the\n * separator from the immutable values, which is cheaper than accessing a cached version in cold storage.\n *\n * @custom:oz-upgrades-unsafe-allow state-variable-immutable\n */\nabstract contract EIP712 {\n    using ShortStrings for *;\n\n    /// keccak256(\"EIP712Domain(string name,string version,address verifyingContract,bytes32 salt)\")\n    bytes32 private constant TYPE_HASH = 0x36c25de3e541d5d970f66e4210d728721220fff5c077cc6cd008b3a0c62adab7;\n\n    // Cache the domain separator as an immutable value, but also store the chain id that it corresponds to, in order to\n    // invalidate the cached domain separator if the chain id changes.\n    bytes32 private immutable _cachedDomainSeparator;\n    uint256 private immutable _cachedChainId;\n    address private immutable _cachedThis;\n\n    bytes32 private immutable _hashedName;\n    bytes32 private immutable _hashedVersion;\n\n    ShortString private immutable _name;\n    ShortString private immutable _version;\n    string private _nameFallback;\n    string private _versionFallback;\n\n    /**\n     * @dev Initializes the domain separator and parameter caches.\n     *\n     * The meaning of `name` and `version` is specified in\n     * https://eips.ethereum.org/EIPS/eip-712#definition-of-domainseparator[EIP 712]:\n     *\n     * - `name`: the user readable name of the signing domain, i.e. the name of the DApp or the protocol.\n     * - `version`: the current major version of the signing domain.\n     *\n     * NOTE: These parameters cannot be changed except through a xref:learn::upgrading-smart-contracts.adoc[smart\n     * contract upgrade].\n     */\n    constructor(string memory name, string memory version) {\n        _name = name.toShortStringWithFallback(_nameFallback);\n        _version = version.toShortStringWithFallback(_versionFallback);\n        _hashedName = keccak256(bytes(name));\n        _hashedVersion = keccak256(bytes(version));\n\n        _cachedChainId = block.chainid;\n        _cachedDomainSeparator = _buildDomainSeparator();\n        _cachedThis = address(this);\n    }\n\n    /**\n     * @dev Returns the domain separator for the current chain.\n     */\n    function _domainSeparatorV4() internal view returns (bytes32) {\n        if (address(this) == _cachedThis && block.chainid == _cachedChainId) {\n            return _cachedDomainSeparator;\n        } else {\n            return _buildDomainSeparator();\n        }\n    }\n\n    function _buildDomainSeparator() private view returns (bytes32) {\n        return keccak256(abi.encode(TYPE_HASH, _hashedName, _hashedVersion, address(this), block.chainid));\n    }\n\n    /**\n     * @dev Given an already https://eips.ethereum.org/EIPS/eip-712#definition-of-hashstruct[hashed struct], this\n     * function returns the hash of the fully encoded EIP712 message for this domain.\n     *\n     * This hash can be used together with {ECDSA-recover} to obtain the signer of a message. For example:\n     *\n     * ```solidity\n     * bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(\n     *     keccak256(\"Mail(address to,string contents)\"),\n     *     mailTo,\n     *     keccak256(bytes(mailContents))\n     * )));\n     * address signer = ECDSA.recover(digest, signature);\n     * ```\n     */\n    function _hashTypedDataV4(bytes32 structHash) internal view virtual returns (bytes32) {\n        return MessageHashUtils.toTypedDataHash(_domainSeparatorV4(), structHash);\n    }\n\n    /**\n     * @dev The name parameter for the EIP712 domain.\n     *\n     * NOTE: By default this function reads _name which is an immutable value.\n     * It only reads from storage if necessary (in case the value is too large to fit in a ShortString).\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function _EIP712Name() internal view returns (string memory) {\n        return _name.toStringWithFallback(_nameFallback);\n    }\n\n    /**\n     * @dev The version parameter for the EIP712 domain.\n     *\n     * NOTE: By default this function reads _version which is an immutable value.\n     * It only reads from storage if necessary (in case the value is too large to fit in a ShortString).\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function _EIP712Version() internal view returns (string memory) {\n        return _version.toStringWithFallback(_versionFallback);\n    }\n}\n"
+    },
+    "src/coupons/interfaces/ICoupon.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {CouponTypes} from \"src/coupons/CouponTypes.sol\";\nimport {MarketplaceTypes} from \"src/marketplace/MarketplaceTypes.sol\";\n\n/// @notice Interface for the Coupon contract.\ninterface ICoupon {\n    function applyCoupon(MarketplaceTypes.Trade calldata _trade, CouponTypes.Coupon calldata _coupon) external view returns (MarketplaceTypes.Trade memory);\n}\n"
+    },
+    "src/coupons/CouponTypesHashing.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {CommonTypesHashing} from \"src/common/CommonTypesHashing.sol\";\nimport {CouponTypes} from \"src/coupons/CouponTypes.sol\";\n\n/// @notice Hashing functions for the Coupon types. Used for EIP712 signatures.\nabstract contract CouponTypesHashing is CouponTypes, CommonTypesHashing {\n    // keccak256(\"Coupon(Checks checks,address couponAddress,bytes data)Checks(uint256 uses,uint256 expiration,uint256 effective,bytes32 salt,uint256 contractSignatureIndex,uint256 signerSignatureIndex,bytes32 allowedRoot,ExternalCheck[] externalChecks)ExternalCheck(address contractAddress,bytes4 selector,bytes value,bool required)\")\n    bytes32 private constant COUPON_TYPE_HASH = 0x550ebdbba619b5765a2af482a21795aa7bd7c99cb3a00921f6d87704d97e7c9e;\n\n    function _hashCoupon(Coupon calldata _coupon) internal pure returns (bytes32) {\n        return keccak256(\n            abi.encode(\n                COUPON_TYPE_HASH, \n                _hashChecks(_coupon.checks), \n                _coupon.couponAddress, \n                keccak256(_coupon.data)\n            )\n        );\n    }\n}\n"
+    },
+    "src/marketplace/MarketplaceTypes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {CommonTypes} from \"src/common/CommonTypes.sol\";\n\n/// @notice Types used by the Marketplace.\nabstract contract MarketplaceTypes is CommonTypes {\n    /// @notice Schema for the Asset type.\n    /// This represents any kind of asset that will be traded.\n    /// @param assetType Type of the asset. Used to know how to handle it.\n    /// @param contractAddress Address of the contract of the asset.\n    /// @param value Value of the asset. The amount for ERC20s, the ID for ERC721s, etc.\n    /// @param beneficiary Address that will receive the asset. If empty, depending if the asset is sent or received, the beneficiary will be the signer or the caller.\n    /// In the case of sent assets, the beneficiary is not validated in the signature. This is to allow the caller to determine which address will receive the asset.\n    /// @param extra Extra data that can be used to store additional information. \n    struct Asset {\n        uint256 assetType;\n        address contractAddress;\n        uint256 value;\n        address beneficiary;\n        bytes extra;\n    }\n\n    /// @notice Schema for the Trade type.\n    /// This represents a signed Trade that indicates the terms of the Trade, as well as the assets involved.\n    /// @param signer Address of the signer of the Trade.\n    /// @param signature Signature of the Trade.\n    /// @param checks Checks to be performed before executing the Trade.\n    /// @param sent Assets that will be sent to the caller in the Trade.\n    /// @param received Assets that will be received by the signer in the Trade.\n    struct Trade {\n        address signer;\n        bytes signature;\n        Checks checks;\n        Asset[] sent;\n        Asset[] received;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/Context.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n\n    function _msgData() internal view virtual returns (bytes calldata) {\n        return msg.data;\n    }\n\n    function _contextSuffixLength() internal view virtual returns (uint256) {\n        return 0;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/MerkleProof.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev These functions deal with verification of Merkle Tree proofs.\n *\n * The tree and the proofs can be generated using our\n * https://github.com/OpenZeppelin/merkle-tree[JavaScript library].\n * You will find a quickstart guide in the readme.\n *\n * WARNING: You should avoid using leaf values that are 64 bytes long prior to\n * hashing, or use a hash function other than keccak256 for hashing leaves.\n * This is because the concatenation of a sorted pair of internal nodes in\n * the Merkle tree could be reinterpreted as a leaf value.\n * OpenZeppelin's JavaScript library generates Merkle trees that are safe\n * against this attack out of the box.\n */\nlibrary MerkleProof {\n    /**\n     *@dev The multiproof provided is not valid.\n     */\n    error MerkleProofInvalidMultiproof();\n\n    /**\n     * @dev Returns true if a `leaf` can be proved to be a part of a Merkle tree\n     * defined by `root`. For this, a `proof` must be provided, containing\n     * sibling hashes on the branch from the leaf to the root of the tree. Each\n     * pair of leaves and each pair of pre-images are assumed to be sorted.\n     */\n    function verify(bytes32[] memory proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {\n        return processProof(proof, leaf) == root;\n    }\n\n    /**\n     * @dev Calldata version of {verify}\n     */\n    function verifyCalldata(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {\n        return processProofCalldata(proof, leaf) == root;\n    }\n\n    /**\n     * @dev Returns the rebuilt hash obtained by traversing a Merkle tree up\n     * from `leaf` using `proof`. A `proof` is valid if and only if the rebuilt\n     * hash matches the root of the tree. When processing the proof, the pairs\n     * of leafs & pre-images are assumed to be sorted.\n     */\n    function processProof(bytes32[] memory proof, bytes32 leaf) internal pure returns (bytes32) {\n        bytes32 computedHash = leaf;\n        for (uint256 i = 0; i < proof.length; i++) {\n            computedHash = _hashPair(computedHash, proof[i]);\n        }\n        return computedHash;\n    }\n\n    /**\n     * @dev Calldata version of {processProof}\n     */\n    function processProofCalldata(bytes32[] calldata proof, bytes32 leaf) internal pure returns (bytes32) {\n        bytes32 computedHash = leaf;\n        for (uint256 i = 0; i < proof.length; i++) {\n            computedHash = _hashPair(computedHash, proof[i]);\n        }\n        return computedHash;\n    }\n\n    /**\n     * @dev Returns true if the `leaves` can be simultaneously proven to be a part of a Merkle tree defined by\n     * `root`, according to `proof` and `proofFlags` as described in {processMultiProof}.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     */\n    function multiProofVerify(\n        bytes32[] memory proof,\n        bool[] memory proofFlags,\n        bytes32 root,\n        bytes32[] memory leaves\n    ) internal pure returns (bool) {\n        return processMultiProof(proof, proofFlags, leaves) == root;\n    }\n\n    /**\n     * @dev Calldata version of {multiProofVerify}\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     */\n    function multiProofVerifyCalldata(\n        bytes32[] calldata proof,\n        bool[] calldata proofFlags,\n        bytes32 root,\n        bytes32[] memory leaves\n    ) internal pure returns (bool) {\n        return processMultiProofCalldata(proof, proofFlags, leaves) == root;\n    }\n\n    /**\n     * @dev Returns the root of a tree reconstructed from `leaves` and sibling nodes in `proof`. The reconstruction\n     * proceeds by incrementally reconstructing all inner nodes by combining a leaf/inner node with either another\n     * leaf/inner node or a proof sibling node, depending on whether each `proofFlags` item is true or false\n     * respectively.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. To use multiproofs, it is sufficient to ensure that: 1) the tree\n     * is complete (but not necessarily perfect), 2) the leaves to be proven are in the opposite order they are in the\n     * tree (i.e., as seen from right to left starting at the deepest layer and continuing at the next layer).\n     */\n    function processMultiProof(\n        bytes32[] memory proof,\n        bool[] memory proofFlags,\n        bytes32[] memory leaves\n    ) internal pure returns (bytes32 merkleRoot) {\n        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by\n        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the\n        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of\n        // the Merkle tree.\n        uint256 leavesLen = leaves.length;\n        uint256 proofLen = proof.length;\n        uint256 totalHashes = proofFlags.length;\n\n        // Check proof validity.\n        if (leavesLen + proofLen != totalHashes + 1) {\n            revert MerkleProofInvalidMultiproof();\n        }\n\n        // The xxxPos values are \"pointers\" to the next value to consume in each array. All accesses are done using\n        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's \"pop\".\n        bytes32[] memory hashes = new bytes32[](totalHashes);\n        uint256 leafPos = 0;\n        uint256 hashPos = 0;\n        uint256 proofPos = 0;\n        // At each step, we compute the next hash using two values:\n        // - a value from the \"main queue\". If not all leaves have been consumed, we get the next leaf, otherwise we\n        //   get the next hash.\n        // - depending on the flag, either another value from the \"main queue\" (merging branches) or an element from the\n        //   `proof` array.\n        for (uint256 i = 0; i < totalHashes; i++) {\n            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];\n            bytes32 b = proofFlags[i]\n                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])\n                : proof[proofPos++];\n            hashes[i] = _hashPair(a, b);\n        }\n\n        if (totalHashes > 0) {\n            if (proofPos != proofLen) {\n                revert MerkleProofInvalidMultiproof();\n            }\n            unchecked {\n                return hashes[totalHashes - 1];\n            }\n        } else if (leavesLen > 0) {\n            return leaves[0];\n        } else {\n            return proof[0];\n        }\n    }\n\n    /**\n     * @dev Calldata version of {processMultiProof}.\n     *\n     * CAUTION: Not all Merkle trees admit multiproofs. See {processMultiProof} for details.\n     */\n    function processMultiProofCalldata(\n        bytes32[] calldata proof,\n        bool[] calldata proofFlags,\n        bytes32[] memory leaves\n    ) internal pure returns (bytes32 merkleRoot) {\n        // This function rebuilds the root hash by traversing the tree up from the leaves. The root is rebuilt by\n        // consuming and producing values on a queue. The queue starts with the `leaves` array, then goes onto the\n        // `hashes` array. At the end of the process, the last hash in the `hashes` array should contain the root of\n        // the Merkle tree.\n        uint256 leavesLen = leaves.length;\n        uint256 proofLen = proof.length;\n        uint256 totalHashes = proofFlags.length;\n\n        // Check proof validity.\n        if (leavesLen + proofLen != totalHashes + 1) {\n            revert MerkleProofInvalidMultiproof();\n        }\n\n        // The xxxPos values are \"pointers\" to the next value to consume in each array. All accesses are done using\n        // `xxx[xxxPos++]`, which return the current value and increment the pointer, thus mimicking a queue's \"pop\".\n        bytes32[] memory hashes = new bytes32[](totalHashes);\n        uint256 leafPos = 0;\n        uint256 hashPos = 0;\n        uint256 proofPos = 0;\n        // At each step, we compute the next hash using two values:\n        // - a value from the \"main queue\". If not all leaves have been consumed, we get the next leaf, otherwise we\n        //   get the next hash.\n        // - depending on the flag, either another value from the \"main queue\" (merging branches) or an element from the\n        //   `proof` array.\n        for (uint256 i = 0; i < totalHashes; i++) {\n            bytes32 a = leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++];\n            bytes32 b = proofFlags[i]\n                ? (leafPos < leavesLen ? leaves[leafPos++] : hashes[hashPos++])\n                : proof[proofPos++];\n            hashes[i] = _hashPair(a, b);\n        }\n\n        if (totalHashes > 0) {\n            if (proofPos != proofLen) {\n                revert MerkleProofInvalidMultiproof();\n            }\n            unchecked {\n                return hashes[totalHashes - 1];\n            }\n        } else if (leavesLen > 0) {\n            return leaves[0];\n        } else {\n            return proof[0];\n        }\n    }\n\n    /**\n     * @dev Sorts the pair (a, b) and hashes the result.\n     */\n    function _hashPair(bytes32 a, bytes32 b) private pure returns (bytes32) {\n        return a < b ? _efficientHash(a, b) : _efficientHash(b, a);\n    }\n\n    /**\n     * @dev Implementation of keccak256(abi.encode(a, b)) that doesn't allocate or expand memory.\n     */\n    function _efficientHash(bytes32 a, bytes32 b) private pure returns (bytes32 value) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            mstore(0x00, a)\n            mstore(0x20, b)\n            value := keccak256(0x00, 0x40)\n        }\n    }\n}\n"
+    },
+    "src/common/Signatures.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {Ownable} from \"@openzeppelin/contracts/access/Ownable.sol\";\nimport {SignatureChecker} from \"@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol\";\n\nimport {EIP712} from \"src/common/EIP712.sol\";\n\n/// @dev Adds some functions to manage signatures.\nabstract contract Signatures is Ownable, EIP712 {\n    /// @notice Value of the current contract signature index.\n    /// The owner of the contract can update this value to revoke signatures created with another value.\n    uint256 public contractSignatureIndex;\n\n    /// @notice Value of the current signer signature index.\n    /// Signers can update this value to revoke signatures created with another value.\n    mapping(address => uint256) public signerSignatureIndex;\n\n    /// @notice Mapping of cancelled signatures.\n    /// Signers can invalidate any particular signature by adding it to this mapping.\n    mapping(bytes32 => bool) public cancelledSignatures;\n\n    /// @notice Mapping of signature uses.\n    /// Tracks how many times a signature has been used.\n    /// Useful in case the signer wants to determine how many times a signature can be used.\n    mapping(bytes32 => uint256) public signatureUses;\n\n    event ContractSignatureIndexIncreased(address indexed _caller, uint256 indexed _newValue);\n    event SignerSignatureIndexIncreased(address indexed _caller, uint256 indexed _newValue);\n    event SignatureCancelled(address indexed _caller, bytes32 indexed _signature);\n\n    error InvalidSignature();\n\n    /// @notice Allows the owner of the contract to increase the contract signature index.\n    /// Revokes all signatures created with a previous index.\n    function increaseContractSignatureIndex() external onlyOwner {\n        uint256 newIndex = ++contractSignatureIndex;\n\n        emit ContractSignatureIndexIncreased(_msgSender(), newIndex);\n    }\n\n    /// @notice Allows the signer to increase their signature index.\n    /// Revokes all signatures created by the signer with a previous index.\n    function increaseSignerSignatureIndex() external {\n        address caller = _msgSender();\n        uint256 newIndex = ++signerSignatureIndex[caller];\n\n        emit SignerSignatureIndexIncreased(caller, newIndex);\n    }\n\n    /// @dev Useful to cancel a signature so it cannot be used anymore.\n    /// The implementation should call this function after validating that the caller is the creator of the signature.\n    /// @param _hashedSignature The hash of the signature to cancel.\n    /// @param _caller The address that is canceling the signature.\n    function _cancelSignature(bytes32 _hashedSignature, address _caller) internal {\n        cancelledSignatures[keccak256(abi.encode(_caller, _hashedSignature))] = true;\n\n        emit SignatureCancelled(_caller, _hashedSignature);\n    }\n\n    /// @dev Verifies that a signature has been signed by a particular signer.\n    /// @param _typeHash The type hash.\n    /// @param _signature The signature.\n    /// @param _signer The signer who is supposed to have signed the signature.\n    function _verifySignature(bytes32 _typeHash, bytes calldata _signature, address _signer) internal view {\n        if (!SignatureChecker.isValidSignatureNow(_signer, _hashTypedDataV4(_typeHash), _signature)) {\n            revert InvalidSignature();\n        }\n    }\n}\n"
+    },
+    "src/common/CommonTypes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\n/// @notice Types used by many contracts in this project.\nabstract contract CommonTypes {\n    /// @notice Schema of an external check.\n    /// This is used to verify that certain external requirements are met.\n    /// @param contractAddress The address of the contract to call.\n    /// @param selector The selector of the function to call.\n    /// @param value The value to pass to the function.\n    /// @param required If the check is required or not.\n    struct ExternalCheck {\n        address contractAddress;\n        bytes4 selector;\n        bytes value;\n        bool required;\n    }\n\n    /// @notice Schema of a check.\n    /// This is used to verify that certain requirements are met.\n    /// @param uses The number of times the signature can be used.\n    /// @param expiration The expiration date of the signature.\n    /// @param effective The effective date of the signature.\n    /// @param salt A value used to make the signature unique.\n    /// @param contractSignatureIndex The contract signature index required to validate the signature.\n    /// @param signerSignatureIndex The signer signature index required to validate the signature.\n    /// @param allowedRoot The Merkle Root of the allowed addresses. If empty, no check is performed.\n    /// @param allowedProof The Merkle Proof that validates that the caller is allowed. Is not validated in the signature given that it is data used by the caller.\n    /// @param externalChecks The external checks to verify.\n    struct Checks {\n        uint256 uses;\n        uint256 expiration;\n        uint256 effective;\n        bytes32 salt;\n        uint256 contractSignatureIndex;\n        uint256 signerSignatureIndex;\n        bytes32 allowedRoot;\n        bytes32[] allowedProof;\n        ExternalCheck[] externalChecks;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/MessageHashUtils.sol)\n\npragma solidity ^0.8.20;\n\nimport {Strings} from \"../Strings.sol\";\n\n/**\n * @dev Signature message hash utilities for producing digests to be consumed by {ECDSA} recovery or signing.\n *\n * The library provides methods for generating a hash of a message that conforms to the\n * https://eips.ethereum.org/EIPS/eip-191[EIP 191] and https://eips.ethereum.org/EIPS/eip-712[EIP 712]\n * specifications.\n */\nlibrary MessageHashUtils {\n    /**\n     * @dev Returns the keccak256 digest of an EIP-191 signed data with version\n     * `0x45` (`personal_sign` messages).\n     *\n     * The digest is calculated by prefixing a bytes32 `messageHash` with\n     * `\"\\x19Ethereum Signed Message:\\n32\"` and hashing the result. It corresponds with the\n     * hash signed when using the https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`] JSON-RPC method.\n     *\n     * NOTE: The `messageHash` parameter is intended to be the result of hashing a raw message with\n     * keccak256, although any bytes32 value can be safely used because the final digest will\n     * be re-hashed.\n     *\n     * See {ECDSA-recover}.\n     */\n    function toEthSignedMessageHash(bytes32 messageHash) internal pure returns (bytes32 digest) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            mstore(0x00, \"\\x19Ethereum Signed Message:\\n32\") // 32 is the bytes-length of messageHash\n            mstore(0x1c, messageHash) // 0x1c (28) is the length of the prefix\n            digest := keccak256(0x00, 0x3c) // 0x3c is the length of the prefix (0x1c) + messageHash (0x20)\n        }\n    }\n\n    /**\n     * @dev Returns the keccak256 digest of an EIP-191 signed data with version\n     * `0x45` (`personal_sign` messages).\n     *\n     * The digest is calculated by prefixing an arbitrary `message` with\n     * `\"\\x19Ethereum Signed Message:\\n\" + len(message)` and hashing the result. It corresponds with the\n     * hash signed when using the https://eth.wiki/json-rpc/API#eth_sign[`eth_sign`] JSON-RPC method.\n     *\n     * See {ECDSA-recover}.\n     */\n    function toEthSignedMessageHash(bytes memory message) internal pure returns (bytes32) {\n        return\n            keccak256(bytes.concat(\"\\x19Ethereum Signed Message:\\n\", bytes(Strings.toString(message.length)), message));\n    }\n\n    /**\n     * @dev Returns the keccak256 digest of an EIP-191 signed data with version\n     * `0x00` (data with intended validator).\n     *\n     * The digest is calculated by prefixing an arbitrary `data` with `\"\\x19\\x00\"` and the intended\n     * `validator` address. Then hashing the result.\n     *\n     * See {ECDSA-recover}.\n     */\n    function toDataWithIntendedValidatorHash(address validator, bytes memory data) internal pure returns (bytes32) {\n        return keccak256(abi.encodePacked(hex\"19_00\", validator, data));\n    }\n\n    /**\n     * @dev Returns the keccak256 digest of an EIP-712 typed data (EIP-191 version `0x01`).\n     *\n     * The digest is calculated from a `domainSeparator` and a `structHash`, by prefixing them with\n     * `\\x19\\x01` and hashing the result. It corresponds to the hash signed by the\n     * https://eips.ethereum.org/EIPS/eip-712[`eth_signTypedData`] JSON-RPC method as part of EIP-712.\n     *\n     * See {ECDSA-recover}.\n     */\n    function toTypedDataHash(bytes32 domainSeparator, bytes32 structHash) internal pure returns (bytes32 digest) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            let ptr := mload(0x40)\n            mstore(ptr, hex\"19_01\")\n            mstore(add(ptr, 0x02), domainSeparator)\n            mstore(add(ptr, 0x22), structHash)\n            digest := keccak256(ptr, 0x42)\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/ShortStrings.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/ShortStrings.sol)\n\npragma solidity ^0.8.20;\n\nimport {StorageSlot} from \"./StorageSlot.sol\";\n\n// | string  | 0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA   |\n// | length  | 0x                                                              BB |\ntype ShortString is bytes32;\n\n/**\n * @dev This library provides functions to convert short memory strings\n * into a `ShortString` type that can be used as an immutable variable.\n *\n * Strings of arbitrary length can be optimized using this library if\n * they are short enough (up to 31 bytes) by packing them with their\n * length (1 byte) in a single EVM word (32 bytes). Additionally, a\n * fallback mechanism can be used for every other case.\n *\n * Usage example:\n *\n * ```solidity\n * contract Named {\n *     using ShortStrings for *;\n *\n *     ShortString private immutable _name;\n *     string private _nameFallback;\n *\n *     constructor(string memory contractName) {\n *         _name = contractName.toShortStringWithFallback(_nameFallback);\n *     }\n *\n *     function name() external view returns (string memory) {\n *         return _name.toStringWithFallback(_nameFallback);\n *     }\n * }\n * ```\n */\nlibrary ShortStrings {\n    // Used as an identifier for strings longer than 31 bytes.\n    bytes32 private constant FALLBACK_SENTINEL = 0x00000000000000000000000000000000000000000000000000000000000000FF;\n\n    error StringTooLong(string str);\n    error InvalidShortString();\n\n    /**\n     * @dev Encode a string of at most 31 chars into a `ShortString`.\n     *\n     * This will trigger a `StringTooLong` error is the input string is too long.\n     */\n    function toShortString(string memory str) internal pure returns (ShortString) {\n        bytes memory bstr = bytes(str);\n        if (bstr.length > 31) {\n            revert StringTooLong(str);\n        }\n        return ShortString.wrap(bytes32(uint256(bytes32(bstr)) | bstr.length));\n    }\n\n    /**\n     * @dev Decode a `ShortString` back to a \"normal\" string.\n     */\n    function toString(ShortString sstr) internal pure returns (string memory) {\n        uint256 len = byteLength(sstr);\n        // using `new string(len)` would work locally but is not memory safe.\n        string memory str = new string(32);\n        /// @solidity memory-safe-assembly\n        assembly {\n            mstore(str, len)\n            mstore(add(str, 0x20), sstr)\n        }\n        return str;\n    }\n\n    /**\n     * @dev Return the length of a `ShortString`.\n     */\n    function byteLength(ShortString sstr) internal pure returns (uint256) {\n        uint256 result = uint256(ShortString.unwrap(sstr)) & 0xFF;\n        if (result > 31) {\n            revert InvalidShortString();\n        }\n        return result;\n    }\n\n    /**\n     * @dev Encode a string into a `ShortString`, or write it to storage if it is too long.\n     */\n    function toShortStringWithFallback(string memory value, string storage store) internal returns (ShortString) {\n        if (bytes(value).length < 32) {\n            return toShortString(value);\n        } else {\n            StorageSlot.getStringSlot(store).value = value;\n            return ShortString.wrap(FALLBACK_SENTINEL);\n        }\n    }\n\n    /**\n     * @dev Decode a string that was encoded to `ShortString` or written to storage using {setWithFallback}.\n     */\n    function toStringWithFallback(ShortString value, string storage store) internal pure returns (string memory) {\n        if (ShortString.unwrap(value) != FALLBACK_SENTINEL) {\n            return toString(value);\n        } else {\n            return store;\n        }\n    }\n\n    /**\n     * @dev Return the length of a string that was encoded to `ShortString` or written to storage using\n     * {setWithFallback}.\n     *\n     * WARNING: This will return the \"byte length\" of the string. This may not reflect the actual length in terms of\n     * actual characters as the UTF-8 encoding of a single character can span over multiple bytes.\n     */\n    function byteLengthWithFallback(ShortString value, string storage store) internal view returns (uint256) {\n        if (ShortString.unwrap(value) != FALLBACK_SENTINEL) {\n            return byteLength(value);\n        } else {\n            return bytes(store).length;\n        }\n    }\n}\n"
+    },
+    "src/coupons/CouponTypes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {CommonTypes} from \"src/common/CommonTypes.sol\";\n\n/// @notice Types used by the Coupons.\nabstract contract CouponTypes is CommonTypes {\n    /// @notice Schema for the Coupon type.\n    /// @param signature Signature of the coupon.\n    /// @param checks Values to be verified before applying the coupon.\n    /// @param couponAddress Address of the Coupon contract to be used.\n    /// @param data Data to be used by the Coupon contract.\n    /// @param callerData Data sent by the caller to be used by the Coupon contract.\n    struct Coupon {\n        bytes signature;\n        Checks checks;\n        address couponAddress;\n        bytes data;\n        bytes callerData;\n    }\n}\n"
+    },
+    "src/common/CommonTypesHashing.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.20;\n\nimport {CommonTypes} from \"src/common/CommonTypes.sol\";\n\n/// @notice Hashing of the common types, used for EIP712 signature verification.\nabstract contract CommonTypesHashing is CommonTypes {\n    // keccak256(\"ExternalCheck(address contractAddress,bytes4 selector,bytes value,bool required)\")\n    bytes32 private constant EXTERNAL_CHECK_TYPE_HASH = 0x8d4afe924d276922e1a624d4cc4d5b316cb369a5d290db2fae6417ec282d01f8;\n\n    // keccak256(\"Checks(uint256 uses,uint256 expiration,uint256 effective,bytes32 salt,uint256 contractSignatureIndex,uint256 signerSignatureIndex,bytes32 allowedRoot,ExternalCheck[] externalChecks)ExternalCheck(address contractAddress,bytes4 selector,bytes value,bool required)\")\n    bytes32 private constant CHECKS_TYPE_HASH = 0xcae85973b802c2104c84d94b18a0a8a13a0576322547fe2fab563e83849ce641;\n\n    function _hashExternalChecks(ExternalCheck[] calldata _externalChecks) private pure returns (bytes32) {\n        bytes32[] memory hashes = new bytes32[](_externalChecks.length);\n\n        for (uint256 i = 0; i < hashes.length; i++) {\n            ExternalCheck calldata externalCheck = _externalChecks[i];\n\n            hashes[i] = keccak256(\n                abi.encode(\n                    EXTERNAL_CHECK_TYPE_HASH,\n                    externalCheck.contractAddress,\n                    externalCheck.selector,\n                    keccak256(externalCheck.value),\n                    externalCheck.required\n                )\n            );\n        }\n\n        return keccak256(abi.encodePacked(hashes));\n    }\n\n    function _hashChecks(Checks calldata _checks) internal pure returns (bytes32) {\n        return keccak256(\n            abi.encode(\n                CHECKS_TYPE_HASH,\n                _checks.uses,\n                _checks.expiration,\n                _checks.effective,\n                _checks.salt,\n                _checks.contractSignatureIndex,\n                _checks.signerSignatureIndex,\n                _checks.allowedRoot,\n                _hashExternalChecks(_checks.externalChecks)\n            )\n        );\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/cryptography/SignatureChecker.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/SignatureChecker.sol)\n\npragma solidity ^0.8.20;\n\nimport {ECDSA} from \"./ECDSA.sol\";\nimport {IERC1271} from \"../../interfaces/IERC1271.sol\";\n\n/**\n * @dev Signature verification helper that can be used instead of `ECDSA.recover` to seamlessly support both ECDSA\n * signatures from externally owned accounts (EOAs) as well as ERC1271 signatures from smart contract wallets like\n * Argent and Safe Wallet (previously Gnosis Safe).\n */\nlibrary SignatureChecker {\n    /**\n     * @dev Checks if a signature is valid for a given signer and data hash. If the signer is a smart contract, the\n     * signature is validated against that smart contract using ERC1271, otherwise it's validated using `ECDSA.recover`.\n     *\n     * NOTE: Unlike ECDSA signatures, contract signatures are revocable, and the outcome of this function can thus\n     * change through time. It could return true at block N and false at block N+1 (or the opposite).\n     */\n    function isValidSignatureNow(address signer, bytes32 hash, bytes memory signature) internal view returns (bool) {\n        (address recovered, ECDSA.RecoverError error, ) = ECDSA.tryRecover(hash, signature);\n        return\n            (error == ECDSA.RecoverError.NoError && recovered == signer) ||\n            isValidERC1271SignatureNow(signer, hash, signature);\n    }\n\n    /**\n     * @dev Checks if a signature is valid for a given signer and data hash. The signature is validated\n     * against the signer smart contract using ERC1271.\n     *\n     * NOTE: Unlike ECDSA signatures, contract signatures are revocable, and the outcome of this function can thus\n     * change through time. It could return true at block N and false at block N+1 (or the opposite).\n     */\n    function isValidERC1271SignatureNow(\n        address signer,\n        bytes32 hash,\n        bytes memory signature\n    ) internal view returns (bool) {\n        (bool success, bytes memory result) = signer.staticcall(\n            abi.encodeCall(IERC1271.isValidSignature, (hash, signature))\n        );\n        return (success &&\n            result.length >= 32 &&\n            abi.decode(result, (bytes32)) == bytes32(IERC1271.isValidSignature.selector));\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/Strings.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/Strings.sol)\n\npragma solidity ^0.8.20;\n\nimport {Math} from \"./math/Math.sol\";\nimport {SignedMath} from \"./math/SignedMath.sol\";\n\n/**\n * @dev String operations.\n */\nlibrary Strings {\n    bytes16 private constant HEX_DIGITS = \"0123456789abcdef\";\n    uint8 private constant ADDRESS_LENGTH = 20;\n\n    /**\n     * @dev The `value` string doesn't fit in the specified `length`.\n     */\n    error StringsInsufficientHexLength(uint256 value, uint256 length);\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` decimal representation.\n     */\n    function toString(uint256 value) internal pure returns (string memory) {\n        unchecked {\n            uint256 length = Math.log10(value) + 1;\n            string memory buffer = new string(length);\n            uint256 ptr;\n            /// @solidity memory-safe-assembly\n            assembly {\n                ptr := add(buffer, add(32, length))\n            }\n            while (true) {\n                ptr--;\n                /// @solidity memory-safe-assembly\n                assembly {\n                    mstore8(ptr, byte(mod(value, 10), HEX_DIGITS))\n                }\n                value /= 10;\n                if (value == 0) break;\n            }\n            return buffer;\n        }\n    }\n\n    /**\n     * @dev Converts a `int256` to its ASCII `string` decimal representation.\n     */\n    function toStringSigned(int256 value) internal pure returns (string memory) {\n        return string.concat(value < 0 ? \"-\" : \"\", toString(SignedMath.abs(value)));\n    }\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.\n     */\n    function toHexString(uint256 value) internal pure returns (string memory) {\n        unchecked {\n            return toHexString(value, Math.log256(value) + 1);\n        }\n    }\n\n    /**\n     * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.\n     */\n    function toHexString(uint256 value, uint256 length) internal pure returns (string memory) {\n        uint256 localValue = value;\n        bytes memory buffer = new bytes(2 * length + 2);\n        buffer[0] = \"0\";\n        buffer[1] = \"x\";\n        for (uint256 i = 2 * length + 1; i > 1; --i) {\n            buffer[i] = HEX_DIGITS[localValue & 0xf];\n            localValue >>= 4;\n        }\n        if (localValue != 0) {\n            revert StringsInsufficientHexLength(value, length);\n        }\n        return string(buffer);\n    }\n\n    /**\n     * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal\n     * representation.\n     */\n    function toHexString(address addr) internal pure returns (string memory) {\n        return toHexString(uint256(uint160(addr)), ADDRESS_LENGTH);\n    }\n\n    /**\n     * @dev Returns true if the two strings are equal.\n     */\n    function equal(string memory a, string memory b) internal pure returns (bool) {\n        return bytes(a).length == bytes(b).length && keccak256(bytes(a)) == keccak256(bytes(b));\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/StorageSlot.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/StorageSlot.sol)\n// This file was procedurally generated from scripts/generate/templates/StorageSlot.js.\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Library for reading and writing primitive types to specific storage slots.\n *\n * Storage slots are often used to avoid storage conflict when dealing with upgradeable contracts.\n * This library helps with reading and writing to such slots without the need for inline assembly.\n *\n * The functions in this library return Slot structs that contain a `value` member that can be used to read or write.\n *\n * Example usage to set ERC1967 implementation slot:\n * ```solidity\n * contract ERC1967 {\n *     bytes32 internal constant _IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;\n *\n *     function _getImplementation() internal view returns (address) {\n *         return StorageSlot.getAddressSlot(_IMPLEMENTATION_SLOT).value;\n *     }\n *\n *     function _setImplementation(address newImplementation) internal {\n *         require(newImplementation.code.length > 0);\n *         StorageSlot.getAddressSlot(_IMPLEMENTATION_SLOT).value = newImplementation;\n *     }\n * }\n * ```\n */\nlibrary StorageSlot {\n    struct AddressSlot {\n        address value;\n    }\n\n    struct BooleanSlot {\n        bool value;\n    }\n\n    struct Bytes32Slot {\n        bytes32 value;\n    }\n\n    struct Uint256Slot {\n        uint256 value;\n    }\n\n    struct StringSlot {\n        string value;\n    }\n\n    struct BytesSlot {\n        bytes value;\n    }\n\n    /**\n     * @dev Returns an `AddressSlot` with member `value` located at `slot`.\n     */\n    function getAddressSlot(bytes32 slot) internal pure returns (AddressSlot storage r) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns an `BooleanSlot` with member `value` located at `slot`.\n     */\n    function getBooleanSlot(bytes32 slot) internal pure returns (BooleanSlot storage r) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns an `Bytes32Slot` with member `value` located at `slot`.\n     */\n    function getBytes32Slot(bytes32 slot) internal pure returns (Bytes32Slot storage r) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns an `Uint256Slot` with member `value` located at `slot`.\n     */\n    function getUint256Slot(bytes32 slot) internal pure returns (Uint256Slot storage r) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns an `StringSlot` with member `value` located at `slot`.\n     */\n    function getStringSlot(bytes32 slot) internal pure returns (StringSlot storage r) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns an `StringSlot` representation of the string storage pointer `store`.\n     */\n    function getStringSlot(string storage store) internal pure returns (StringSlot storage r) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            r.slot := store.slot\n        }\n    }\n\n    /**\n     * @dev Returns an `BytesSlot` with member `value` located at `slot`.\n     */\n    function getBytesSlot(bytes32 slot) internal pure returns (BytesSlot storage r) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            r.slot := slot\n        }\n    }\n\n    /**\n     * @dev Returns an `BytesSlot` representation of the bytes storage pointer `store`.\n     */\n    function getBytesSlot(bytes storage store) internal pure returns (BytesSlot storage r) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            r.slot := store.slot\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/cryptography/ECDSA.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Elliptic Curve Digital Signature Algorithm (ECDSA) operations.\n *\n * These functions can be used to verify that a message was signed by the holder\n * of the private keys of a given address.\n */\nlibrary ECDSA {\n    enum RecoverError {\n        NoError,\n        InvalidSignature,\n        InvalidSignatureLength,\n        InvalidSignatureS\n    }\n\n    /**\n     * @dev The signature derives the `address(0)`.\n     */\n    error ECDSAInvalidSignature();\n\n    /**\n     * @dev The signature has an invalid length.\n     */\n    error ECDSAInvalidSignatureLength(uint256 length);\n\n    /**\n     * @dev The signature has an S value that is in the upper half order.\n     */\n    error ECDSAInvalidSignatureS(bytes32 s);\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with `signature` or an error. This will not\n     * return address(0) without also returning an error description. Errors are documented using an enum (error type)\n     * and a bytes32 providing additional information about the error.\n     *\n     * If no error is returned, then the address can be used for verification purposes.\n     *\n     * The `ecrecover` EVM precompile allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {MessageHashUtils-toEthSignedMessageHash} on it.\n     *\n     * Documentation for signature generation:\n     * - with https://web3js.readthedocs.io/en/v1.3.4/web3-eth-accounts.html#sign[Web3.js]\n     * - with https://docs.ethers.io/v5/api/signer/#Signer-signMessage[ethers]\n     */\n    function tryRecover(bytes32 hash, bytes memory signature) internal pure returns (address, RecoverError, bytes32) {\n        if (signature.length == 65) {\n            bytes32 r;\n            bytes32 s;\n            uint8 v;\n            // ecrecover takes the signature parameters, and the only way to get them\n            // currently is to use assembly.\n            /// @solidity memory-safe-assembly\n            assembly {\n                r := mload(add(signature, 0x20))\n                s := mload(add(signature, 0x40))\n                v := byte(0, mload(add(signature, 0x60)))\n            }\n            return tryRecover(hash, v, r, s);\n        } else {\n            return (address(0), RecoverError.InvalidSignatureLength, bytes32(signature.length));\n        }\n    }\n\n    /**\n     * @dev Returns the address that signed a hashed message (`hash`) with\n     * `signature`. This address can then be used for verification purposes.\n     *\n     * The `ecrecover` EVM precompile allows for malleable (non-unique) signatures:\n     * this function rejects them by requiring the `s` value to be in the lower\n     * half order, and the `v` value to be either 27 or 28.\n     *\n     * IMPORTANT: `hash` _must_ be the result of a hash operation for the\n     * verification to be secure: it is possible to craft signatures that\n     * recover to arbitrary addresses for non-hashed data. A safe way to ensure\n     * this is by receiving a hash of the original message (which may otherwise\n     * be too long), and then calling {MessageHashUtils-toEthSignedMessageHash} on it.\n     */\n    function recover(bytes32 hash, bytes memory signature) internal pure returns (address) {\n        (address recovered, RecoverError error, bytes32 errorArg) = tryRecover(hash, signature);\n        _throwError(error, errorArg);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `r` and `vs` short-signature fields separately.\n     *\n     * See https://eips.ethereum.org/EIPS/eip-2098[EIP-2098 short signatures]\n     */\n    function tryRecover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address, RecoverError, bytes32) {\n        unchecked {\n            bytes32 s = vs & bytes32(0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff);\n            // We do not check for an overflow here since the shift operation results in 0 or 1.\n            uint8 v = uint8((uint256(vs) >> 255) + 27);\n            return tryRecover(hash, v, r, s);\n        }\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `r and `vs` short-signature fields separately.\n     */\n    function recover(bytes32 hash, bytes32 r, bytes32 vs) internal pure returns (address) {\n        (address recovered, RecoverError error, bytes32 errorArg) = tryRecover(hash, r, vs);\n        _throwError(error, errorArg);\n        return recovered;\n    }\n\n    /**\n     * @dev Overload of {ECDSA-tryRecover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function tryRecover(\n        bytes32 hash,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal pure returns (address, RecoverError, bytes32) {\n        // EIP-2 still allows signature malleability for ecrecover(). Remove this possibility and make the signature\n        // unique. Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}. Most\n        // signatures from current libraries generate a unique signature with an s-value in the lower half order.\n        //\n        // If your library generates malleable signatures, such as s-values in the upper range, calculate a new s-value\n        // with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or\n        // vice versa. If your library also generates signatures with 0/1 for v instead 27/28, add 27 to v to accept\n        // these malleable signatures as well.\n        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {\n            return (address(0), RecoverError.InvalidSignatureS, s);\n        }\n\n        // If the signature is valid (and not malleable), return the signer address\n        address signer = ecrecover(hash, v, r, s);\n        if (signer == address(0)) {\n            return (address(0), RecoverError.InvalidSignature, bytes32(0));\n        }\n\n        return (signer, RecoverError.NoError, bytes32(0));\n    }\n\n    /**\n     * @dev Overload of {ECDSA-recover} that receives the `v`,\n     * `r` and `s` signature fields separately.\n     */\n    function recover(bytes32 hash, uint8 v, bytes32 r, bytes32 s) internal pure returns (address) {\n        (address recovered, RecoverError error, bytes32 errorArg) = tryRecover(hash, v, r, s);\n        _throwError(error, errorArg);\n        return recovered;\n    }\n\n    /**\n     * @dev Optionally reverts with the corresponding custom error according to the `error` argument provided.\n     */\n    function _throwError(RecoverError error, bytes32 errorArg) private pure {\n        if (error == RecoverError.NoError) {\n            return; // no error: do nothing\n        } else if (error == RecoverError.InvalidSignature) {\n            revert ECDSAInvalidSignature();\n        } else if (error == RecoverError.InvalidSignatureLength) {\n            revert ECDSAInvalidSignatureLength(uint256(errorArg));\n        } else if (error == RecoverError.InvalidSignatureS) {\n            revert ECDSAInvalidSignatureS(errorArg);\n        }\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/interfaces/IERC1271.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (interfaces/IERC1271.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Interface of the ERC1271 standard signature validation method for\n * contracts as defined in https://eips.ethereum.org/EIPS/eip-1271[ERC-1271].\n */\ninterface IERC1271 {\n    /**\n     * @dev Should return whether the signature provided is valid for the provided data\n     * @param hash      Hash of the data to be signed\n     * @param signature Signature byte array associated with _data\n     */\n    function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4 magicValue);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/math/Math.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Standard math utilities missing in the Solidity language.\n */\nlibrary Math {\n    /**\n     * @dev Muldiv operation overflow.\n     */\n    error MathOverflowedMulDiv();\n\n    enum Rounding {\n        Floor, // Toward negative infinity\n        Ceil, // Toward positive infinity\n        Trunc, // Toward zero\n        Expand // Away from zero\n    }\n\n    /**\n     * @dev Returns the addition of two unsigned integers, with an overflow flag.\n     */\n    function tryAdd(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        unchecked {\n            uint256 c = a + b;\n            if (c < a) return (false, 0);\n            return (true, c);\n        }\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.\n     */\n    function trySub(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        unchecked {\n            if (b > a) return (false, 0);\n            return (true, a - b);\n        }\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.\n     */\n    function tryMul(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        unchecked {\n            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the\n            // benefit is lost if 'b' is also tested.\n            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522\n            if (a == 0) return (true, 0);\n            uint256 c = a * b;\n            if (c / a != b) return (false, 0);\n            return (true, c);\n        }\n    }\n\n    /**\n     * @dev Returns the division of two unsigned integers, with a division by zero flag.\n     */\n    function tryDiv(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        unchecked {\n            if (b == 0) return (false, 0);\n            return (true, a / b);\n        }\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.\n     */\n    function tryMod(uint256 a, uint256 b) internal pure returns (bool, uint256) {\n        unchecked {\n            if (b == 0) return (false, 0);\n            return (true, a % b);\n        }\n    }\n\n    /**\n     * @dev Returns the largest of two numbers.\n     */\n    function max(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a > b ? a : b;\n    }\n\n    /**\n     * @dev Returns the smallest of two numbers.\n     */\n    function min(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a < b ? a : b;\n    }\n\n    /**\n     * @dev Returns the average of two numbers. The result is rounded towards\n     * zero.\n     */\n    function average(uint256 a, uint256 b) internal pure returns (uint256) {\n        // (a + b) / 2 can overflow.\n        return (a & b) + (a ^ b) / 2;\n    }\n\n    /**\n     * @dev Returns the ceiling of the division of two numbers.\n     *\n     * This differs from standard division with `/` in that it rounds towards infinity instead\n     * of rounding towards zero.\n     */\n    function ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {\n        if (b == 0) {\n            // Guarantee the same behavior as in a regular Solidity division.\n            return a / b;\n        }\n\n        // (a + b - 1) / b can overflow on addition, so we distribute.\n        return a == 0 ? 0 : (a - 1) / b + 1;\n    }\n\n    /**\n     * @notice Calculates floor(x * y / denominator) with full precision. Throws if result overflows a uint256 or\n     * denominator == 0.\n     * @dev Original credit to Remco Bloemen under MIT license (https://xn--2-umb.com/21/muldiv) with further edits by\n     * Uniswap Labs also under MIT license.\n     */\n    function mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {\n        unchecked {\n            // 512-bit multiply [prod1 prod0] = x * y. Compute the product mod 2^256 and mod 2^256 - 1, then use\n            // use the Chinese Remainder Theorem to reconstruct the 512 bit result. The result is stored in two 256\n            // variables such that product = prod1 * 2^256 + prod0.\n            uint256 prod0 = x * y; // Least significant 256 bits of the product\n            uint256 prod1; // Most significant 256 bits of the product\n            assembly {\n                let mm := mulmod(x, y, not(0))\n                prod1 := sub(sub(mm, prod0), lt(mm, prod0))\n            }\n\n            // Handle non-overflow cases, 256 by 256 division.\n            if (prod1 == 0) {\n                // Solidity will revert if denominator == 0, unlike the div opcode on its own.\n                // The surrounding unchecked block does not change this fact.\n                // See https://docs.soliditylang.org/en/latest/control-structures.html#checked-or-unchecked-arithmetic.\n                return prod0 / denominator;\n            }\n\n            // Make sure the result is less than 2^256. Also prevents denominator == 0.\n            if (denominator <= prod1) {\n                revert MathOverflowedMulDiv();\n            }\n\n            ///////////////////////////////////////////////\n            // 512 by 256 division.\n            ///////////////////////////////////////////////\n\n            // Make division exact by subtracting the remainder from [prod1 prod0].\n            uint256 remainder;\n            assembly {\n                // Compute remainder using mulmod.\n                remainder := mulmod(x, y, denominator)\n\n                // Subtract 256 bit number from 512 bit number.\n                prod1 := sub(prod1, gt(remainder, prod0))\n                prod0 := sub(prod0, remainder)\n            }\n\n            // Factor powers of two out of denominator and compute largest power of two divisor of denominator.\n            // Always >= 1. See https://cs.stackexchange.com/q/138556/92363.\n\n            uint256 twos = denominator & (0 - denominator);\n            assembly {\n                // Divide denominator by twos.\n                denominator := div(denominator, twos)\n\n                // Divide [prod1 prod0] by twos.\n                prod0 := div(prod0, twos)\n\n                // Flip twos such that it is 2^256 / twos. If twos is zero, then it becomes one.\n                twos := add(div(sub(0, twos), twos), 1)\n            }\n\n            // Shift in bits from prod1 into prod0.\n            prod0 |= prod1 * twos;\n\n            // Invert denominator mod 2^256. Now that denominator is an odd number, it has an inverse modulo 2^256 such\n            // that denominator * inv = 1 mod 2^256. Compute the inverse by starting with a seed that is correct for\n            // four bits. That is, denominator * inv = 1 mod 2^4.\n            uint256 inverse = (3 * denominator) ^ 2;\n\n            // Use the Newton-Raphson iteration to improve the precision. Thanks to Hensel's lifting lemma, this also\n            // works in modular arithmetic, doubling the correct bits in each step.\n            inverse *= 2 - denominator * inverse; // inverse mod 2^8\n            inverse *= 2 - denominator * inverse; // inverse mod 2^16\n            inverse *= 2 - denominator * inverse; // inverse mod 2^32\n            inverse *= 2 - denominator * inverse; // inverse mod 2^64\n            inverse *= 2 - denominator * inverse; // inverse mod 2^128\n            inverse *= 2 - denominator * inverse; // inverse mod 2^256\n\n            // Because the division is now exact we can divide by multiplying with the modular inverse of denominator.\n            // This will give us the correct result modulo 2^256. Since the preconditions guarantee that the outcome is\n            // less than 2^256, this is the final result. We don't need to compute the high bits of the result and prod1\n            // is no longer required.\n            result = prod0 * inverse;\n            return result;\n        }\n    }\n\n    /**\n     * @notice Calculates x * y / denominator with full precision, following the selected rounding direction.\n     */\n    function mulDiv(uint256 x, uint256 y, uint256 denominator, Rounding rounding) internal pure returns (uint256) {\n        uint256 result = mulDiv(x, y, denominator);\n        if (unsignedRoundsUp(rounding) && mulmod(x, y, denominator) > 0) {\n            result += 1;\n        }\n        return result;\n    }\n\n    /**\n     * @dev Returns the square root of a number. If the number is not a perfect square, the value is rounded\n     * towards zero.\n     *\n     * Inspired by Henry S. Warren, Jr.'s \"Hacker's Delight\" (Chapter 11).\n     */\n    function sqrt(uint256 a) internal pure returns (uint256) {\n        if (a == 0) {\n            return 0;\n        }\n\n        // For our first guess, we get the biggest power of 2 which is smaller than the square root of the target.\n        //\n        // We know that the \"msb\" (most significant bit) of our target number `a` is a power of 2 such that we have\n        // `msb(a) <= a < 2*msb(a)`. This value can be written `msb(a)=2**k` with `k=log2(a)`.\n        //\n        // This can be rewritten `2**log2(a) <= a < 2**(log2(a) + 1)`\n        // → `sqrt(2**k) <= sqrt(a) < sqrt(2**(k+1))`\n        // → `2**(k/2) <= sqrt(a) < 2**((k+1)/2) <= 2**(k/2 + 1)`\n        //\n        // Consequently, `2**(log2(a) / 2)` is a good first approximation of `sqrt(a)` with at least 1 correct bit.\n        uint256 result = 1 << (log2(a) >> 1);\n\n        // At this point `result` is an estimation with one bit of precision. We know the true value is a uint128,\n        // since it is the square root of a uint256. Newton's method converges quadratically (precision doubles at\n        // every iteration). We thus need at most 7 iteration to turn our partial result with one bit of precision\n        // into the expected uint128 result.\n        unchecked {\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            result = (result + a / result) >> 1;\n            return min(result, a / result);\n        }\n    }\n\n    /**\n     * @notice Calculates sqrt(a), following the selected rounding direction.\n     */\n    function sqrt(uint256 a, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = sqrt(a);\n            return result + (unsignedRoundsUp(rounding) && result * result < a ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 2 of a positive value rounded towards zero.\n     * Returns 0 if given 0.\n     */\n    function log2(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >> 128 > 0) {\n                value >>= 128;\n                result += 128;\n            }\n            if (value >> 64 > 0) {\n                value >>= 64;\n                result += 64;\n            }\n            if (value >> 32 > 0) {\n                value >>= 32;\n                result += 32;\n            }\n            if (value >> 16 > 0) {\n                value >>= 16;\n                result += 16;\n            }\n            if (value >> 8 > 0) {\n                value >>= 8;\n                result += 8;\n            }\n            if (value >> 4 > 0) {\n                value >>= 4;\n                result += 4;\n            }\n            if (value >> 2 > 0) {\n                value >>= 2;\n                result += 2;\n            }\n            if (value >> 1 > 0) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 2, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log2(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log2(value);\n            return result + (unsignedRoundsUp(rounding) && 1 << result < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 10 of a positive value rounded towards zero.\n     * Returns 0 if given 0.\n     */\n    function log10(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >= 10 ** 64) {\n                value /= 10 ** 64;\n                result += 64;\n            }\n            if (value >= 10 ** 32) {\n                value /= 10 ** 32;\n                result += 32;\n            }\n            if (value >= 10 ** 16) {\n                value /= 10 ** 16;\n                result += 16;\n            }\n            if (value >= 10 ** 8) {\n                value /= 10 ** 8;\n                result += 8;\n            }\n            if (value >= 10 ** 4) {\n                value /= 10 ** 4;\n                result += 4;\n            }\n            if (value >= 10 ** 2) {\n                value /= 10 ** 2;\n                result += 2;\n            }\n            if (value >= 10 ** 1) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 10, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log10(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log10(value);\n            return result + (unsignedRoundsUp(rounding) && 10 ** result < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Return the log in base 256 of a positive value rounded towards zero.\n     * Returns 0 if given 0.\n     *\n     * Adding one to the result gives the number of pairs of hex symbols needed to represent `value` as a hex string.\n     */\n    function log256(uint256 value) internal pure returns (uint256) {\n        uint256 result = 0;\n        unchecked {\n            if (value >> 128 > 0) {\n                value >>= 128;\n                result += 16;\n            }\n            if (value >> 64 > 0) {\n                value >>= 64;\n                result += 8;\n            }\n            if (value >> 32 > 0) {\n                value >>= 32;\n                result += 4;\n            }\n            if (value >> 16 > 0) {\n                value >>= 16;\n                result += 2;\n            }\n            if (value >> 8 > 0) {\n                result += 1;\n            }\n        }\n        return result;\n    }\n\n    /**\n     * @dev Return the log in base 256, following the selected rounding direction, of a positive value.\n     * Returns 0 if given 0.\n     */\n    function log256(uint256 value, Rounding rounding) internal pure returns (uint256) {\n        unchecked {\n            uint256 result = log256(value);\n            return result + (unsignedRoundsUp(rounding) && 1 << (result << 3) < value ? 1 : 0);\n        }\n    }\n\n    /**\n     * @dev Returns whether a provided rounding mode is considered rounding up for unsigned integers.\n     */\n    function unsignedRoundsUp(Rounding rounding) internal pure returns (bool) {\n        return uint8(rounding) % 2 == 1;\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (utils/math/SignedMath.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Standard signed math utilities missing in the Solidity language.\n */\nlibrary SignedMath {\n    /**\n     * @dev Returns the largest of two signed numbers.\n     */\n    function max(int256 a, int256 b) internal pure returns (int256) {\n        return a > b ? a : b;\n    }\n\n    /**\n     * @dev Returns the smallest of two signed numbers.\n     */\n    function min(int256 a, int256 b) internal pure returns (int256) {\n        return a < b ? a : b;\n    }\n\n    /**\n     * @dev Returns the average of two signed numbers without overflow.\n     * The result is rounded towards zero.\n     */\n    function average(int256 a, int256 b) internal pure returns (int256) {\n        // Formula from the book \"Hacker's Delight\"\n        int256 x = (a & b) + ((a ^ b) >> 1);\n        return x + (int256(uint256(x) >> 255) & (a ^ b));\n    }\n\n    /**\n     * @dev Returns the absolute unsigned value of a signed value.\n     */\n    function abs(int256 n) internal pure returns (uint256) {\n        unchecked {\n            // must be unchecked in order to support `n = type(int256).min`\n            return uint256(n >= 0 ? n : -n);\n        }\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.20+commit.a1b79de6"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_marketplace",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_owner",
+              "type": "address"
+            },
+            {
+              "internalType": "address[]",
+              "name": "_allowedCoupons",
+              "type": "address[]"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_coupon",
+              "type": "address"
+            }
+          ],
+          "name": "CouponNotAllowed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Expired",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ExternalChecksFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidContractSignatureIndex",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidSignature",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidSignerSignatureIndex",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "LengthMissmatch",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotAllowed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NotEffective",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnableInvalidOwner",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "OwnableUnauthorizedAccount",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "SignatureOveruse",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "string",
+              "name": "str",
+              "type": "string"
+            }
+          ],
+          "name": "StringTooLong",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            }
+          ],
+          "name": "UnauthorizedCaller",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "UsingCancelledSignature",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_coupon",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "_value",
+              "type": "bool"
+            }
+          ],
+          "name": "AllowedCouponsUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "_newValue",
+              "type": "uint256"
+            }
+          ],
+          "name": "ContractSignatureIndexIncreased",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_tradeSignature",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_couponSignature",
+              "type": "bytes32"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "bytes",
+                  "name": "signature",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "uses",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "expiration",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "effective",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "salt",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "contractSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "signerSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "allowedRoot",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "bytes32[]",
+                      "name": "allowedProof",
+                      "type": "bytes32[]"
+                    },
+                    {
+                      "components": [
+                        {
+                          "internalType": "address",
+                          "name": "contractAddress",
+                          "type": "address"
+                        },
+                        {
+                          "internalType": "bytes4",
+                          "name": "selector",
+                          "type": "bytes4"
+                        },
+                        {
+                          "internalType": "bytes",
+                          "name": "value",
+                          "type": "bytes"
+                        },
+                        {
+                          "internalType": "bool",
+                          "name": "required",
+                          "type": "bool"
+                        }
+                      ],
+                      "internalType": "struct CommonTypes.ExternalCheck[]",
+                      "name": "externalChecks",
+                      "type": "tuple[]"
+                    }
+                  ],
+                  "internalType": "struct CommonTypes.Checks",
+                  "name": "checks",
+                  "type": "tuple"
+                },
+                {
+                  "internalType": "address",
+                  "name": "couponAddress",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "callerData",
+                  "type": "bytes"
+                }
+              ],
+              "indexed": false,
+              "internalType": "struct CouponTypes.Coupon",
+              "name": "_coupon",
+              "type": "tuple"
+            }
+          ],
+          "name": "CouponApplied",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_marketplace",
+              "type": "address"
+            }
+          ],
+          "name": "MarketplaceUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "previousOwner",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipTransferred",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "_signature",
+              "type": "bytes32"
+            }
+          ],
+          "name": "SignatureCancelled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "_newValue",
+              "type": "uint256"
+            }
+          ],
+          "name": "SignerSignatureIndexIncreased",
+          "type": "event"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "allowedCoupons",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "signer",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "signature",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "uses",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "expiration",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "effective",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "salt",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "contractSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "signerSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "allowedRoot",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "bytes32[]",
+                      "name": "allowedProof",
+                      "type": "bytes32[]"
+                    },
+                    {
+                      "components": [
+                        {
+                          "internalType": "address",
+                          "name": "contractAddress",
+                          "type": "address"
+                        },
+                        {
+                          "internalType": "bytes4",
+                          "name": "selector",
+                          "type": "bytes4"
+                        },
+                        {
+                          "internalType": "bytes",
+                          "name": "value",
+                          "type": "bytes"
+                        },
+                        {
+                          "internalType": "bool",
+                          "name": "required",
+                          "type": "bool"
+                        }
+                      ],
+                      "internalType": "struct CommonTypes.ExternalCheck[]",
+                      "name": "externalChecks",
+                      "type": "tuple[]"
+                    }
+                  ],
+                  "internalType": "struct CommonTypes.Checks",
+                  "name": "checks",
+                  "type": "tuple"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "assetType",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "contractAddress",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "beneficiary",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "extra",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct MarketplaceTypes.Asset[]",
+                  "name": "sent",
+                  "type": "tuple[]"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "assetType",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "contractAddress",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "beneficiary",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "extra",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct MarketplaceTypes.Asset[]",
+                  "name": "received",
+                  "type": "tuple[]"
+                }
+              ],
+              "internalType": "struct MarketplaceTypes.Trade",
+              "name": "_trade",
+              "type": "tuple"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "bytes",
+                  "name": "signature",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "uses",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "expiration",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "effective",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "salt",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "contractSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "signerSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "allowedRoot",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "bytes32[]",
+                      "name": "allowedProof",
+                      "type": "bytes32[]"
+                    },
+                    {
+                      "components": [
+                        {
+                          "internalType": "address",
+                          "name": "contractAddress",
+                          "type": "address"
+                        },
+                        {
+                          "internalType": "bytes4",
+                          "name": "selector",
+                          "type": "bytes4"
+                        },
+                        {
+                          "internalType": "bytes",
+                          "name": "value",
+                          "type": "bytes"
+                        },
+                        {
+                          "internalType": "bool",
+                          "name": "required",
+                          "type": "bool"
+                        }
+                      ],
+                      "internalType": "struct CommonTypes.ExternalCheck[]",
+                      "name": "externalChecks",
+                      "type": "tuple[]"
+                    }
+                  ],
+                  "internalType": "struct CommonTypes.Checks",
+                  "name": "checks",
+                  "type": "tuple"
+                },
+                {
+                  "internalType": "address",
+                  "name": "couponAddress",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "callerData",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct CouponTypes.Coupon",
+              "name": "_coupon",
+              "type": "tuple"
+            }
+          ],
+          "name": "applyCoupon",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "signer",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "signature",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "uses",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "expiration",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "effective",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "salt",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "contractSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "signerSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "allowedRoot",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "bytes32[]",
+                      "name": "allowedProof",
+                      "type": "bytes32[]"
+                    },
+                    {
+                      "components": [
+                        {
+                          "internalType": "address",
+                          "name": "contractAddress",
+                          "type": "address"
+                        },
+                        {
+                          "internalType": "bytes4",
+                          "name": "selector",
+                          "type": "bytes4"
+                        },
+                        {
+                          "internalType": "bytes",
+                          "name": "value",
+                          "type": "bytes"
+                        },
+                        {
+                          "internalType": "bool",
+                          "name": "required",
+                          "type": "bool"
+                        }
+                      ],
+                      "internalType": "struct CommonTypes.ExternalCheck[]",
+                      "name": "externalChecks",
+                      "type": "tuple[]"
+                    }
+                  ],
+                  "internalType": "struct CommonTypes.Checks",
+                  "name": "checks",
+                  "type": "tuple"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "assetType",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "contractAddress",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "beneficiary",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "extra",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct MarketplaceTypes.Asset[]",
+                  "name": "sent",
+                  "type": "tuple[]"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "assetType",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "contractAddress",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "value",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "beneficiary",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bytes",
+                      "name": "extra",
+                      "type": "bytes"
+                    }
+                  ],
+                  "internalType": "struct MarketplaceTypes.Asset[]",
+                  "name": "received",
+                  "type": "tuple[]"
+                }
+              ],
+              "internalType": "struct MarketplaceTypes.Trade",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes",
+                  "name": "signature",
+                  "type": "bytes"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "uint256",
+                      "name": "uses",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "expiration",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "effective",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "salt",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "contractSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "signerSignatureIndex",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "bytes32",
+                      "name": "allowedRoot",
+                      "type": "bytes32"
+                    },
+                    {
+                      "internalType": "bytes32[]",
+                      "name": "allowedProof",
+                      "type": "bytes32[]"
+                    },
+                    {
+                      "components": [
+                        {
+                          "internalType": "address",
+                          "name": "contractAddress",
+                          "type": "address"
+                        },
+                        {
+                          "internalType": "bytes4",
+                          "name": "selector",
+                          "type": "bytes4"
+                        },
+                        {
+                          "internalType": "bytes",
+                          "name": "value",
+                          "type": "bytes"
+                        },
+                        {
+                          "internalType": "bool",
+                          "name": "required",
+                          "type": "bool"
+                        }
+                      ],
+                      "internalType": "struct CommonTypes.ExternalCheck[]",
+                      "name": "externalChecks",
+                      "type": "tuple[]"
+                    }
+                  ],
+                  "internalType": "struct CommonTypes.Checks",
+                  "name": "checks",
+                  "type": "tuple"
+                },
+                {
+                  "internalType": "address",
+                  "name": "couponAddress",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "data",
+                  "type": "bytes"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "callerData",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct CouponTypes.Coupon[]",
+              "name": "_coupons",
+              "type": "tuple[]"
+            }
+          ],
+          "name": "cancelSignature",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "cancelledSignatures",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "contractSignatureIndex",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "increaseContractSignatureIndex",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "increaseSignerSignatureIndex",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "marketplace",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "renounceOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "signatureUses",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "signerSignatureIndex",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "transferOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "_coupons",
+              "type": "address[]"
+            },
+            {
+              "internalType": "bool[]",
+              "name": "_values",
+              "type": "bool[]"
+            }
+          ],
+          "name": "updateAllowedCoupons",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_marketplace",
+              "type": "address"
+            }
+          ],
+          "name": "updateMarketplace",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "errors": {
+          "OwnableInvalidOwner(address)": [
+            {
+              "details": "The owner is not a valid owner account. (eg. `address(0)`)"
+            }
+          ],
+          "OwnableUnauthorizedAccount(address)": [
+            {
+              "details": "The caller account is not authorized to perform an operation."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "applyCoupon((address,bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),(uint256,address,uint256,address,bytes)[],(uint256,address,uint256,address,bytes)[]),(bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),address,bytes,bytes))": {
+            "params": {
+              "_coupon": "The Coupon to apply.",
+              "_trade": "The Trade to apply the Coupon to."
+            },
+            "returns": {
+              "_0": "The Trade with the Coupon applied."
+            }
+          },
+          "cancelSignature((bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),address,bytes,bytes)[])": {
+            "params": {
+              "_coupons": "The list of coupon signatures to be canceled."
+            }
+          },
+          "constructor": {
+            "params": {
+              "_allowedCoupons": "The initial list of allowed Coupons.",
+              "_marketplace": "The address of the Marketplace that will be able to apply Coupons.",
+              "_owner": "The owner of the contract."
+            }
+          },
+          "owner()": {
+            "details": "Returns the address of the current owner."
+          },
+          "renounceOwnership()": {
+            "details": "Leaves the contract without owner. It will not be possible to call `onlyOwner` functions. Can only be called by the current owner. NOTE: Renouncing ownership will leave the contract without an owner, thereby disabling any functionality that is only available to the owner."
+          },
+          "transferOwnership(address)": {
+            "details": "Transfers ownership of the contract to a new account (`newOwner`). Can only be called by the current owner."
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "allowedCoupons(address)": {
+            "notice": "Mapping of the allowed Coupon contracts. If a Coupon is not in this mapping, it will not be allowed to be applied."
+          },
+          "applyCoupon((address,bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),(uint256,address,uint256,address,bytes)[],(uint256,address,uint256,address,bytes)[]),(bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),address,bytes,bytes))": {
+            "notice": "Applies a Coupon to a Trade."
+          },
+          "cancelSignature((bytes,(uint256,uint256,uint256,bytes32,uint256,uint256,bytes32,bytes32[],(address,bytes4,bytes,bool)[]),address,bytes,bytes)[])": {
+            "notice": "Revokes the signatures of all provided coupons. The caller must be the signer of those coupons."
+          },
+          "cancelledSignatures(bytes32)": {
+            "notice": "Mapping of cancelled signatures. Signers can invalidate any particular signature by adding it to this mapping."
+          },
+          "contractSignatureIndex()": {
+            "notice": "Value of the current contract signature index. The owner of the contract can update this value to revoke signatures created with another value."
+          },
+          "increaseContractSignatureIndex()": {
+            "notice": "Allows the owner of the contract to increase the contract signature index. Revokes all signatures created with a previous index."
+          },
+          "increaseSignerSignatureIndex()": {
+            "notice": "Allows the signer to increase their signature index. Revokes all signatures created by the signer with a previous index."
+          },
+          "marketplace()": {
+            "notice": "The address of the Marketplace that will be able to apply Coupons. Only this address will be able to apply Coupons."
+          },
+          "signatureUses(bytes32)": {
+            "notice": "Mapping of signature uses. Tracks how many times a signature has been used. Useful in case the signer wants to determine how many times a signature can be used."
+          },
+          "signerSignatureIndex(address)": {
+            "notice": "Value of the current signer signature index. Signers can update this value to revoke signatures created with another value."
+          },
+          "updateAllowedCoupons(address[],bool[])": {
+            "notice": "Updates the list of allowed Coupons."
+          },
+          "updateMarketplace(address)": {
+            "notice": "Updates the address of the Marketplace that will be able to apply Coupons."
+          }
+        },
+        "notice": "Contract that allows applying Coupons to Trades. It holds the logic to control which Coupons are allowed to be applied. It also manages the Coupon signatures and their uses. This is useful to be able to add or remove new Coupons while still using the same EIP712 domain.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/coupons/CouponManager.sol": "CouponManager"
+      },
+      "evmVersion": "shanghai",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+        ":ds-test/=lib/openzeppelin-contracts/lib/forge-std/lib/ds-test/src/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/"
+      ]
+    },
+    "sources": {
+      "lib/openzeppelin-contracts/contracts/access/Ownable.sol": {
+        "keccak256": "0xff6d0bb2e285473e5311d9d3caacb525ae3538a80758c10649a4d61029b017bb",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8ed324d3920bb545059d66ab97d43e43ee85fd3bd52e03e401f020afb0b120f6",
+          "dweb:/ipfs/QmfEckWLmZkDDcoWrkEvMWhms66xwTLff9DDhegYpvHo1a"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/interfaces/IERC1271.sol": {
+        "keccak256": "0x85a45f3f10014a0f8be41157a32b6a5f905753ea64a4b64e29fc12b7deeecf39",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c3c74009ce36136b36c77c23935b8e4a7b4f253be2da2be4fb4a916b1ce43743",
+          "dweb:/ipfs/QmcH36v3iN7SJJuF73AunLR2LtNxhVJ1wm63ph4dPZ4pcL"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/Context.sol": {
+        "keccak256": "0x493033a8d1b176a037b2cc6a04dad01a5c157722049bbecf632ca876224dd4b2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6a708e8a5bdb1011c2c381c9a5cfd8a9a956d7d0a9dc1bd8bcdaf52f76ef2f12",
+          "dweb:/ipfs/Qmax9WHBnVsZP46ZxEMNRQpLQnrdE4dK8LehML1Py8FowF"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/ShortStrings.sol": {
+        "keccak256": "0x18a7171df639a934592915a520ecb97c5bbc9675a1105607aac8a94e72bf62c6",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7478e1f13da69a2867ccd883001d836b75620362e743f196376d63ed0c422a1c",
+          "dweb:/ipfs/QmWywcQ9TNfwtoqAxbn25d8C5VrV12PrPS9UjtGe6pL2BA"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/StorageSlot.sol": {
+        "keccak256": "0x32ba59b4b7299237c8ba56319110989d7978a039faf754793064e967e5894418",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://1ae50c8b562427df610cc4540c9bf104acca7ef8e2dcae567ae7e52272281e9c",
+          "dweb:/ipfs/QmTHiadFCSJUPpRjNegc5SahmeU8bAoY8i9Aq6tVscbcKR"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/Strings.sol": {
+        "keccak256": "0x55f102ea785d8399c0e58d1108e2d289506dde18abc6db1b7f68c1f9f9bc5792",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6e52e0a7765c943ef14e5bcf11e46e6139fa044be564881378349236bf2e3453",
+          "dweb:/ipfs/QmZEeeXoFPW47amyP35gfzomF9DixqqTEPwzBakv6cZw6i"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol": {
+        "keccak256": "0xeed0a08b0b091f528356cbc7245891a4c748682d4f6a18055e8e6ca77d12a6cf",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ba80ba06c8e6be852847e4c5f4492cef801feb6558ae09ed705ff2e04ea8b13c",
+          "dweb:/ipfs/QmXRJDv3xHLVQCVXg1ZvR35QS9sij5y9NDWYzMfUfAdTHF"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/cryptography/MerkleProof.sol": {
+        "keccak256": "0x6400c4bee15052e043e5d10315135972529bd1c8012f43da494dc6b4f4661058",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://da5d3d47d35af4373743a559ea4b9b7ecfe4bab6f0703f410c1e59959b7966ac",
+          "dweb:/ipfs/QmTHdoghh4WLu4yURjGEgRk162pcwwdsG52MPGa12GqnGR"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol": {
+        "keccak256": "0xba333517a3add42cd35fe877656fc3dfcc9de53baa4f3aabbd6d12a92e4ea435",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2ceacff44c0fdc81e48e0e0b1db87a2076d3c1fb497341de077bf1da9f6b406c",
+          "dweb:/ipfs/QmRUo1muMRAewxrKQ7TkXUtknyRoR57AyEkoPpiuZQ8FzX"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/cryptography/SignatureChecker.sol": {
+        "keccak256": "0x6b11eb41a228cca35d4b662b4df69fcd75192851365102690f57b2ac01e83fe6",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ab006a2983ed350d2af21ddcdd835dcae3b8340086cc4d088460da5abd041f69",
+          "dweb:/ipfs/QmbEacDhkJZiGrgzLjB4pNtE8Z1uudjDw1DvcDUTVQFsLG"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/math/Math.sol": {
+        "keccak256": "0x005ec64c6313f0555d59e278f9a7a5ab2db5bdc72a027f255a37c327af1ec02d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4ece9f0b9c8daca08c76b6b5405a6446b6f73b3a15fab7ff56e296cbd4a2c875",
+          "dweb:/ipfs/QmQyRpyPRL5SQuAgj6SHmbir3foX65FJjbVTTQrA2EFg6L"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol": {
+        "keccak256": "0x5f7e4076e175393767754387c962926577f1660dd9b810187b9002407656be72",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7d533a1c97cd43a57cd9c465f7ee8dd0e39ae93a8fb8ff8e5303a356b081cdcc",
+          "dweb:/ipfs/QmVBEei6aTnvYNZp2CHYVNKyZS4q1KkjANfY39WVXZXVoT"
+        ]
+      },
+      "src/common/CommonTypes.sol": {
+        "keccak256": "0x4f88ccd845b74ef49f133a8e6392f264280d11a34c6554adef3405506a0507f0",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://00d256911483f993b7d5461e7efc637c61115f87496910cf70955a67aa20dd2b",
+          "dweb:/ipfs/QmcnBadeFYuHDCewQ9wZzvJPzcdzm46vKK5MEhrn3T2v5D"
+        ]
+      },
+      "src/common/CommonTypesHashing.sol": {
+        "keccak256": "0xe798e85362d7bcf5ec5fbdc666c9d8ed49279a0f58580b1386ea166103776018",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://cc9d858e7d73b50d644f38b17cb3db1a541501ebc282bb8481af538a027d5d12",
+          "dweb:/ipfs/QmcpQQhCPVcqNG3vCYyEaBWBe52hLsQy4KtubsJ1JMAsKk"
+        ]
+      },
+      "src/common/EIP712.sol": {
+        "keccak256": "0xd3758d023adabfd784f3dc35d0202231c0056dac52652d1b84ef94b041803a4a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2e1d79c4d227f945d84f77e3f5ec9fe9b983f4590f2f179bf9405b69e344bd02",
+          "dweb:/ipfs/QmPLDn7fxMWdetrbM8NThnWVcCTe82Y5GQ9wQwNxik5uE6"
+        ]
+      },
+      "src/common/Signatures.sol": {
+        "keccak256": "0xde461326c0b4e6206179c4b3ec75acf9d4c7e096eaae20bc061242009181948b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://3777b14da7e5b532352e4bcccfee4bdb9cffc1bd3383ff1063eb07a561b0a7fb",
+          "dweb:/ipfs/QmTnGgQYBM4voqwWFBbotcVpo9bH9KTQpzcvFM4jzyg2oy"
+        ]
+      },
+      "src/common/Verifications.sol": {
+        "keccak256": "0x20b9402c175defc2404fb41bb1691e8e5d6fc3ede751ed58ee476a036c61a5be",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c44ce7adc1264ccd17f4742c82ca1713e6106535dc92a922637894fabe44af26",
+          "dweb:/ipfs/QmXdbtTQvQwDRRdimtkoWe77PbDDE7MtzfcezmNiNn4UaN"
+        ]
+      },
+      "src/coupons/CouponManager.sol": {
+        "keccak256": "0x10b0f9f9201d19e0cd643a1fa795fd37e76b216bece1c878cece6e5c53a6e99f",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0b2816bdb0b43a3c64e6b42c8ab7708a235ff1e727f04cc5ffc8b6c8809a370b",
+          "dweb:/ipfs/QmR5u4r9gNTP98oiA2RiMzpb6Z9nnrgJ6dKXF3CdzUwET1"
+        ]
+      },
+      "src/coupons/CouponTypes.sol": {
+        "keccak256": "0x12eddc3a00fd422b3ff10bcb242ad0293cd45293ce734b008a358d39ff5c5984",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://274085cd93d49a0d88e97be50b743e525aee50bf0d3b347f88bbb7abf7356c46",
+          "dweb:/ipfs/QmTqkpoTLpTDMYTtNtNpV9sVdUVQEa7cnoBHimbJE3kuCR"
+        ]
+      },
+      "src/coupons/CouponTypesHashing.sol": {
+        "keccak256": "0xdd6b8c737132fc0902b234eed425968f1297842518ed2816ba03527cc4c2baca",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6d02826708b6bf19eb458e55f6cdb04ac8422b59bdd19b2f65a3b15d850608db",
+          "dweb:/ipfs/QmbvAnVMEHJ2ndzUabgrWmUktqpCcA4PugPsmUaypJPAUd"
+        ]
+      },
+      "src/coupons/interfaces/ICoupon.sol": {
+        "keccak256": "0xe88754aa919781224c5c26fb0258634a6e4612b82cc1684385ed03edda58fec3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://311467ef59245ebc0915bfd9be6badcab4373721bc03366373e108695e40bde0",
+          "dweb:/ipfs/QmXq4bCD7bvehCfjir5qDpyV4rMRqKqNgaCakQs992Y3E6"
+        ]
+      },
+      "src/marketplace/MarketplaceTypes.sol": {
+        "keccak256": "0x20e212e02791bdb538436302149488e402e43689809dd57e9294a0a5966acb0d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://23ba465ca85c0fff876e6e091f72a8d02b75ff490f378ea0f936eefe4260f75d",
+          "dweb:/ipfs/QmVAWPwhjTCTYeZN3LUuwH4HiaFfxiBvKfmg9T9iVHwRDK"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.20+commit.a1b79de6",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "shanghai",
+      "remappings": [
+        "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+        "ds-test/=lib/openzeppelin-contracts/lib/forge-std/lib/ds-test/src/",
+        "erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        "forge-std/=lib/forge-std/src/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/"
+      ]
+    },
+    "name": "CouponManager",
+    "fullyQualifiedName": "src/coupons/CouponManager.sol:CouponManager"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "10888145",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2025-12-16T11:39:58Z",
+  "match": "exact_match",
+  "chainId": "137",
+  "address": "0x3Fd3056EE72a2a85e9392FAB3A450E7736536081"
+}
