@@ -1,0 +1,367 @@
+{
+  "sources": {
+    "contracts/multisigs/VerifyData.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\n/// @dev The combination of target and selector is not authorized.\n/// @param target Target address.\n/// @param selector Function selector.\n/// @param chainId Chain Id.\nerror NotAuthorized(address target, bytes4 selector, uint256 chainId);\n\n/// @title VerifyData - Smart contract for verifying the Guard CM data\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\nabstract contract VerifyData {\n    // Mapping of (target address | bytes4 selector | uint64 chain Id) => enabled / disabled\n    mapping(uint256 => bool) public mapAllowedTargetSelectorChainIds;\n\n    /// @dev Verifies authorized combinations of target and selector.\n    /// @notice The bottom-most internal function is still not \"view\" since some reverts are not explicitly handled\n    /// @param target Target address.\n    /// @param data Payload bytes.\n    /// @param chainId Chain Id.\n    function _verifyData(address target, bytes memory data, uint256 chainId) internal {\n        // Push a pair of key defining variables into one key\n        // target occupies first 160 bits\n        uint256 targetSelectorChainId = uint256(uint160(target));\n        // selector occupies next 32 bits\n        bytes4 targetSelector = bytes4(data);\n        targetSelectorChainId |= uint256(uint32(targetSelector)) << 160;\n        // chainId occupies next 64 bits\n        targetSelectorChainId |= chainId << 192;\n\n        // Check the authorized combination of target and selector\n        if (!mapAllowedTargetSelectorChainIds[targetSelectorChainId]) {\n            revert NotAuthorized(target, targetSelector, chainId);\n        }\n    }\n}"
+    },
+    "contracts/multisigs/bridge_verifier/ProcessBridgedDataArbitrum.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\nimport {VerifyBridgedData} from \"./VerifyBridgedData.sol\";\n\n/// @dev Provided incorrect data length.\n/// @param expected Expected minimum data length.\n/// @param provided Provided data length.\nerror IncorrectDataLength(uint256 expected, uint256 provided);\n\n/// @dev Provided wrong function selector.\n/// @param functionSig Function selector.\n/// @param chainId Chain Id.\nerror WrongSelector(bytes4 functionSig, uint256 chainId);\n\n/// @dev Provided non zero value when it has to be zero.\n/// @param amount Value amount.\nerror NonZeroValue(uint256 amount);\n\n/// @dev Provided wrong L2 bridge mediator address.\n/// @param provided Provided address.\n/// @param expected Expected address.\nerror WrongL2BridgeMediator(address provided, address expected);\n\n/// @title ProcessBridgedDataArbitrum - Smart contract for verifying the Guard CM bridged data on Arbitrum\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\ncontract ProcessBridgedDataArbitrum is VerifyBridgedData {\n    // unsafeCreateRetryableTicket selector in bridge mediator L1\n    bytes4 public constant CREATE_TICKET_UNSAFE = bytes4(keccak256(bytes(\"unsafeCreateRetryableTicket(address,uint256,uint256,address,address,uint256,uint256,bytes)\")));\n    // createRetryableTicket selector in bridge mediator L1\n    bytes4 public constant CREATE_TICKET = bytes4(keccak256(bytes(\"createRetryableTicket(address,uint256,uint256,address,address,uint256,uint256,bytes)\")));\n    // Minimum payload length for message on Arbitrum accounting for all required encoding and at least one selector\n    uint256 public constant MIN_ARBITRUM_PAYLOAD_LENGTH = 324;\n\n    /// @dev Processes bridged data: checks the header and verifies the payload.\n    /// @notice CM is not supposed to transfer l2CallValue.\n    /// @param data Full data bytes with the header.\n    /// @param l2Timelock Arbitrum aliased Timelock address.\n    /// @param chainId L2 chain Id.\n    function processBridgeData(\n        bytes memory data,\n        address l2Timelock,\n        uint256 chainId\n    ) external override\n    {\n        // Check the L1 initial selector\n        bytes4 functionSig = bytes4(data);\n        if (functionSig != CREATE_TICKET_UNSAFE && functionSig != CREATE_TICKET) {\n            revert WrongSelector(functionSig, chainId);\n        }\n\n        // Check if the data length is less than a size of a selector plus the message minimum payload size\n        if (data.length < MIN_ARBITRUM_PAYLOAD_LENGTH) {\n            revert IncorrectDataLength(data.length, MIN_ARBITRUM_PAYLOAD_LENGTH);\n        }\n\n        // Copy the data without the selector\n        bytes memory payload = new bytes(data.length - SELECTOR_DATA_LENGTH);\n        for (uint256 i = 0; i < payload.length; ++i) {\n            payload[i] = data[i + 4];\n        }\n\n        // Decode the payload depending on the selector\n        (address targetAddress, uint256 l2CallValue, , address excessFeeRefundAddress, address callValueRefundAddress, , , bytes memory targetPayload) =\n            abi.decode(payload, (address, uint256, uint256, address, address, uint256, uint256, bytes));\n\n        // Check for value\n        if (l2CallValue > 0) {\n            revert NonZeroValue(l2CallValue);\n        }\n\n        // Check excessFeeRefundAddress and callValueRefundAddress values\n        if (excessFeeRefundAddress != l2Timelock) {\n            revert WrongL2BridgeMediator(excessFeeRefundAddress, l2Timelock);\n        }\n        if (callValueRefundAddress != l2Timelock) {\n            revert WrongL2BridgeMediator(callValueRefundAddress, l2Timelock);\n        }\n\n        // Verify the scope of the data\n        _verifyData(targetAddress, targetPayload, chainId);\n    }\n}"
+    },
+    "contracts/multisigs/bridge_verifier/VerifyBridgedData.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\nimport {VerifyData} from \"../VerifyData.sol\";\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Provided incorrect data length.\n/// @param expected Expected minimum data length.\n/// @param provided Provided data length.\nerror DataLengthIncorrect(uint256 expected, uint256 provided);\n\n/// @title VerifyBridgedData - Smart contract for verifying the Guard CM bridged data\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\nabstract contract VerifyBridgedData is VerifyData {\n    // Minimum data length that contains at least a selector (4 bytes or 32 bits)\n    uint256 public constant SELECTOR_DATA_LENGTH = 4;\n\n    /// @dev Processes bridged data: checks the header and verifies the payload.\n    /// @param data Full data bytes with the header.\n    /// @param bridgeMediatorL2 Address of a bridged mediator on L2.\n    /// @param chainId L2 chain Id.\n    function processBridgeData(\n        bytes memory data,\n        address bridgeMediatorL2,\n        uint256 chainId\n    ) external virtual;\n\n    /// @dev Verifies the bridged data for authorized combinations of targets and selectors.\n    /// @notice The processed data is packed as a set of bytes that are assembled using the following parameters:\n    ///         address target, uint96 value, uint32 payloadLength, bytes payload.\n    /// @param data Payload bytes.\n    /// @param chainId L2 chain Id.\n    function _verifyBridgedData(bytes memory data, uint256 chainId) internal {\n        // Unpack and process the data\n        // We need to skip first 12 bytes as those are zeros from encoding\n        for (uint256 i = 0; i < data.length;) {\n            address target;\n            uint32 payloadLength;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                // First 20 bytes is the address (160 bits)\n                i := add(i, 20)\n                target := mload(add(data, i))\n                // Offset the data by 12 bytes of value (96 bits) and by 4 bytes of payload length (32 bits)\n                i := add(i, 16)\n                payloadLength := mload(add(data, i))\n            }\n\n            // Check for the zero address\n            if (target == address(0)) {\n                revert ZeroAddress();\n            }\n\n            // The payload length must be at least of the a function selector size\n            if (payloadLength < SELECTOR_DATA_LENGTH) {\n                revert DataLengthIncorrect(payloadLength, SELECTOR_DATA_LENGTH);\n            }\n\n            // Get the payload\n            bytes memory payload = new bytes(payloadLength);\n            for (uint256 j = 0; j < payloadLength; ++j) {\n                payload[j] = data[i + j];\n            }\n            // Offset the data by the payload number of bytes\n            i += payloadLength;\n\n            // Verify the scope of the data\n            _verifyData(target, payload, chainId);\n        }\n    }\n}"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.30+commit.73712a01"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncorrectDataLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "NonZeroValue",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes4",
+              "name": "selector",
+              "type": "bytes4"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "NotAuthorized",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "provided",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "expected",
+              "type": "address"
+            }
+          ],
+          "name": "WrongL2BridgeMediator",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes4",
+              "name": "functionSig",
+              "type": "bytes4"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongSelector",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "CREATE_TICKET",
+          "outputs": [
+            {
+              "internalType": "bytes4",
+              "name": "",
+              "type": "bytes4"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "CREATE_TICKET_UNSAFE",
+          "outputs": [
+            {
+              "internalType": "bytes4",
+              "name": "",
+              "type": "bytes4"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MIN_ARBITRUM_PAYLOAD_LENGTH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "SELECTOR_DATA_LENGTH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "mapAllowedTargetSelectorChainIds",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            },
+            {
+              "internalType": "address",
+              "name": "l2Timelock",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "processBridgeData",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>Andrey Lebedev - <andrey.lebedev@valory.xyz>Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>",
+        "errors": {
+          "IncorrectDataLength(uint256,uint256)": [
+            {
+              "details": "Provided incorrect data length.",
+              "params": {
+                "expected": "Expected minimum data length.",
+                "provided": "Provided data length."
+              }
+            }
+          ],
+          "NonZeroValue(uint256)": [
+            {
+              "details": "Provided non zero value when it has to be zero.",
+              "params": {
+                "amount": "Value amount."
+              }
+            }
+          ],
+          "NotAuthorized(address,bytes4,uint256)": [
+            {
+              "details": "The combination of target and selector is not authorized.",
+              "params": {
+                "chainId": "Chain Id.",
+                "selector": "Function selector.",
+                "target": "Target address."
+              }
+            }
+          ],
+          "WrongL2BridgeMediator(address,address)": [
+            {
+              "details": "Provided wrong L2 bridge mediator address.",
+              "params": {
+                "expected": "Expected address.",
+                "provided": "Provided address."
+              }
+            }
+          ],
+          "WrongSelector(bytes4,uint256)": [
+            {
+              "details": "Provided wrong function selector.",
+              "params": {
+                "chainId": "Chain Id.",
+                "functionSig": "Function selector."
+              }
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "processBridgeData(bytes,address,uint256)": {
+            "details": "Processes bridged data: checks the header and verifies the payload.",
+            "params": {
+              "chainId": "L2 chain Id.",
+              "data": "Full data bytes with the header.",
+              "l2Timelock": "Arbitrum aliased Timelock address."
+            }
+          }
+        },
+        "title": "ProcessBridgedDataArbitrum - Smart contract for verifying the Guard CM bridged data on Arbitrum",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "processBridgeData(bytes,address,uint256)": {
+            "notice": "CM is not supposed to transfer l2CallValue."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/multisigs/bridge_verifier/ProcessBridgedDataArbitrum.sol": "ProcessBridgedDataArbitrum"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@gnosis.pm/=node_modules/@gnosis.pm/",
+        ":@handlers/=lib/fx-portal/test/handlers/",
+        ":@mock/=lib/fx-portal/test/mock/",
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":@utils/=lib/fx-portal/test/utils/",
+        ":ds-test/=lib/solmate/lib/ds-test/src/",
+        ":forge-std/=lib/fx-portal/lib/forge-std/src/",
+        ":fx-portal/=node_modules/fx-portal/",
+        ":openzeppelin-contracts/=lib/fx-portal/lib/openzeppelin-contracts/",
+        ":solmate/=lib/solmate/src/"
+      ]
+    },
+    "sources": {
+      "contracts/multisigs/VerifyData.sol": {
+        "keccak256": "0xa1011258ef374f174ed928b0c8199546410dd58f141c4d751bb59101c24b04d5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://9ea7db143f07099c1e716ff432c38eadcb1e28e49951d24bc3289178717091cf",
+          "dweb:/ipfs/QmRvsgrT8WStNkWrUSAJT4UQ9EVoP9MaV2eBz7u5XX4Y95"
+        ]
+      },
+      "contracts/multisigs/bridge_verifier/ProcessBridgedDataArbitrum.sol": {
+        "keccak256": "0xd8ba61f8945e27fe44ef00e13988ae3b07688984fdef9395b807b0aa8fc92b41",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d977e14b9edb0678f660c283f05dfaaf889e5e1167cea58a2032b9f7f728666e",
+          "dweb:/ipfs/QmXAjNUQH1LA5XwfRXCziWupLP1Lab1AWNxzZw6y1BihbF"
+        ]
+      },
+      "contracts/multisigs/bridge_verifier/VerifyBridgedData.sol": {
+        "keccak256": "0x5f9db898e3d0b75afe45b380249f7f7db6c0934e36eeac063a98fdbbd97d1d1d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://968460187240bba9f779eedb8cb36c8996c5fedb665600dc25bab2d8946b03ea",
+          "dweb:/ipfs/QmcT12w4PSEC5THRoAQqtiYkv3YjjWhJHkCZJ54NBXNWvt"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.30+commit.73712a01",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "@gnosis.pm/=node_modules/@gnosis.pm/",
+        "@openzeppelin/=node_modules/@openzeppelin/",
+        "fx-portal/=node_modules/fx-portal/",
+        "@handlers/=lib/fx-portal/test/handlers/",
+        "@mock/=lib/fx-portal/test/mock/",
+        "@utils/=lib/fx-portal/test/utils/",
+        "ds-test/=lib/solmate/lib/ds-test/src/",
+        "forge-std/=lib/fx-portal/lib/forge-std/src/",
+        "openzeppelin-contracts/=lib/fx-portal/lib/openzeppelin-contracts/",
+        "solmate/=lib/solmate/src/"
+      ]
+    },
+    "name": "ProcessBridgedDataArbitrum",
+    "fullyQualifiedName": "contracts/multisigs/bridge_verifier/ProcessBridgedDataArbitrum.sol:ProcessBridgedDataArbitrum"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "30225802",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-06-01T07:04:22Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0x0F33636698F6607B2FDdC1e857788535914C44d4"
+}
