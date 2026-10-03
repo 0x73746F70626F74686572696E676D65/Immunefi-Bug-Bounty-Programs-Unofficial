@@ -14,7 +14,7 @@ def digest(s): return hashlib.sha256(s.encode()).hexdigest()[:24]
 def safe(s): return re.sub(r'[^a-zA-Z0-9._-]', '_', s)[:160]
 def save_json(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix+'.tmp'); tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False)+'\n'); tmp.replace(path)
+    tmp = temporary('json-'); tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False)+'\n'); tmp.replace(path)
 def relative(path): return str(path.relative_to(ROOT))
 def temporary(prefix='response-'):
     fd,path=tempfile.mkstemp(prefix=prefix,dir=WORK);os.close(fd);return pathlib.Path(path)
@@ -227,8 +227,10 @@ def crate(entry):
     return {'status':'fetched','kind':'rust_crate','version':version,'archive':relative(path),'file_count':count,'archive_sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
 
 def generic(entry):
-    url=entry['url']; parsed=urllib.parse.urlsplit(url);host=parsed.netloc.lower(); address=re.search(r'0x[a-fA-F0-9]{40}',url)
+    url=entry['url']; parsed=urllib.parse.urlsplit(url);host=parsed.netloc.lower(); address=re.search(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])',url)
     if 'hiro.so' in host:return stacks(entry)
+    if host=='tronscan.org':return tron(entry)
+    if host=='explorer.zksync.io':return zksync(entry)
     if host=='crates.io':return crate(entry)
     if address and any(s in host for s in ('blockscout','explorer.inkonchain','explorer.gobob','explorer.hemi','explorer.tac','explorer.lyra','explorer.mantle','explorer.intuition','explorer.plume','explorer.orderly','explorer.morph')):
         try:return blockscout(entry,host,address.group())
@@ -237,7 +239,10 @@ def generic(entry):
     if address and any(s in host for s in ('scan.','scan.org','scan.io','scan.xyz','snowtrace','hecoinfo')):fetch_url='https://'+host+'/address/'+address.group()+'#code'
     file,_=download(fetch_url);body=file.read_bytes();text=body.decode('utf-8','replace');file.unlink(missing_ok=True)
     obj=parse_scan(text)
-    if obj:return persist_contract(entry,obj,'explorer_verified_contract',fetch_url)
+    if obj:
+        addresses=proxy_addresses(text)
+        if addresses:obj['explorer_implementation_addresses']=addresses
+        return persist_contract(entry,obj,'explorer_verified_contract',fetch_url)
     # Deployment explorer pages can refer to the verified implementation.
     if address:
         impl=[]
@@ -277,7 +282,47 @@ def generic(entry):
         if bundles:save_json(dest/'scripts.json',bundles);result['browser_scripts']=relative(dest/'scripts.json');result['script_count']=sum('path' in b for b in bundles)
     return result
 
+def proxy_addresses(text):
+    addresses=[]
+    for pattern in (r'lit(?:ProxyContractABIAddress|MinimalProxyImplementation)\s*=\s*["\x27](0x[a-fA-F0-9]{40})',r'divImplementationAddress[^>]*>.*?href=["\x27]/address/(0x[a-fA-F0-9]{40})'):
+        addresses.extend(re.findall(pattern,text,re.I|re.S))
+    return list(dict.fromkeys(a.lower() for a in addresses))
+
+def zksync(entry):
+    address=re.search(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])',entry['url']).group()
+    endpoint='https://zksync2-mainnet-explorer.zksync.io/contract_verification/info/'+address
+    data=get_json(endpoint);code=data['request'].get('sourceCode')
+    if isinstance(code,str):
+        try:code=json.loads(code)
+        except ValueError:code={'sources':{'Contract.sol':{'content':code}}}
+    if not code or not code.get('sources'):raise RuntimeError('zkSync verification API has no source')
+    obj={**code,'verification':data}
+    return persist_contract(entry,obj,'zksync_verified_contract',endpoint)
+
+def tron(entry):
+    address=re.search(r'/contract/(T[a-zA-Z0-9]{33})',entry['url']).group(1)
+    endpoint='https://apilist.tronscanapi.com/api/contracts/code?contract='+address
+    obj=get_json(endpoint).get('data') or {}
+    # Tronscan serves the multi-file source via the contract-source endpoint.
+    endpoint='https://apilist.tronscanapi.com/api/contract/code?contract='+address
+    data=get_json(endpoint)
+    obj['source_response']=data
+    sources={}
+    def collect(value):
+        if isinstance(value,dict):
+            for key in ('source_code','sourceCode','code','content'):
+                v=value.get(key)
+                if isinstance(v,str) and any(t in v for t in ('pragma solidity','contract ','SPDX-License-Identifier')):
+                    name=value.get('name') or value.get('fileName') or value.get('filename') or 'Contract.sol';sources[name]={'content':v}
+            for v in value.values():collect(v)
+        elif isinstance(value,list):
+            for v in value:collect(v)
+    collect(data)
+    if not sources:raise RuntimeError('Tronscan did not return verified source text')
+    obj['sources']=sources;return persist_contract(entry,obj,'tron_verified_contract',endpoint)
+
 CHAIN_IDS = {
+ 'explore.tempo.xyz':4217,'cornscan.io':21000000,'flarescan.com':14,'hashscan.io':295,'xdcscan.com':50,'taikoscan.io':167000,'blastscan.io':81457,
  'etherscan.io':1,'polygonscan.com':137,'arbiscan.io':42161,'snowtrace.io':43114,
  'snowscan.xyz':43114,'basescan.org':8453,'bscscan.com':56,'optimistic.etherscan.io':10,
  'gnosisscan.io':100,'scrollscan.com':534352,'sonicscan.org':146,'celoscan.io':42220,
@@ -294,9 +339,10 @@ CHAIN_IDS = {
 }
 BLOCKSCOUT_ALIASES={'optimistic.etherscan.io':'optimism.blockscout.com','explorer.optimism.io':'optimism.blockscout.com','basescan.org':'base.blockscout.com','etherscan.io':'eth.blockscout.com','gnosisscan.io':'gnosis.blockscout.com','polygonscan.com':'polygon.blockscout.com','arbiscan.io':'arbitrum.blockscout.com','scrollscan.com':'scroll.blockscout.com','uniscan.xyz':'unichain.blockscout.com','worldscan.org':'worldchain-mainnet.explorer.alchemy.com'}
 def alternate_contract(entry):
-    parsed=urllib.parse.urlsplit(entry['url']);host=parsed.netloc.lower();m=re.search(r'0x[a-fA-F0-9]{40}',entry['url'])
+    parsed=urllib.parse.urlsplit(entry['url']);host=parsed.netloc.lower();m=re.search(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])',entry['url'])
     if not m:raise RuntimeError('No EVM address; no alternate verification endpoint')
     address=m.group();chain=CHAIN_IDS.get(host)
+    if host=='www.oklink.com':chain={'x-layer':196,'okc':66,'ethereum':1,'polygon':137,'arbitrum':42161}.get(parsed.path.strip('/').split('/')[0])
     if host=='blockscout.com':
         if '/eth/mainnet/' in parsed.path:chain=1
         if '/xdai/mainnet/' in parsed.path:chain=100
