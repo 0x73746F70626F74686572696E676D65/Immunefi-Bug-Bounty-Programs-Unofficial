@@ -3,9 +3,11 @@
 import collections, gzip, hashlib, json, pathlib, subprocess
 import fetch_sources as f
 import fetch_submodules as submodules
+import fetch_proxy_sources as proxies
 
 def main():
     submodules.main(retry_failed=True)
+    proxies.main(retry_failed=True)
     inventory=json.loads((f.OUT/'inventory.json').read_text());results=json.loads((f.OUT/'results.json').read_text())
     repaired=[]
     for row in results:

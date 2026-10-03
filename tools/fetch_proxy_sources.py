@@ -6,6 +6,17 @@ import fetch_sources as f
 
 RESULTS=f.OUT/'proxy-sources.json'
 
+def implementation_url(parent,address):
+    parsed=urllib.parse.urlsplit(parent['url'])
+    path=re.sub(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])',address,parsed.path,count=1)
+    if path==parsed.path:path='/address/'+address
+    return urllib.parse.urlunsplit(('https',parsed.netloc,path,'','code'))
+
+def network_key(url):
+    parsed=urllib.parse.urlsplit(url)
+    parts=parsed.path.strip('/').split('/')
+    return (parsed.netloc,'/'.join(parts[:2]) if parsed.netloc=='blockscout.com' else parts[0] if parsed.netloc=='www.oklink.com' else '')
+
 def discover(result):
     path=f.ROOT/result['source'];obj=json.loads(path.read_text());addresses=list(obj.get('explorer_implementation_addresses') or [])
     for key in ('implementations',):
@@ -48,20 +59,25 @@ def discover(result):
 
 def fetch_impl(parent,address):
     host=urllib.parse.urlsplit(parent['url']).netloc
-    url='https://'+host+'/address/'+address+'#code'
+    url=implementation_url(parent,address)
     entry={'id':f.digest(url),'url':url,'programs':parent.get('programs',[]),'assets':[{'type':'smart_contract','description':'Proxy implementation for '+parent['url']}],'metadata_fields':[]}
-    cached=PRIMARY_INDEX.get((host,address.lower()))
+    cached=PRIMARY_INDEX.get((network_key(url),address.lower()))
     result={**cached,**entry,'shared_source_from':cached['url']} if cached else f.fetch(entry)
     result['parent_url']=parent['url'];result['implementation_address']=address
     return result
 
-def main():
+def main(retry_failed=False):
     results={r['id']:r for r in json.loads(RESULTS.read_text())} if RESULTS.exists() else {}
     primary=json.loads((f.OUT/'results.json').read_text())
     for row in primary:
         if row.get('status')!='fetched' or not row.get('source'):continue
         match=re.search(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])',row['url'])
-        if match:PRIMARY_INDEX[(urllib.parse.urlsplit(row['url']).netloc,match.group().lower())]=row
+        if match:PRIMARY_INDEX[(network_key(row['url']),match.group().lower())]=row
+    if retry_failed:
+        for key,row in list(results.items()):
+            if row['status']=='fetched' or not row.get('parent_url'):continue
+            corrected=implementation_url({'url':row['parent_url']},row['implementation_address'])
+            if corrected!=row['url']:del results[key]
     parents=[r for r in primary if r.get('source')]+[r for r in results.values() if r.get('source')]
     seen=set();round_number=0
     while parents:
@@ -71,8 +87,8 @@ def main():
             for parent,addresses in zip(parents,discovered):
                 host=urllib.parse.urlsplit(parent['url']).netloc
                 for address in addresses:
-                    key=f.digest('https://'+host+'/address/'+address+'#code')
-                    if key in seen or key in results:continue
+                    key=f.digest(implementation_url(parent,address))
+                    if key in seen or (key in results and (not retry_failed or results[key]['status']=='fetched')):continue
                     if address in parent['url'].lower():continue
                     seen.add(key);tasks.append((parent,address))
         print('Proxy source round',round_number,'implementations',len(tasks),flush=True);parents=[]
