@@ -39,6 +39,11 @@ archived records in `project/` do not determine eligibility.
   reference to its active programs.
 - `sources/results.json` records retrieval outcomes and the saved source locations.
 - `sources/summary.json` reports coverage and outstanding or unavailable sources.
+- `sources/submodules.json` records pinned dependency retrievals, including exact-commit
+  recoveries from renamed repositories or public mirrors.
+- `sources/proxy-sources.json` records implementation source linked from scoped proxies.
+- `sources/verification.json` records integrity checks and coverage; `sources/coverage.json`
+  provides the per-program counts, and `sources/unresolved.json` lists unavailable scoped sources.
 - GitHub archives include a resolved commit, SHA-256 digest, and complete file index.
   Join numbered `source.tar.gz.part*` files in order before opening a split archive.
 - Verified contract `source.json` files preserve source text and compiler metadata
