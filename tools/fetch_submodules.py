@@ -48,7 +48,9 @@ def tasks():
         except configparser.Error:continue
         for section in config.sections():
             if not config.has_option(section,'path') or not config.has_option(section,'url'):continue
-            path=config.get(section,'path').strip('"');url=config.get(section,'url').strip('"')
+            # Git accepts differently indented keys; ConfigParser may treat the
+            # next key as a continuation. Paths and repository URLs are single lines.
+            path=config.get(section,'path').splitlines()[0].strip().strip('"');url=config.get(section,'url').splitlines()[0].strip().strip('"')
             key=f.digest(parent['snapshot']+'|'+path);result[key]=(parent,path,url)
     return result
 
