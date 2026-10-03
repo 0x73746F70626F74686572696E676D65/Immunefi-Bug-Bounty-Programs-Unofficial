@@ -1,0 +1,2080 @@
+{
+  "sources": {
+    "contracts/Payments.sol": {
+      "content": "// SPDX-License-Identifier: UNLICENSED\npragma solidity ^0.8.0;\npragma abicoder v2;\n\nimport \"./interfaces/IWETH9.sol\";\nimport \"./libraries/TransferHelper.sol\";\n\nimport \"./libraries/helpers/Errors.sol\";\n\nabstract contract Payments {\n    address public immutable WETH9;\n\n    modifier avoidUsingNativeEther() {\n        require(msg.value == 0, \"avoid using native ether\");\n        _;\n    }\n\n    constructor(address _WETH9) {\n        WETH9 = _WETH9;\n    }\n\n    receive() external payable {\n        require(msg.sender == WETH9, Errors.VL_NOT_WETH9);\n    }\n\n    function unwrapWETH9(uint256 amountMinimum, address recipient) internal {\n        uint256 balanceWETH9 = IWETH9(WETH9).balanceOf(address(this));\n        require(balanceWETH9 >= amountMinimum, Errors.VL_INSUFFICIENT_WETH9);\n\n        if (balanceWETH9 > 0) {\n            IWETH9(WETH9).withdraw(balanceWETH9);\n            TransferHelper.safeTransferETH(recipient, balanceWETH9);\n        }\n    }\n\n    function refundETH() internal {\n        if (address(this).balance > 0)\n            TransferHelper.safeTransferETH(msg.sender, address(this).balance);\n    }\n\n    /// @param token The token to pay\n    /// @param payer The entity that must pay\n    /// @param recipient The entity that will receive payment\n    /// @param value The amount to pay\n    function pay(\n        address token,\n        address payer,\n        address recipient,\n        uint256 value\n    ) internal {\n        if (token == WETH9 && address(this).balance >= value) {\n            // pay with WETH9\n            IWETH9(WETH9).deposit{value: value}(); // wrap only what is needed to pay\n            require(\n                IWETH9(WETH9).transfer(recipient, value),\n                \"transfer failed\"\n            );\n        } else if (payer == address(this)) {\n            // pay with tokens already in the contract (for the exact input multihop case)\n            TransferHelper.safeTransfer(token, recipient, value);\n        } else {\n            // pull payment\n            TransferHelper.safeTransferFrom(token, payer, recipient, value);\n        }\n    }\n}\n"
+    },
+    "contracts/interfaces/IWETH9.sol": {
+      "content": "// SPDX-License-Identifier: GPL-2.0-or-later\npragma solidity ^0.8.0;\n\nimport \"../external/openzeppelin/contracts/token/ERC20/IERC20.sol\";\n\n/// @title Interface for WETH9\ninterface IWETH9 is IERC20 {\n    /// @notice Deposit ether to get wrapped ether\n    function deposit() external payable;\n\n    /// @notice Withdraw wrapped ether to get ether\n    function withdraw(uint256) external;\n}\n"
+    },
+    "contracts/VeloPositionManager.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\npragma abicoder v2;\n\nimport \"./external/openzeppelin/contracts/security/ReentrancyGuard.sol\";\nimport \"./external/openzeppelin/contracts/access/Ownable.sol\";\nimport \"./external/openzeppelin/contracts/utils/math/SafeMath.sol\";\nimport \"./external/openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol\";\n\nimport \"./interfaces/IVeloVaultPositionManager.sol\";\nimport \"./interfaces/IVaultFactory.sol\";\nimport \"./interfaces/IVeloVault.sol\";\n\nimport \"./libraries/helpers/Errors.sol\";\nimport \"./Payments.sol\";\n\nimport \"./interfaces/IAddressRegistry.sol\";\nimport \"./libraries/helpers/AddressId.sol\";\n\nimport \"./libraries/types/VaultTypes.sol\";\n\ncontract VeloPositionManager is\n    ReentrancyGuard,\n    IVeloVaultPositionManager,\n    Ownable,\n    Payments\n{\n    using SafeMath for uint256;\n\n    /// @notice Contract address of the AddressProvider\n    address public immutable addressProvider;\n    /// @notice Contract address of the VaultFactory\n    address public immutable vaultFactory;\n\n    /// @notice permissionLessLiquidation feature\n    /// Only if this feature is true, users can liquidate positions without permissions.\n    /// Otherwise only liquidators in the whitelist can liquidate positions.\n    bool public permissionLessLiquidationEnabled;\n    /// @notice liquidatorWhitelist\n    mapping(address => bool) public liquidatorWhitelist;\n\n    /// @notice permissionLessCompoundEnabled feature\n    /// Only if this feature is true, users can claim the vaults' rewards and reinvest to liquidity  without permissions.\n    /// Otherwise only users in the whitelist can call the reinvest function\n    bool public permissionLessCompoundEnabled;\n    /// @notice CompounderWhitelist\n    mapping(address => bool) public compounderWhitelist;\n\n    /// @notice permissionLessRangeStopEnabled feature\n    /// Only if this feature is true, users can close outof-range positions\n    bool public permissionLessRangeStopEnabled;\n    /// @notice rangeStopCallerWhitelist\n    mapping(address => bool) public rangeStopCallerWhitelist;\n\n    modifier checkDeadline(uint256 deadline) {\n        require(block.timestamp <= deadline, Errors.VL_TRANSACTION_TOO_OLD);\n        _;\n    }\n\n    modifier liquidatorInWhitelist() {\n        require(\n            permissionLessLiquidationEnabled || liquidatorWhitelist[msg.sender],\n            Errors.VL_LIQUIDATOR_NOT_IN_WHITELIST\n        );\n        _;\n    }\n\n    modifier compounderInWhitelist() {\n        require(\n            permissionLessCompoundEnabled || compounderWhitelist[msg.sender],\n            Errors.VL_LIQUIDATOR_NOT_IN_WHITELIST\n        );\n        _;\n    }\n\n    modifier rangeStopCallerInWhitelist() {\n        require(\n            permissionLessRangeStopEnabled ||\n                rangeStopCallerWhitelist[msg.sender],\n            Errors.VL_LIQUIDATOR_NOT_IN_WHITELIST\n        );\n        _;\n    }\n\n    constructor(\n        address _addressProvider\n    )\n        Payments(\n            IAddressRegistry(_addressProvider).getAddress(\n                AddressId.ADDRESS_ID_WETH9\n            )\n        )\n    {\n        require(_addressProvider != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n        addressProvider = _addressProvider;\n        vaultFactory = IAddressRegistry(addressProvider).getAddress(\n            AddressId.ADDRESS_ID_VAULT_FACTORY\n        );\n\n        disablePermissionLessLiquidation();\n        addPermissionedLiquidator(msg.sender);\n        disablePermissionLessCompound();\n        addPermissionedCompounder(msg.sender);\n        disablePermissonLessRangeStop();\n        addPermissionedRangeStopCaller(msg.sender);\n    }\n\n    /// @notice Callback functions called by the vault to pay tokens to the vault contract.\n    /// The caller to this function must be the vault contract\n    function payToVaultCallback(\n        PayToVaultCallbackParams calldata params\n    ) external {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(\n            params.vaultId\n        );\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n        require(\n            vaultAddress == _msgSender(),\n            Errors.VT_VAULT_CALLBACK_INVALID_SENDER\n        );\n\n        // transfer token0 and token1 from user's wallet to vault\n        if (params.amount0 > 0) {\n            pay(\n                IVeloVault(vaultAddress).token0(),\n                params.payer,\n                vaultAddress,\n                params.amount0\n            );\n        }\n        if (params.amount1 > 0) {\n            pay(\n                IVeloVault(vaultAddress).token1(),\n                params.payer,\n                vaultAddress,\n                params.amount1\n            );\n        }\n    }\n\n    /// @notice Callback functions called by the vault to pay protocol fee.\n    /// The caller to this function must be the vault contract\n    function payFeeToTreasuryCallback(\n        uint256 vaultId,\n        address asset,\n        uint256 amount,\n        uint256 feeType\n    ) external {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(vaultId);\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n        require(\n            vaultAddress == _msgSender(),\n            Errors.VT_VAULT_CALLBACK_INVALID_SENDER\n        );\n\n        address treasury = IAddressRegistry(addressProvider).getAddress(\n            AddressId.ADDRESS_ID_TREASURY\n        );\n        require(treasury != address(0), \"zero-address treasury\");\n\n        SafeERC20.safeTransferFrom(\n            IERC20(asset),\n            vaultAddress,\n            treasury,\n            amount\n        );\n\n        emit FeePaid(vaultId, asset, feeType, amount);\n    }\n\n    /// @notice Open a new vaultPosition or invest to a existing vault position\n    /// @param params The parameters necessary, encoded as `NewOrInvestToVaultPositionParams` in calldata\n    function newOrInvestToVaultPosition(\n        NewOrInvestToVaultPositionParams calldata params\n    ) external payable nonReentrant checkDeadline(params.deadline) {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(\n            params.vaultId\n        );\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n\n        (uint256 positionId, uint256 liquidity) = IVeloVault(vaultAddress)\n            .newOrInvestToVaultPosition(params, _msgSender());\n\n        if (params.vaultPositionId == 0) {\n            emit NewVaultPosition(params.vaultId, positionId, _msgSender());\n        }\n\n        // if user use ether, refund unused ether to msg.sender\n        if (msg.value > 0) {\n            refundETH();\n        }\n\n        emit InvestToVaultPosition(\n            params.vaultId,\n            positionId,\n            _msgSender(),\n            params.amount0Invest,\n            params.amount1Invest,\n            params.amount0Borrow,\n            params.amount1Borrow,\n            liquidity\n        );\n    }\n\n    /// @notice Close a vaultPosition partially\n    /// @param params The parameters necessary, encoded as `CloseVaultPositionPartiallyParams` in calldata\n    function closeVaultPositionPartially(\n        CloseVaultPositionPartiallyParams calldata params\n    )\n        external\n        payable\n        override\n        nonReentrant\n        checkDeadline(params.deadline)\n        avoidUsingNativeEther\n    {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(\n            params.vaultId\n        );\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n\n        (\n            uint256 amount0,\n            uint256 amount1,\n            uint256 repay0,\n            uint256 repay1\n        ) = IVeloVault(vaultAddress).closeAndRepayPartially(\n                params,\n                _msgSender()\n            );\n\n        if (\n            amount0 > 0 &&\n            IVeloVault(vaultAddress).token0() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(amount0, params.receiver);\n        }\n\n        if (\n            amount1 > 0 &&\n            IVeloVault(vaultAddress).token1() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(amount1, params.receiver);\n        }\n\n        emit CloseVaultPositionPartially(\n            params.vaultId,\n            params.vaultPositionId,\n            _msgSender(),\n            params.percent,\n            amount0,\n            amount1,\n            repay0,\n            repay1\n        );\n    }\n\n    /// @notice Close the position which is outof price range.\n    /// This function can be called only if the `rangeStop` feature is enabled.\n    /// Any permissioned user can call this function, regardless of whether they are the position owner.\n    /// @param params The parameters necessary, encoded as `CloseVaultPositionPartiallyParams` in calldata\n    function closeOutOfRangePosition(\n        CloseVaultPositionPartiallyParams calldata params\n    )\n        external\n        payable\n        nonReentrant\n        rangeStopCallerInWhitelist\n        avoidUsingNativeEther\n    {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(\n            params.vaultId\n        );\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n\n        (\n            address positionManager,\n            uint256 price,\n            uint256 amount0,\n            uint256 amount1,\n            uint256 fee0,\n            uint256 fee1\n        ) = IVeloVault(vaultAddress).closeAndRepayOutOfRangePosition(params);\n\n        if (\n            fee0 > 0 &&\n            IVeloVault(vaultAddress).token0() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(fee0, params.receiver);\n        }\n\n        if (\n            fee1 > 0 &&\n            IVeloVault(vaultAddress).token1() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(fee1, params.receiver);\n        }\n\n        emit CloseOutOfRangePosition(\n            params.vaultId,\n            params.vaultPositionId,\n            positionManager,\n            _msgSender(),\n            params.percent,\n            uint64(block.timestamp),\n            price,\n            amount0,\n            amount1,\n            fee0,\n            fee1\n        );\n    }\n\n    /// @notice Liquidate a vaultPosition partially\n    /// @param params The parameters necessary, encoded as `LiquidateVaultPositionPartiallyParams` in calldata\n    function liquidateVaultPositionPartially(\n        LiquidateVaultPositionPartiallyParams calldata params\n    ) external payable nonReentrant liquidatorInWhitelist {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(\n            params.vaultId\n        );\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n\n        IVeloVault.LiquidateState memory result = IVeloVault(vaultAddress)\n            .repayAndLiquidatePositionPartially(params, _msgSender());\n\n        if (\n            result.liquidatorReceive0 > 0 &&\n            IVeloVault(vaultAddress).token0() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(result.liquidatorReceive0, params.receiver);\n        }\n\n        if (\n            result.liquidatorReceive1 > 0 &&\n            IVeloVault(vaultAddress).token1() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(result.liquidatorReceive1, params.receiver);\n        }\n\n        // if user use ether, refund unused ether to msg.sender\n        if (msg.value > 0) {\n            refundETH();\n        }\n\n        emit LiquidateVaultPositionPartially(\n            params.vaultId,\n            params.vaultPositionId,\n            result.manager,\n            _msgSender(),\n            params.percent,\n            uint64(block.timestamp),\n            result.price,\n            result.repaidValue,\n            result.removedLiquidityValue,\n            result.amount0Left,\n            result.amount1Left,\n            result.liquidateFee0,\n            result.liquidateFee1\n        );\n    }\n\n    /// @notice Invest the earned fee by the position to liquidity\n    function investEarnedFeeToLiquidity(\n        InvestEarnedFeeToLiquidityParam calldata params\n    )\n        external\n        payable\n        nonReentrant\n        compounderInWhitelist\n        avoidUsingNativeEther\n    {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(\n            params.vaultId\n        );\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n\n        (\n            uint256 liquidity,\n            uint256 fee0,\n            uint256 fee1,\n            uint256[] memory rewards\n        ) = IVeloVault(vaultAddress).claimRewardsAndReInvestToLiquidity(params);\n\n        if (\n            fee0 > 0 &&\n            IVeloVault(vaultAddress).token0() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(fee0, params.compoundFeeReceiver);\n        }\n\n        if (\n            fee1 > 0 &&\n            IVeloVault(vaultAddress).token1() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(fee1, params.compoundFeeReceiver);\n        }\n\n        emit InvestEarnedFeeToLiquidity(\n            params.vaultId,\n            _msgSender(),\n            liquidity,\n            fee0,\n            fee1,\n            rewards\n        );\n    }\n\n    /// @notice Repay exact value of debts\n    function exactRepay(\n        ExactRepayParam calldata params\n    )\n        external\n        payable\n        nonReentrant\n        returns (uint256 amount0Repaid, uint256 amount1Repaid)\n    {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(\n            params.vaultId\n        );\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n\n        address positionMananegr;\n\n        (positionMananegr, amount0Repaid, amount1Repaid) = IVeloVault(\n            vaultAddress\n        ).exactRepay(params, _msgSender());\n\n        if (\n            params.amount0ToRepay > amount0Repaid &&\n            IVeloVault(vaultAddress).token0() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(params.amount0ToRepay.sub(amount0Repaid), _msgSender());\n        }\n\n        if (\n            params.amount1ToRepay > amount1Repaid &&\n            IVeloVault(vaultAddress).token1() == WETH9 &&\n            params.receiveNativeETH\n        ) {\n            unwrapWETH9(params.amount1ToRepay.sub(amount1Repaid), _msgSender());\n        }\n\n        // if there is unused ETH, refund it to msg.sender\n        if (msg.value > 0) {\n            refundETH();\n        }\n\n        emit ExactRepay(\n            params.vaultId,\n            params.vaultPositionId,\n            positionMananegr,\n            _msgSender(),\n            amount0Repaid,\n            amount1Repaid\n        );\n    }\n\n    function adminSetVault(\n        uint256 vaultId,\n        bytes calldata params\n    ) external nonReentrant onlyOwner {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(vaultId);\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n        IVeloVault(vaultAddress).adminSetVault(params);\n    }\n\n    /// @notice Transfer the position's manager to another wallet\n    /// Must be called by the current manager of the posistion\n    /// @param vaultId The Id of the vault\n    /// @param vaultPositionId The Id of the position\n    /// @param newManager The new address of the manager\n    function transferManagerOfVaultPosition(\n        uint256 vaultId,\n        uint256 vaultPositionId,\n        address newManager\n    ) external override nonReentrant {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(vaultId);\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n        IVeloVault(vaultAddress).transferManagerTo(\n            _msgSender(),\n            vaultPositionId,\n            newManager\n        );\n    }\n\n    /// @notice Set stop-loss price range of the position\n    /// Users can set a stop-loss price range for a position only if the position is enabled `RangeStop` feature.\n    /// If current price goes out of the stop-loss price range, extraFi's bots will close the position\n    /// @param vaultId The Id of the vault\n    /// @param vaultPositionId The Id of the position\n    /// @param enable Enable or Disable the rangeStop feature\n    /// @param minPrice The lower price of the stop-loss price range\n    /// @param maxPrice The upper price of the stop-loss price range\n    function setRangeStop(\n        uint256 vaultId,\n        uint256 vaultPositionId,\n        bool enable,\n        uint256 minPrice,\n        uint256 maxPrice\n    ) external override nonReentrant {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(vaultId);\n        require(vaultAddress != address(0), Errors.VL_ADDRESS_CANNOT_ZERO);\n        IVeloVault(vaultAddress).setRangeStop(\n            _msgSender(),\n            vaultPositionId,\n            enable,\n            minPrice,\n            maxPrice\n        );\n    }\n\n    function enablePermissionLessLiquidation() public nonReentrant onlyOwner {\n        permissionLessLiquidationEnabled = true;\n    }\n\n    function disablePermissionLessLiquidation() public nonReentrant onlyOwner {\n        permissionLessLiquidationEnabled = false;\n    }\n\n    function addPermissionedLiquidator(\n        address addr\n    ) public nonReentrant onlyOwner {\n        liquidatorWhitelist[addr] = true;\n    }\n\n    function removePermissionedLiquidator(\n        address addr\n    ) public nonReentrant onlyOwner {\n        liquidatorWhitelist[addr] = false;\n    }\n\n    function enablePermissionLessCompound() public nonReentrant onlyOwner {\n        permissionLessCompoundEnabled = true;\n    }\n\n    function disablePermissionLessCompound() public nonReentrant onlyOwner {\n        permissionLessCompoundEnabled = false;\n    }\n\n    function addPermissionedCompounder(\n        address addr\n    ) public nonReentrant onlyOwner {\n        compounderWhitelist[addr] = true;\n    }\n\n    function removePermissionedCompounder(\n        address addr\n    ) public nonReentrant onlyOwner {\n        compounderWhitelist[addr] = false;\n    }\n\n    function enablePermissonLessRangeStop() public nonReentrant onlyOwner {\n        permissionLessRangeStopEnabled = true;\n    }\n\n    function disablePermissonLessRangeStop() public nonReentrant onlyOwner {\n        permissionLessRangeStopEnabled = false;\n    }\n\n    function addPermissionedRangeStopCaller(\n        address addr\n    ) public nonReentrant onlyOwner {\n        rangeStopCallerWhitelist[addr] = true;\n    }\n\n    function removePermissionedRangeStopCaller(\n        address addr\n    ) public nonReentrant onlyOwner {\n        rangeStopCallerWhitelist[addr] = false;\n    }\n\n    //----------------->>>>>  getters <<<<<-----------------\n    function getVault(\n        uint256 vaultId\n    ) external view override returns (VaultTypes.VeloVaultState memory) {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(vaultId);\n        return IVeloVault(vaultAddress).getVaultState();\n    }\n\n    function getVaultPosition(\n        uint256 vaultId,\n        uint256 vaultPositionId\n    )\n        external\n        view\n        override\n        returns (VaultTypes.VeloPositionValue memory state)\n    {\n        address vaultAddress = IVaultFactory(vaultFactory).vaults(vaultId);\n        return IVeloVault(vaultAddress).getPositionValue(vaultPositionId);\n    }\n}\n"
+    },
+    "contracts/interfaces/IVeloVault.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\npragma abicoder v2;\n\nimport \"./IVeloVaultPositionManager.sol\";\nimport \"../libraries/types/VaultTypes.sol\";\n\ninterface IVeloVault {\n    /// @notice token0 address of the related velo pair\n    function token0() external view returns (address);\n\n    /// @notice token1 address of the related velo pair\n    function token1() external view returns (address);\n\n    /// @notice stable of the related velo pair\n    function stable() external view returns (bool);\n\n    function getVaultState()\n        external\n        view\n        returns (VaultTypes.VeloVaultState memory vault);\n\n    function adminSetVault(bytes calldata params) external;\n\n    function transferManagerTo(\n        address caller,\n        uint256 positionId,\n        address newManager\n    ) external;\n\n    function setRangeStop(\n        address caller,\n        uint256 positionId,\n        bool enable,\n        uint256 minPrice,\n        uint256 maxPrice\n    ) external;\n\n    function getPositionValue(\n        uint256 vaultPositionId\n    ) external view returns (VaultTypes.VeloPositionValue memory positionValue);\n\n    function getPosition(\n        uint256 vaultPositionId\n    ) external view returns (VaultTypes.VeloPosition memory position);\n\n    function newOrInvestToVaultPosition(\n        IVeloVaultPositionManager.NewOrInvestToVaultPositionParams\n            calldata params,\n        address caller\n    ) external returns (uint256 positionId, uint256 liquidity);\n\n    function closeAndRepayPartially(\n        IVeloVaultPositionManager.CloseVaultPositionPartiallyParams\n            calldata params,\n        address caller\n    ) external returns (uint256, uint256, uint256, uint256);\n\n    function closeAndRepayOutOfRangePosition(\n        IVeloVaultPositionManager.CloseVaultPositionPartiallyParams\n            calldata params\n    )\n        external\n        returns (\n            address manager,\n            uint256 price,\n            uint256 amount0Left,\n            uint256 amount1Left,\n            uint256 fee0,\n            uint256 fee1\n        );\n\n    struct LiquidateState {\n        address manager;\n        uint256 price;\n        uint256 amount0Left;\n        uint256 amount1Left;\n        uint256 amount0Repaid;\n        uint256 amount1Repaid;\n        uint256 repaidValue;\n        uint256 removedLiquidityValue;\n        uint256 liquidateFeeValue;\n        uint256 equivalentRepaid0;\n        uint256 equivalentRepaid1;\n        uint256 liquidatorReceive0;\n        uint256 liquidatorReceive1;\n        uint256 liquidateFee0;\n        uint256 liquidateFee1;\n    }\n\n    function repayAndLiquidatePositionPartially(\n        IVeloVaultPositionManager.LiquidateVaultPositionPartiallyParams\n            calldata params,\n        address caller\n    ) external returns (LiquidateState memory);\n\n    function exactRepay(\n        IVeloVaultPositionManager.ExactRepayParam calldata params,\n        address caller\n    )\n        external\n        returns (\n            address positionMananger,\n            uint256 amount0Repaid,\n            uint256 amount1Repaid\n        );\n\n    function claimRewardsAndReInvestToLiquidity(\n        IVeloVaultPositionManager.InvestEarnedFeeToLiquidityParam\n            calldata params\n    )\n        external\n        returns (\n            uint256 liquidity,\n            uint256 fee0,\n            uint256 fee1,\n            uint256[] memory rewards\n        );\n}\n"
+    },
+    "contracts/interfaces/IVaultFactory.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\npragma abicoder v2;\n\ninterface IVaultFactory {\n    event NewVault(\n        address indexed token0,\n        address indexed token1,\n        bool stable,\n        address vaultAddress,\n        uint256 indexed vaultId\n    );\n\n    function vaults(uint256 vaultId) external view returns (address);\n}\n"
+    },
+    "contracts/libraries/TransferHelper.sol": {
+      "content": "// SPDX-License-Identifier: GPL-2.0-or-later\npragma solidity >=0.6.0;\n\nimport \"../external/openzeppelin/contracts/token/ERC20/IERC20.sol\";\n\nlibrary TransferHelper {\n    /// @notice Transfers tokens from the targeted address to the given destination\n    /// @notice Errors with 'STF' if transfer fails\n    /// @param token The contract address of the token to be transferred\n    /// @param from The originating address from which the tokens will be transferred\n    /// @param to The destination address of the transfer\n    /// @param value The amount to be transferred\n    function safeTransferFrom(\n        address token,\n        address from,\n        address to,\n        uint256 value\n    ) internal {\n        (bool success, bytes memory data) = token.call(\n            abi.encodeWithSelector(\n                IERC20.transferFrom.selector,\n                from,\n                to,\n                value\n            )\n        );\n        require(\n            success && (data.length == 0 || abi.decode(data, (bool))),\n            \"STF\"\n        );\n    }\n\n    /// @notice Transfers tokens from msg.sender to a recipient\n    /// @dev Errors with ST if transfer fails\n    /// @param token The contract address of the token which will be transferred\n    /// @param to The recipient of the transfer\n    /// @param value The value of the transfer\n    function safeTransfer(address token, address to, uint256 value) internal {\n        (bool success, bytes memory data) = token.call(\n            abi.encodeWithSelector(IERC20.transfer.selector, to, value)\n        );\n        require(\n            success && (data.length == 0 || abi.decode(data, (bool))),\n            \"ST\"\n        );\n    }\n\n    /// @notice Approves the stipulated contract to spend the given allowance in the given token\n    /// @dev Errors with 'SA' if transfer fails\n    /// @param token The contract address of the token to be approved\n    /// @param to The target of the approval\n    /// @param value The amount of the given token the target will be allowed to spend\n    function safeApprove(address token, address to, uint256 value) internal {\n        (bool success, bytes memory data) = token.call(\n            abi.encodeWithSelector(IERC20.approve.selector, to, value)\n        );\n        require(\n            success && (data.length == 0 || abi.decode(data, (bool))),\n            \"SA\"\n        );\n    }\n\n    /// @notice Transfers ETH to the recipient address\n    /// @dev Fails with `STE`\n    /// @param to The destination of the transfer\n    /// @param value The value to be transferred\n    function safeTransferETH(address to, uint256 value) internal {\n        (bool success, ) = to.call{value: value}(new bytes(0));\n        require(success, \"STE\");\n    }\n}\n"
+    },
+    "contracts/libraries/helpers/Errors.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\n\n/**\n * @title Errors library\n * @notice Defines the error messages emitted by the different contracts\n * @dev Error messages prefix glossary:\n *  - VL = ValidationLogic\n *  - VT = Vault\n *  - LP = LendingPool\n *  - P = Pausable\n */\nlibrary Errors {\n    //contract specific errors\n    string internal constant VL_TRANSACTION_TOO_OLD = \"0\"; // 'Transaction too old'\n    string internal constant VL_NO_ACTIVE_RESERVE = \"1\"; // 'Action requires an active reserve'\n    string internal constant VL_RESERVE_FROZEN = \"2\"; // 'Action cannot be performed because the reserve is frozen'\n    string internal constant VL_CURRENT_AVAILABLE_LIQUIDITY_NOT_ENOUGH = \"3\"; // 'The current liquidity is not enough'\n    string internal constant VL_NOT_ENOUGH_AVAILABLE_USER_BALANCE = \"4\"; // 'User cannot withdraw more than the available balance'\n    string internal constant VL_TRANSFER_NOT_ALLOWED = \"5\"; // 'Transfer cannot be allowed.'\n    string internal constant VL_BORROWING_NOT_ENABLED = \"6\"; // 'Borrowing is not enabled'\n    string internal constant VL_INVALID_DEBT_OWNER = \"7\"; // 'Invalid interest rate mode selected'\n    string internal constant VL_BORROWING_CALLER_NOT_IN_WHITELIST = \"8\"; // 'The collateral balance is 0'\n    string internal constant VL_DEPOSIT_TOO_MUCH = \"9\"; // 'Deposit too much'\n    string internal constant VL_OUT_OF_CAPACITY = \"10\"; // 'There is not enough collateral to cover a new borrow'\n    string internal constant VL_OUT_OF_CREDITS = \"11\"; // 'Out of credits, there is not enough credits to borrow'\n    string internal constant VL_PERCENT_TOO_LARGE = \"12\"; // 'Percentage too large'\n    string internal constant VL_ADDRESS_CANNOT_ZERO = \"13\"; // vault address cannot be zero\n    string internal constant VL_VAULT_UN_ACTIVE = \"14\";\n    string internal constant VL_VAULT_FROZEN = \"15\";\n    string internal constant VL_VAULT_BORROWING_DISABLED = \"16\";\n    string internal constant VL_NOT_WETH9 = \"17\";\n    string internal constant VL_INSUFFICIENT_WETH9 = \"18\";\n    string internal constant VL_INSUFFICIENT_TOKEN = \"19\";\n    string internal constant VL_LIQUIDATOR_NOT_IN_WHITELIST = \"20\";\n    string internal constant VL_COMPOUNDER_NOT_IN_WHITELIST = \"21\";\n    string internal constant VL_VAULT_ALREADY_INITIALIZED = \"22\";\n    string internal constant VL_TREASURY_ADDRESS_NOT_SET = \"23\";\n\n    string internal constant VT_INVALID_RESERVE_ID = \"40\"; // invalid reserve id\n    string internal constant VT_INVALID_POOL = \"41\"; // invalid uniswap v3 pool\n    string internal constant VT_INVALID_VAULT_POSITION_MANAGER = \"42\"; // invalid vault position manager\n    string internal constant VT_VAULT_POSITION_NOT_ACTIVE = \"43\"; // vault position is not active\n    string internal constant VT_VAULT_POSITION_AUTO_COMPOUND_NOT_ENABLED = \"44\"; // 'auto compound not enabled'\n    string internal constant VT_VAULT_POSITION_ID_INVALID = \"45\"; // 'VaultPositionId invalid'\n    string internal constant VT_VAULT_PAUSED = \"46\"; // 'vault is paused'\n    string internal constant VT_VAULT_FROZEN = \"47\"; // 'vault is frozen'\n    string internal constant VT_VAULT_CALLBACK_INVALID_SENDER = \"48\"; // 'callback must be initiate by the vault self\n    string internal constant VT_VAULT_DEBT_RATIO_TOO_LOW_TO_LIQUIDATE = \"49\"; // 'debt ratio haven't reach liquidate ratio'\n    string internal constant VT_VAULT_POSITION_MANAGER_INVALID = \"50\"; // 'invalid vault manager'\n    string internal constant VT_VAULT_POSITION_RANGE_STOP_DISABLED = \"60\"; // 'vault positions' range stop is disabled'\n    string internal constant VT_VAULT_POSITION_RANGE_STOP_PRICE_INVALID = \"61\"; // 'invalid range stop price'\n    string internal constant VT_VAULT_POSITION_OUT_OF_MAX_LEVERAGE = \"62\";\n    string internal constant VT_VAULT_POSITION_SHARES_INVALID = \"63\";\n\n    string internal constant LP_NOT_ENOUGH_LIQUIDITY_TO_BORROW = \"80\"; // 'There is not enough liquidity available to borrow'\n    string internal constant LP_CALLER_MUST_BE_LENDING_POOL = \"81\"; // 'Caller must be lending pool contract'\n    string internal constant LP_BORROW_INDEX_OVERFLOW = \"82\"; // 'The borrow index overflow'\n    string internal constant LP_IS_PAUSED = \"83\"; // lending pool is paused\n}\n"
+    },
+    "contracts/libraries/types/VaultTypes.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\npragma abicoder v2;\n\nlibrary VaultTypes {\n    struct VeloVaultStorage {\n        VeloVaultState state;\n        mapping(uint256 => VeloPosition) positions;\n        uint256 nextPositionId;\n        address[] rewardTokens;\n        address addressProvider;\n        address veloFactory;\n        address veloRouter;\n        address swapPathManager;\n        address lendingPool;\n        address vaultPositionManager;\n        address WETH9;\n        address veToken;\n    }\n\n    struct VeloPositionValue {\n        // manager of the position, who can adjust the position\n        address manager;\n        bool isActive;\n        bool enableRangeStop;\n        // timestamp when open\n        uint64 openedAt;\n        // timestamp now\n        uint64 current;\n        // token0Principal is the original invested token0\n        uint256 token0Principal;\n        // token1Principal is the original invested token1\n        uint256 token1Principal;\n        // liquidityPrincipal is the original liquidity user added to the pool\n        uint256 liquidityPrincipal;\n        // left token0 not added to the liquidity\n        uint256 token0Left;\n        // left Token1 not added to the liquidity\n        uint256 token1Left;\n        // left token0 in liquidity\n        uint256 token0InLiquidity;\n        // left Token1 not added to the liquidity\n        uint256 token1InLiquidity;\n        // The lp amount\n        uint256 liquidity;\n        // The debt share of debtPosition0 in the vault\n        uint256 debt0;\n        // The debt share for debtPosition1 in the vault\n        uint256 debt1;\n        // The borrowingIndex of debt0 in lendingPool\n        uint256 borrowingIndex0;\n        // The borrowingIndex of debt1 in lendingPool\n        uint256 borrowingIndex1;\n        // range stop config\n        uint256 minPriceOfRangeStop;\n        uint256 maxPriceOfRangeStop;\n    }\n\n    struct VeloPosition {\n        // manager of the position, who can adjust the position\n        address manager;\n        bool isActive;\n        bool enableRangeStop;\n        // timestamp when open\n        uint64 openedAt;\n        // token0Principal is the original invested token0\n        uint256 token0Principal;\n        // token1Principal is the original invested token1\n        uint256 token1Principal;\n        // liquidityPrincipal is the original liquidity user added to the pool\n        uint256 liquidityPrincipal;\n        // left token0 not added to the liquidity\n        uint256 token0Left;\n        // left Token1 not added to the liquidity\n        uint256 token1Left;\n        // The lp shares in the vault\n        uint256 lpShares;\n        // The debt share of debtPosition0 in the vault\n        uint256 debtShare0;\n        // The debt share for debtPosition1 in the vault\n        uint256 debtShare1;\n        // range stop config\n        uint256 minPriceOfRangeStop;\n        uint256 maxPriceOfRangeStop;\n    }\n\n    struct VeloVaultState {\n        address gauge;\n        address pair;\n        address token0;\n        address token1;\n        bool stable;\n        // If the vault is paused, new or close positions would be rejected by the contract.\n        bool paused;\n        // If the vault is frozen, only new position action is rejected, the close is normal.\n        bool frozen;\n        // Only if this feature is true, users of the vault can borrow tokens from lending pool.\n        bool borrowingEnabled;\n        // liquidate with TWAP\n        bool liquidateWithTWAP;\n        // max leverage when open a position\n        // the value has with a multiplier of 100\n        // 1x -> 1 * 100\n        // 2x -> 2 * 100\n        uint16 maxLeverage;\n        // premium leverage for a position of users who have specific veToken's voting power\n        uint16 premiumMaxLeverage;\n        uint16 maxPriceDiff;\n        // The debt ratio trigger liquidation\n        // When a position's debt ratio goes out of liquidateDebtRatio\n        // the position can be liquidated\n        uint16 liquidateDebtRatio;\n        uint16 withdrawFeeRate;\n        uint16 compoundFeeRate;\n        uint16 liquidateFeeRate;\n        uint16 rangeStopFeeRate;\n        uint16 protocolFeeRate;\n        // the minimal voting power reqruired to use premium functions\n        uint256 premiumRequirement;\n        // Protocol Fee\n        uint256 protocolFee0Accumulated;\n        uint256 protocolFee1Accumulated;\n        // minimal invest value\n        uint256 minInvestValue;\n        uint256 minSwapAmount0;\n        uint256 minSwapAmount1;\n        // total lp\n        uint256 totalLp;\n        uint256 totalLpShares;\n        // the utilization of the lending reserve pool trigger premium check\n        uint256 premiumUtilizationOfReserve0;\n        // debt limit of token0\n        uint256 debtLimit0;\n        // debt positionId of token0\n        uint256 debtPositionId0;\n        // debt total_shares\n        uint256 debtTotalShares0;\n        // the utilization of the lending reserve pool trigger premium check\n        uint256 premiumUtilizationOfReserve1;\n        // debt limit of token1\n        uint256 debtLimit1;\n        // debt positionId of token1\n        uint256 debtPositionId1;\n        // debt total_shares\n        uint256 debtTotalShares1;\n    }\n}\n"
+    },
+    "contracts/interfaces/IAddressRegistry.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\n\nimport \"../libraries/helpers/AddressId.sol\";\n\ninterface IAddressRegistry {\n    event SetAddress(\n        address indexed setter,\n        uint256 indexed id,\n        address newAddress\n    );\n\n    function getAddress(uint256 id) external view returns (address);\n}\n"
+    },
+    "contracts/libraries/helpers/AddressId.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\npragma abicoder v2;\n\nlibrary AddressId {\n    uint256 constant ADDRESS_ID_WETH9 = 1;\n    uint256 constant ADDRESS_ID_UNI_V3_FACTORY = 2;\n    uint256 constant ADDRESS_ID_UNI_V3_NONFUNGIBLE_POSITION_MANAGER = 3;\n    uint256 constant ADDRESS_ID_UNI_V3_SWAP_ROUTER = 4;\n    uint256 constant ADDRESS_ID_VELO_ROUTER = 5;\n    uint256 constant ADDRESS_ID_VELO_FACTORY = 6;\n    uint256 constant ADDRESS_ID_VAULT_POSITION_MANAGER = 7;\n    uint256 constant ADDRESS_ID_SWAP_EXECUTOR_MANAGER = 8;\n    uint256 constant ADDRESS_ID_LENDING_POOL = 9;\n    uint256 constant ADDRESS_ID_VAULT_FACTORY = 10;\n    uint256 constant ADDRESS_ID_TREASURY = 11;\n    uint256 constant ADDRESS_ID_VE_TOKEN = 12;\n\n    uint256 constant ADDRESS_ID_VELO_VAULT_DEPLOYER = 101;\n    uint256 constant ADDRESS_ID_VELO_VAULT_INITIALIZER = 102;\n    uint256 constant ADDRESS_ID_VELO_VAULT_POSITION_LOGIC = 103;\n    uint256 constant ADDRESS_ID_VELO_VAULT_REWARDS_LOGIC = 104;\n    uint256 constant ADDRESS_ID_VELO_VAULT_OWNER_ACTIONS = 105;\n    uint256 constant ADDRESS_ID_VELO_SWAP_PATH_MANAGER = 106;\n}\n"
+    },
+    "contracts/interfaces/IVeloVaultPositionManager.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\n\nimport \"../external/velodrome/contracts/interfaces/IRouter.sol\";\nimport \"../libraries/types/VaultTypes.sol\";\n\ninterface IVeloVaultPositionManager {\n    /// @notice New a vaultPosition\n    /// @param vaultId The id of the vault\n    /// @param manager The manager of the position, usually the caller\n    /// @param vaultPositionId The id of the newed position\n    event NewVaultPosition(\n        uint256 indexed vaultId,\n        uint256 indexed vaultPositionId,\n        address indexed manager\n    );\n\n    /// @notice Invest to a position\n    /// @param vaultId The id of the vault\n    /// @param vaultPositionId The id of the new vaultPosition\n    /// @param manager The manager of the vaultPosition, usually the caller\n    /// @param amount0Invest The amount of token0 user wants to transfer\n    /// @param amount1Invest The amount of token1 user wants to transfer\n    /// @param amount0Borrow The amount of token0 user wants to borrow\n    /// @param amount1Borrow The amount of token1 user wants to borrow\n    /// @param liquidity The amount of lp tokens added to the pool\n    event InvestToVaultPosition(\n        uint256 indexed vaultId,\n        uint256 indexed vaultPositionId,\n        address indexed manager,\n        uint256 amount0Invest,\n        uint256 amount1Invest,\n        uint256 amount0Borrow,\n        uint256 amount1Borrow,\n        uint256 liquidity\n    );\n\n    /// @notice Close a position partially\n    /// @param vaultId The id of the vault\n    /// @param vaultPositionId The id of the vaultPosition\n    /// @param manager The manager of the vaultPosition\n    /// @param percent The percentage of the vault user want to close\n    /// @param amount0Received The amount of token0 user received after close\n    /// @param amount1Received The amount of token1 user received after close\n    /// @param amount0Repaid The amount of token0 user repaid when close\n    /// @param amount1Repaid The amount of token1 user repaid when close\n    event CloseVaultPositionPartially(\n        uint256 indexed vaultId,\n        uint256 indexed vaultPositionId,\n        address indexed manager,\n        uint16 percent,\n        uint256 amount0Received,\n        uint256 amount1Received,\n        uint256 amount0Repaid,\n        uint256 amount1Repaid\n    );\n\n    /// @notice Close a position which is outof price range\n    /// @param vaultId The id of the vault\n    /// @param vaultPositionId The id of the vaultPosition\n    /// @param manager The manager of the vaultPosition\n    /// @param caller The caller initiate range stop\n    /// @param percent The percentage of the vault user want to close\n    /// @param amount0Received The amount of token0 user received after close\n    /// @param amount1Received The amount of token1 user received after close\n    /// @param fee0 The caller received\n    /// @param fee1 The caller received\n    event CloseOutOfRangePosition(\n        uint256 indexed vaultId,\n        uint256 indexed vaultPositionId,\n        address indexed manager,\n        address caller,\n        uint16 percent,\n        uint64 timestamp,\n        uint256 price,\n        uint256 amount0Received,\n        uint256 amount1Received,\n        uint256 fee0,\n        uint256 fee1\n    );\n\n    /// @notice Liquidate a position partially\n    /// @param vaultId The id of the vault\n    /// @param vaultPositionId The id of the vaultPosition\n    /// @param manager The manager of the vaultPosition\n    /// @param liquidator The caller of the function\n    /// @param percent The percentage of the vault user want to liquidate\n    /// @param amount0Left The amount of token0 transferred to the position's manager after close\n    /// @param amount1Left The amount of token1 transferred to the position's manager after close\n    /// @param liquidateFee0 The amount of token0 for liquidation bonus\n    /// @param liquidateFee1 The amount of token1 for liquidation bonus\n    event LiquidateVaultPositionPartially(\n        uint256 indexed vaultId,\n        uint256 indexed vaultPositionId,\n        address indexed manager,\n        address liquidator,\n        uint16 percent,\n        uint64 timestamp,\n        uint256 price,\n        uint256 debtValueOfPosition,\n        uint256 liquidityValueOfPosition,\n        uint256 amount0Left,\n        uint256 amount1Left,\n        uint256 liquidateFee0,\n        uint256 liquidateFee1\n    );\n\n    /// @notice Liquidate a position partially\n    /// @param vaultId The id of the vault\n    /// @param vaultPositionId The id of the vaultPosition\n    /// @param manager The manager of the vaultPosition\n    /// @param caller The initiator of the repay action\n    /// @param amount0Repaid The amount of token0 repaid\n    /// @param amount1Repaid The amount of token1 repaid\n    event ExactRepay(\n        uint256 indexed vaultId,\n        uint256 indexed vaultPositionId,\n        address indexed manager,\n        address caller,\n        uint256 amount0Repaid,\n        uint256 amount1Repaid\n    );\n\n    /// @notice InvestEarnedFeeToLiquidity\n    /// @param vaultId The id of the vault\n    /// @param caller The initiator of the repay action\n    /// @param liquidityAdded The liquidity amount added by adding rewards to the pool\n    /// @param fee0 The fee in token0\n    /// @param fee1 The fee in token1\n    /// @param rewards The rewards claimed\n    event InvestEarnedFeeToLiquidity(\n        uint256 indexed vaultId,\n        address indexed caller,\n        uint256 liquidityAdded,\n        uint256 fee0,\n        uint256 fee1,\n        uint256[] rewards\n    );\n\n    event FeePaid(\n        uint256 indexed vaultId,\n        address indexed asset,\n        uint256 indexed feeType,\n        uint256 amount\n    );\n\n    function getVaultPosition(\n        uint256 vaultId,\n        uint256 vaultPositionId\n    ) external view returns (VaultTypes.VeloPositionValue memory state);\n\n    function getVault(\n        uint256 vaultId\n    ) external view returns (VaultTypes.VeloVaultState memory);\n\n    struct PayToVaultCallbackParams {\n        uint256 vaultId;\n        uint256 amount0;\n        uint256 amount1;\n        address payer;\n    }\n\n    /// @notice Callback functions called by the vault to pay tokens to the vault contract.\n    /// The caller to this function must be the vault contract\n    function payToVaultCallback(\n        PayToVaultCallbackParams calldata params\n    ) external;\n\n    /// @notice Callback functions called by the vault to pay fees to treasury.\n    /// The caller to this function must be the vault contract\n    function payFeeToTreasuryCallback(\n        uint256 vaultId,\n        address asset,\n        uint256 amount,\n        uint256 feeType\n    ) external;\n\n    /// @notice The param struct used in function newOrInvestToVaultPosition(param)\n    struct NewOrInvestToVaultPositionParams {\n        // vaultId\n        uint256 vaultId;\n        // The vaultPositionId of the vaultPosition to invest\n        // 0  if open a new vaultPosition\n        uint256 vaultPositionId;\n        // The amount of token0 user want to invest\n        uint256 amount0Invest;\n        // The amount of token0 user want to borrow\n        uint256 amount0Borrow;\n        // The amount of token1 user want to invest\n        uint256 amount1Invest;\n        // The amount of token1 user want to borrow\n        uint256 amount1Borrow;\n        // The minimal amount of token0 should be added to the liquidity\n        // This value will be used when call mint() or addLiquidity() of uniswap V3 pool\n        uint256 amount0Min;\n        // The minimal amount of token1 should be added to the liquidity\n        // This value will be used when call mint() or addLiquidity() of uniswap V3 pool\n        uint256 amount1Min;\n        // The deadline of the tx\n        uint256 deadline;\n        // The swapExecutor to swap tokens\n        uint256 swapExecutorId;\n        // The swap path to swap tokens\n        bytes swapPath;\n    }\n\n    /// @notice Open a new vaultPosition or invest to a existed vault position\n    /// @param params The parameters necessary, encoded as `NewOrInvestToVaultPositionParams` in calldata\n    function newOrInvestToVaultPosition(\n        NewOrInvestToVaultPositionParams calldata params\n    ) external payable;\n\n    /// @notice The param struct used in function closeVaultPositionPartially(param)\n    struct CloseVaultPositionPartiallyParams {\n        // vaultId\n        uint256 vaultId;\n        // The Id of vaultPosition to be closed\n        uint256 vaultPositionId;\n        // The percentage of the entire position to close\n        uint16 percent;\n        // The receiver of the left tokens when close then position\n        // Or the fee receiver when used in `closeOutOfRangePosition`\n        address receiver;\n        bool receiveNativeETH;\n        // The receiveType of the left tokens\n        // 0: only receive token0, swap all left token1 to token0\n        // 1: only receive token1, swap all left token0 to token1\n        // 2: receive tokens according to minimal swap rule\n        uint8 receiveType;\n        // The minimal token0 receive after remove the liquidity, will be used when call removeLiquidity() of uniswap\n        uint256 minAmount0WhenRemoveLiquidity;\n        // The minimal token1 receive after remove the liquidity, will be used when call removeLiquidity() of uniswap\n        uint256 minAmount1WhenRemoveLiquidity;\n        // The deadline of the tx, the tx will be reverted if the _blockTimestamp() > deadline\n        uint256 deadline;\n        // The swapExecutor to swap tokens\n        uint256 swapExecutorId;\n        // The swap path to swap tokens\n        bytes swapPath;\n    }\n\n    /// @notice Close a vaultPosition partially\n    /// @param params The parameters necessary, encoded as `CloseVaultPositionPartiallyParams` in calldata\n    function closeVaultPositionPartially(\n        CloseVaultPositionPartiallyParams calldata params\n    ) external payable;\n\n    /// @notice The param struct used in function closeVaultPositionPartially(param)\n    struct LiquidateVaultPositionPartiallyParams {\n        // vaultId\n        uint256 vaultId;\n        // The Id of vaultPosition to be closed\n        uint256 vaultPositionId;\n        // The percentage of the entire position to close\n        uint16 percent;\n        // The liquidator's fee receiver\n        address receiver;\n        bool receiveNativeETH;\n        // The receiveType of the left tokens\n        // 0: only receive token0, swap all left token1 to token0\n        // 1: only receive token1, swap all left token0 to token1\n        // 2: receive tokens according to minimal swap rule\n        uint8 receiveType;\n        // The minimal token0 receive after remove the liquidity, will be used when call removeLiquidity() of uniswap\n        uint256 minAmount0WhenRemoveLiquidity;\n        // The minimal token1 receive after remove the liquidity, will be used when call removeLiquidity() of uniswap\n        uint256 minAmount1WhenRemoveLiquidity;\n        // The deadline of the tx, the tx will be reverted if the _blockTimestamp() > deadline\n        uint256 deadline;\n        // The maximum amount of token0 to repay debts\n        uint256 maxRepay0;\n        // The maximum amount of token1 to repay debts\n        uint256 maxRepay1;\n        // The swapExecutor to swap tokens\n        uint256 swapExecutorId;\n        // The swap path to swap tokens\n        bytes swapPath;\n    }\n\n    /// @notice Liquidate a vaultPosition partially\n    /// @param params The parameters necessary, encoded as `CloseVaultPositionPartiallyParam` in calldata\n    function liquidateVaultPositionPartially(\n        LiquidateVaultPositionPartiallyParams calldata params\n    ) external payable;\n\n    struct InvestEarnedFeeToLiquidityParam {\n        // vaultId\n        uint256 vaultId;\n        // The compound fee receive\n        address compoundFeeReceiver;\n        IRouter.route[][] routes;\n        bool receiveNativeETH;\n        // The deadline of the tx, the tx will be reverted if the _blockTimestamp() > deadline\n        uint256 deadline;\n    }\n\n    /// @notice Invest the earned fee by the position to liquidity\n    /// The manager of the position can call this function with no compound fee charged\n    /// If the manager allow others to compound the fee, there will be a small fee charged  as bonus for the caller\n    function investEarnedFeeToLiquidity(\n        InvestEarnedFeeToLiquidityParam calldata params\n    ) external payable;\n\n    struct ExactRepayParam {\n        // vaultId\n        uint256 vaultId;\n        // The Id of vaultPosition to be closed\n        uint256 vaultPositionId;\n        // The max amount of token0 to repay\n        uint256 amount0ToRepay;\n        // The max amount of token1 to repay\n        uint256 amount1ToRepay;\n        // whether receive nativeETH or WETH when there are un-repaid ETH\n        bool receiveNativeETH;\n        // The deadline of the tx, the tx will be reverted if the _blockTimestamp() > deadline\n        uint256 deadline;\n    }\n\n    /// @notice Repay exact value of debts\n    function exactRepay(\n        ExactRepayParam calldata params\n    ) external payable returns (uint256, uint256);\n\n    /// @notice Transfer the position's manager to another wallet\n    /// Must be called by the current manager of the posistion\n    /// @param vaultId The Id of the vault\n    /// @param vaultPositionId The Id of the position\n    /// @param newManager The new address of the manager\n    function transferManagerOfVaultPosition(\n        uint256 vaultId,\n        uint256 vaultPositionId,\n        address newManager\n    ) external;\n\n    /// @notice Set stop-loss price range of the position\n    /// Users can set a stop-loss price range for a position only if the position is enabled `RangeStop` feature.\n    /// If current price goes out of the stop-loss price range, extraFi's bots will close the position\n    /// @param vaultId The Id of the vault\n    /// @param vaultPositionId The Id of the position\n    /// @param enable The enable status to set\n    /// @param minPrice The lower price of the stop-loss price range\n    /// @param maxPrice The upper price of the stop-loss price range\n    function setRangeStop(\n        uint256 vaultId,\n        uint256 vaultPositionId,\n        bool enable,\n        uint256 minPrice,\n        uint256 maxPrice\n    ) external;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/Address.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (utils/Address.sol)\n\npragma solidity ^0.8.1;\n\n/**\n * @dev Collection of functions related to the address type\n */\nlibrary Address {\n    /**\n     * @dev Returns true if `account` is a contract.\n     *\n     * [IMPORTANT]\n     * ====\n     * It is unsafe to assume that an address for which this function returns\n     * false is an externally-owned account (EOA) and not a contract.\n     *\n     * Among others, `isContract` will return false for the following\n     * types of addresses:\n     *\n     *  - an externally-owned account\n     *  - a contract in construction\n     *  - an address where a contract will be created\n     *  - an address where a contract lived, but was destroyed\n     * ====\n     *\n     * [IMPORTANT]\n     * ====\n     * You shouldn't rely on `isContract` to protect against flash loan attacks!\n     *\n     * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets\n     * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract\n     * constructor.\n     * ====\n     */\n    function isContract(address account) internal view returns (bool) {\n        // This method relies on extcodesize/address.code.length, which returns 0\n        // for contracts in construction, since the code is only stored at the end\n        // of the constructor execution.\n\n        return account.code.length > 0;\n    }\n\n    /**\n     * @dev Replacement for Solidity's `transfer`: sends `amount` wei to\n     * `recipient`, forwarding all available gas and reverting on errors.\n     *\n     * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost\n     * of certain opcodes, possibly making contracts go over the 2300 gas limit\n     * imposed by `transfer`, making them unable to receive funds via\n     * `transfer`. {sendValue} removes this limitation.\n     *\n     * https://diligence.consensys.net/posts/2019/09/stop-using-soliditys-transfer-now/[Learn more].\n     *\n     * IMPORTANT: because control is transferred to `recipient`, care must be\n     * taken to not create reentrancy vulnerabilities. Consider using\n     * {ReentrancyGuard} or the\n     * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].\n     */\n    function sendValue(address payable recipient, uint256 amount) internal {\n        require(\n            address(this).balance >= amount,\n            \"Address: insufficient balance\"\n        );\n\n        (bool success, ) = recipient.call{value: amount}(\"\");\n        require(\n            success,\n            \"Address: unable to send value, recipient may have reverted\"\n        );\n    }\n\n    /**\n     * @dev Performs a Solidity function call using a low level `call`. A\n     * plain `call` is an unsafe replacement for a function call: use this\n     * function instead.\n     *\n     * If `target` reverts with a revert reason, it is bubbled up by this\n     * function (like regular Solidity function calls).\n     *\n     * Returns the raw returned data. To convert to the expected return value,\n     * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].\n     *\n     * Requirements:\n     *\n     * - `target` must be a contract.\n     * - calling `target` with `data` must not revert.\n     *\n     * _Available since v3.1._\n     */\n    function functionCall(\n        address target,\n        bytes memory data\n    ) internal returns (bytes memory) {\n        return\n            functionCallWithValue(\n                target,\n                data,\n                0,\n                \"Address: low-level call failed\"\n            );\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with\n     * `errorMessage` as a fallback revert reason when `target` reverts.\n     *\n     * _Available since v3.1._\n     */\n    function functionCall(\n        address target,\n        bytes memory data,\n        string memory errorMessage\n    ) internal returns (bytes memory) {\n        return functionCallWithValue(target, data, 0, errorMessage);\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],\n     * but also transferring `value` wei to `target`.\n     *\n     * Requirements:\n     *\n     * - the calling contract must have an ETH balance of at least `value`.\n     * - the called Solidity function must be `payable`.\n     *\n     * _Available since v3.1._\n     */\n    function functionCallWithValue(\n        address target,\n        bytes memory data,\n        uint256 value\n    ) internal returns (bytes memory) {\n        return\n            functionCallWithValue(\n                target,\n                data,\n                value,\n                \"Address: low-level call with value failed\"\n            );\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but\n     * with `errorMessage` as a fallback revert reason when `target` reverts.\n     *\n     * _Available since v3.1._\n     */\n    function functionCallWithValue(\n        address target,\n        bytes memory data,\n        uint256 value,\n        string memory errorMessage\n    ) internal returns (bytes memory) {\n        require(\n            address(this).balance >= value,\n            \"Address: insufficient balance for call\"\n        );\n        (bool success, bytes memory returndata) = target.call{value: value}(\n            data\n        );\n        return\n            verifyCallResultFromTarget(\n                target,\n                success,\n                returndata,\n                errorMessage\n            );\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],\n     * but performing a static call.\n     *\n     * _Available since v3.3._\n     */\n    function functionStaticCall(\n        address target,\n        bytes memory data\n    ) internal view returns (bytes memory) {\n        return\n            functionStaticCall(\n                target,\n                data,\n                \"Address: low-level static call failed\"\n            );\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],\n     * but performing a static call.\n     *\n     * _Available since v3.3._\n     */\n    function functionStaticCall(\n        address target,\n        bytes memory data,\n        string memory errorMessage\n    ) internal view returns (bytes memory) {\n        (bool success, bytes memory returndata) = target.staticcall(data);\n        return\n            verifyCallResultFromTarget(\n                target,\n                success,\n                returndata,\n                errorMessage\n            );\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],\n     * but performing a delegate call.\n     *\n     * _Available since v3.4._\n     */\n    function functionDelegateCall(\n        address target,\n        bytes memory data\n    ) internal returns (bytes memory) {\n        return\n            functionDelegateCall(\n                target,\n                data,\n                \"Address: low-level delegate call failed\"\n            );\n    }\n\n    /**\n     * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],\n     * but performing a delegate call.\n     *\n     * _Available since v3.4._\n     */\n    function functionDelegateCall(\n        address target,\n        bytes memory data,\n        string memory errorMessage\n    ) internal returns (bytes memory) {\n        (bool success, bytes memory returndata) = target.delegatecall(data);\n        return\n            verifyCallResultFromTarget(\n                target,\n                success,\n                returndata,\n                errorMessage\n            );\n    }\n\n    /**\n     * @dev Tool to verify that a low level call to smart-contract was successful, and revert (either by bubbling\n     * the revert reason or using the provided one) in case of unsuccessful call or if target was not a contract.\n     *\n     * _Available since v4.8._\n     */\n    function verifyCallResultFromTarget(\n        address target,\n        bool success,\n        bytes memory returndata,\n        string memory errorMessage\n    ) internal view returns (bytes memory) {\n        if (success) {\n            if (returndata.length == 0) {\n                // only check isContract if the call was successful and the return data is empty\n                // otherwise we already know that it was a contract\n                require(isContract(target), \"Address: call to non-contract\");\n            }\n            return returndata;\n        } else {\n            _revert(returndata, errorMessage);\n        }\n    }\n\n    /**\n     * @dev Tool to verify that a low level call was successful, and revert if it wasn't, either by bubbling the\n     * revert reason or using the provided one.\n     *\n     * _Available since v4.3._\n     */\n    function verifyCallResult(\n        bool success,\n        bytes memory returndata,\n        string memory errorMessage\n    ) internal pure returns (bytes memory) {\n        if (success) {\n            return returndata;\n        } else {\n            _revert(returndata, errorMessage);\n        }\n    }\n\n    function _revert(\n        bytes memory returndata,\n        string memory errorMessage\n    ) private pure {\n        // Look for revert reason and bubble it up if present\n        if (returndata.length > 0) {\n            // The easiest way to bubble the revert reason is using memory via assembly\n            /// @solidity memory-safe-assembly\n            assembly {\n                let returndata_size := mload(returndata)\n                revert(add(32, returndata), returndata_size)\n            }\n        } else {\n            revert(errorMessage);\n        }\n    }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/Context.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n\n    function _msgData() internal view virtual returns (bytes calldata) {\n        return msg.data;\n    }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/access/Ownable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.7.0) (access/Ownable.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../utils/Context.sol\";\n\n/**\n * @dev Contract module which provides a basic access control mechanism, where\n * there is an account (an owner) that can be granted exclusive access to\n * specific functions.\n *\n * By default, the owner account will be the one that deploys the contract. This\n * can later be changed with {transferOwnership}.\n *\n * This module is used through inheritance. It will make available the modifier\n * `onlyOwner`, which can be applied to your functions to restrict their use to\n * the owner.\n */\nabstract contract Ownable is Context {\n    address private _owner;\n\n    event OwnershipTransferred(\n        address indexed previousOwner,\n        address indexed newOwner\n    );\n\n    /**\n     * @dev Initializes the contract setting the deployer as the initial owner.\n     */\n    constructor() {\n        _transferOwnership(_msgSender());\n    }\n\n    /**\n     * @dev Throws if called by any account other than the owner.\n     */\n    modifier onlyOwner() {\n        _checkOwner();\n        _;\n    }\n\n    /**\n     * @dev Returns the address of the current owner.\n     */\n    function owner() public view virtual returns (address) {\n        return _owner;\n    }\n\n    /**\n     * @dev Throws if the sender is not the owner.\n     */\n    function _checkOwner() internal view virtual {\n        require(owner() == _msgSender(), \"Ownable: caller is not the owner\");\n    }\n\n    /**\n     * @dev Leaves the contract without owner. It will not be possible to call\n     * `onlyOwner` functions anymore. Can only be called by the current owner.\n     *\n     * NOTE: Renouncing ownership will leave the contract without an owner,\n     * thereby removing any functionality that is only available to the owner.\n     */\n    function renounceOwnership() public virtual onlyOwner {\n        _transferOwnership(address(0));\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Can only be called by the current owner.\n     */\n    function transferOwnership(address newOwner) public virtual onlyOwner {\n        require(\n            newOwner != address(0),\n            \"Ownable: new owner is the zero address\"\n        );\n        _transferOwnership(newOwner);\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Internal function without access restriction.\n     */\n    function _transferOwnership(address newOwner) internal virtual {\n        address oldOwner = _owner;\n        _owner = newOwner;\n        emit OwnershipTransferred(oldOwner, newOwner);\n    }\n}\n"
+    },
+    "contracts/external/velodrome/contracts/interfaces/IRouter.sol": {
+      "content": "// SPDX-License-Identifier: gpl-3.0\npragma solidity ^0.8.0;\npragma abicoder v2;\n\ninterface IRouter {\n    function pairFor(\n        address tokenA,\n        address tokenB,\n        bool stable\n    ) external view returns (address pair);\n\n    function getReserves(\n        address tokenA,\n        address tokenB,\n        bool stable\n    ) external view returns (uint reserveA, uint reserveB);\n\n    function getAmountOut(\n        uint amountIn,\n        address tokenIn,\n        address tokenOut\n    ) external view returns (uint amount, bool stable);\n\n    struct route {\n        address from;\n        address to;\n        bool stable;\n    }\n\n    function getAmountsOut(\n        uint amountIn,\n        route[] memory routes\n    ) external view returns (uint[] memory amounts);\n\n    function isPair(address pair) external view returns (bool);\n\n    function quoteAddLiquidity(\n        address tokenA,\n        address tokenB,\n        bool stable,\n        uint amountADesired,\n        uint amountBDesired\n    ) external view returns (uint amountA, uint amountB, uint liquidity);\n\n    function quoteRemoveLiquidity(\n        address tokenA,\n        address tokenB,\n        bool stable,\n        uint liquidity\n    ) external view returns (uint amountA, uint amountB);\n\n    function addLiquidity(\n        address tokenA,\n        address tokenB,\n        bool stable,\n        uint amountADesired,\n        uint amountBDesired,\n        uint amountAMin,\n        uint amountBMin,\n        address to,\n        uint deadline\n    ) external returns (uint amountA, uint amountB, uint liquidity);\n\n    function removeLiquidity(\n        address tokenA,\n        address tokenB,\n        bool stable,\n        uint liquidity,\n        uint amountAMin,\n        uint amountBMin,\n        address to,\n        uint deadline\n    ) external returns (uint amountA, uint amountB);\n\n    function swapExactTokensForTokensSimple(\n        uint amountIn,\n        uint amountOutMin,\n        address tokenFrom,\n        address tokenTo,\n        bool stable,\n        address to,\n        uint deadline\n    ) external returns (uint[] memory amounts);\n\n    function swapExactTokensForTokens(\n        uint amountIn,\n        uint amountOutMin,\n        route[] calldata routes,\n        address to,\n        uint deadline\n    ) external returns (uint[] memory amounts);\n\n    function swapExactETHForTokens(\n        uint amountOutMin,\n        route[] calldata routes,\n        address to,\n        uint deadline\n    ) external payable returns (uint[] memory amounts);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/token/ERC20/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.6.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n    /**\n     * @dev Emitted when `value` tokens are moved from one account (`from`) to\n     * another (`to`).\n     *\n     * Note that `value` may be zero.\n     */\n    event Transfer(address indexed from, address indexed to, uint256 value);\n\n    /**\n     * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n     * a call to {approve}. `value` is the new allowance.\n     */\n    event Approval(\n        address indexed owner,\n        address indexed spender,\n        uint256 value\n    );\n\n    /**\n     * @dev Returns the amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256);\n\n    /**\n     * @dev Returns the amount of tokens owned by `account`.\n     */\n    function balanceOf(address account) external view returns (uint256);\n\n    /**\n     * @dev Moves `amount` tokens from the caller's account to `to`.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Returns the remaining number of tokens that `spender` will be\n     * allowed to spend on behalf of `owner` through {transferFrom}. This is\n     * zero by default.\n     *\n     * This value changes when {approve} or {transferFrom} are called.\n     */\n    function allowance(\n        address owner,\n        address spender\n    ) external view returns (uint256);\n\n    /**\n     * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * IMPORTANT: Beware that changing an allowance with this method brings the risk\n     * that someone may use both the old and the new allowance by unfortunate\n     * transaction ordering. One possible solution to mitigate this race\n     * condition is to first reduce the spender's allowance to 0 and set the\n     * desired value afterwards:\n     * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n     *\n     * Emits an {Approval} event.\n     */\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /**\n     * @dev Moves `amount` tokens from `from` to `to` using the\n     * allowance mechanism. `amount` is then deducted from the caller's\n     * allowance.\n     *\n     * Returns a boolean value indicating whether the operation succeeded.\n     *\n     * Emits a {Transfer} event.\n     */\n    function transferFrom(\n        address from,\n        address to,\n        uint256 amount\n    ) external returns (bool);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/math/SafeMath.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.6.0) (utils/math/SafeMath.sol)\n\npragma solidity ^0.8.0;\n\n// CAUTION\n// This version of SafeMath should only be used with Solidity 0.8 or later,\n// because it relies on the compiler's built in overflow checks.\n\n/**\n * @dev Wrappers over Solidity's arithmetic operations.\n *\n * NOTE: `SafeMath` is generally not needed starting with Solidity 0.8, since the compiler\n * now has built in overflow checking.\n */\nlibrary SafeMath {\n    /**\n     * @dev Returns the addition of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryAdd(\n        uint256 a,\n        uint256 b\n    ) internal pure returns (bool, uint256) {\n        unchecked {\n            uint256 c = a + b;\n            if (c < a) return (false, 0);\n            return (true, c);\n        }\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function trySub(\n        uint256 a,\n        uint256 b\n    ) internal pure returns (bool, uint256) {\n        unchecked {\n            if (b > a) return (false, 0);\n            return (true, a - b);\n        }\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, with an overflow flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryMul(\n        uint256 a,\n        uint256 b\n    ) internal pure returns (bool, uint256) {\n        unchecked {\n            // Gas optimization: this is cheaper than requiring 'a' not being zero, but the\n            // benefit is lost if 'b' is also tested.\n            // See: https://github.com/OpenZeppelin/openzeppelin-contracts/pull/522\n            if (a == 0) return (true, 0);\n            uint256 c = a * b;\n            if (c / a != b) return (false, 0);\n            return (true, c);\n        }\n    }\n\n    /**\n     * @dev Returns the division of two unsigned integers, with a division by zero flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryDiv(\n        uint256 a,\n        uint256 b\n    ) internal pure returns (bool, uint256) {\n        unchecked {\n            if (b == 0) return (false, 0);\n            return (true, a / b);\n        }\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers, with a division by zero flag.\n     *\n     * _Available since v3.4._\n     */\n    function tryMod(\n        uint256 a,\n        uint256 b\n    ) internal pure returns (bool, uint256) {\n        unchecked {\n            if (b == 0) return (false, 0);\n            return (true, a % b);\n        }\n    }\n\n    /**\n     * @dev Returns the addition of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `+` operator.\n     *\n     * Requirements:\n     *\n     * - Addition cannot overflow.\n     */\n    function add(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a + b;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting on\n     * overflow (when the result is negative).\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a - b;\n    }\n\n    /**\n     * @dev Returns the multiplication of two unsigned integers, reverting on\n     * overflow.\n     *\n     * Counterpart to Solidity's `*` operator.\n     *\n     * Requirements:\n     *\n     * - Multiplication cannot overflow.\n     */\n    function mul(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a * b;\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting on\n     * division by zero. The result is rounded towards zero.\n     *\n     * Counterpart to Solidity's `/` operator.\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a / b;\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting when dividing by zero.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a % b;\n    }\n\n    /**\n     * @dev Returns the subtraction of two unsigned integers, reverting with custom message on\n     * overflow (when the result is negative).\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {trySub}.\n     *\n     * Counterpart to Solidity's `-` operator.\n     *\n     * Requirements:\n     *\n     * - Subtraction cannot overflow.\n     */\n    function sub(\n        uint256 a,\n        uint256 b,\n        string memory errorMessage\n    ) internal pure returns (uint256) {\n        unchecked {\n            require(b <= a, errorMessage);\n            return a - b;\n        }\n    }\n\n    /**\n     * @dev Returns the integer division of two unsigned integers, reverting with custom message on\n     * division by zero. The result is rounded towards zero.\n     *\n     * Counterpart to Solidity's `/` operator. Note: this function uses a\n     * `revert` opcode (which leaves remaining gas untouched) while Solidity\n     * uses an invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function div(\n        uint256 a,\n        uint256 b,\n        string memory errorMessage\n    ) internal pure returns (uint256) {\n        unchecked {\n            require(b > 0, errorMessage);\n            return a / b;\n        }\n    }\n\n    /**\n     * @dev Returns the remainder of dividing two unsigned integers. (unsigned integer modulo),\n     * reverting with custom message when dividing by zero.\n     *\n     * CAUTION: This function is deprecated because it requires allocating memory for the error\n     * message unnecessarily. For custom revert reasons use {tryMod}.\n     *\n     * Counterpart to Solidity's `%` operator. This function uses a `revert`\n     * opcode (which leaves remaining gas untouched) while Solidity uses an\n     * invalid opcode to revert (consuming all remaining gas).\n     *\n     * Requirements:\n     *\n     * - The divisor cannot be zero.\n     */\n    function mod(\n        uint256 a,\n        uint256 b,\n        string memory errorMessage\n    ) internal pure returns (uint256) {\n        unchecked {\n            require(b > 0, errorMessage);\n            return a % b;\n        }\n    }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/security/ReentrancyGuard.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (security/ReentrancyGuard.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Contract module that helps prevent reentrant calls to a function.\n *\n * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier\n * available, which can be applied to functions to make sure there are no nested\n * (reentrant) calls to them.\n *\n * Note that because there is a single `nonReentrant` guard, functions marked as\n * `nonReentrant` may not call one another. This can be worked around by making\n * those functions `private`, and then adding `external` `nonReentrant` entry\n * points to them.\n *\n * TIP: If you would like to learn more about reentrancy and alternative ways\n * to protect against it, check out our blog post\n * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].\n */\nabstract contract ReentrancyGuard {\n    // Booleans are more expensive than uint256 or any type that takes up a full\n    // word because each write operation emits an extra SLOAD to first read the\n    // slot's contents, replace the bits taken up by the boolean, and then write\n    // back. This is the compiler's defense against contract upgrades and\n    // pointer aliasing, and it cannot be disabled.\n\n    // The values being non-zero value makes deployment a bit more expensive,\n    // but in exchange the refund on every call to nonReentrant will be lower in\n    // amount. Since refunds are capped to a percentage of the total\n    // transaction's gas, it is best to keep them low in cases like this one, to\n    // increase the likelihood of the full refund coming into effect.\n    uint256 private constant _NOT_ENTERED = 1;\n    uint256 private constant _ENTERED = 2;\n\n    uint256 private _status;\n\n    constructor() {\n        _status = _NOT_ENTERED;\n    }\n\n    /**\n     * @dev Prevents a contract from calling itself, directly or indirectly.\n     * Calling a `nonReentrant` function from another `nonReentrant`\n     * function is not supported. It is possible to prevent this from happening\n     * by making the `nonReentrant` function external, and making it call a\n     * `private` function that does the actual work.\n     */\n    modifier nonReentrant() {\n        _nonReentrantBefore();\n        _;\n        _nonReentrantAfter();\n    }\n\n    function _nonReentrantBefore() private {\n        // On the first call to nonReentrant, _status will be _NOT_ENTERED\n        require(_status != _ENTERED, \"ReentrancyGuard: reentrant call\");\n\n        // Any calls to nonReentrant after this point will fail\n        _status = _ENTERED;\n    }\n\n    function _nonReentrantAfter() private {\n        // By storing the original value once again, a refund is triggered (see\n        // https://eips.ethereum.org/EIPS/eip-2200)\n        _status = _NOT_ENTERED;\n    }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.8.0) (token/ERC20/utils/SafeERC20.sol)\n\npragma solidity ^0.8.0;\n\nimport \"../IERC20.sol\";\nimport \"../extensions/draft-IERC20Permit.sol\";\nimport \"../../../utils/Address.sol\";\n\n/**\n * @title SafeERC20\n * @dev Wrappers around ERC20 operations that throw on failure (when the token\n * contract returns false). Tokens that return no value (and instead revert or\n * throw on failure) are also supported, non-reverting calls are assumed to be\n * successful.\n * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,\n * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.\n */\nlibrary SafeERC20 {\n    using Address for address;\n\n    function safeTransfer(IERC20 token, address to, uint256 value) internal {\n        _callOptionalReturn(\n            token,\n            abi.encodeWithSelector(token.transfer.selector, to, value)\n        );\n    }\n\n    function safeTransferFrom(\n        IERC20 token,\n        address from,\n        address to,\n        uint256 value\n    ) internal {\n        _callOptionalReturn(\n            token,\n            abi.encodeWithSelector(token.transferFrom.selector, from, to, value)\n        );\n    }\n\n    /**\n     * @dev Deprecated. This function has issues similar to the ones found in\n     * {IERC20-approve}, and its usage is discouraged.\n     *\n     * Whenever possible, use {safeIncreaseAllowance} and\n     * {safeDecreaseAllowance} instead.\n     */\n    function safeApprove(\n        IERC20 token,\n        address spender,\n        uint256 value\n    ) internal {\n        // safeApprove should only be called when setting an initial allowance,\n        // or when resetting it to zero. To increase and decrease it, use\n        // 'safeIncreaseAllowance' and 'safeDecreaseAllowance'\n        require(\n            (value == 0) || (token.allowance(address(this), spender) == 0),\n            \"SafeERC20: approve from non-zero to non-zero allowance\"\n        );\n        _callOptionalReturn(\n            token,\n            abi.encodeWithSelector(token.approve.selector, spender, value)\n        );\n    }\n\n    function safeIncreaseAllowance(\n        IERC20 token,\n        address spender,\n        uint256 value\n    ) internal {\n        uint256 newAllowance = token.allowance(address(this), spender) + value;\n        _callOptionalReturn(\n            token,\n            abi.encodeWithSelector(\n                token.approve.selector,\n                spender,\n                newAllowance\n            )\n        );\n    }\n\n    function safeDecreaseAllowance(\n        IERC20 token,\n        address spender,\n        uint256 value\n    ) internal {\n        unchecked {\n            uint256 oldAllowance = token.allowance(address(this), spender);\n            require(\n                oldAllowance >= value,\n                \"SafeERC20: decreased allowance below zero\"\n            );\n            uint256 newAllowance = oldAllowance - value;\n            _callOptionalReturn(\n                token,\n                abi.encodeWithSelector(\n                    token.approve.selector,\n                    spender,\n                    newAllowance\n                )\n            );\n        }\n    }\n\n    function safePermit(\n        IERC20Permit token,\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) internal {\n        uint256 nonceBefore = token.nonces(owner);\n        token.permit(owner, spender, value, deadline, v, r, s);\n        uint256 nonceAfter = token.nonces(owner);\n        require(\n            nonceAfter == nonceBefore + 1,\n            \"SafeERC20: permit did not succeed\"\n        );\n    }\n\n    /**\n     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement\n     * on the return value: the return value is optional (but if data is returned, it must not be false).\n     * @param token The token targeted by the call.\n     * @param data The call data (encoded using abi.encode or one of its variants).\n     */\n    function _callOptionalReturn(IERC20 token, bytes memory data) private {\n        // We need to perform a low level call here, to bypass Solidity's return data size checking mechanism, since\n        // we're implementing it ourselves. We use {Address-functionCall} to perform this call, which verifies that\n        // the target address contains contract code and also asserts for success in the low-level call.\n\n        bytes memory returndata = address(token).functionCall(\n            data,\n            \"SafeERC20: low-level call failed\"\n        );\n        if (returndata.length > 0) {\n            // Return data is optional\n            require(\n                abi.decode(returndata, (bool)),\n                \"SafeERC20: ERC20 operation did not succeed\"\n            );\n        }\n    }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (token/ERC20/extensions/draft-IERC20Permit.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 Permit extension allowing approvals to be made via signatures, as defined in\n * https://eips.ethereum.org/EIPS/eip-2612[EIP-2612].\n *\n * Adds the {permit} method, which can be used to change an account's ERC20 allowance (see {IERC20-allowance}) by\n * presenting a message signed by the account. By not relying on {IERC20-approve}, the token holder account doesn't\n * need to send a transaction, and thus is not required to hold Ether at all.\n */\ninterface IERC20Permit {\n    /**\n     * @dev Sets `value` as the allowance of `spender` over ``owner``'s tokens,\n     * given ``owner``'s signed approval.\n     *\n     * IMPORTANT: The same issues {IERC20-approve} has related to transaction\n     * ordering also apply here.\n     *\n     * Emits an {Approval} event.\n     *\n     * Requirements:\n     *\n     * - `spender` cannot be the zero address.\n     * - `deadline` must be a timestamp in the future.\n     * - `v`, `r` and `s` must be a valid `secp256k1` signature from `owner`\n     * over the EIP712-formatted function arguments.\n     * - the signature must use ``owner``'s current nonce (see {nonces}).\n     *\n     * For more information on the signature format, see the\n     * https://eips.ethereum.org/EIPS/eip-2612#specification[relevant EIP\n     * section].\n     */\n    function permit(\n        address owner,\n        address spender,\n        uint256 value,\n        uint256 deadline,\n        uint8 v,\n        bytes32 r,\n        bytes32 s\n    ) external;\n\n    /**\n     * @dev Returns the current nonce for `owner`. This value must be\n     * included whenever a signature is generated for {permit}.\n     *\n     * Every successful call to {permit} increases ``owner``'s nonce by one. This\n     * prevents a signature from being used multiple times.\n     */\n    function nonces(address owner) external view returns (uint256);\n\n    /**\n     * @dev Returns the domain separator used in the encoding of the signature for {permit}, as defined by {EIP712}.\n     */\n    // solhint-disable-next-line func-name-mixedcase\n    function DOMAIN_SEPARATOR() external view returns (bytes32);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.18+commit.87f61d96"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_addressProvider",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "caller",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "percent",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "timestamp",
+              "type": "uint64"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "price",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount0Received",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount1Received",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "fee0",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "fee1",
+              "type": "uint256"
+            }
+          ],
+          "name": "CloseOutOfRangePosition",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "percent",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount0Received",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount1Received",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount0Repaid",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount1Repaid",
+              "type": "uint256"
+            }
+          ],
+          "name": "CloseVaultPositionPartially",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "caller",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount0Repaid",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount1Repaid",
+              "type": "uint256"
+            }
+          ],
+          "name": "ExactRepay",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "feeType",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "FeePaid",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "caller",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "liquidityAdded",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "fee0",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "fee1",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "rewards",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "InvestEarnedFeeToLiquidity",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount0Invest",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount1Invest",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount0Borrow",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount1Borrow",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "liquidity",
+              "type": "uint256"
+            }
+          ],
+          "name": "InvestToVaultPosition",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "liquidator",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint16",
+              "name": "percent",
+              "type": "uint16"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "timestamp",
+              "type": "uint64"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "price",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "debtValueOfPosition",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "liquidityValueOfPosition",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount0Left",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount1Left",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "liquidateFee0",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "liquidateFee1",
+              "type": "uint256"
+            }
+          ],
+          "name": "LiquidateVaultPositionPartially",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            }
+          ],
+          "name": "NewVaultPosition",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "previousOwner",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipTransferred",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "WETH9",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "addr",
+              "type": "address"
+            }
+          ],
+          "name": "addPermissionedCompounder",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "addr",
+              "type": "address"
+            }
+          ],
+          "name": "addPermissionedLiquidator",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "addr",
+              "type": "address"
+            }
+          ],
+          "name": "addPermissionedRangeStopCaller",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "addressProvider",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "params",
+              "type": "bytes"
+            }
+          ],
+          "name": "adminSetVault",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "vaultId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "vaultPositionId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "percent",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "address",
+                  "name": "receiver",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "receiveNativeETH",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "uint8",
+                  "name": "receiveType",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minAmount0WhenRemoveLiquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minAmount1WhenRemoveLiquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "deadline",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "swapExecutorId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "swapPath",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct IVeloVaultPositionManager.CloseVaultPositionPartiallyParams",
+              "name": "params",
+              "type": "tuple"
+            }
+          ],
+          "name": "closeOutOfRangePosition",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "vaultId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "vaultPositionId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "percent",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "address",
+                  "name": "receiver",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "receiveNativeETH",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "uint8",
+                  "name": "receiveType",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minAmount0WhenRemoveLiquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minAmount1WhenRemoveLiquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "deadline",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "swapExecutorId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "swapPath",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct IVeloVaultPositionManager.CloseVaultPositionPartiallyParams",
+              "name": "params",
+              "type": "tuple"
+            }
+          ],
+          "name": "closeVaultPositionPartially",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "compounderWhitelist",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "disablePermissionLessCompound",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "disablePermissionLessLiquidation",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "disablePermissonLessRangeStop",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "enablePermissionLessCompound",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "enablePermissionLessLiquidation",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "enablePermissonLessRangeStop",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "vaultId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "vaultPositionId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount0ToRepay",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount1ToRepay",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "receiveNativeETH",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "deadline",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct IVeloVaultPositionManager.ExactRepayParam",
+              "name": "params",
+              "type": "tuple"
+            }
+          ],
+          "name": "exactRepay",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount0Repaid",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount1Repaid",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getVault",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "gauge",
+                  "type": "address"
+                },
+                {
+                  "internalType": "address",
+                  "name": "pair",
+                  "type": "address"
+                },
+                {
+                  "internalType": "address",
+                  "name": "token0",
+                  "type": "address"
+                },
+                {
+                  "internalType": "address",
+                  "name": "token1",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "stable",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "paused",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "frozen",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "borrowingEnabled",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "liquidateWithTWAP",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "maxLeverage",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "premiumMaxLeverage",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "maxPriceDiff",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "liquidateDebtRatio",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "withdrawFeeRate",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "compoundFeeRate",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "liquidateFeeRate",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "rangeStopFeeRate",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "protocolFeeRate",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "premiumRequirement",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "protocolFee0Accumulated",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "protocolFee1Accumulated",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minInvestValue",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minSwapAmount0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minSwapAmount1",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "totalLp",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "totalLpShares",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "premiumUtilizationOfReserve0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "debtLimit0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "debtPositionId0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "debtTotalShares0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "premiumUtilizationOfReserve1",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "debtLimit1",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "debtPositionId1",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "debtTotalShares1",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct VaultTypes.VeloVaultState",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getVaultPosition",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "address",
+                  "name": "manager",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "isActive",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "enableRangeStop",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "uint64",
+                  "name": "openedAt",
+                  "type": "uint64"
+                },
+                {
+                  "internalType": "uint64",
+                  "name": "current",
+                  "type": "uint64"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "token0Principal",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "token1Principal",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "liquidityPrincipal",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "token0Left",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "token1Left",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "token0InLiquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "token1InLiquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "liquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "debt0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "debt1",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "borrowingIndex0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "borrowingIndex1",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minPriceOfRangeStop",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "maxPriceOfRangeStop",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct VaultTypes.VeloPositionValue",
+              "name": "state",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "vaultId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "address",
+                  "name": "compoundFeeReceiver",
+                  "type": "address"
+                },
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "from",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "to",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "bool",
+                      "name": "stable",
+                      "type": "bool"
+                    }
+                  ],
+                  "internalType": "struct IRouter.route[][]",
+                  "name": "routes",
+                  "type": "tuple[][]"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "receiveNativeETH",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "deadline",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct IVeloVaultPositionManager.InvestEarnedFeeToLiquidityParam",
+              "name": "params",
+              "type": "tuple"
+            }
+          ],
+          "name": "investEarnedFeeToLiquidity",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "vaultId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "vaultPositionId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint16",
+                  "name": "percent",
+                  "type": "uint16"
+                },
+                {
+                  "internalType": "address",
+                  "name": "receiver",
+                  "type": "address"
+                },
+                {
+                  "internalType": "bool",
+                  "name": "receiveNativeETH",
+                  "type": "bool"
+                },
+                {
+                  "internalType": "uint8",
+                  "name": "receiveType",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minAmount0WhenRemoveLiquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "minAmount1WhenRemoveLiquidity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "deadline",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "maxRepay0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "maxRepay1",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "swapExecutorId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "swapPath",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct IVeloVaultPositionManager.LiquidateVaultPositionPartiallyParams",
+              "name": "params",
+              "type": "tuple"
+            }
+          ],
+          "name": "liquidateVaultPositionPartially",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "liquidatorWhitelist",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "vaultId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "vaultPositionId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount0Invest",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount0Borrow",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount1Invest",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount1Borrow",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount0Min",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount1Min",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "deadline",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "swapExecutorId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes",
+                  "name": "swapPath",
+                  "type": "bytes"
+                }
+              ],
+              "internalType": "struct IVeloVaultPositionManager.NewOrInvestToVaultPositionParams",
+              "name": "params",
+              "type": "tuple"
+            }
+          ],
+          "name": "newOrInvestToVaultPosition",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "feeType",
+              "type": "uint256"
+            }
+          ],
+          "name": "payFeeToTreasuryCallback",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "vaultId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount0",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "amount1",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "address",
+                  "name": "payer",
+                  "type": "address"
+                }
+              ],
+              "internalType": "struct IVeloVaultPositionManager.PayToVaultCallbackParams",
+              "name": "params",
+              "type": "tuple"
+            }
+          ],
+          "name": "payToVaultCallback",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "permissionLessCompoundEnabled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "permissionLessLiquidationEnabled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "permissionLessRangeStopEnabled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "rangeStopCallerWhitelist",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "addr",
+              "type": "address"
+            }
+          ],
+          "name": "removePermissionedCompounder",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "addr",
+              "type": "address"
+            }
+          ],
+          "name": "removePermissionedLiquidator",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "addr",
+              "type": "address"
+            }
+          ],
+          "name": "removePermissionedRangeStopCaller",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "renounceOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "enable",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint256",
+              "name": "minPrice",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxPrice",
+              "type": "uint256"
+            }
+          ],
+          "name": "setRangeStop",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "vaultId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "vaultPositionId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "newManager",
+              "type": "address"
+            }
+          ],
+          "name": "transferManagerOfVaultPosition",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "transferOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "vaultFactory",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "events": {
+          "CloseOutOfRangePosition(uint256,uint256,address,address,uint16,uint64,uint256,uint256,uint256,uint256,uint256)": {
+            "params": {
+              "amount0Received": "The amount of token0 user received after close",
+              "amount1Received": "The amount of token1 user received after close",
+              "caller": "The caller initiate range stop",
+              "fee0": "The caller received",
+              "fee1": "The caller received",
+              "manager": "The manager of the vaultPosition",
+              "percent": "The percentage of the vault user want to close",
+              "vaultId": "The id of the vault",
+              "vaultPositionId": "The id of the vaultPosition"
+            }
+          },
+          "CloseVaultPositionPartially(uint256,uint256,address,uint16,uint256,uint256,uint256,uint256)": {
+            "params": {
+              "amount0Received": "The amount of token0 user received after close",
+              "amount0Repaid": "The amount of token0 user repaid when close",
+              "amount1Received": "The amount of token1 user received after close",
+              "amount1Repaid": "The amount of token1 user repaid when close",
+              "manager": "The manager of the vaultPosition",
+              "percent": "The percentage of the vault user want to close",
+              "vaultId": "The id of the vault",
+              "vaultPositionId": "The id of the vaultPosition"
+            }
+          },
+          "ExactRepay(uint256,uint256,address,address,uint256,uint256)": {
+            "params": {
+              "amount0Repaid": "The amount of token0 repaid",
+              "amount1Repaid": "The amount of token1 repaid",
+              "caller": "The initiator of the repay action",
+              "manager": "The manager of the vaultPosition",
+              "vaultId": "The id of the vault",
+              "vaultPositionId": "The id of the vaultPosition"
+            }
+          },
+          "InvestEarnedFeeToLiquidity(uint256,address,uint256,uint256,uint256,uint256[])": {
+            "params": {
+              "caller": "The initiator of the repay action",
+              "fee0": "The fee in token0",
+              "fee1": "The fee in token1",
+              "liquidityAdded": "The liquidity amount added by adding rewards to the pool",
+              "rewards": "The rewards claimed",
+              "vaultId": "The id of the vault"
+            }
+          },
+          "InvestToVaultPosition(uint256,uint256,address,uint256,uint256,uint256,uint256,uint256)": {
+            "params": {
+              "amount0Borrow": "The amount of token0 user wants to borrow",
+              "amount0Invest": "The amount of token0 user wants to transfer",
+              "amount1Borrow": "The amount of token1 user wants to borrow",
+              "amount1Invest": "The amount of token1 user wants to transfer",
+              "liquidity": "The amount of lp tokens added to the pool",
+              "manager": "The manager of the vaultPosition, usually the caller",
+              "vaultId": "The id of the vault",
+              "vaultPositionId": "The id of the new vaultPosition"
+            }
+          },
+          "LiquidateVaultPositionPartially(uint256,uint256,address,address,uint16,uint64,uint256,uint256,uint256,uint256,uint256,uint256,uint256)": {
+            "params": {
+              "amount0Left": "The amount of token0 transferred to the position's manager after close",
+              "amount1Left": "The amount of token1 transferred to the position's manager after close",
+              "liquidateFee0": "The amount of token0 for liquidation bonus",
+              "liquidateFee1": "The amount of token1 for liquidation bonus",
+              "liquidator": "The caller of the function",
+              "manager": "The manager of the vaultPosition",
+              "percent": "The percentage of the vault user want to liquidate",
+              "vaultId": "The id of the vault",
+              "vaultPositionId": "The id of the vaultPosition"
+            }
+          },
+          "NewVaultPosition(uint256,uint256,address)": {
+            "params": {
+              "manager": "The manager of the position, usually the caller",
+              "vaultId": "The id of the vault",
+              "vaultPositionId": "The id of the newed position"
+            }
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "closeOutOfRangePosition((uint256,uint256,uint16,address,bool,uint8,uint256,uint256,uint256,uint256,bytes))": {
+            "params": {
+              "params": "The parameters necessary, encoded as `CloseVaultPositionPartiallyParams` in calldata"
+            }
+          },
+          "closeVaultPositionPartially((uint256,uint256,uint16,address,bool,uint8,uint256,uint256,uint256,uint256,bytes))": {
+            "params": {
+              "params": "The parameters necessary, encoded as `CloseVaultPositionPartiallyParams` in calldata"
+            }
+          },
+          "liquidateVaultPositionPartially((uint256,uint256,uint16,address,bool,uint8,uint256,uint256,uint256,uint256,uint256,uint256,bytes))": {
+            "params": {
+              "params": "The parameters necessary, encoded as `LiquidateVaultPositionPartiallyParams` in calldata"
+            }
+          },
+          "newOrInvestToVaultPosition((uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bytes))": {
+            "params": {
+              "params": "The parameters necessary, encoded as `NewOrInvestToVaultPositionParams` in calldata"
+            }
+          },
+          "owner()": {
+            "details": "Returns the address of the current owner."
+          },
+          "renounceOwnership()": {
+            "details": "Leaves the contract without owner. It will not be possible to call `onlyOwner` functions anymore. Can only be called by the current owner. NOTE: Renouncing ownership will leave the contract without an owner, thereby removing any functionality that is only available to the owner."
+          },
+          "setRangeStop(uint256,uint256,bool,uint256,uint256)": {
+            "params": {
+              "enable": "Enable or Disable the rangeStop feature",
+              "maxPrice": "The upper price of the stop-loss price range",
+              "minPrice": "The lower price of the stop-loss price range",
+              "vaultId": "The Id of the vault",
+              "vaultPositionId": "The Id of the position"
+            }
+          },
+          "transferManagerOfVaultPosition(uint256,uint256,address)": {
+            "params": {
+              "newManager": "The new address of the manager",
+              "vaultId": "The Id of the vault",
+              "vaultPositionId": "The Id of the position"
+            }
+          },
+          "transferOwnership(address)": {
+            "details": "Transfers ownership of the contract to a new account (`newOwner`). Can only be called by the current owner."
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "events": {
+          "CloseOutOfRangePosition(uint256,uint256,address,address,uint16,uint64,uint256,uint256,uint256,uint256,uint256)": {
+            "notice": "Close a position which is outof price range"
+          },
+          "CloseVaultPositionPartially(uint256,uint256,address,uint16,uint256,uint256,uint256,uint256)": {
+            "notice": "Close a position partially"
+          },
+          "ExactRepay(uint256,uint256,address,address,uint256,uint256)": {
+            "notice": "Liquidate a position partially"
+          },
+          "InvestEarnedFeeToLiquidity(uint256,address,uint256,uint256,uint256,uint256[])": {
+            "notice": "InvestEarnedFeeToLiquidity"
+          },
+          "InvestToVaultPosition(uint256,uint256,address,uint256,uint256,uint256,uint256,uint256)": {
+            "notice": "Invest to a position"
+          },
+          "LiquidateVaultPositionPartially(uint256,uint256,address,address,uint16,uint64,uint256,uint256,uint256,uint256,uint256,uint256,uint256)": {
+            "notice": "Liquidate a position partially"
+          },
+          "NewVaultPosition(uint256,uint256,address)": {
+            "notice": "New a vaultPosition"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "addressProvider()": {
+            "notice": "Contract address of the AddressProvider"
+          },
+          "closeOutOfRangePosition((uint256,uint256,uint16,address,bool,uint8,uint256,uint256,uint256,uint256,bytes))": {
+            "notice": "Close the position which is outof price range. This function can be called only if the `rangeStop` feature is enabled. Any permissioned user can call this function, regardless of whether they are the position owner."
+          },
+          "closeVaultPositionPartially((uint256,uint256,uint16,address,bool,uint8,uint256,uint256,uint256,uint256,bytes))": {
+            "notice": "Close a vaultPosition partially"
+          },
+          "compounderWhitelist(address)": {
+            "notice": "CompounderWhitelist"
+          },
+          "exactRepay((uint256,uint256,uint256,uint256,bool,uint256))": {
+            "notice": "Repay exact value of debts"
+          },
+          "investEarnedFeeToLiquidity((uint256,address,(address,address,bool)[][],bool,uint256))": {
+            "notice": "Invest the earned fee by the position to liquidity"
+          },
+          "liquidateVaultPositionPartially((uint256,uint256,uint16,address,bool,uint8,uint256,uint256,uint256,uint256,uint256,uint256,bytes))": {
+            "notice": "Liquidate a vaultPosition partially"
+          },
+          "liquidatorWhitelist(address)": {
+            "notice": "liquidatorWhitelist"
+          },
+          "newOrInvestToVaultPosition((uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bytes))": {
+            "notice": "Open a new vaultPosition or invest to a existing vault position"
+          },
+          "payFeeToTreasuryCallback(uint256,address,uint256,uint256)": {
+            "notice": "Callback functions called by the vault to pay protocol fee. The caller to this function must be the vault contract"
+          },
+          "payToVaultCallback((uint256,uint256,uint256,address))": {
+            "notice": "Callback functions called by the vault to pay tokens to the vault contract. The caller to this function must be the vault contract"
+          },
+          "permissionLessCompoundEnabled()": {
+            "notice": "permissionLessCompoundEnabled feature Only if this feature is true, users can claim the vaults' rewards and reinvest to liquidity  without permissions. Otherwise only users in the whitelist can call the reinvest function"
+          },
+          "permissionLessLiquidationEnabled()": {
+            "notice": "permissionLessLiquidation feature Only if this feature is true, users can liquidate positions without permissions. Otherwise only liquidators in the whitelist can liquidate positions."
+          },
+          "permissionLessRangeStopEnabled()": {
+            "notice": "permissionLessRangeStopEnabled feature Only if this feature is true, users can close outof-range positions"
+          },
+          "rangeStopCallerWhitelist(address)": {
+            "notice": "rangeStopCallerWhitelist"
+          },
+          "setRangeStop(uint256,uint256,bool,uint256,uint256)": {
+            "notice": "Set stop-loss price range of the position Users can set a stop-loss price range for a position only if the position is enabled `RangeStop` feature. If current price goes out of the stop-loss price range, extraFi's bots will close the position"
+          },
+          "transferManagerOfVaultPosition(uint256,uint256,address)": {
+            "notice": "Transfer the position's manager to another wallet Must be called by the current manager of the posistion"
+          },
+          "vaultFactory()": {
+            "notice": "Contract address of the VaultFactory"
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/VeloPositionManager.sol": "VeloPositionManager"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/Payments.sol": {
+        "keccak256": "0xd65c99bfc1a69ecf4e22c5ad96aec600b7337c8bd90d5e523b77bc631b69385b",
+        "license": "UNLICENSED",
+        "urls": [
+          "bzz-raw://826e56b3b95a35c4661c098d0340080df1013ea325cda30a39d05790880a095e",
+          "dweb:/ipfs/QmYNRUJyrbcr4SQMaSBaQhU8Px8e9ErPYgPzGfT7yrV3fV"
+        ]
+      },
+      "contracts/VeloPositionManager.sol": {
+        "keccak256": "0x4a6a82015b0ad96523eaa9278a0fdfff9d42ee6f8e988759681d51323b97dcac",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://8056996516d2f8b4aac71e5a4292c1c070e472e7508223a18ce63f1b2f4364dc",
+          "dweb:/ipfs/QmdJEuBiWKAShZnG6nLSomXAnMC7ovZHraA8qSXEBTVH3u"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/access/Ownable.sol": {
+        "keccak256": "0xb557b71fe746c789156698b258d79253a509d227176f562bfea6cab01cc6a4e6",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://a4628bc07d29b17667f78abbdcd1466e9b293862fb1c4881e8c9147b7afff9af",
+          "dweb:/ipfs/QmYmeJXbixfMVpzVzWygre4MSxcVjPKGABoCRGTXypM88z"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/security/ReentrancyGuard.sol": {
+        "keccak256": "0x190dd6f8d592b7e4e930feb7f4313aeb8e1c4ad3154c27ce1cf6a512fc30d8cc",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4ce8dfb62d0c4fa260d6eec8f1cd47f5f2a044e11bde5b31d18072fa6e7d9010",
+          "dweb:/ipfs/QmTyFztU3tLEcEDnqqiaW4UJetqsU77LXc6pjc9oTXCK5u"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/ERC20/IERC20.sol": {
+        "keccak256": "0xbe7e8c250bbebe46299f337b29c535ce00d67fe289eb03d84ebbd74934eec19f",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://aab34b98f68a20449e2b82b780bc4d5f8ee67178c0399168985256260097c855",
+          "dweb:/ipfs/QmUX83r9Exzk7yJQSCKwzgpN8Q5bivYRwCLvyQUJauTPGf"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol": {
+        "keccak256": "0xf41ca991f30855bf80ffd11e9347856a517b977f0a6c2d52e6421a99b7840329",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b2717fd2bdac99daa960a6de500754ea1b932093c946388c381da48658234b95",
+          "dweb:/ipfs/QmP6QVMn6UeA3ByahyJbYQr5M6coHKBKsf3ySZSfbyA8R7"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol": {
+        "keccak256": "0x7b14c1177ceef6f43ea85967050257c10e6fd1226da70316879f13d91ea39836",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7d627f3af0a69f9b5d05d023b8001d3fd309716e2802df6821c3a55f2bd97eb1",
+          "dweb:/ipfs/QmSnCp7DQjLHXk6PUgYfDCGD36NKm1bYNz5yovZbWSiWLV"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/Address.sol": {
+        "keccak256": "0xe731a2cd5e80ed4fc64e3c68dc3d57b821a8a37b15441988ed6c23a042a92b96",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d6f8bc78de707a6a448e51d63b67a4aaf7709a934a74bfa10834e50341e99b53",
+          "dweb:/ipfs/QmTWe5WcFNuodVyYVesyfA45Xs78SiALSq66yjoZX2tavE"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/Context.sol": {
+        "keccak256": "0xe2e337e6dde9ef6b680e07338c493ebea1b5fd09b43424112868e9cc1706bca7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6df0ddf21ce9f58271bdfaa85cde98b200ef242a05a3f85c2bc10a8294800a92",
+          "dweb:/ipfs/QmRK2Y5Yc6BK7tGKkgsgn3aJEQGi5aakeSPZvS65PV8Xp3"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/math/SafeMath.sol": {
+        "keccak256": "0x5648dcaf7dc1f1c43ddd49a3def8d95d42cbc47b557e8d0f692e08982565ff36",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b6e6e39e08d0cb0aa9c0edac0ec190895980b74f198aa4bb25ac38debf5af18e",
+          "dweb:/ipfs/QmQPpsaGReXufzXL3o3f4MVxSQCA5KSLrM6iGnmhhbKNom"
+        ]
+      },
+      "contracts/external/velodrome/contracts/interfaces/IRouter.sol": {
+        "keccak256": "0x73cfba5c6a5093b97c00174feb940cfcda1f06cf49c935addfd1ee0cffd218e6",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://abda70083b13f0054a1887e86505261352499278d37e2775e5290369b5c803e8",
+          "dweb:/ipfs/QmUDjDFyr6LzqUHcpwVVpERqHJcdgjiKkf3y29f5Y6XoLU"
+        ]
+      },
+      "contracts/interfaces/IAddressRegistry.sol": {
+        "keccak256": "0x56497e00feb8618e9505fc09a1bc33f93c821a257bf3575e923cfb9f3effa4a6",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://45f7bea7ff17c288ebdfffadcced6b42664f87c147de136cf2d09a5f9eb2294e",
+          "dweb:/ipfs/QmT4sJ66xVrzwcyNqH1GoUD6oejnjzCX5C1putpQUTBP2g"
+        ]
+      },
+      "contracts/interfaces/IVaultFactory.sol": {
+        "keccak256": "0x320ec88190efe3e9fa06d5b82627ee948bb95a00b5b160cdf84c25c9bee259f7",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://65b7f93504af53d4e97edb2150b34240ea037fc0a76e539b9470ea4324bdc5d0",
+          "dweb:/ipfs/QmWP89Fkx8STxAknLhh9jUNroa8NeXhyNs8GcQnCRi7Jx1"
+        ]
+      },
+      "contracts/interfaces/IVeloVault.sol": {
+        "keccak256": "0xa8f92a610eb7f72d0a45453dd047cbdf8490cdeec0c9a7204e0f57f8d2e57321",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://ad3b2fbc57b756ddaf0b70f40aa8d2b034a41c91ebb3f08f136cfd00e7ecff83",
+          "dweb:/ipfs/QmVLG3ADfBYaMui14a6niETJtMzZMsUbFuERAB4DHTyAoY"
+        ]
+      },
+      "contracts/interfaces/IVeloVaultPositionManager.sol": {
+        "keccak256": "0x21de277f62e0f0e6177d8d697982c43a152611a5ba6c88cfeb116928ae688648",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://9789c799482148654f243306142b751285bd3ecb82d29cb36fdfb3689d0e530b",
+          "dweb:/ipfs/QmdZo4dtp7vkVd2DGnuhbcDMVgG8FWwsSwnnSCwQMeQtti"
+        ]
+      },
+      "contracts/interfaces/IWETH9.sol": {
+        "keccak256": "0x3d06286214d081f12333481f15da6bc2c5e42d7009dfd3605ab9e52abf061360",
+        "license": "GPL-2.0-or-later",
+        "urls": [
+          "bzz-raw://b970c403e277887c1a697e06002d33aff179c4867de2d56697238bc0a9c2a79f",
+          "dweb:/ipfs/QmRkQRUz4dz5Pjgi3YcnfxVpmZNz6cQ2FmgUTi2WNjP2Uj"
+        ]
+      },
+      "contracts/libraries/TransferHelper.sol": {
+        "keccak256": "0x5258689d36f9bc24fb177e1caf89ca3671bffd4f99a3da20ad5d4fcbc5759bf5",
+        "license": "GPL-2.0-or-later",
+        "urls": [
+          "bzz-raw://144dd5624292ae13337db7317086c9b5af596e96fe45b987e0df6e3d8a217fcf",
+          "dweb:/ipfs/QmZm73BSJZ3p4LgkGivzCX4aR7N6z166RbCJULsWgwcsLf"
+        ]
+      },
+      "contracts/libraries/helpers/AddressId.sol": {
+        "keccak256": "0x8d29b33f8ea06000baba7e409c6e8a9054d91b6e4e1c861379ac8373d7b9a514",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://8b93e88da9a0d180d4a276933a91de22c39250d30dd490d034503af1f321856d",
+          "dweb:/ipfs/QmUvHvCLyZj9Bu6kFkJpCmTU5ov9PxmSYv6iZY6dgAtpEg"
+        ]
+      },
+      "contracts/libraries/helpers/Errors.sol": {
+        "keccak256": "0x9edd42f248173bcbbd4d8804807eb5a072cdd47f8488f4cde8be1e3dd1f2b82d",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://a8bd59774ffdd2c3ae33f48b35d0ff349b48ada05fb52a4febb1d66ddc9e3779",
+          "dweb:/ipfs/QmT139efAhoGby8GsjZNu5t4CN5Zr3n1jAsYbZQwkSfxSA"
+        ]
+      },
+      "contracts/libraries/types/VaultTypes.sol": {
+        "keccak256": "0xc1a7b22bd4ade603c89d0e0ae4ad63b96ed69753a46241d6a7674911a40bfe04",
+        "license": "gpl-3.0",
+        "urls": [
+          "bzz-raw://1b73a1295d9e7231cbab5a787f111626e333f404d1a10963435d98649eacfb1e",
+          "dweb:/ipfs/QmSd6XrUQeb1YHLCVLBi2NnRPEQ8zCVKr6ecDSiYiMizy3"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.18+commit.87f61d96",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": []
+    },
+    "name": "VeloPositionManager",
+    "fullyQualifiedName": "contracts/VeloPositionManager.sol:VeloPositionManager"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "32331",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T10:34:03Z",
+  "match": "exact_match",
+  "chainId": "10",
+  "address": "0xf9cFB8a62f50e10AdDE5Aa888B44cF01C5957055"
+}
