@@ -1,0 +1,590 @@
+{
+  "sources": {
+    "contracts/release/extensions/policy-manager/policies/asset-managers/AllowedExternalPositionTypesPerManagerPolicy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\npragma experimental ABIEncoderV2;\n\nimport {IComptroller} from \"../../../../core/fund/comptroller/IComptroller.sol\";\nimport {IVault} from \"../../../../core/fund/vault/IVault.sol\";\nimport {IExternalPositionProxy} from \"../../../../../persistent/external-positions/IExternalPositionProxy.sol\";\nimport {IPolicyManager} from \"../../IPolicyManager.sol\";\nimport {UintListRegistryPerUserPolicyBase} from \"../utils/0.6.12/UintListRegistryPerUserPolicyBase.sol\";\n\n/// @title AllowedExternalPositionTypesPerManagerPolicy Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A policy that limits which external position types an asset manager can use for a given fund\ncontract AllowedExternalPositionTypesPerManagerPolicy is UintListRegistryPerUserPolicyBase {\n    uint256 public constant BYPASS_FLAG = type(uint256).max;\n\n    constructor(address _policyManager, address _uintListRegistry)\n        public\n        UintListRegistryPerUserPolicyBase(_policyManager, _uintListRegistry)\n    {}\n\n    // EXTERNAL FUNCTIONS\n\n    /// @notice Whether or not the policy can be disabled\n    /// @return canDisable_ True if the policy can be disabled\n    function canDisable() external pure virtual override returns (bool canDisable_) {\n        return true;\n    }\n\n    /// @notice Provides a constant string identifier for a policy\n    /// @return identifier_ The identifier string\n    function identifier() external pure override returns (string memory identifier_) {\n        return \"ALLOWED_EXTERNAL_POSITION_TYPES_PER_MANAGER\";\n    }\n\n    /// @notice Gets the implemented PolicyHooks for a policy\n    /// @return implementedHooks_ The implemented PolicyHooks\n    function implementedHooks() external pure override returns (IPolicyManager.PolicyHook[] memory implementedHooks_) {\n        implementedHooks_ = new IPolicyManager.PolicyHook[](4);\n        implementedHooks_[0] = IPolicyManager.PolicyHook.CreateExternalPosition;\n        implementedHooks_[1] = IPolicyManager.PolicyHook.PostCallOnExternalPosition;\n        implementedHooks_[2] = IPolicyManager.PolicyHook.ReactivateExternalPosition;\n        implementedHooks_[3] = IPolicyManager.PolicyHook.RemoveExternalPosition;\n\n        return implementedHooks_;\n    }\n\n    /// @notice Updates the policy settings for a fund\n    /// @param _comptrollerProxy The fund's ComptrollerProxy address\n    /// @param _encodedSettings Encoded settings to apply to a fund\n    /// @dev Assigns a new array of lists (does not add/remove lists nor update items in a list)\n    function updateFundSettings(address _comptrollerProxy, bytes calldata _encodedSettings)\n        external\n        override\n        onlyPolicyManager\n    {\n        __updateListsForFund(_comptrollerProxy, _encodedSettings);\n    }\n\n    /// @notice Apply the rule with the specified parameters of a PolicyHook\n    /// @param _comptrollerProxy The fund's ComptrollerProxy address\n    /// @param _hook The PolicyHook\n    /// @param _encodedArgs Encoded args with which to validate the rule\n    /// @return isValid_ True if the rule passes\n    /// @dev onlyPolicyManager validation not necessary, as state is not updated and no events are fired\n    function validateRule(address _comptrollerProxy, IPolicyManager.PolicyHook _hook, bytes calldata _encodedArgs)\n        external\n        override\n        returns (bool isValid_)\n    {\n        uint256 externalPositionTypeId;\n        address caller;\n        if (_hook == IPolicyManager.PolicyHook.CreateExternalPosition) {\n            (caller, externalPositionTypeId,) = __decodeCreateExternalPositionValidationData(_encodedArgs);\n        } else if (_hook == IPolicyManager.PolicyHook.PostCallOnExternalPosition) {\n            address externalPosition;\n            (caller, externalPosition,,,,) = __decodePostCallOnExternalPositionValidationData(_encodedArgs);\n            externalPositionTypeId = IExternalPositionProxy(externalPosition).getExternalPositionType();\n        } else if (_hook == IPolicyManager.PolicyHook.ReactivateExternalPosition) {\n            address externalPosition;\n            (caller, externalPosition) = __decodeReactivateExternalPositionValidationData(_encodedArgs);\n            externalPositionTypeId = IExternalPositionProxy(externalPosition).getExternalPositionType();\n        } else {\n            // PolicyHook.RemoveExternalPosition\n            address externalPosition;\n            (caller, externalPosition) = __decodeRemoveExternalPositionValidationData(_encodedArgs);\n            externalPositionTypeId = IExternalPositionProxy(externalPosition).getExternalPositionType();\n        }\n\n        return passesRule(_comptrollerProxy, caller, externalPositionTypeId);\n    }\n\n    // PUBLIC FUNCTIONS\n\n    /// @notice Checks whether a particular condition passes the rule for a particular fund\n    /// @param _comptrollerProxy The fund's ComptrollerProxy address\n    /// @param _caller The caller for which to check the rule\n    /// @param _externalPositionTypeId The external position type id for which to check the rule\n    /// @return isValid_ True if the rule passes\n    function passesRule(address _comptrollerProxy, address _caller, uint256 _externalPositionTypeId)\n        public\n        view\n        returns (bool isValid_)\n    {\n        if (_caller == IVault(IComptroller(_comptrollerProxy).getVaultProxy()).getOwner()) {\n            // fund owner passes rule by default\n            return true;\n        }\n\n        uint256[] memory listIds = getListIdsForFundAndUser(_comptrollerProxy, _caller);\n\n        if (listIds.length == 0) {\n            // A manager without any configured lists does not pass the rule\n            return false;\n        }\n\n        if (listIds[0] == BYPASS_FLAG) {\n            // The bypass flag is only accepted if in the first position in listIds\n            return true;\n        }\n\n        return UINT_LIST_REGISTRY_CONTRACT.isInSomeOfLists(listIds, _externalPositionTypeId);\n    }\n}\n"
+    },
+    "contracts/release/core/fund/comptroller/IComptroller.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport {IVault} from \"../vault/IVault.sol\";\n\n/// @title IComptroller Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IComptroller {\n    function activate(bool _isMigration) external;\n\n    function buyBackProtocolFeeShares(uint256 _sharesAmount) external;\n\n    function buyShares(uint256 _investmentAmount, uint256 _minSharesQuantity)\n        external\n        returns (uint256 sharesReceived_);\n\n    function buySharesOnBehalf(address _buyer, uint256 _investmentAmount, uint256 _minSharesQuantity)\n        external\n        returns (uint256 sharesReceived_);\n\n    function calcGav() external returns (uint256 gav_);\n\n    function calcGrossShareValue() external returns (uint256 grossShareValue_);\n\n    function callOnExtension(address _extension, uint256 _actionId, bytes calldata _callArgs) external;\n\n    function deployGasRelayPaymaster() external;\n\n    function depositToGasRelayPaymaster() external;\n\n    function destructActivated(uint256 _deactivateFeeManagerGasLimit, uint256 _payProtocolFeeGasLimit) external;\n\n    function destructUnactivated() external;\n\n    function doesAutoProtocolFeeSharesBuyback() external view returns (bool doesAutoBuyback_);\n\n    function getDenominationAsset() external view returns (address denominationAsset_);\n\n    function getDispatcher() external view returns (address dispatcher_);\n\n    function getExternalPositionManager() external view returns (address externalPositionManager_);\n\n    function getFeeManager() external view returns (address feeManager_);\n\n    function getFundDeployer() external view returns (address fundDeployer_);\n\n    function getGasRelayPaymaster() external view returns (address gasRelayPaymaster_);\n\n    function getIntegrationManager() external view returns (address integrationManager_);\n\n    function getLastSharesBoughtTimestampForAccount(address _who)\n        external\n        view\n        returns (uint256 lastSharesBoughtTimestamp_);\n\n    function getMlnToken() external view returns (address mlnToken_);\n\n    function getPolicyManager() external view returns (address policyManager_);\n\n    function getProtocolFeeReserve() external view returns (address protocolFeeReserve_);\n\n    function getSharesActionTimelock() external view returns (uint256 sharesActionTimelock_);\n\n    function getValueInterpreter() external view returns (address valueInterpreter_);\n\n    function getVaultProxy() external view returns (address vaultProxy_);\n\n    function getWethToken() external view returns (address wethToken_);\n\n    function init(address _denominationAsset, uint256 _sharesActionTimelock) external;\n\n    function permissionedVaultAction(IVault.VaultAction _action, bytes calldata _actionData) external;\n\n    function preTransferSharesHook(address _sender, address _recipient, uint256 _amount) external;\n\n    function preTransferSharesHookFreelyTransferable(address _sender) external view;\n\n    function redeemSharesForSpecificAssets(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _payoutAssets,\n        uint256[] calldata _payoutAssetPercentages\n    ) external returns (uint256[] memory payoutAmounts_);\n\n    function redeemSharesInKind(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _additionalAssets,\n        address[] calldata _assetsToSkip\n    ) external returns (address[] memory payoutAssets_, uint256[] memory payoutAmounts_);\n\n    function setAutoProtocolFeeSharesBuyback(bool _nextAutoProtocolFeeSharesBuyback) external;\n\n    function setGasRelayPaymaster(address _nextGasRelayPaymaster) external;\n\n    function setVaultProxy(address _vaultProxy) external;\n\n    function shutdownGasRelayPaymaster() external;\n\n    function vaultCallOnContract(address _contract, bytes4 _selector, bytes calldata _encodedArgs)\n        external\n        returns (bytes memory returnData_);\n}\n"
+    },
+    "contracts/release/core/fund/vault/IVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport {IExternalPositionVault} from \"../../../../persistent/vault/interfaces/IExternalPositionVault.sol\";\nimport {IFreelyTransferableSharesVault} from\n    \"../../../../persistent/vault/interfaces/IFreelyTransferableSharesVault.sol\";\nimport {IMigratableVault} from \"../../../../persistent/vault/interfaces/IMigratableVault.sol\";\nimport {IVaultCore} from \"../../../../persistent/vault/interfaces/IVaultCore.sol\";\n\n/// @title IVault Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IVault is IVaultCore, IMigratableVault, IFreelyTransferableSharesVault, IExternalPositionVault {\n    enum VaultAction {\n        None,\n        // Shares management\n        BurnShares,\n        MintShares,\n        TransferShares,\n        // Asset management\n        AddTrackedAsset,\n        ApproveAssetSpender,\n        RemoveTrackedAsset,\n        WithdrawAssetTo,\n        // External position management\n        AddExternalPosition,\n        CallOnExternalPosition,\n        RemoveExternalPosition\n    }\n\n    function addAssetManagers(address[] calldata _managers) external;\n\n    function addTrackedAsset(address _asset) external;\n\n    function burnShares(address _target, uint256 _amount) external;\n\n    function buyBackProtocolFeeShares(uint256 _sharesAmount, uint256 _mlnValue, uint256 _gav) external;\n\n    function callOnContract(address _contract, bytes calldata _callData) external returns (bytes memory returnData_);\n\n    function canManageAssets(address _who) external view returns (bool canManageAssets_);\n\n    function canRelayCalls(address _who) external view returns (bool canRelayCalls_);\n\n    function claimOwnership() external;\n\n    function getActiveExternalPositions() external view returns (address[] memory activeExternalPositions_);\n\n    function getExternalPositionManager() external view returns (address externalPositionManager_);\n\n    function getFundDeployer() external view returns (address fundDeployer_);\n\n    function getMlnBurner() external view returns (address mlnBurner_);\n\n    function getMlnToken() external view returns (address mlnToken_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getPositionsLimit() external view returns (uint256 positionsLimit_);\n\n    function getProtocolFeeReserve() external view returns (address protocolFeeReserve_);\n\n    function getProtocolFeeTracker() external view returns (address protocolFeeTracker_);\n\n    function getTrackedAssets() external view returns (address[] memory trackedAssets_);\n\n    function isActiveExternalPosition(address _externalPosition)\n        external\n        view\n        returns (bool isActiveExternalPosition_);\n\n    function isAssetManager(address _who) external view returns (bool isAssetManager_);\n\n    function isTrackedAsset(address _asset) external view returns (bool isTrackedAsset_);\n\n    function mintShares(address _target, uint256 _amount) external;\n\n    function payProtocolFee() external;\n\n    function receiveValidatedVaultAction(VaultAction _action, bytes calldata _actionData) external;\n\n    function removeAssetManagers(address[] calldata _managers) external;\n\n    function removeNominatedOwner() external;\n\n    function setAccessorForFundReconfiguration(address _nextAccessor) external;\n\n    function setFreelyTransferableShares() external;\n\n    function setMigrator(address _nextMigrator) external;\n\n    function setName(string calldata _nextName) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSymbol(string calldata _nextSymbol) external;\n\n    function transferShares(address _from, address _to, uint256 _amount) external;\n\n    function withdrawAssetTo(address _asset, address _target, uint256 _amount) external;\n}\n"
+    },
+    "contracts/persistent/external-positions/IExternalPositionProxy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IExternalPositionProxy interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice An interface for publicly accessible functions on the ExternalPositionProxy\ninterface IExternalPositionProxy {\n    function getExternalPositionType() external view returns (uint256 typeId_);\n\n    function getVaultProxy() external view returns (address vaultProxy_);\n\n    function receiveCallFromVault(bytes memory _data) external;\n}\n"
+    },
+    "contracts/release/extensions/policy-manager/IPolicyManager.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\n/// @title PolicyManager Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Interface for the PolicyManager\ninterface IPolicyManager {\n    // When updating PolicyHook, also update these functions in PolicyManager:\n    // 1. __getAllPolicyHooks()\n    // 2. __policyHookRestrictsCurrentInvestorActions()\n    enum PolicyHook {\n        PostBuyShares,\n        PostCallOnIntegration,\n        PreTransferShares,\n        RedeemSharesForSpecificAssets,\n        AddTrackedAssets,\n        RemoveTrackedAssets,\n        CreateExternalPosition,\n        PostCallOnExternalPosition,\n        RemoveExternalPosition,\n        ReactivateExternalPosition\n    }\n\n    function disablePolicyForFund(address _comptrollerProxy, address _policy) external;\n\n    function enablePolicyForFund(address _comptrollerProxy, address _policy, bytes calldata _settingsData) external;\n\n    function getEnabledPoliciesForFund(address _comptrollerProxy)\n        external\n        view\n        returns (address[] memory enabledPolicies_);\n\n    function getEnabledPoliciesOnHookForFund(address _comptrollerProxy, PolicyHook _hook)\n        external\n        view\n        returns (address[] memory enabledPolicies_);\n\n    function policyIsEnabledOnHookForFund(address _comptrollerProxy, PolicyHook _hook, address _policy)\n        external\n        view\n        returns (bool isEnabled_);\n\n    function updatePolicySettingsForFund(address _comptrollerProxy, address _policy, bytes calldata _settingsData)\n        external;\n\n    function validatePolicies(address _comptrollerProxy, PolicyHook _hook, bytes calldata _validationData) external;\n}\n"
+    },
+    "contracts/release/extensions/policy-manager/policies/utils/0.6.12/UintListRegistryPerUserPolicyBase.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport {IUintListRegistry} from \"../../../../../../persistent/uint-list-registry/IUintListRegistry.sol\";\nimport {IComptroller} from \"../../../../../core/fund/comptroller/IComptroller.sol\";\nimport {PolicyBase} from \"./PolicyBase.sol\";\n\n/// @title UintListRegistryPerUserPolicyBase Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Base contract inheritable by any policy that uses the UintListRegistry and wants to track lists per fund user\nabstract contract UintListRegistryPerUserPolicyBase is PolicyBase {\n    event ListsSetForFundAndUser(address indexed comptrollerProxy, address indexed user, uint256[] listIds);\n\n    IUintListRegistry internal immutable UINT_LIST_REGISTRY_CONTRACT;\n\n    mapping(address => mapping(address => uint256[])) private comptrollerProxyToUserToListIds;\n\n    constructor(address _policyUser, address _uintListRegistry) public PolicyBase(_policyUser) {\n        UINT_LIST_REGISTRY_CONTRACT = IUintListRegistry(_uintListRegistry);\n    }\n\n    // EXTERNAL FUNCTIONS\n\n    /// @notice Adds the initial policy settings for a fund\n    /// @param _comptrollerProxy The fund's ComptrollerProxy address\n    /// @param _encodedSettings Encoded settings to apply to a fund\n    function addFundSettings(address _comptrollerProxy, bytes calldata _encodedSettings)\n        external\n        virtual\n        override\n        onlyPolicyManager\n    {\n        __updateListsForFund(_comptrollerProxy, _encodedSettings);\n    }\n\n    // INTERNAL FUNCTIONS\n\n    /// @dev Helper to set the lists to be used by a given fund and for specific users\n    function __updateListsForFund(address _comptrollerProxy, bytes calldata _encodedSettings) internal {\n        (address[] memory users, bytes[] memory listsData) = __decodePolicySettings(_encodedSettings);\n\n        require(users.length == listsData.length, \"__updateListsForFund: unequal arrays\");\n\n        for (uint256 i; i < listsData.length; i++) {\n            __updateListsForFundAndUser(_comptrollerProxy, users[i], listsData[i]);\n        }\n    }\n\n    // PRIVATE FUNCTIONS\n\n    /// @dev Helper to create new list from encoded data\n    function __createUintListFromData(address _vaultProxy, bytes memory _newListData)\n        private\n        returns (uint256 listId_)\n    {\n        (IUintListRegistry.UpdateType updateType, uint256[] memory initialItems) = __decodeNewListData(_newListData);\n\n        return UINT_LIST_REGISTRY_CONTRACT.createList(_vaultProxy, updateType, initialItems);\n    }\n\n    /// @dev Helper to parse the args needed to create a new list\n    function __decodeNewListData(bytes memory _newListData)\n        private\n        pure\n        returns (IUintListRegistry.UpdateType updateType_, uint256[] memory initialItems_)\n    {\n        return abi.decode(_newListData, (IUintListRegistry.UpdateType, uint256[]));\n    }\n\n    /// @dev Helper to parse users and corresponding list data from encoded settings\n    function __decodePolicySettings(bytes calldata _encodedSettings)\n        private\n        pure\n        returns (address[] memory users_, bytes[] memory listsData_)\n    {\n        return abi.decode(_encodedSettings, (address[], bytes[]));\n    }\n\n    /// @dev Helper to parse the set of lists to be used for a given user\n    function __decodeUserListsData(bytes memory _listData)\n        private\n        pure\n        returns (uint256[] memory existingListIds_, bytes[] memory newListsData_)\n    {\n        return abi.decode(_listData, (uint256[], bytes[]));\n    }\n\n    /// @dev Helper to set the lists to be used by a given fund and user\n    /// This is done in a simple manner rather than the most gas-efficient way possible\n    /// (e.g., comparing already-stored items with an updated list would save on storage operations during updates).\n    function __updateListsForFundAndUser(address _comptrollerProxy, address _user, bytes memory _listData) private {\n        (uint256[] memory existingListIds, bytes[] memory newListsData) = __decodeUserListsData(_listData);\n\n        // Clear the previously stored list ids as needed\n        if (comptrollerProxyToUserToListIds[_comptrollerProxy][_user].length > 0) {\n            delete comptrollerProxyToUserToListIds[_comptrollerProxy][_user];\n        }\n\n        uint256[] memory nextListIds = new uint256[](existingListIds.length + newListsData.length);\n\n        if (nextListIds.length > 0) {\n            // Add existing list ids.\n            // No need to validate existence, policy will just fail if out-of-bounds index.\n            for (uint256 i; i < existingListIds.length; i++) {\n                nextListIds[i] = existingListIds[i];\n                comptrollerProxyToUserToListIds[_comptrollerProxy][_user].push(existingListIds[i]);\n            }\n\n            // Create and add any new lists\n            if (newListsData.length > 0) {\n                address vaultProxy = IComptroller(_comptrollerProxy).getVaultProxy();\n                for (uint256 i; i < newListsData.length; i++) {\n                    uint256 nextListIdsIndex = existingListIds.length + i;\n                    nextListIds[nextListIdsIndex] = __createUintListFromData(vaultProxy, newListsData[i]);\n                    comptrollerProxyToUserToListIds[_comptrollerProxy][_user].push(nextListIds[nextListIdsIndex]);\n                }\n            }\n        }\n\n        emit ListsSetForFundAndUser(_comptrollerProxy, _user, nextListIds);\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the list ids used by a given fund and user\n    /// @param _comptrollerProxy The ComptrollerProxy of the fund\n    /// @param _user The user of the fund\n    /// @return listIds_ The list ids\n    function getListIdsForFundAndUser(address _comptrollerProxy, address _user)\n        public\n        view\n        returns (uint256[] memory listIds_)\n    {\n        return comptrollerProxyToUserToListIds[_comptrollerProxy][_user];\n    }\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IExternalPositionVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IExternalPositionVault interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// Provides an interface to get the externalPositionLib for a given type from the Vault\ninterface IExternalPositionVault {\n    function getExternalPositionLibForType(uint256) external view returns (address);\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IFreelyTransferableSharesVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IFreelyTransferableSharesVault Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Provides the interface for determining whether a vault's shares\n/// are guaranteed to be freely transferable.\n/// @dev DO NOT EDIT CONTRACT\ninterface IFreelyTransferableSharesVault {\n    function sharesAreFreelyTransferable() external view returns (bool sharesAreFreelyTransferable_);\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IMigratableVault Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @dev DO NOT EDIT CONTRACT\ninterface IMigratableVault {\n    function canMigrate(address _who) external view returns (bool canMigrate_);\n\n    function init(address _owner, address _accessor, string calldata _fundName) external;\n\n    function setAccessor(address _nextAccessor) external;\n\n    function setVaultLib(address _nextVaultLib) external;\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IVaultCore.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IVaultCore interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Interface for getters of core vault storage\n/// @dev DO NOT EDIT CONTRACT\ninterface IVaultCore {\n    function getAccessor() external view returns (address accessor_);\n\n    function getCreator() external view returns (address creator_);\n\n    function getMigrator() external view returns (address migrator_);\n\n    function getOwner() external view returns (address owner_);\n}\n"
+    },
+    "contracts/persistent/uint-list-registry/IUintListRegistry.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\npragma experimental ABIEncoderV2;\n\n/// @title IUintListRegistry Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IUintListRegistry {\n    enum UpdateType {\n        None,\n        AddOnly,\n        RemoveOnly,\n        AddAndRemove\n    }\n\n    /////////////////////\n    // LIST MANAGEMENT //\n    /////////////////////\n\n    function addToList(uint256 _id, uint256[] calldata _items) external;\n\n    function attestLists(uint256[] calldata _ids, string[] calldata _descriptions) external;\n\n    function createList(address _owner, UpdateType _updateType, uint256[] calldata _initialItems)\n        external\n        returns (uint256 id_);\n\n    function removeFromList(uint256 _id, uint256[] calldata _items) external;\n\n    function setListOwner(uint256 _id, address _nextOwner) external;\n\n    function setListUpdateType(uint256 _id, UpdateType _nextUpdateType) external;\n\n    /////////////////\n    // LIST SEARCH //\n    /////////////////\n\n    function areAllInAllLists(uint256[] memory _ids, uint256[] memory _items)\n        external\n        view\n        returns (bool areAllInAllLists_);\n\n    function areAllInList(uint256 _id, uint256[] memory _items) external view returns (bool areAllInList_);\n\n    function areAllInSomeOfLists(uint256[] memory _ids, uint256[] memory _items)\n        external\n        view\n        returns (bool areAllInSomeOfLists_);\n\n    function areAllNotInAnyOfLists(uint256[] memory _ids, uint256[] memory _items)\n        external\n        view\n        returns (bool areAllNotInAnyOfLists_);\n\n    function areAllNotInList(uint256 _id, uint256[] memory _items) external view returns (bool areAllNotInList_);\n\n    function isInAllLists(uint256[] memory _ids, uint256 _item) external view returns (bool isInAllLists_);\n\n    function isInList(uint256 _id, uint256 _item) external view returns (bool isInList_);\n\n    function isInSomeOfLists(uint256[] memory _ids, uint256 _item) external view returns (bool isInSomeOfLists_);\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    function getListCount() external view returns (uint256 count_);\n\n    function getListOwner(uint256 _id) external view returns (address owner_);\n\n    function getListUpdateType(uint256 _id) external view returns (UpdateType updateType_);\n}\n"
+    },
+    "contracts/release/extensions/policy-manager/policies/utils/0.6.12/PolicyBase.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport {IPolicy} from \"../../../IPolicy.sol\";\n\n/// @title PolicyBase Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Abstract base contract for all policies\nabstract contract PolicyBase is IPolicy {\n    address internal immutable POLICY_MANAGER;\n\n    modifier onlyPolicyManager() {\n        require(msg.sender == POLICY_MANAGER, \"Only the PolicyManager can make this call\");\n        _;\n    }\n\n    constructor(address _policyManager) public {\n        POLICY_MANAGER = _policyManager;\n    }\n\n    /// @notice Validates and initializes a policy as necessary prior to fund activation\n    /// @dev Unimplemented by default, can be overridden by the policy\n    function activateForFund(address) external virtual override {\n        return;\n    }\n\n    /// @notice Whether or not the policy can be disabled\n    /// @return canDisable_ True if the policy can be disabled\n    /// @dev False by default, can be overridden by the policy\n    function canDisable() external pure virtual override returns (bool canDisable_) {\n        return false;\n    }\n\n    /// @notice Updates the policy settings for a fund\n    /// @dev Disallowed by default, can be overridden by the policy\n    function updateFundSettings(address, bytes calldata) external virtual override {\n        revert(\"updateFundSettings: Updates not allowed for this policy\");\n    }\n\n    //////////////////////////////\n    // VALIDATION DATA DECODING //\n    //////////////////////////////\n\n    /// @dev Helper to parse validation arguments from encoded data for AddTrackedAssets policy hook\n    function __decodeAddTrackedAssetsValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (address caller_, address[] memory assets_)\n    {\n        return abi.decode(_validationData, (address, address[]));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for CreateExternalPosition policy hook\n    function __decodeCreateExternalPositionValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (address caller_, uint256 typeId_, bytes memory initializationData_)\n    {\n        return abi.decode(_validationData, (address, uint256, bytes));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for PreTransferShares policy hook\n    function __decodePreTransferSharesValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (address sender_, address recipient_, uint256 amount_)\n    {\n        return abi.decode(_validationData, (address, address, uint256));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for PostBuyShares policy hook\n    function __decodePostBuySharesValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (address buyer_, uint256 investmentAmount_, uint256 sharesIssued_, uint256 gav_)\n    {\n        return abi.decode(_validationData, (address, uint256, uint256, uint256));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for PostCallOnExternalPosition policy hook\n    function __decodePostCallOnExternalPositionValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (\n            address caller_,\n            address externalPosition_,\n            address[] memory assetsToTransfer_,\n            uint256[] memory amountsToTransfer_,\n            address[] memory assetsToReceive_,\n            bytes memory encodedActionData_\n        )\n    {\n        return abi.decode(_validationData, (address, address, address[], uint256[], address[], bytes));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for PostCallOnIntegration policy hook\n    function __decodePostCallOnIntegrationValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (\n            address caller_,\n            address adapter_,\n            bytes4 selector_,\n            address[] memory incomingAssets_,\n            uint256[] memory incomingAssetAmounts_,\n            address[] memory spendAssets_,\n            uint256[] memory spendAssetAmounts_\n        )\n    {\n        return abi.decode(_validationData, (address, address, bytes4, address[], uint256[], address[], uint256[]));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for ReactivateExternalPosition policy hook\n    function __decodeReactivateExternalPositionValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (address caller_, address externalPosition_)\n    {\n        return abi.decode(_validationData, (address, address));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for RedeemSharesForSpecificAssets policy hook\n    function __decodeRedeemSharesForSpecificAssetsValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (\n            address redeemer_,\n            address recipient_,\n            uint256 sharesToRedeemPostFees_,\n            address[] memory assets_,\n            uint256[] memory assetAmounts_,\n            uint256 gavPreRedeem_\n        )\n    {\n        return abi.decode(_validationData, (address, address, uint256, address[], uint256[], uint256));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for RemoveExternalPosition policy hook\n    function __decodeRemoveExternalPositionValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (address caller_, address externalPosition_)\n    {\n        return abi.decode(_validationData, (address, address));\n    }\n\n    /// @dev Helper to parse validation arguments from encoded data for RemoveTrackedAssets policy hook\n    function __decodeRemoveTrackedAssetsValidationData(bytes memory _validationData)\n        internal\n        pure\n        returns (address caller_, address[] memory assets_)\n    {\n        return abi.decode(_validationData, (address, address[]));\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the `POLICY_MANAGER` variable value\n    /// @return policyManager_ The `POLICY_MANAGER` variable value\n    function getPolicyManager() external view returns (address policyManager_) {\n        return POLICY_MANAGER;\n    }\n}\n"
+    },
+    "contracts/release/extensions/policy-manager/IPolicy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport {IPolicyManager} from \"./IPolicyManager.sol\";\n\n/// @title Policy Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IPolicy {\n    function activateForFund(address _comptrollerProxy) external;\n\n    function addFundSettings(address _comptrollerProxy, bytes calldata _encodedSettings) external;\n\n    function canDisable() external pure returns (bool canDisable_);\n\n    function identifier() external pure returns (string memory identifier_);\n\n    function implementedHooks() external pure returns (IPolicyManager.PolicyHook[] memory implementedHooks_);\n\n    function updateFundSettings(address _comptrollerProxy, bytes calldata _encodedSettings) external;\n\n    function validateRule(address _comptrollerProxy, IPolicyManager.PolicyHook _hook, bytes calldata _encodedArgs)\n        external\n        returns (bool isValid_);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.6.12+commit.27d51765"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_policyManager",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_uintListRegistry",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "comptrollerProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "listIds",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "ListsSetForFundAndUser",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "BYPASS_FLAG",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "activateForFund",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_comptrollerProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_encodedSettings",
+              "type": "bytes"
+            }
+          ],
+          "name": "addFundSettings",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "canDisable",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "canDisable_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_comptrollerProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_user",
+              "type": "address"
+            }
+          ],
+          "name": "getListIdsForFundAndUser",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "listIds_",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getPolicyManager",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "policyManager_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "identifier",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "identifier_",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "implementedHooks",
+          "outputs": [
+            {
+              "internalType": "enum IPolicyManager.PolicyHook[]",
+              "name": "implementedHooks_",
+              "type": "uint8[]"
+            }
+          ],
+          "stateMutability": "pure",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_comptrollerProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_caller",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_externalPositionTypeId",
+              "type": "uint256"
+            }
+          ],
+          "name": "passesRule",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isValid_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_comptrollerProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_encodedSettings",
+              "type": "bytes"
+            }
+          ],
+          "name": "updateFundSettings",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_comptrollerProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "enum IPolicyManager.PolicyHook",
+              "name": "_hook",
+              "type": "uint8"
+            },
+            {
+              "internalType": "bytes",
+              "name": "_encodedArgs",
+              "type": "bytes"
+            }
+          ],
+          "name": "validateRule",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isValid_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Enzyme Council <security@enzyme.finance>",
+        "kind": "dev",
+        "methods": {
+          "activateForFund(address)": {
+            "details": "Unimplemented by default, can be overridden by the policy"
+          },
+          "addFundSettings(address,bytes)": {
+            "params": {
+              "_comptrollerProxy": "The fund's ComptrollerProxy address",
+              "_encodedSettings": "Encoded settings to apply to a fund"
+            }
+          },
+          "canDisable()": {
+            "returns": {
+              "canDisable_": "True if the policy can be disabled"
+            }
+          },
+          "getListIdsForFundAndUser(address,address)": {
+            "params": {
+              "_comptrollerProxy": "The ComptrollerProxy of the fund",
+              "_user": "The user of the fund"
+            },
+            "returns": {
+              "listIds_": "The list ids"
+            }
+          },
+          "getPolicyManager()": {
+            "returns": {
+              "policyManager_": "The `POLICY_MANAGER` variable value"
+            }
+          },
+          "identifier()": {
+            "returns": {
+              "identifier_": "The identifier string"
+            }
+          },
+          "implementedHooks()": {
+            "returns": {
+              "implementedHooks_": "The implemented PolicyHooks"
+            }
+          },
+          "passesRule(address,address,uint256)": {
+            "params": {
+              "_caller": "The caller for which to check the rule",
+              "_comptrollerProxy": "The fund's ComptrollerProxy address",
+              "_externalPositionTypeId": "The external position type id for which to check the rule"
+            },
+            "returns": {
+              "isValid_": "True if the rule passes"
+            }
+          },
+          "updateFundSettings(address,bytes)": {
+            "details": "Assigns a new array of lists (does not add/remove lists nor update items in a list)",
+            "params": {
+              "_comptrollerProxy": "The fund's ComptrollerProxy address",
+              "_encodedSettings": "Encoded settings to apply to a fund"
+            }
+          },
+          "validateRule(address,uint8,bytes)": {
+            "details": "onlyPolicyManager validation not necessary, as state is not updated and no events are fired",
+            "params": {
+              "_comptrollerProxy": "The fund's ComptrollerProxy address",
+              "_encodedArgs": "Encoded args with which to validate the rule",
+              "_hook": "The PolicyHook"
+            },
+            "returns": {
+              "isValid_": "True if the rule passes"
+            }
+          }
+        },
+        "title": "AllowedExternalPositionTypesPerManagerPolicy Contract",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "activateForFund(address)": {
+            "notice": "Validates and initializes a policy as necessary prior to fund activation"
+          },
+          "addFundSettings(address,bytes)": {
+            "notice": "Adds the initial policy settings for a fund"
+          },
+          "canDisable()": {
+            "notice": "Whether or not the policy can be disabled"
+          },
+          "getListIdsForFundAndUser(address,address)": {
+            "notice": "Gets the list ids used by a given fund and user"
+          },
+          "getPolicyManager()": {
+            "notice": "Gets the `POLICY_MANAGER` variable value"
+          },
+          "identifier()": {
+            "notice": "Provides a constant string identifier for a policy"
+          },
+          "implementedHooks()": {
+            "notice": "Gets the implemented PolicyHooks for a policy"
+          },
+          "passesRule(address,address,uint256)": {
+            "notice": "Checks whether a particular condition passes the rule for a particular fund"
+          },
+          "updateFundSettings(address,bytes)": {
+            "notice": "Updates the policy settings for a fund"
+          },
+          "validateRule(address,uint8,bytes)": {
+            "notice": "Apply the rule with the specified parameters of a PolicyHook"
+          }
+        },
+        "notice": "A policy that limits which external position types an asset manager can use for a given fund",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/release/extensions/policy-manager/policies/asset-managers/AllowedExternalPositionTypesPerManagerPolicy.sol": "AllowedExternalPositionTypesPerManagerPolicy"
+      },
+      "evmVersion": "istanbul",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "none"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": false
+        },
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "sources": {
+      "contracts/persistent/external-positions/IExternalPositionProxy.sol": {
+        "keccak256": "0x152dc9102037596ef766b7577038e6e48d5e30cb6c352d5f0536ddbcab872c26",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://e6540f160daa81c278e75a4f466e091955d96b147819c3f5cf79f1a3dcd20de7",
+          "dweb:/ipfs/QmStfeMuW85zU7UGkXkMvUCCnqgp5Y4bGmcWkKT4NcRUpe"
+        ]
+      },
+      "contracts/persistent/uint-list-registry/IUintListRegistry.sol": {
+        "keccak256": "0xede284d77a089f85fb7f949bcf19947fae59f3b86b969cb06b756a5a8bf3a94f",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://40a246b1f9b2073b91aede1eb6213240125708c6202a0cd0bbd10f9f4aa1e4dd",
+          "dweb:/ipfs/QmcNiuNGcuUzFeDbtpGqYPaEFPwTEBQ2TfchD2gd2x8ogN"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IExternalPositionVault.sol": {
+        "keccak256": "0xb6cf518c8c94ce9f8fae7530a2375e29120b31711fc339f4ce0e714c31282fea",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://fa9d66b8f0452c172b0a655ccb33fc772d7102873a54e1a446413e62632c8cdf",
+          "dweb:/ipfs/Qmdm3UsraUXtTusrJAPg4LYzAhJTkUFwieK31NitNMbDyn"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IFreelyTransferableSharesVault.sol": {
+        "keccak256": "0xdb36ef7f61945f8488b7f0acc74f26d8ce1a41519f03bc6f1fc86fc3c31c0384",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://09b2785ee742e908ae930d5b3ddc3aa96f646d1a17e07a3589eff55eccd77bf3",
+          "dweb:/ipfs/QmRZWjsy94TENGUjymuaFSoLYkjd8jWiqWoqMwAJm2rW49"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+        "keccak256": "0x1b1956b2ac590528410b7f4589d6c3f550c79cfd2532162a6de3a4fceacb5554",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://151ea25b89825b17ba2925932ae76415e8814430341e4cab383e6925609a4ef2",
+          "dweb:/ipfs/QmeqfHJdbupwPp2EEiiRjQhSs7GJFS2N57RhAzkjPRb9gV"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IVaultCore.sol": {
+        "keccak256": "0x0ff4789582215631d19bf47c3f37119881a92d6491a20d44c7cbf961d840a671",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://a41cf871b473629b835c6397f2cdaa4e0aea793e4d02273b3e1b89772ca8a74f",
+          "dweb:/ipfs/QmS8QMM6Sakx6H4F6UjXb24gRSscdJrMpzzgkwTEWaaen8"
+        ]
+      },
+      "contracts/release/core/fund/comptroller/IComptroller.sol": {
+        "keccak256": "0xf413b701374fcae1b14c375e994587c3ecb60da500093a462bc85aaddc2f9a4a",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://0f900e775f7d8b57a318dbd5704758e64c6bb41d04ec5c1578e4fbdf5437c696",
+          "dweb:/ipfs/QmQR8x6di6jewrim9kLj14F91r3MKyCjpK9TGYdTdw1JT1"
+        ]
+      },
+      "contracts/release/core/fund/vault/IVault.sol": {
+        "keccak256": "0x5b87dd5ea62691db4aa554b7494afd2578b89adcfb6744879de86c072ade0b20",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://c7be9a0df2d22adce56fb50300ffececacbdb8a7547530d7e4b949b53dd1e27b",
+          "dweb:/ipfs/QmU65178Un3BouvmhxPRKLF6AzBAMp8HRfLgX8a1rPQmhX"
+        ]
+      },
+      "contracts/release/extensions/policy-manager/IPolicy.sol": {
+        "keccak256": "0x1932c9766eb0125a6c66224b929c51f62cf7013b1e89314cc3160205354757e2",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://bf8967c4b3728e87a783f892d2fae1760a0ec058d55829ca1a3a7fa2a662d46c",
+          "dweb:/ipfs/QmXiN3WFS8xaBjxcV8yWd7svG33vJ526Dm1QXBXY94tHmu"
+        ]
+      },
+      "contracts/release/extensions/policy-manager/IPolicyManager.sol": {
+        "keccak256": "0x334a12332f99dc02f140e77c508bcdaf598bc51f64102c8a7d6e43fec83ff5f1",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://cdd83af77baed8a47a9e0361d396ed7e12a01a8ca6aa72da47b1f02bcde39684",
+          "dweb:/ipfs/QmSJVkyU7BfxzWNRxa6iZguYrURnYUS86KGGuMaKNcDHLF"
+        ]
+      },
+      "contracts/release/extensions/policy-manager/policies/asset-managers/AllowedExternalPositionTypesPerManagerPolicy.sol": {
+        "keccak256": "0x572362e84c0d76183e76be3b77cfb8e76822ccbd5b918d6a7146f8b369ba2df6",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://448873b560f42f172228c43f8af82c46f584f1bd86bb4c0a5e6ed16886f803cd",
+          "dweb:/ipfs/QmX2PpABN2qMzJSQHnTDzDw27MZGYEKNddgK4g1899j8CU"
+        ]
+      },
+      "contracts/release/extensions/policy-manager/policies/utils/0.6.12/PolicyBase.sol": {
+        "keccak256": "0x1c38be4bccf9a0667116c066f701635cd737d46d11e2b95346ba202506ea362b",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://a14aa620f87e429f0fc332f212d3f445f8d3910125f0b9c617180bdc943a7922",
+          "dweb:/ipfs/QmezuRYeKvGE7g6GApqHBo36bPcNnDuAu7wjUR6khW3hWC"
+        ]
+      },
+      "contracts/release/extensions/policy-manager/policies/utils/0.6.12/UintListRegistryPerUserPolicyBase.sol": {
+        "keccak256": "0x0666c30edb8fea1725964d49e626e9213c714d2edfbebe3ce826daaefb2980a6",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://1fce7ee6f50e414098979d647f213bb32ab9b5cfb3843dddd2ca7dc2027eb21b",
+          "dweb:/ipfs/QmbFeTRQas2a9gpxyPQZNaSp4XNtPUxTkowH9fkyzvSX8k"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.6.12+commit.27d51765",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "none",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "details": {
+          "yul": false
+        },
+        "enabled": true
+      },
+      "evmVersion": "istanbul",
+      "remappings": [
+        "@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        "@uniswap/v3-core/=lib/uniswap-v3-core/",
+        "ds-test/=lib/forge-std/lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        "openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        "openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        "uniswap-v3-core/=lib/uniswap-v3-core/",
+        "uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        "uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/",
+        "uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/"
+      ]
+    },
+    "name": "AllowedExternalPositionTypesPerManagerPolicy",
+    "fullyQualifiedName": "contracts/release/extensions/policy-manager/policies/asset-managers/AllowedExternalPositionTypesPerManagerPolicy.sol:AllowedExternalPositionTypesPerManagerPolicy"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "36700757",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-06-26T10:39:11Z",
+  "match": "match",
+  "chainId": "8453",
+  "address": "0x31AF0ed80bc630522035c114972C3Bec574CEe60"
+}

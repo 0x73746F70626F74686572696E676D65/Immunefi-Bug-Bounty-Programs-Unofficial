@@ -1,0 +1,253 @@
+{
+  "sources": {
+    "contracts/external-interfaces/IChainlinkAggregator.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IChainlinkAggregator Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IChainlinkAggregator {\n    function decimals() external view returns (uint8);\n\n    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);\n}\n"
+    },
+    "contracts/release/infrastructure/price-feeds/primitives/IChainlinkPriceFeedMixin.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IChainlinkPriceFeedMixin Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Interface for ChainlinkPriceFeedMixin\ninterface IChainlinkPriceFeedMixin {\n    enum RateAsset {\n        ETH,\n        USD\n    }\n\n    struct AggregatorInfo {\n        address aggregator;\n        RateAsset rateAsset;\n    }\n\n    function getAggregatorForPrimitive(address _primitive) external view returns (address aggregator_);\n\n    function getEthUsdAggregator() external view returns (address ethUsdAggregator_);\n\n    function getRateAssetForPrimitive(address _primitive) external view returns (RateAsset rateAsset_);\n\n    function getStaleRateThreshold() external view returns (uint256 staleRateThreshold_);\n\n    function getUnitForPrimitive(address _primitive) external view returns (uint256 unit_);\n\n    function getWethToken() external view returns (address wethToken_);\n}\n"
+    },
+    "contracts/release/infrastructure/price-feeds/primitives/NonStandardPrecisionSimulatedAggregator.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.8.19;\n\nimport {IChainlinkAggregator} from \"../../../../external-interfaces/IChainlinkAggregator.sol\";\nimport {IChainlinkPriceFeedMixin} from \"./IChainlinkPriceFeedMixin.sol\";\n\n/// @title NonStandardPrecisionSimulatedAggregator Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A simulated aggregator to support a Chainlink-like aggregator that uses\n/// a non-standard number of decimals for precision\ncontract NonStandardPrecisionSimulatedAggregator {\n    enum ScaleType {\n        Up,\n        Down\n    }\n\n    error NegativeAnswer();\n\n    error NoScalingNeeded();\n\n    error UnsupportedRateAsset();\n\n    uint8 private constant STANDARD_ETH_RATE_DECIMALS = 18;\n    uint8 private constant STANDARD_USD_RATE_DECIMALS = 8;\n\n    IChainlinkAggregator private immutable AGGREGATOR;\n    int256 private immutable SCALE_FACTOR;\n    ScaleType private immutable SCALE_TYPE;\n    uint8 private immutable STANDARD_RATE_DECIMALS;\n\n    constructor(IChainlinkAggregator _aggregator, IChainlinkPriceFeedMixin.RateAsset _rateAsset) {\n        AGGREGATOR = _aggregator;\n\n        // Set the usual decimal precision used for Chainlink feeds of the given rate asset\n        uint8 standardRateDecimals;\n        if (_rateAsset == IChainlinkPriceFeedMixin.RateAsset.ETH) {\n            standardRateDecimals = STANDARD_ETH_RATE_DECIMALS;\n        } else if (_rateAsset == IChainlinkPriceFeedMixin.RateAsset.USD) {\n            standardRateDecimals = STANDARD_USD_RATE_DECIMALS;\n        } else {\n            revert UnsupportedRateAsset();\n        }\n        STANDARD_RATE_DECIMALS = standardRateDecimals;\n\n        // Set the scale type and factor to convert to the standard rate precision,\n        // given the actual aggregator's decimal precision\n        uint256 scaleFactorUint;\n        ScaleType scaleType;\n        uint8 aggregatorDecimals = _aggregator.decimals();\n        if (aggregatorDecimals > standardRateDecimals) {\n            scaleType = ScaleType.Down;\n            scaleFactorUint = 10 ** (aggregatorDecimals - standardRateDecimals);\n        } else if (aggregatorDecimals < standardRateDecimals) {\n            scaleType = ScaleType.Up;\n            scaleFactorUint = 10 ** (standardRateDecimals - aggregatorDecimals);\n        } else {\n            revert NoScalingNeeded();\n        }\n        SCALE_FACTOR = int256(scaleFactorUint);\n        SCALE_TYPE = scaleType;\n    }\n\n    /// @notice The decimals used for rate precision of this simulated aggregator\n    /// @return decimals_ The number of decimals\n    function decimals() external view returns (uint8 decimals_) {\n        return STANDARD_RATE_DECIMALS;\n    }\n\n    /// @notice The latest round data for this simulated aggregator\n    /// @return roundId_ The `roundId` value returned by the Chainlink aggregator\n    /// @return answer_ The `answer` value returned by the Chainlink aggregator, converted to standard rate decimals\n    /// @return startedAt_ The `startedAt` value returned by the Chainlink aggregator\n    /// @return updatedAt_ The `updatedAt` value returned by the Chainlink aggregator\n    /// @return answeredInRound_ The `answeredInRound` value returned by the Chainlink aggregator\n    /// @dev All values are returned directly from the target Chainlink-like aggregator,\n    /// other than `answer_`, which is converted to the standard decimal precision for the rate asset\n    /// and is given the local precision of `DECIMALS`.\n    function latestRoundData()\n        external\n        view\n        returns (uint80 roundId_, int256 answer_, uint256 startedAt_, uint256 updatedAt_, uint80 answeredInRound_)\n    {\n        int256 aggregatorAnswer;\n        (roundId_, aggregatorAnswer, startedAt_, updatedAt_, answeredInRound_) = AGGREGATOR.latestRoundData();\n\n        if (aggregatorAnswer < 0) {\n            revert NegativeAnswer();\n        }\n\n        if (SCALE_TYPE == ScaleType.Up) {\n            answer_ = aggregatorAnswer * SCALE_FACTOR;\n        } else {\n            answer_ = aggregatorAnswer / SCALE_FACTOR;\n        }\n\n        return (roundId_, answer_, startedAt_, updatedAt_, answeredInRound_);\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.19+commit.7dd6d404"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "contract IChainlinkAggregator",
+              "name": "_aggregator",
+              "type": "address"
+            },
+            {
+              "internalType": "enum IChainlinkPriceFeedMixin.RateAsset",
+              "name": "_rateAsset",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "NegativeAnswer",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NoScalingNeeded",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "UnsupportedRateAsset",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "decimals",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "decimals_",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "latestRoundData",
+          "outputs": [
+            {
+              "internalType": "uint80",
+              "name": "roundId_",
+              "type": "uint80"
+            },
+            {
+              "internalType": "int256",
+              "name": "answer_",
+              "type": "int256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "startedAt_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "updatedAt_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint80",
+              "name": "answeredInRound_",
+              "type": "uint80"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Enzyme Council <security@enzyme.finance>",
+        "kind": "dev",
+        "methods": {
+          "decimals()": {
+            "returns": {
+              "decimals_": "The number of decimals"
+            }
+          },
+          "latestRoundData()": {
+            "details": "All values are returned directly from the target Chainlink-like aggregator, other than `answer_`, which is converted to the standard decimal precision for the rate asset and is given the local precision of `DECIMALS`.",
+            "returns": {
+              "answer_": "The `answer` value returned by the Chainlink aggregator, converted to standard rate decimals",
+              "answeredInRound_": "The `answeredInRound` value returned by the Chainlink aggregator",
+              "roundId_": "The `roundId` value returned by the Chainlink aggregator",
+              "startedAt_": "The `startedAt` value returned by the Chainlink aggregator",
+              "updatedAt_": "The `updatedAt` value returned by the Chainlink aggregator"
+            }
+          }
+        },
+        "title": "NonStandardPrecisionSimulatedAggregator Contract",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "decimals()": {
+            "notice": "The decimals used for rate precision of this simulated aggregator"
+          },
+          "latestRoundData()": {
+            "notice": "The latest round data for this simulated aggregator"
+          }
+        },
+        "notice": "A simulated aggregator to support a Chainlink-like aggregator that uses a non-standard number of decimals for precision",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/release/infrastructure/price-feeds/primitives/NonStandardPrecisionSimulatedAggregator.sol": "NonStandardPrecisionSimulatedAggregator"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "appendCBOR": false,
+        "bytecodeHash": "none"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "inliner": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": false
+        },
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "sources": {
+      "contracts/external-interfaces/IChainlinkAggregator.sol": {
+        "keccak256": "0x961ab9ed2948cb47cd46ee35fdffcc5ee2ff93c108465b443f3893267e2b26f2",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://2e06bbc884cd54843c5ea8df13ae37dc8fb45324c6595edc01a380db5e836a77",
+          "dweb:/ipfs/QmYHqYRVErWnQyx2eu8rFQKVshoCgPFbRZr7vqY3QqG8j8"
+        ]
+      },
+      "contracts/release/infrastructure/price-feeds/primitives/IChainlinkPriceFeedMixin.sol": {
+        "keccak256": "0x7d4b13a93c829d317ad3b0e92f4c5afac9de963739601bef1d6a387f280b3729",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://39fa072289c7ac153720bd9274f2598c2b30a7cc517b8c66a381921caa2f64f1",
+          "dweb:/ipfs/QmViw6naHwhyghGtLmd2h2sGH5ragsy1oza2yjzPeoqgmr"
+        ]
+      },
+      "contracts/release/infrastructure/price-feeds/primitives/NonStandardPrecisionSimulatedAggregator.sol": {
+        "keccak256": "0xe967946d9c56f7e26968f46f3ddca8cf3e79170774682c415979d420fd7b5d11",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://75a8f5163d371e420eecc6380c16ccab0838d5609ee506d4c951657937cf781b",
+          "dweb:/ipfs/QmPKuRfjmZsoaWtTbzfxdjXBgvW56p4wHPp9wN6W181xSz"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.19+commit.7dd6d404",
+    "compilerSettings": {
+      "metadata": {
+        "appendCBOR": false,
+        "bytecodeHash": "none"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "details": {
+          "cse": true,
+          "yul": false,
+          "inliner": true,
+          "peephole": true,
+          "deduplicate": true,
+          "orderLiterals": true,
+          "jumpdestRemover": true,
+          "constantOptimizer": true
+        }
+      },
+      "evmVersion": "paris",
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "name": "NonStandardPrecisionSimulatedAggregator",
+    "fullyQualifiedName": "contracts/release/infrastructure/price-feeds/primitives/NonStandardPrecisionSimulatedAggregator.sol:NonStandardPrecisionSimulatedAggregator"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "21264376",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-03-06T01:15:39Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0xCa289456c31392074a804A7Db0AAc918fB36cf36"
+}

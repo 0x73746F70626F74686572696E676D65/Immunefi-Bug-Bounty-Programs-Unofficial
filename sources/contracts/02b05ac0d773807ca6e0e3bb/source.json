@@ -1,0 +1,1086 @@
+{
+  "sources": {
+    "contracts/persistent/vault/VaultProxy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"./utils/ProxiableVaultLib.sol\";\n\n/// @title VaultProxy Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A proxy contract for all VaultProxy instances, slightly modified from EIP-1822\n/// @dev Adapted from the recommended implementation of a Proxy in EIP-1822, updated for solc 0.6.12,\n/// and using the EIP-1967 storage slot for the proxiable implementation.\n/// i.e., `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`, which is\n/// \"0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc\"\n/// See: https://eips.ethereum.org/EIPS/eip-1822\ncontract VaultProxy {\n    constructor(bytes memory _constructData, address _vaultLib) public {\n        // \"0x027b9570e9fedc1a80b937ae9a06861e5faef3992491af30b684a64b3fbec7a5\" corresponds to\n        // `bytes32(keccak256('mln.proxiable.vaultlib'))`\n        require(\n            bytes32(0x027b9570e9fedc1a80b937ae9a06861e5faef3992491af30b684a64b3fbec7a5)\n                == ProxiableVaultLib(_vaultLib).proxiableUUID(),\n            \"constructor: _vaultLib not compatible\"\n        );\n\n        assembly {\n            // solium-disable-line\n            sstore(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc, _vaultLib)\n        }\n\n        (bool success, bytes memory returnData) = _vaultLib.delegatecall(_constructData); // solium-disable-line\n        require(success, string(returnData));\n    }\n\n    fallback() external payable {\n        assembly {\n            // solium-disable-line\n            let contractLogic := sload(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc)\n            calldatacopy(0x0, 0x0, calldatasize())\n            let success := delegatecall(sub(gas(), 10000), contractLogic, 0x0, calldatasize(), 0, 0)\n            let retSz := returndatasize()\n            returndatacopy(0, 0, retSz)\n            switch success\n            case 0 { revert(0, retSz) }\n            default { return(0, retSz) }\n        }\n    }\n}\n"
+    },
+    "contracts/persistent/dispatcher/Dispatcher.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"../vault/interfaces/IMigratableVault.sol\";\nimport \"../vault/VaultProxy.sol\";\nimport \"./IDispatcher.sol\";\nimport \"./IMigrationHookHandler.sol\";\n\n/// @title Dispatcher Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice The top-level contract linking multiple releases.\n/// It handles the deployment of new VaultProxy instances,\n/// and the regulation of fund migration from a previous release to the current one.\n/// It can also be referred to for access-control based on this contract's owner.\n/// @dev DO NOT EDIT CONTRACT\ncontract Dispatcher is IDispatcher {\n    event CurrentFundDeployerSet(address prevFundDeployer, address nextFundDeployer);\n\n    event MigrationCancelled(\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib,\n        uint256 executableTimestamp\n    );\n\n    event MigrationExecuted(\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib,\n        uint256 executableTimestamp\n    );\n\n    event MigrationSignaled(\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib,\n        uint256 executableTimestamp\n    );\n\n    event MigrationTimelockSet(uint256 prevTimelock, uint256 nextTimelock);\n\n    event NominatedOwnerSet(address indexed nominatedOwner);\n\n    event NominatedOwnerRemoved(address indexed nominatedOwner);\n\n    event OwnershipTransferred(address indexed prevOwner, address indexed nextOwner);\n\n    event MigrationInCancelHookFailed(\n        bytes failureReturnData,\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib\n    );\n\n    event MigrationOutHookFailed(\n        bytes failureReturnData,\n        IMigrationHookHandler.MigrationOutHook hook,\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib\n    );\n\n    event SharesTokenSymbolSet(string _nextSymbol);\n\n    event VaultProxyDeployed(\n        address indexed fundDeployer,\n        address indexed owner,\n        address vaultProxy,\n        address indexed vaultLib,\n        address vaultAccessor,\n        string fundName\n    );\n\n    struct MigrationRequest {\n        address nextFundDeployer;\n        address nextVaultAccessor;\n        address nextVaultLib;\n        uint256 executableTimestamp;\n    }\n\n    address private currentFundDeployer;\n    address private nominatedOwner;\n    address private owner;\n    uint256 private migrationTimelock;\n    string private sharesTokenSymbol;\n    mapping(address => address) private vaultProxyToFundDeployer;\n    mapping(address => MigrationRequest) private vaultProxyToMigrationRequest;\n\n    modifier onlyCurrentFundDeployer() {\n        require(msg.sender == currentFundDeployer, \"Only the current FundDeployer can call this function\");\n        _;\n    }\n\n    modifier onlyOwner() {\n        require(msg.sender == owner, \"Only the contract owner can call this function\");\n        _;\n    }\n\n    constructor() public {\n        migrationTimelock = 2 days;\n        owner = msg.sender;\n        sharesTokenSymbol = \"ENZF\";\n    }\n\n    /////////////\n    // GENERAL //\n    /////////////\n\n    /// @notice Sets a new `symbol` value for VaultProxy instances\n    /// @param _nextSymbol The symbol value to set\n    function setSharesTokenSymbol(string calldata _nextSymbol) external override onlyOwner {\n        sharesTokenSymbol = _nextSymbol;\n\n        emit SharesTokenSymbolSet(_nextSymbol);\n    }\n\n    ////////////////////\n    // ACCESS CONTROL //\n    ////////////////////\n\n    /// @notice Claim ownership of the contract\n    function claimOwnership() external override {\n        address nextOwner = nominatedOwner;\n        require(msg.sender == nextOwner, \"claimOwnership: Only the nominatedOwner can call this function\");\n\n        delete nominatedOwner;\n\n        address prevOwner = owner;\n        owner = nextOwner;\n\n        emit OwnershipTransferred(prevOwner, nextOwner);\n    }\n\n    /// @notice Revoke the nomination of a new contract owner\n    function removeNominatedOwner() external override onlyOwner {\n        address removedNominatedOwner = nominatedOwner;\n        require(removedNominatedOwner != address(0), \"removeNominatedOwner: There is no nominated owner\");\n\n        delete nominatedOwner;\n\n        emit NominatedOwnerRemoved(removedNominatedOwner);\n    }\n\n    /// @notice Set a new FundDeployer for use within the contract\n    /// @param _nextFundDeployer The address of the FundDeployer contract\n    function setCurrentFundDeployer(address _nextFundDeployer) external override onlyOwner {\n        require(_nextFundDeployer != address(0), \"setCurrentFundDeployer: _nextFundDeployer cannot be empty\");\n        require(__isContract(_nextFundDeployer), \"setCurrentFundDeployer: Non-contract _nextFundDeployer\");\n\n        address prevFundDeployer = currentFundDeployer;\n        require(\n            _nextFundDeployer != prevFundDeployer,\n            \"setCurrentFundDeployer: _nextFundDeployer is already currentFundDeployer\"\n        );\n\n        currentFundDeployer = _nextFundDeployer;\n\n        emit CurrentFundDeployerSet(prevFundDeployer, _nextFundDeployer);\n    }\n\n    /// @notice Nominate a new contract owner\n    /// @param _nextNominatedOwner The account to nominate\n    /// @dev Does not prohibit overwriting the current nominatedOwner\n    function setNominatedOwner(address _nextNominatedOwner) external override onlyOwner {\n        require(_nextNominatedOwner != address(0), \"setNominatedOwner: _nextNominatedOwner cannot be empty\");\n        require(_nextNominatedOwner != owner, \"setNominatedOwner: _nextNominatedOwner is already the owner\");\n        require(_nextNominatedOwner != nominatedOwner, \"setNominatedOwner: _nextNominatedOwner is already nominated\");\n\n        nominatedOwner = _nextNominatedOwner;\n\n        emit NominatedOwnerSet(_nextNominatedOwner);\n    }\n\n    /// @dev Helper to check whether an address is a deployed contract\n    function __isContract(address _who) private view returns (bool isContract_) {\n        uint256 size;\n        assembly {\n            size := extcodesize(_who)\n        }\n\n        return size > 0;\n    }\n\n    ////////////////\n    // DEPLOYMENT //\n    ////////////////\n\n    /// @notice Deploys a VaultProxy\n    /// @param _vaultLib The VaultLib library with which to instantiate the VaultProxy\n    /// @param _owner The account to set as the VaultProxy's owner\n    /// @param _vaultAccessor The account to set as the VaultProxy's permissioned accessor\n    /// @param _fundName The name of the fund\n    /// @dev Input validation should be handled by the VaultProxy during deployment\n    function deployVaultProxy(address _vaultLib, address _owner, address _vaultAccessor, string calldata _fundName)\n        external\n        override\n        onlyCurrentFundDeployer\n        returns (address vaultProxy_)\n    {\n        require(__isContract(_vaultAccessor), \"deployVaultProxy: Non-contract _vaultAccessor\");\n\n        bytes memory constructData =\n            abi.encodeWithSelector(IMigratableVault.init.selector, _owner, _vaultAccessor, _fundName);\n        vaultProxy_ = address(new VaultProxy(constructData, _vaultLib));\n\n        address fundDeployer = msg.sender;\n        vaultProxyToFundDeployer[vaultProxy_] = fundDeployer;\n\n        emit VaultProxyDeployed(fundDeployer, _owner, vaultProxy_, _vaultLib, _vaultAccessor, _fundName);\n\n        return vaultProxy_;\n    }\n\n    ////////////////\n    // MIGRATIONS //\n    ////////////////\n\n    /// @notice Cancels a pending migration request\n    /// @param _vaultProxy The VaultProxy contract for which to cancel the migration request\n    /// @param _bypassFailure True if a failure in either migration hook should be ignored\n    /// @dev Because this function must also be callable by a permissioned migrator, it has an\n    /// extra migration hook to the nextFundDeployer for the case where cancelMigration()\n    /// is called directly (rather than via the nextFundDeployer).\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external override {\n        MigrationRequest memory request = vaultProxyToMigrationRequest[_vaultProxy];\n        address nextFundDeployer = request.nextFundDeployer;\n        require(nextFundDeployer != address(0), \"cancelMigration: No migration request exists\");\n\n        // TODO: confirm that if canMigrate() does not exist but the caller is a valid FundDeployer, this still works.\n        require(\n            msg.sender == nextFundDeployer || IMigratableVault(_vaultProxy).canMigrate(msg.sender),\n            \"cancelMigration: Not an allowed caller\"\n        );\n\n        address prevFundDeployer = vaultProxyToFundDeployer[_vaultProxy];\n        address nextVaultAccessor = request.nextVaultAccessor;\n        address nextVaultLib = request.nextVaultLib;\n        uint256 executableTimestamp = request.executableTimestamp;\n\n        delete vaultProxyToMigrationRequest[_vaultProxy];\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PostCancel,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            nextVaultAccessor,\n            nextVaultLib,\n            _bypassFailure\n        );\n        __invokeMigrationInCancelHook(\n            _vaultProxy, prevFundDeployer, nextFundDeployer, nextVaultAccessor, nextVaultLib, _bypassFailure\n        );\n\n        emit MigrationCancelled(\n            _vaultProxy, prevFundDeployer, nextFundDeployer, nextVaultAccessor, nextVaultLib, executableTimestamp\n        );\n    }\n\n    /// @notice Executes a pending migration request\n    /// @param _vaultProxy The VaultProxy contract for which to execute the migration request\n    /// @param _bypassFailure True if a failure in either migration hook should be ignored\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external override {\n        MigrationRequest memory request = vaultProxyToMigrationRequest[_vaultProxy];\n        address nextFundDeployer = request.nextFundDeployer;\n        require(nextFundDeployer != address(0), \"executeMigration: No migration request exists for _vaultProxy\");\n        require(msg.sender == nextFundDeployer, \"executeMigration: Only the target FundDeployer can call this function\");\n        require(\n            nextFundDeployer == currentFundDeployer,\n            \"executeMigration: The target FundDeployer is no longer the current FundDeployer\"\n        );\n        uint256 executableTimestamp = request.executableTimestamp;\n        require(block.timestamp >= executableTimestamp, \"executeMigration: The migration timelock has not elapsed\");\n\n        address prevFundDeployer = vaultProxyToFundDeployer[_vaultProxy];\n        address nextVaultAccessor = request.nextVaultAccessor;\n        address nextVaultLib = request.nextVaultLib;\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PreMigrate,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            nextVaultAccessor,\n            nextVaultLib,\n            _bypassFailure\n        );\n\n        // Upgrade the VaultProxy to a new VaultLib and update the accessor via the new VaultLib\n        IMigratableVault(_vaultProxy).setVaultLib(nextVaultLib);\n        IMigratableVault(_vaultProxy).setAccessor(nextVaultAccessor);\n\n        // Update the FundDeployer that migrated the VaultProxy\n        vaultProxyToFundDeployer[_vaultProxy] = nextFundDeployer;\n\n        // Remove the migration request\n        delete vaultProxyToMigrationRequest[_vaultProxy];\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PostMigrate,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            nextVaultAccessor,\n            nextVaultLib,\n            _bypassFailure\n        );\n\n        emit MigrationExecuted(\n            _vaultProxy, prevFundDeployer, nextFundDeployer, nextVaultAccessor, nextVaultLib, executableTimestamp\n        );\n    }\n\n    /// @notice Sets a new migration timelock\n    /// @param _nextTimelock The number of seconds for the new timelock\n    function setMigrationTimelock(uint256 _nextTimelock) external override onlyOwner {\n        uint256 prevTimelock = migrationTimelock;\n        require(_nextTimelock != prevTimelock, \"setMigrationTimelock: _nextTimelock is the current timelock\");\n\n        migrationTimelock = _nextTimelock;\n\n        emit MigrationTimelockSet(prevTimelock, _nextTimelock);\n    }\n\n    /// @notice Signals a migration by creating a migration request\n    /// @param _vaultProxy The VaultProxy contract for which to signal migration\n    /// @param _nextVaultAccessor The account that will be the next `accessor` on the VaultProxy\n    /// @param _nextVaultLib The next VaultLib library contract address to set on the VaultProxy\n    /// @param _bypassFailure True if a failure in either migration hook should be ignored\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external override onlyCurrentFundDeployer {\n        require(__isContract(_nextVaultAccessor), \"signalMigration: Non-contract _nextVaultAccessor\");\n\n        address prevFundDeployer = vaultProxyToFundDeployer[_vaultProxy];\n        require(prevFundDeployer != address(0), \"signalMigration: _vaultProxy does not exist\");\n\n        address nextFundDeployer = msg.sender;\n        require(nextFundDeployer != prevFundDeployer, \"signalMigration: Can only migrate to a new FundDeployer\");\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PreSignal,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            _nextVaultAccessor,\n            _nextVaultLib,\n            _bypassFailure\n        );\n\n        uint256 executableTimestamp = block.timestamp + migrationTimelock;\n        vaultProxyToMigrationRequest[_vaultProxy] = MigrationRequest({\n            nextFundDeployer: nextFundDeployer,\n            nextVaultAccessor: _nextVaultAccessor,\n            nextVaultLib: _nextVaultLib,\n            executableTimestamp: executableTimestamp\n        });\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PostSignal,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            _nextVaultAccessor,\n            _nextVaultLib,\n            _bypassFailure\n        );\n\n        emit MigrationSignaled(\n            _vaultProxy, prevFundDeployer, nextFundDeployer, _nextVaultAccessor, _nextVaultLib, executableTimestamp\n        );\n    }\n\n    /// @dev Helper to invoke a MigrationInCancelHook on the next FundDeployer being \"migrated in\" to,\n    /// which can optionally be implemented on the FundDeployer\n    function __invokeMigrationInCancelHook(\n        address _vaultProxy,\n        address _prevFundDeployer,\n        address _nextFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) private {\n        (bool success, bytes memory returnData) = _nextFundDeployer.call(\n            abi.encodeWithSelector(\n                IMigrationHookHandler.invokeMigrationInCancelHook.selector,\n                _vaultProxy,\n                _prevFundDeployer,\n                _nextVaultAccessor,\n                _nextVaultLib\n            )\n        );\n        if (!success) {\n            require(_bypassFailure, string(abi.encodePacked(\"MigrationOutCancelHook: \", returnData)));\n\n            emit MigrationInCancelHookFailed(\n                returnData, _vaultProxy, _prevFundDeployer, _nextFundDeployer, _nextVaultAccessor, _nextVaultLib\n            );\n        }\n    }\n\n    /// @dev Helper to invoke a IMigrationHookHandler.MigrationOutHook on the previous FundDeployer being \"migrated out\" of,\n    /// which can optionally be implemented on the FundDeployer\n    function __invokeMigrationOutHook(\n        IMigrationHookHandler.MigrationOutHook _hook,\n        address _vaultProxy,\n        address _prevFundDeployer,\n        address _nextFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) private {\n        (bool success, bytes memory returnData) = _prevFundDeployer.call(\n            abi.encodeWithSelector(\n                IMigrationHookHandler.invokeMigrationOutHook.selector,\n                _hook,\n                _vaultProxy,\n                _nextFundDeployer,\n                _nextVaultAccessor,\n                _nextVaultLib\n            )\n        );\n        if (!success) {\n            require(_bypassFailure, string(abi.encodePacked(__migrationOutHookFailureReasonPrefix(_hook), returnData)));\n\n            emit MigrationOutHookFailed(\n                returnData, _hook, _vaultProxy, _prevFundDeployer, _nextFundDeployer, _nextVaultAccessor, _nextVaultLib\n            );\n        }\n    }\n\n    /// @dev Helper to return a revert reason string prefix for a given MigrationOutHook\n    function __migrationOutHookFailureReasonPrefix(IMigrationHookHandler.MigrationOutHook _hook)\n        private\n        pure\n        returns (string memory failureReasonPrefix_)\n    {\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PreSignal) {\n            return \"MigrationOutHook.PreSignal: \";\n        }\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PostSignal) {\n            return \"MigrationOutHook.PostSignal: \";\n        }\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PreMigrate) {\n            return \"MigrationOutHook.PreMigrate: \";\n        }\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PostMigrate) {\n            return \"MigrationOutHook.PostMigrate: \";\n        }\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PostCancel) {\n            return \"MigrationOutHook.PostCancel: \";\n        }\n\n        return \"\";\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    // Provides several potentially helpful getters that are not strictly necessary\n\n    /// @notice Gets the current FundDeployer that is allowed to deploy and migrate funds\n    /// @return currentFundDeployer_ The current FundDeployer contract address\n    function getCurrentFundDeployer() external view override returns (address currentFundDeployer_) {\n        return currentFundDeployer;\n    }\n\n    /// @notice Gets the FundDeployer with which a given VaultProxy is associated\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return fundDeployer_ The FundDeployer contract address\n    function getFundDeployerForVaultProxy(address _vaultProxy) external view override returns (address fundDeployer_) {\n        return vaultProxyToFundDeployer[_vaultProxy];\n    }\n\n    /// @notice Gets the details of a pending migration request for a given VaultProxy\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return nextFundDeployer_ The FundDeployer contract address from which the migration\n    /// request was made\n    /// @return nextVaultAccessor_ The account that will be the next `accessor` on the VaultProxy\n    /// @return nextVaultLib_ The next VaultLib library contract address to set on the VaultProxy\n    /// @return executableTimestamp_ The timestamp at which the migration request can be executed\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        override\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        )\n    {\n        MigrationRequest memory r = vaultProxyToMigrationRequest[_vaultProxy];\n        if (r.executableTimestamp > 0) {\n            return (r.nextFundDeployer, r.nextVaultAccessor, r.nextVaultLib, r.executableTimestamp);\n        }\n    }\n\n    /// @notice Gets the amount of time that must pass between signaling and executing a migration\n    /// @return migrationTimelock_ The timelock value (in seconds)\n    function getMigrationTimelock() external view override returns (uint256 migrationTimelock_) {\n        return migrationTimelock;\n    }\n\n    /// @notice Gets the account that is nominated to be the next owner of this contract\n    /// @return nominatedOwner_ The account that is nominated to be the owner\n    function getNominatedOwner() external view override returns (address nominatedOwner_) {\n        return nominatedOwner;\n    }\n\n    /// @notice Gets the owner of this contract\n    /// @return owner_ The account that is the owner\n    function getOwner() external view override returns (address owner_) {\n        return owner;\n    }\n\n    /// @notice Gets the shares token `symbol` value for use in VaultProxy instances\n    /// @return sharesTokenSymbol_ The `symbol` value\n    function getSharesTokenSymbol() external view override returns (string memory sharesTokenSymbol_) {\n        return sharesTokenSymbol;\n    }\n\n    /// @notice Gets the time remaining until the migration request of a given VaultProxy can be executed\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return secondsRemaining_ The number of seconds remaining on the timelock\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        override\n        returns (uint256 secondsRemaining_)\n    {\n        uint256 executableTimestamp = vaultProxyToMigrationRequest[_vaultProxy].executableTimestamp;\n        if (executableTimestamp == 0) {\n            return 0;\n        }\n\n        if (block.timestamp >= executableTimestamp) {\n            return 0;\n        }\n\n        return executableTimestamp - block.timestamp;\n    }\n\n    /// @notice Checks whether a migration request that is executable exists for a given VaultProxy\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return hasExecutableRequest_ True if a migration request exists and is executable\n    function hasExecutableMigrationRequest(address _vaultProxy)\n        external\n        view\n        override\n        returns (bool hasExecutableRequest_)\n    {\n        uint256 executableTimestamp = vaultProxyToMigrationRequest[_vaultProxy].executableTimestamp;\n\n        return executableTimestamp > 0 && block.timestamp >= executableTimestamp;\n    }\n\n    /// @notice Checks whether a migration request exists for a given VaultProxy\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return hasMigrationRequest_ True if a migration request exists\n    function hasMigrationRequest(address _vaultProxy) external view override returns (bool hasMigrationRequest_) {\n        return vaultProxyToMigrationRequest[_vaultProxy].executableTimestamp > 0;\n    }\n}\n"
+    },
+    "contracts/persistent/dispatcher/IDispatcher.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IDispatcher Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IDispatcher {\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function claimOwnership() external;\n\n    function deployVaultProxy(address _vaultLib, address _owner, address _vaultAccessor, string calldata _fundName)\n        external\n        returns (address vaultProxy_);\n\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function getCurrentFundDeployer() external view returns (address currentFundDeployer_);\n\n    function getFundDeployerForVaultProxy(address _vaultProxy) external view returns (address fundDeployer_);\n\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        );\n\n    function getMigrationTimelock() external view returns (uint256 migrationTimelock_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getOwner() external view returns (address owner_);\n\n    function getSharesTokenSymbol() external view returns (string memory sharesTokenSymbol_);\n\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (uint256 secondsRemaining_);\n\n    function hasExecutableMigrationRequest(address _vaultProxy) external view returns (bool hasExecutableRequest_);\n\n    function hasMigrationRequest(address _vaultProxy) external view returns (bool hasMigrationRequest_);\n\n    function removeNominatedOwner() external;\n\n    function setCurrentFundDeployer(address _nextFundDeployer) external;\n\n    function setMigrationTimelock(uint256 _nextTimelock) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSharesTokenSymbol(string calldata _nextSymbol) external;\n\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external;\n}\n"
+    },
+    "contracts/persistent/vault/utils/ProxiableVaultLib.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title ProxiableVaultLib Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A contract that defines the upgrade behavior for VaultLib instances\n/// @dev The recommended implementation of the target of a proxy according to EIP-1822 and EIP-1967\n/// Code position in storage is `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`,\n/// which is \"0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc\".\nabstract contract ProxiableVaultLib {\n    /// @dev Updates the target of the proxy to be the contract at _nextVaultLib\n    function __updateCodeAddress(address _nextVaultLib) internal {\n        require(\n            bytes32(0x027b9570e9fedc1a80b937ae9a06861e5faef3992491af30b684a64b3fbec7a5)\n                == ProxiableVaultLib(_nextVaultLib).proxiableUUID(),\n            \"__updateCodeAddress: _nextVaultLib not compatible\"\n        );\n        assembly {\n            // solium-disable-line\n            sstore(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc, _nextVaultLib)\n        }\n    }\n\n    /// @notice Returns a unique bytes32 hash for VaultLib instances\n    /// @return uuid_ The bytes32 hash representing the UUID\n    /// @dev The UUID is `bytes32(keccak256('mln.proxiable.vaultlib'))`\n    function proxiableUUID() public pure returns (bytes32 uuid_) {\n        return 0x027b9570e9fedc1a80b937ae9a06861e5faef3992491af30b684a64b3fbec7a5;\n    }\n}\n"
+    },
+    "contracts/persistent/dispatcher/IMigrationHookHandler.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IMigrationHookHandler Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IMigrationHookHandler {\n    enum MigrationOutHook {\n        PreSignal,\n        PostSignal,\n        PreMigrate,\n        PostMigrate,\n        PostCancel\n    }\n\n    function invokeMigrationInCancelHook(\n        address _vaultProxy,\n        address _prevFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib\n    ) external;\n\n    function invokeMigrationOutHook(\n        MigrationOutHook _hook,\n        address _vaultProxy,\n        address _nextFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib\n    ) external;\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IMigratableVault Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @dev DO NOT EDIT CONTRACT\ninterface IMigratableVault {\n    function canMigrate(address _who) external view returns (bool canMigrate_);\n\n    function init(address _owner, address _accessor, string calldata _fundName) external;\n\n    function setAccessor(address _nextAccessor) external;\n\n    function setVaultLib(address _nextVaultLib) external;\n}\n"
+    },
+    "AssetManager/contracts/persistent/dispatcher/Dispatcher.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"../vault/interfaces/IMigratableVault.sol\";\nimport \"../vault/VaultProxy.sol\";\nimport \"./IDispatcher.sol\";\nimport \"./IMigrationHookHandler.sol\";\n\n/// @title Dispatcher Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice The top-level contract linking multiple releases.\n/// It handles the deployment of new VaultProxy instances,\n/// and the regulation of fund migration from a previous release to the current one.\n/// It can also be referred to for access-control based on this contract's owner.\n/// @dev DO NOT EDIT CONTRACT\ncontract Dispatcher is IDispatcher {\n    event CurrentFundDeployerSet(address prevFundDeployer, address nextFundDeployer);\n\n    event MigrationCancelled(\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib,\n        uint256 executableTimestamp\n    );\n\n    event MigrationExecuted(\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib,\n        uint256 executableTimestamp\n    );\n\n    event MigrationSignaled(\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib,\n        uint256 executableTimestamp\n    );\n\n    event MigrationTimelockSet(uint256 prevTimelock, uint256 nextTimelock);\n\n    event NominatedOwnerSet(address indexed nominatedOwner);\n\n    event NominatedOwnerRemoved(address indexed nominatedOwner);\n\n    event OwnershipTransferred(address indexed prevOwner, address indexed nextOwner);\n\n    event MigrationInCancelHookFailed(\n        bytes failureReturnData,\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib\n    );\n\n    event MigrationOutHookFailed(\n        bytes failureReturnData,\n        IMigrationHookHandler.MigrationOutHook hook,\n        address indexed vaultProxy,\n        address indexed prevFundDeployer,\n        address indexed nextFundDeployer,\n        address nextVaultAccessor,\n        address nextVaultLib\n    );\n\n    event SharesTokenSymbolSet(string _nextSymbol);\n\n    event VaultProxyDeployed(\n        address indexed fundDeployer,\n        address indexed owner,\n        address vaultProxy,\n        address indexed vaultLib,\n        address vaultAccessor,\n        string fundName\n    );\n\n    struct MigrationRequest {\n        address nextFundDeployer;\n        address nextVaultAccessor;\n        address nextVaultLib;\n        uint256 executableTimestamp;\n    }\n\n    address private currentFundDeployer;\n    address private nominatedOwner;\n    address private owner;\n    uint256 private migrationTimelock;\n    string private sharesTokenSymbol;\n    mapping(address => address) private vaultProxyToFundDeployer;\n    mapping(address => MigrationRequest) private vaultProxyToMigrationRequest;\n\n    modifier onlyCurrentFundDeployer() {\n        require(msg.sender == currentFundDeployer, \"Only the current FundDeployer can call this function\");\n        _;\n    }\n\n    modifier onlyOwner() {\n        require(msg.sender == owner, \"Only the contract owner can call this function\");\n        _;\n    }\n\n    constructor() public {\n        migrationTimelock = 2 days;\n        owner = msg.sender;\n        sharesTokenSymbol = \"ENZF\";\n    }\n\n    /////////////\n    // GENERAL //\n    /////////////\n\n    /// @notice Sets a new `symbol` value for VaultProxy instances\n    /// @param _nextSymbol The symbol value to set\n    function setSharesTokenSymbol(string calldata _nextSymbol) external override onlyOwner {\n        sharesTokenSymbol = _nextSymbol;\n\n        emit SharesTokenSymbolSet(_nextSymbol);\n    }\n\n    ////////////////////\n    // ACCESS CONTROL //\n    ////////////////////\n\n    /// @notice Claim ownership of the contract\n    function claimOwnership() external override {\n        address nextOwner = nominatedOwner;\n        require(msg.sender == nextOwner, \"claimOwnership: Only the nominatedOwner can call this function\");\n\n        delete nominatedOwner;\n\n        address prevOwner = owner;\n        owner = nextOwner;\n\n        emit OwnershipTransferred(prevOwner, nextOwner);\n    }\n\n    /// @notice Revoke the nomination of a new contract owner\n    function removeNominatedOwner() external override onlyOwner {\n        address removedNominatedOwner = nominatedOwner;\n        require(removedNominatedOwner != address(0), \"removeNominatedOwner: There is no nominated owner\");\n\n        delete nominatedOwner;\n\n        emit NominatedOwnerRemoved(removedNominatedOwner);\n    }\n\n    /// @notice Set a new FundDeployer for use within the contract\n    /// @param _nextFundDeployer The address of the FundDeployer contract\n    function setCurrentFundDeployer(address _nextFundDeployer) external override onlyOwner {\n        require(_nextFundDeployer != address(0), \"setCurrentFundDeployer: _nextFundDeployer cannot be empty\");\n        require(__isContract(_nextFundDeployer), \"setCurrentFundDeployer: Non-contract _nextFundDeployer\");\n\n        address prevFundDeployer = currentFundDeployer;\n        require(\n            _nextFundDeployer != prevFundDeployer,\n            \"setCurrentFundDeployer: _nextFundDeployer is already currentFundDeployer\"\n        );\n\n        currentFundDeployer = _nextFundDeployer;\n\n        emit CurrentFundDeployerSet(prevFundDeployer, _nextFundDeployer);\n    }\n\n    /// @notice Nominate a new contract owner\n    /// @param _nextNominatedOwner The account to nominate\n    /// @dev Does not prohibit overwriting the current nominatedOwner\n    function setNominatedOwner(address _nextNominatedOwner) external override onlyOwner {\n        require(_nextNominatedOwner != address(0), \"setNominatedOwner: _nextNominatedOwner cannot be empty\");\n        require(_nextNominatedOwner != owner, \"setNominatedOwner: _nextNominatedOwner is already the owner\");\n        require(_nextNominatedOwner != nominatedOwner, \"setNominatedOwner: _nextNominatedOwner is already nominated\");\n\n        nominatedOwner = _nextNominatedOwner;\n\n        emit NominatedOwnerSet(_nextNominatedOwner);\n    }\n\n    /// @dev Helper to check whether an address is a deployed contract\n    function __isContract(address _who) private view returns (bool isContract_) {\n        uint256 size;\n        assembly {\n            size := extcodesize(_who)\n        }\n\n        return size > 0;\n    }\n\n    ////////////////\n    // DEPLOYMENT //\n    ////////////////\n\n    /// @notice Deploys a VaultProxy\n    /// @param _vaultLib The VaultLib library with which to instantiate the VaultProxy\n    /// @param _owner The account to set as the VaultProxy's owner\n    /// @param _vaultAccessor The account to set as the VaultProxy's permissioned accessor\n    /// @param _fundName The name of the fund\n    /// @dev Input validation should be handled by the VaultProxy during deployment\n    function deployVaultProxy(address _vaultLib, address _owner, address _vaultAccessor, string calldata _fundName)\n        external\n        override\n        onlyCurrentFundDeployer\n        returns (address vaultProxy_)\n    {\n        require(__isContract(_vaultAccessor), \"deployVaultProxy: Non-contract _vaultAccessor\");\n\n        bytes memory constructData =\n            abi.encodeWithSelector(IMigratableVault.init.selector, _owner, _vaultAccessor, _fundName);\n        vaultProxy_ = address(new VaultProxy(constructData, _vaultLib));\n\n        address fundDeployer = msg.sender;\n        vaultProxyToFundDeployer[vaultProxy_] = fundDeployer;\n\n        emit VaultProxyDeployed(fundDeployer, _owner, vaultProxy_, _vaultLib, _vaultAccessor, _fundName);\n\n        return vaultProxy_;\n    }\n\n    ////////////////\n    // MIGRATIONS //\n    ////////////////\n\n    /// @notice Cancels a pending migration request\n    /// @param _vaultProxy The VaultProxy contract for which to cancel the migration request\n    /// @param _bypassFailure True if a failure in either migration hook should be ignored\n    /// @dev Because this function must also be callable by a permissioned migrator, it has an\n    /// extra migration hook to the nextFundDeployer for the case where cancelMigration()\n    /// is called directly (rather than via the nextFundDeployer).\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external override {\n        MigrationRequest memory request = vaultProxyToMigrationRequest[_vaultProxy];\n        address nextFundDeployer = request.nextFundDeployer;\n        require(nextFundDeployer != address(0), \"cancelMigration: No migration request exists\");\n\n        // TODO: confirm that if canMigrate() does not exist but the caller is a valid FundDeployer, this still works.\n        require(\n            msg.sender == nextFundDeployer || IMigratableVault(_vaultProxy).canMigrate(msg.sender),\n            \"cancelMigration: Not an allowed caller\"\n        );\n\n        address prevFundDeployer = vaultProxyToFundDeployer[_vaultProxy];\n        address nextVaultAccessor = request.nextVaultAccessor;\n        address nextVaultLib = request.nextVaultLib;\n        uint256 executableTimestamp = request.executableTimestamp;\n\n        delete vaultProxyToMigrationRequest[_vaultProxy];\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PostCancel,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            nextVaultAccessor,\n            nextVaultLib,\n            _bypassFailure\n        );\n        __invokeMigrationInCancelHook(\n            _vaultProxy, prevFundDeployer, nextFundDeployer, nextVaultAccessor, nextVaultLib, _bypassFailure\n        );\n\n        emit MigrationCancelled(\n            _vaultProxy, prevFundDeployer, nextFundDeployer, nextVaultAccessor, nextVaultLib, executableTimestamp\n        );\n    }\n\n    /// @notice Executes a pending migration request\n    /// @param _vaultProxy The VaultProxy contract for which to execute the migration request\n    /// @param _bypassFailure True if a failure in either migration hook should be ignored\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external override {\n        MigrationRequest memory request = vaultProxyToMigrationRequest[_vaultProxy];\n        address nextFundDeployer = request.nextFundDeployer;\n        require(nextFundDeployer != address(0), \"executeMigration: No migration request exists for _vaultProxy\");\n        require(msg.sender == nextFundDeployer, \"executeMigration: Only the target FundDeployer can call this function\");\n        require(\n            nextFundDeployer == currentFundDeployer,\n            \"executeMigration: The target FundDeployer is no longer the current FundDeployer\"\n        );\n        uint256 executableTimestamp = request.executableTimestamp;\n        require(block.timestamp >= executableTimestamp, \"executeMigration: The migration timelock has not elapsed\");\n\n        address prevFundDeployer = vaultProxyToFundDeployer[_vaultProxy];\n        address nextVaultAccessor = request.nextVaultAccessor;\n        address nextVaultLib = request.nextVaultLib;\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PreMigrate,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            nextVaultAccessor,\n            nextVaultLib,\n            _bypassFailure\n        );\n\n        // Upgrade the VaultProxy to a new VaultLib and update the accessor via the new VaultLib\n        IMigratableVault(_vaultProxy).setVaultLib(nextVaultLib);\n        IMigratableVault(_vaultProxy).setAccessor(nextVaultAccessor);\n\n        // Update the FundDeployer that migrated the VaultProxy\n        vaultProxyToFundDeployer[_vaultProxy] = nextFundDeployer;\n\n        // Remove the migration request\n        delete vaultProxyToMigrationRequest[_vaultProxy];\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PostMigrate,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            nextVaultAccessor,\n            nextVaultLib,\n            _bypassFailure\n        );\n\n        emit MigrationExecuted(\n            _vaultProxy, prevFundDeployer, nextFundDeployer, nextVaultAccessor, nextVaultLib, executableTimestamp\n        );\n    }\n\n    /// @notice Sets a new migration timelock\n    /// @param _nextTimelock The number of seconds for the new timelock\n    function setMigrationTimelock(uint256 _nextTimelock) external override onlyOwner {\n        uint256 prevTimelock = migrationTimelock;\n        require(_nextTimelock != prevTimelock, \"setMigrationTimelock: _nextTimelock is the current timelock\");\n\n        migrationTimelock = _nextTimelock;\n\n        emit MigrationTimelockSet(prevTimelock, _nextTimelock);\n    }\n\n    /// @notice Signals a migration by creating a migration request\n    /// @param _vaultProxy The VaultProxy contract for which to signal migration\n    /// @param _nextVaultAccessor The account that will be the next `accessor` on the VaultProxy\n    /// @param _nextVaultLib The next VaultLib library contract address to set on the VaultProxy\n    /// @param _bypassFailure True if a failure in either migration hook should be ignored\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external override onlyCurrentFundDeployer {\n        require(__isContract(_nextVaultAccessor), \"signalMigration: Non-contract _nextVaultAccessor\");\n\n        address prevFundDeployer = vaultProxyToFundDeployer[_vaultProxy];\n        require(prevFundDeployer != address(0), \"signalMigration: _vaultProxy does not exist\");\n\n        address nextFundDeployer = msg.sender;\n        require(nextFundDeployer != prevFundDeployer, \"signalMigration: Can only migrate to a new FundDeployer\");\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PreSignal,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            _nextVaultAccessor,\n            _nextVaultLib,\n            _bypassFailure\n        );\n\n        uint256 executableTimestamp = block.timestamp + migrationTimelock;\n        vaultProxyToMigrationRequest[_vaultProxy] = MigrationRequest({\n            nextFundDeployer: nextFundDeployer,\n            nextVaultAccessor: _nextVaultAccessor,\n            nextVaultLib: _nextVaultLib,\n            executableTimestamp: executableTimestamp\n        });\n\n        __invokeMigrationOutHook(\n            IMigrationHookHandler.MigrationOutHook.PostSignal,\n            _vaultProxy,\n            prevFundDeployer,\n            nextFundDeployer,\n            _nextVaultAccessor,\n            _nextVaultLib,\n            _bypassFailure\n        );\n\n        emit MigrationSignaled(\n            _vaultProxy, prevFundDeployer, nextFundDeployer, _nextVaultAccessor, _nextVaultLib, executableTimestamp\n        );\n    }\n\n    /// @dev Helper to invoke a MigrationInCancelHook on the next FundDeployer being \"migrated in\" to,\n    /// which can optionally be implemented on the FundDeployer\n    function __invokeMigrationInCancelHook(\n        address _vaultProxy,\n        address _prevFundDeployer,\n        address _nextFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) private {\n        (bool success, bytes memory returnData) = _nextFundDeployer.call(\n            abi.encodeWithSelector(\n                IMigrationHookHandler.invokeMigrationInCancelHook.selector,\n                _vaultProxy,\n                _prevFundDeployer,\n                _nextVaultAccessor,\n                _nextVaultLib\n            )\n        );\n        if (!success) {\n            require(_bypassFailure, string(abi.encodePacked(\"MigrationOutCancelHook: \", returnData)));\n\n            emit MigrationInCancelHookFailed(\n                returnData, _vaultProxy, _prevFundDeployer, _nextFundDeployer, _nextVaultAccessor, _nextVaultLib\n            );\n        }\n    }\n\n    /// @dev Helper to invoke a IMigrationHookHandler.MigrationOutHook on the previous FundDeployer being \"migrated out\" of,\n    /// which can optionally be implemented on the FundDeployer\n    function __invokeMigrationOutHook(\n        IMigrationHookHandler.MigrationOutHook _hook,\n        address _vaultProxy,\n        address _prevFundDeployer,\n        address _nextFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) private {\n        (bool success, bytes memory returnData) = _prevFundDeployer.call(\n            abi.encodeWithSelector(\n                IMigrationHookHandler.invokeMigrationOutHook.selector,\n                _hook,\n                _vaultProxy,\n                _nextFundDeployer,\n                _nextVaultAccessor,\n                _nextVaultLib\n            )\n        );\n        if (!success) {\n            require(_bypassFailure, string(abi.encodePacked(__migrationOutHookFailureReasonPrefix(_hook), returnData)));\n\n            emit MigrationOutHookFailed(\n                returnData, _hook, _vaultProxy, _prevFundDeployer, _nextFundDeployer, _nextVaultAccessor, _nextVaultLib\n            );\n        }\n    }\n\n    /// @dev Helper to return a revert reason string prefix for a given MigrationOutHook\n    function __migrationOutHookFailureReasonPrefix(IMigrationHookHandler.MigrationOutHook _hook)\n        private\n        pure\n        returns (string memory failureReasonPrefix_)\n    {\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PreSignal) {\n            return \"MigrationOutHook.PreSignal: \";\n        }\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PostSignal) {\n            return \"MigrationOutHook.PostSignal: \";\n        }\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PreMigrate) {\n            return \"MigrationOutHook.PreMigrate: \";\n        }\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PostMigrate) {\n            return \"MigrationOutHook.PostMigrate: \";\n        }\n        if (_hook == IMigrationHookHandler.MigrationOutHook.PostCancel) {\n            return \"MigrationOutHook.PostCancel: \";\n        }\n\n        return \"\";\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    // Provides several potentially helpful getters that are not strictly necessary\n\n    /// @notice Gets the current FundDeployer that is allowed to deploy and migrate funds\n    /// @return currentFundDeployer_ The current FundDeployer contract address\n    function getCurrentFundDeployer() external view override returns (address currentFundDeployer_) {\n        return currentFundDeployer;\n    }\n\n    /// @notice Gets the FundDeployer with which a given VaultProxy is associated\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return fundDeployer_ The FundDeployer contract address\n    function getFundDeployerForVaultProxy(address _vaultProxy) external view override returns (address fundDeployer_) {\n        return vaultProxyToFundDeployer[_vaultProxy];\n    }\n\n    /// @notice Gets the details of a pending migration request for a given VaultProxy\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return nextFundDeployer_ The FundDeployer contract address from which the migration\n    /// request was made\n    /// @return nextVaultAccessor_ The account that will be the next `accessor` on the VaultProxy\n    /// @return nextVaultLib_ The next VaultLib library contract address to set on the VaultProxy\n    /// @return executableTimestamp_ The timestamp at which the migration request can be executed\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        override\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        )\n    {\n        MigrationRequest memory r = vaultProxyToMigrationRequest[_vaultProxy];\n        if (r.executableTimestamp > 0) {\n            return (r.nextFundDeployer, r.nextVaultAccessor, r.nextVaultLib, r.executableTimestamp);\n        }\n    }\n\n    /// @notice Gets the amount of time that must pass between signaling and executing a migration\n    /// @return migrationTimelock_ The timelock value (in seconds)\n    function getMigrationTimelock() external view override returns (uint256 migrationTimelock_) {\n        return migrationTimelock;\n    }\n\n    /// @notice Gets the account that is nominated to be the next owner of this contract\n    /// @return nominatedOwner_ The account that is nominated to be the owner\n    function getNominatedOwner() external view override returns (address nominatedOwner_) {\n        return nominatedOwner;\n    }\n\n    /// @notice Gets the owner of this contract\n    /// @return owner_ The account that is the owner\n    function getOwner() external view override returns (address owner_) {\n        return owner;\n    }\n\n    /// @notice Gets the shares token `symbol` value for use in VaultProxy instances\n    /// @return sharesTokenSymbol_ The `symbol` value\n    function getSharesTokenSymbol() external view override returns (string memory sharesTokenSymbol_) {\n        return sharesTokenSymbol;\n    }\n\n    /// @notice Gets the time remaining until the migration request of a given VaultProxy can be executed\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return secondsRemaining_ The number of seconds remaining on the timelock\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        override\n        returns (uint256 secondsRemaining_)\n    {\n        uint256 executableTimestamp = vaultProxyToMigrationRequest[_vaultProxy].executableTimestamp;\n        if (executableTimestamp == 0) {\n            return 0;\n        }\n\n        if (block.timestamp >= executableTimestamp) {\n            return 0;\n        }\n\n        return executableTimestamp - block.timestamp;\n    }\n\n    /// @notice Checks whether a migration request that is executable exists for a given VaultProxy\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return hasExecutableRequest_ True if a migration request exists and is executable\n    function hasExecutableMigrationRequest(address _vaultProxy)\n        external\n        view\n        override\n        returns (bool hasExecutableRequest_)\n    {\n        uint256 executableTimestamp = vaultProxyToMigrationRequest[_vaultProxy].executableTimestamp;\n\n        return executableTimestamp > 0 && block.timestamp >= executableTimestamp;\n    }\n\n    /// @notice Checks whether a migration request exists for a given VaultProxy\n    /// @param _vaultProxy The VaultProxy instance\n    /// @return hasMigrationRequest_ True if a migration request exists\n    function hasMigrationRequest(address _vaultProxy) external view override returns (bool hasMigrationRequest_) {\n        return vaultProxyToMigrationRequest[_vaultProxy].executableTimestamp > 0;\n    }\n}\n"
+    },
+    "AssetManager/contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IMigratableVault Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @dev DO NOT EDIT CONTRACT\ninterface IMigratableVault {\n    function canMigrate(address _who) external view returns (bool canMigrate_);\n\n    function init(address _owner, address _accessor, string calldata _fundName) external;\n\n    function setAccessor(address _nextAccessor) external;\n\n    function setVaultLib(address _nextVaultLib) external;\n}\n"
+    },
+    "AssetManager/contracts/persistent/vault/VaultProxy.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"./utils/ProxiableVaultLib.sol\";\n\n/// @title VaultProxy Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A proxy contract for all VaultProxy instances, slightly modified from EIP-1822\n/// @dev Adapted from the recommended implementation of a Proxy in EIP-1822, updated for solc 0.6.12,\n/// and using the EIP-1967 storage slot for the proxiable implementation.\n/// i.e., `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`, which is\n/// \"0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc\"\n/// See: https://eips.ethereum.org/EIPS/eip-1822\ncontract VaultProxy {\n    constructor(bytes memory _constructData, address _vaultLib) public {\n        // \"0x027b9570e9fedc1a80b937ae9a06861e5faef3992491af30b684a64b3fbec7a5\" corresponds to\n        // `bytes32(keccak256('mln.proxiable.vaultlib'))`\n        require(\n            bytes32(0x027b9570e9fedc1a80b937ae9a06861e5faef3992491af30b684a64b3fbec7a5)\n                == ProxiableVaultLib(_vaultLib).proxiableUUID(),\n            \"constructor: _vaultLib not compatible\"\n        );\n\n        assembly {\n            // solium-disable-line\n            sstore(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc, _vaultLib)\n        }\n\n        (bool success, bytes memory returnData) = _vaultLib.delegatecall(_constructData); // solium-disable-line\n        require(success, string(returnData));\n    }\n\n    fallback() external payable {\n        assembly {\n            // solium-disable-line\n            let contractLogic := sload(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc)\n            calldatacopy(0x0, 0x0, calldatasize())\n            let success := delegatecall(sub(gas(), 10000), contractLogic, 0x0, calldatasize(), 0, 0)\n            let retSz := returndatasize()\n            returndatacopy(0, 0, retSz)\n            switch success\n            case 0 { revert(0, retSz) }\n            default { return(0, retSz) }\n        }\n    }\n}\n"
+    },
+    "AssetManager/contracts/persistent/dispatcher/IDispatcher.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IDispatcher Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IDispatcher {\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function claimOwnership() external;\n\n    function deployVaultProxy(address _vaultLib, address _owner, address _vaultAccessor, string calldata _fundName)\n        external\n        returns (address vaultProxy_);\n\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function getCurrentFundDeployer() external view returns (address currentFundDeployer_);\n\n    function getFundDeployerForVaultProxy(address _vaultProxy) external view returns (address fundDeployer_);\n\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        );\n\n    function getMigrationTimelock() external view returns (uint256 migrationTimelock_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getOwner() external view returns (address owner_);\n\n    function getSharesTokenSymbol() external view returns (string memory sharesTokenSymbol_);\n\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (uint256 secondsRemaining_);\n\n    function hasExecutableMigrationRequest(address _vaultProxy) external view returns (bool hasExecutableRequest_);\n\n    function hasMigrationRequest(address _vaultProxy) external view returns (bool hasMigrationRequest_);\n\n    function removeNominatedOwner() external;\n\n    function setCurrentFundDeployer(address _nextFundDeployer) external;\n\n    function setMigrationTimelock(uint256 _nextTimelock) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSharesTokenSymbol(string calldata _nextSymbol) external;\n\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external;\n}\n"
+    },
+    "AssetManager/contracts/persistent/dispatcher/IMigrationHookHandler.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IMigrationHookHandler Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IMigrationHookHandler {\n    enum MigrationOutHook {\n        PreSignal,\n        PostSignal,\n        PreMigrate,\n        PostMigrate,\n        PostCancel\n    }\n\n    function invokeMigrationInCancelHook(\n        address _vaultProxy,\n        address _prevFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib\n    ) external;\n\n    function invokeMigrationOutHook(\n        MigrationOutHook _hook,\n        address _vaultProxy,\n        address _nextFundDeployer,\n        address _nextVaultAccessor,\n        address _nextVaultLib\n    ) external;\n}\n"
+    },
+    "AssetManager/contracts/persistent/vault/utils/ProxiableVaultLib.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title ProxiableVaultLib Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A contract that defines the upgrade behavior for VaultLib instances\n/// @dev The recommended implementation of the target of a proxy according to EIP-1822 and EIP-1967\n/// Code position in storage is `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`,\n/// which is \"0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc\".\nabstract contract ProxiableVaultLib {\n    /// @dev Updates the target of the proxy to be the contract at _nextVaultLib\n    function __updateCodeAddress(address _nextVaultLib) internal {\n        require(\n            bytes32(0x027b9570e9fedc1a80b937ae9a06861e5faef3992491af30b684a64b3fbec7a5)\n                == ProxiableVaultLib(_nextVaultLib).proxiableUUID(),\n            \"__updateCodeAddress: _nextVaultLib not compatible\"\n        );\n        assembly {\n            // solium-disable-line\n            sstore(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc, _nextVaultLib)\n        }\n    }\n\n    /// @notice Returns a unique bytes32 hash for VaultLib instances\n    /// @return uuid_ The bytes32 hash representing the UUID\n    /// @dev The UUID is `bytes32(keccak256('mln.proxiable.vaultlib'))`\n    function proxiableUUID() public pure returns (bytes32 uuid_) {\n        return 0x027b9570e9fedc1a80b937ae9a06861e5faef3992491af30b684a64b3fbec7a5;\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.6.12+commit.27d51765"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "prevFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextFundDeployer",
+              "type": "address"
+            }
+          ],
+          "name": "CurrentFundDeployerSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "prevFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nextFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultAccessor",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultLib",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "executableTimestamp",
+              "type": "uint256"
+            }
+          ],
+          "name": "MigrationCancelled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "prevFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nextFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultAccessor",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultLib",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "executableTimestamp",
+              "type": "uint256"
+            }
+          ],
+          "name": "MigrationExecuted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "failureReturnData",
+              "type": "bytes"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "prevFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nextFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultAccessor",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultLib",
+              "type": "address"
+            }
+          ],
+          "name": "MigrationInCancelHookFailed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "failureReturnData",
+              "type": "bytes"
+            },
+            {
+              "indexed": false,
+              "internalType": "enum IMigrationHookHandler.MigrationOutHook",
+              "name": "hook",
+              "type": "uint8"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "prevFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nextFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultAccessor",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultLib",
+              "type": "address"
+            }
+          ],
+          "name": "MigrationOutHookFailed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "prevFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nextFundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultAccessor",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "nextVaultLib",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "executableTimestamp",
+              "type": "uint256"
+            }
+          ],
+          "name": "MigrationSignaled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "prevTimelock",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "nextTimelock",
+              "type": "uint256"
+            }
+          ],
+          "name": "MigrationTimelockSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nominatedOwner",
+              "type": "address"
+            }
+          ],
+          "name": "NominatedOwnerRemoved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nominatedOwner",
+              "type": "address"
+            }
+          ],
+          "name": "NominatedOwnerSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "prevOwner",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "nextOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipTransferred",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "string",
+              "name": "_nextSymbol",
+              "type": "string"
+            }
+          ],
+          "name": "SharesTokenSymbolSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "fundDeployer",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "vaultProxy",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "vaultLib",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "vaultAccessor",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "string",
+              "name": "fundName",
+              "type": "string"
+            }
+          ],
+          "name": "VaultProxyDeployed",
+          "type": "event"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "_bypassFailure",
+              "type": "bool"
+            }
+          ],
+          "name": "cancelMigration",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "claimOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultLib",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_owner",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_vaultAccessor",
+              "type": "address"
+            },
+            {
+              "internalType": "string",
+              "name": "_fundName",
+              "type": "string"
+            }
+          ],
+          "name": "deployVaultProxy",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "vaultProxy_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "_bypassFailure",
+              "type": "bool"
+            }
+          ],
+          "name": "executeMigration",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getCurrentFundDeployer",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "currentFundDeployer_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "getFundDeployerForVaultProxy",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "fundDeployer_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "getMigrationRequestDetailsForVaultProxy",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "nextFundDeployer_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "nextVaultAccessor_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "nextVaultLib_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "executableTimestamp_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getMigrationTimelock",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "migrationTimelock_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getNominatedOwner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "nominatedOwner_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getOwner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "owner_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getSharesTokenSymbol",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "sharesTokenSymbol_",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "getTimelockRemainingForMigrationRequest",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "secondsRemaining_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "hasExecutableMigrationRequest",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "hasExecutableRequest_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            }
+          ],
+          "name": "hasMigrationRequest",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "hasMigrationRequest_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "removeNominatedOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_nextFundDeployer",
+              "type": "address"
+            }
+          ],
+          "name": "setCurrentFundDeployer",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_nextTimelock",
+              "type": "uint256"
+            }
+          ],
+          "name": "setMigrationTimelock",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_nextNominatedOwner",
+              "type": "address"
+            }
+          ],
+          "name": "setNominatedOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "string",
+              "name": "_nextSymbol",
+              "type": "string"
+            }
+          ],
+          "name": "setSharesTokenSymbol",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_vaultProxy",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_nextVaultAccessor",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_nextVaultLib",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "_bypassFailure",
+              "type": "bool"
+            }
+          ],
+          "name": "signalMigration",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Enzyme Council <security@enzyme.finance>",
+        "details": "DO NOT EDIT CONTRACT",
+        "kind": "dev",
+        "methods": {
+          "cancelMigration(address,bool)": {
+            "details": "Because this function must also be callable by a permissioned migrator, it has an extra migration hook to the nextFundDeployer for the case where cancelMigration() is called directly (rather than via the nextFundDeployer).",
+            "params": {
+              "_bypassFailure": "True if a failure in either migration hook should be ignored",
+              "_vaultProxy": "The VaultProxy contract for which to cancel the migration request"
+            }
+          },
+          "deployVaultProxy(address,address,address,string)": {
+            "details": "Input validation should be handled by the VaultProxy during deployment",
+            "params": {
+              "_fundName": "The name of the fund",
+              "_owner": "The account to set as the VaultProxy's owner",
+              "_vaultAccessor": "The account to set as the VaultProxy's permissioned accessor",
+              "_vaultLib": "The VaultLib library with which to instantiate the VaultProxy"
+            }
+          },
+          "executeMigration(address,bool)": {
+            "params": {
+              "_bypassFailure": "True if a failure in either migration hook should be ignored",
+              "_vaultProxy": "The VaultProxy contract for which to execute the migration request"
+            }
+          },
+          "getCurrentFundDeployer()": {
+            "returns": {
+              "currentFundDeployer_": "The current FundDeployer contract address"
+            }
+          },
+          "getFundDeployerForVaultProxy(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy instance"
+            },
+            "returns": {
+              "fundDeployer_": "The FundDeployer contract address"
+            }
+          },
+          "getMigrationRequestDetailsForVaultProxy(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy instance"
+            },
+            "returns": {
+              "executableTimestamp_": "The timestamp at which the migration request can be executed",
+              "nextFundDeployer_": "The FundDeployer contract address from which the migration request was made",
+              "nextVaultAccessor_": "The account that will be the next `accessor` on the VaultProxy",
+              "nextVaultLib_": "The next VaultLib library contract address to set on the VaultProxy"
+            }
+          },
+          "getMigrationTimelock()": {
+            "returns": {
+              "migrationTimelock_": "The timelock value (in seconds)"
+            }
+          },
+          "getNominatedOwner()": {
+            "returns": {
+              "nominatedOwner_": "The account that is nominated to be the owner"
+            }
+          },
+          "getOwner()": {
+            "returns": {
+              "owner_": "The account that is the owner"
+            }
+          },
+          "getSharesTokenSymbol()": {
+            "returns": {
+              "sharesTokenSymbol_": "The `symbol` value"
+            }
+          },
+          "getTimelockRemainingForMigrationRequest(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy instance"
+            },
+            "returns": {
+              "secondsRemaining_": "The number of seconds remaining on the timelock"
+            }
+          },
+          "hasExecutableMigrationRequest(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy instance"
+            },
+            "returns": {
+              "hasExecutableRequest_": "True if a migration request exists and is executable"
+            }
+          },
+          "hasMigrationRequest(address)": {
+            "params": {
+              "_vaultProxy": "The VaultProxy instance"
+            },
+            "returns": {
+              "hasMigrationRequest_": "True if a migration request exists"
+            }
+          },
+          "setCurrentFundDeployer(address)": {
+            "params": {
+              "_nextFundDeployer": "The address of the FundDeployer contract"
+            }
+          },
+          "setMigrationTimelock(uint256)": {
+            "params": {
+              "_nextTimelock": "The number of seconds for the new timelock"
+            }
+          },
+          "setNominatedOwner(address)": {
+            "details": "Does not prohibit overwriting the current nominatedOwner",
+            "params": {
+              "_nextNominatedOwner": "The account to nominate"
+            }
+          },
+          "setSharesTokenSymbol(string)": {
+            "params": {
+              "_nextSymbol": "The symbol value to set"
+            }
+          },
+          "signalMigration(address,address,address,bool)": {
+            "params": {
+              "_bypassFailure": "True if a failure in either migration hook should be ignored",
+              "_nextVaultAccessor": "The account that will be the next `accessor` on the VaultProxy",
+              "_nextVaultLib": "The next VaultLib library contract address to set on the VaultProxy",
+              "_vaultProxy": "The VaultProxy contract for which to signal migration"
+            }
+          }
+        },
+        "title": "Dispatcher Contract",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "cancelMigration(address,bool)": {
+            "notice": "Cancels a pending migration request"
+          },
+          "claimOwnership()": {
+            "notice": "Claim ownership of the contract"
+          },
+          "deployVaultProxy(address,address,address,string)": {
+            "notice": "Deploys a VaultProxy"
+          },
+          "executeMigration(address,bool)": {
+            "notice": "Executes a pending migration request"
+          },
+          "getCurrentFundDeployer()": {
+            "notice": "Gets the current FundDeployer that is allowed to deploy and migrate funds"
+          },
+          "getFundDeployerForVaultProxy(address)": {
+            "notice": "Gets the FundDeployer with which a given VaultProxy is associated"
+          },
+          "getMigrationRequestDetailsForVaultProxy(address)": {
+            "notice": "Gets the details of a pending migration request for a given VaultProxy"
+          },
+          "getMigrationTimelock()": {
+            "notice": "Gets the amount of time that must pass between signaling and executing a migration"
+          },
+          "getNominatedOwner()": {
+            "notice": "Gets the account that is nominated to be the next owner of this contract"
+          },
+          "getOwner()": {
+            "notice": "Gets the owner of this contract"
+          },
+          "getSharesTokenSymbol()": {
+            "notice": "Gets the shares token `symbol` value for use in VaultProxy instances"
+          },
+          "getTimelockRemainingForMigrationRequest(address)": {
+            "notice": "Gets the time remaining until the migration request of a given VaultProxy can be executed"
+          },
+          "hasExecutableMigrationRequest(address)": {
+            "notice": "Checks whether a migration request that is executable exists for a given VaultProxy"
+          },
+          "hasMigrationRequest(address)": {
+            "notice": "Checks whether a migration request exists for a given VaultProxy"
+          },
+          "removeNominatedOwner()": {
+            "notice": "Revoke the nomination of a new contract owner"
+          },
+          "setCurrentFundDeployer(address)": {
+            "notice": "Set a new FundDeployer for use within the contract"
+          },
+          "setMigrationTimelock(uint256)": {
+            "notice": "Sets a new migration timelock"
+          },
+          "setNominatedOwner(address)": {
+            "notice": "Nominate a new contract owner"
+          },
+          "setSharesTokenSymbol(string)": {
+            "notice": "Sets a new `symbol` value for VaultProxy instances"
+          },
+          "signalMigration(address,address,address,bool)": {
+            "notice": "Signals a migration by creating a migration request"
+          }
+        },
+        "notice": "The top-level contract linking multiple releases. It handles the deployment of new VaultProxy instances, and the regulation of fund migration from a previous release to the current one. It can also be referred to for access-control based on this contract's owner.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/persistent/dispatcher/Dispatcher.sol": "Dispatcher"
+      },
+      "evmVersion": "istanbul",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "none"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": false
+        },
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "sources": {
+      "contracts/persistent/dispatcher/Dispatcher.sol": {
+        "keccak256": "0x6e7c6431a010ba067e2571a3965c0d4f8857600a8e089d4bf22857c353fcebd8",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://2e50df00c9e2bb113884209de5a2351f49e8bc53fb097938dce49188695d4f5d",
+          "dweb:/ipfs/QmVNYAVx9rzVeYU5g6pH7h9b7Yn4jSet1hbM9CeduEZWsr"
+        ]
+      },
+      "contracts/persistent/dispatcher/IDispatcher.sol": {
+        "keccak256": "0x2a4df902058211d49327eb16fc81e49dd4085bd8528101bbaac412805977e04a",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://b54c8c4162c819e35fe972142ba55510ce42a9e7c2ec723eb674c227be8bef15",
+          "dweb:/ipfs/QmVhJZjeuYtHzjd5WXUHNKk4ZHaZAZukRoZBhVvPYYmDFT"
+        ]
+      },
+      "contracts/persistent/dispatcher/IMigrationHookHandler.sol": {
+        "keccak256": "0x8096a8b1d03e4c9cc728fa8c130ec25dc9b41bf970f0beac12f1293912ac764f",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://0d9e3ebd497ab9e54c23bd879beb251c5ebd96c31ea99bb23f9550b5e8370048",
+          "dweb:/ipfs/QmPnL4bDHLjK244eSdTJ3XpNyDrvKWyEwqTjN6rRdqLtcV"
+        ]
+      },
+      "contracts/persistent/vault/VaultProxy.sol": {
+        "keccak256": "0xfcd7c5654d9b31160442f2b09efe581842cc6792ead9d087eccff5952ad2e015",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://3ec9846fee4cd1eddb07b4eb2dc8b8a9f469d51820e5c55e9ebf0c3d7c309894",
+          "dweb:/ipfs/QmS8L62njm373i2CyCFEZnvEziLjeS8Zqke7jXAKWB3sQD"
+        ]
+      },
+      "contracts/persistent/vault/interfaces/IMigratableVault.sol": {
+        "keccak256": "0x1b1956b2ac590528410b7f4589d6c3f550c79cfd2532162a6de3a4fceacb5554",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://151ea25b89825b17ba2925932ae76415e8814430341e4cab383e6925609a4ef2",
+          "dweb:/ipfs/QmeqfHJdbupwPp2EEiiRjQhSs7GJFS2N57RhAzkjPRb9gV"
+        ]
+      },
+      "contracts/persistent/vault/utils/ProxiableVaultLib.sol": {
+        "keccak256": "0xe403774759f04151936804ac090275d201395e07f896f3f131a42f3fe4048683",
+        "license": "GPL-3.0",
+        "urls": [
+          "bzz-raw://1f4d89b81013177ce53dba8830366d656403c97d2ce15d210dd6b896e741eba6",
+          "dweb:/ipfs/QmRWtMYpx82zLvCXPuYScxTvZYHZkDAYi6gpFFjs8rBzzP"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.6.12+commit.27d51765",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "none"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "details": {
+          "cse": true,
+          "yul": false,
+          "peephole": true,
+          "deduplicate": true,
+          "orderLiterals": true,
+          "jumpdestRemover": true,
+          "constantOptimizer": true
+        }
+      },
+      "evmVersion": "istanbul",
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+        ":@uniswap/v3-core/=lib/uniswap-v3-core/",
+        ":ds-test/=lib/forge-std/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+        ":openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+        ":openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+        ":uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+        ":uniswap-v3-core/=lib/uniswap-v3-core/",
+        ":uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/",
+        ":uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/"
+      ]
+    },
+    "name": "Dispatcher",
+    "fullyQualifiedName": "contracts/persistent/dispatcher/Dispatcher.sol:Dispatcher"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "5269922",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2024-09-04T09:09:26Z",
+  "match": "match",
+  "chainId": "42161",
+  "address": "0x8da28441a4c594fD2fac72726C1412d8Cf9E4A19"
+}

@@ -1,0 +1,368 @@
+{
+  "file_path": "contracts/persistent/global-config/GlobalConfigLib.sol",
+  "creation_status": "success",
+  "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"../vault/interfaces/IVaultCore.sol\";\nimport \"./bases/GlobalConfigLibBase1.sol\";\nimport \"./interfaces/IGlobalConfig2.sol\";\nimport \"./interfaces/IGlobalConfigLibComptrollerV4.sol\";\n\n/// @title GlobalConfigLib Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice The proxiable library contract for GlobalConfigProxy\n/// @dev Only supports releases v4 and higher\ncontract GlobalConfigLib is IGlobalConfig2, GlobalConfigLibBase1 {\n    uint256 private constant ONE_HUNDRED_PERCENT_IN_BPS = 10000;\n\n    address private immutable FUND_DEPLOYER_V4;\n\n    constructor(address _fundDeployerV4) public {\n        FUND_DEPLOYER_V4 = _fundDeployerV4;\n    }\n\n    /// @notice Formats a deposit call, relative to a vault's current version\n    /// @param _vaultProxy The VaultProxy (shares token)\n    /// @param _depositAsset The token to deposit for shares\n    /// @param _depositAssetAmount The exact amount of _depositAsset to deposit\n    /// @dev Caller must validate expected shares received if required\n    function formatDepositCall(address _vaultProxy, address _depositAsset, uint256 _depositAssetAmount)\n        external\n        view\n        override\n        returns (address target_, bytes memory payload_)\n    {\n        // Get release for _vaultProxy\n        address fundDeployer = __getFundDeployerForVaultProxy(_vaultProxy);\n\n        if (fundDeployer == FUND_DEPLOYER_V4) {\n            address comptrollerProxy = IVaultCore(_vaultProxy).getAccessor();\n\n            // Deposit asset must be denominationAsset\n            require(\n                _depositAsset == IGlobalConfigLibComptrollerV4(comptrollerProxy).getDenominationAsset(),\n                \"formatDepositCall: Unsupported _depositAsset\"\n            );\n\n            target_ = comptrollerProxy;\n            payload_ = abi.encodeWithSelector(IGlobalConfigLibComptrollerV4.buyShares.selector, _depositAssetAmount, 1);\n        } else {\n            revert(\"formatDepositCall: Unsupported release\");\n        }\n\n        return (target_, payload_);\n    }\n\n    /// @notice Formats a redemption call to receive a single asset, relative to a vault's current version\n    /// @param _vaultProxy The VaultProxy (shares token)\n    /// @param _recipient The recipient of _asset\n    /// @param _asset The asset to receive\n    /// @param _amount The exact amount of either shares or _asset, determined by _amountIsShares\n    /// @param _amountIsShares True if _amount is shares (to redeem), false if _asset (to receive)\n    /// @dev Caller must validate expected shares received if required\n    function formatSingleAssetRedemptionCall(\n        address _vaultProxy,\n        address _recipient,\n        address _asset,\n        uint256 _amount,\n        bool _amountIsShares\n    ) external view override returns (address target_, bytes memory payload_) {\n        // Get release for _vaultProxy\n        address fundDeployer = __getFundDeployerForVaultProxy(_vaultProxy);\n\n        if (fundDeployer == FUND_DEPLOYER_V4) {\n            // `_amountIsShares == false` is not yet unsupported\n            require(_amountIsShares, \"formatSingleAssetRedemptionCall: _amountIsShares must be true\");\n\n            target_ = IVaultCore(_vaultProxy).getAccessor();\n\n            address[] memory assets = new address[](1);\n            assets[0] = _asset;\n\n            uint256[] memory percentages = new uint256[](1);\n            percentages[0] = ONE_HUNDRED_PERCENT_IN_BPS;\n\n            payload_ = abi.encodeWithSelector(\n                IGlobalConfigLibComptrollerV4.redeemSharesForSpecificAssets.selector,\n                _recipient,\n                _amount,\n                assets,\n                percentages\n            );\n        } else {\n            revert(\"formatSingleAssetRedemptionCall: Unsupported release\");\n        }\n\n        return (target_, payload_);\n    }\n\n    /// @notice Validates whether a call to redeem shares is valid for the shares version\n    /// @param _vaultProxy The VaultProxy (shares token)\n    /// @param _recipientToValidate The intended recipient of the assets received from the redemption\n    /// @param _sharesAmountToValidate The intended amount of shares to redeem\n    /// @param _redeemContract The contract to call\n    /// @param _redeemSelector The selector to call\n    /// @param _redeemData The encoded params to call\n    /// @return isValid_ True if valid\n    /// @dev Use  NO_VALIDATION_ constants to skip optional validation of recipient and/or amount\n    function isValidRedeemSharesCall(\n        address _vaultProxy,\n        address _recipientToValidate,\n        uint256 _sharesAmountToValidate,\n        address _redeemContract,\n        bytes4 _redeemSelector,\n        bytes calldata _redeemData\n    ) external view override returns (bool isValid_) {\n        // Get release for _vaultProxy\n        address fundDeployer = __getFundDeployerForVaultProxy(_vaultProxy);\n\n        // Validate call data based on release\n        if (fundDeployer == FUND_DEPLOYER_V4) {\n            // Validate contract\n            if (_redeemContract != IVaultCore(_vaultProxy).getAccessor()) {\n                return false;\n            }\n\n            // Validate selector\n            if (\n                !(\n                    _redeemSelector == IGlobalConfigLibComptrollerV4.redeemSharesForSpecificAssets.selector\n                        || _redeemSelector == IGlobalConfigLibComptrollerV4.redeemSharesInKind.selector\n                )\n            ) {\n                return false;\n            }\n\n            // Both functions have the same first two params so we can ignore the rest of _redeemData\n            (address encodedRecipient, uint256 encodedSharesAmount) = abi.decode(_redeemData, (address, uint256));\n\n            // Optionally validate recipient\n            if (_recipientToValidate != NO_VALIDATION_DUMMY_ADDRESS && _recipientToValidate != encodedRecipient) {\n                return false;\n            }\n\n            // Optionally validate shares amount\n            if (_sharesAmountToValidate != NO_VALIDATION_DUMMY_AMOUNT && _sharesAmountToValidate != encodedSharesAmount)\n            {\n                return false;\n            }\n\n            return true;\n        }\n\n        return false;\n    }\n\n    /// @dev Helper to get the FundDeployer (release) for a given vault\n    function __getFundDeployerForVaultProxy(address _vaultProxy) private view returns (address fundDeployer_) {\n        return IDispatcher(getDispatcher()).getFundDeployerForVaultProxy(_vaultProxy);\n    }\n}\n",
+  "deployed_bytecode": "0x608060405234801561001057600080fd5b50600436106100885760003560e01c80635d4755dc1161005b5780635d4755dc146101c15780637f1804331461027a5780639528ee16146102b0578063ebb3d589146102d457610088565b806319ab453c1461008d5780632441593c146100b557806343233f011461018157806352d1902d146101a7575b600080fd5b6100b3600480360360208110156100a357600080fd5b50356001600160a01b03166102dc565b005b6100f9600480360360a08110156100cb57600080fd5b506001600160a01b0381358116916020810135821691604082013516906060810135906080013515156103a3565b60405180836001600160a01b0316815260200180602001828103825283818151815260200191508051906020019080838360005b8381101561014557818101518382015260200161012d565b50505050905090810190601f1680156101725780820380516001836020036101000a031916815260200191505b50935050505060405180910390f35b6100b36004803603602081101561019757600080fd5b50356001600160a01b0316610650565b6101af61074a565b60408051918252519081900360200190f35b610266600480360360c08110156101d757600080fd5b6001600160a01b0382358116926020810135821692604082013592606083013516916001600160e01b03196080820135169181019060c0810160a082013564010000000081111561022757600080fd5b82018360208201111561023957600080fd5b8035906020019184600183028401116401000000008311171561025b57600080fd5b50909250905061076e565b604080519115158252519081900360200190f35b6100f96004803603606081101561029057600080fd5b506001600160a01b03813581169160208101359091169060400135610914565b6102b8610b0b565b604080516001600160a01b039092168252519081900360200190f35b6102b8610b30565b60006102e6610b30565b6001600160a01b031614610341576040805162461bcd60e51b815260206004820152601f60248201527f696e69743a2050726f787920616c726561647920696e697469616c697a656400604482015290519081900360640190fd5b600080546001600160a01b0319166001600160a01b0383161790557fce6de52b779ce41beea76a6e7a997211f0006af21ed2e2924caa5bdc92dac318610385610b0b565b604080516001600160a01b039092168252519081900360200190a150565b6000606060006103b288610b3f565b90507f000000000000000000000000a2b4c827de13d4e9801ea1ca837524a1a148dec36001600160a01b0316816001600160a01b0316141561060e578361042a5760405162461bcd60e51b815260040180806020018281038252603d815260200180610ce5603d913960400191505060405180910390fd5b876001600160a01b0316635a53e3486040518163ffffffff1660e01b815260040160206040518083038186803b15801561046357600080fd5b505afa158015610477573d6000803e3d6000fd5b505050506040513d602081101561048d57600080fd5b5051604080516001808252818301909252919450606091906020808301908036833701905050905086816000815181106104c357fe5b6001600160a01b0392909216602092830291909101909101526040805160018082528183019092526060918160200160208202803683370190505090506127108160008151811061051057fe5b602002602001018181525050633462fcc160e01b8988848460405160240180856001600160a01b031681526020018481526020018060200180602001838103835285818151815260200191508051906020019060200280838360005b8381101561058457818101518382015260200161056c565b50505050905001838103825284818151815260200191508051906020019060200280838360005b838110156105c35781810151838201526020016105ab565b505050509050019650505050505050604051602081830303815290604052906001600160e01b0319166020820180516001600160e01b03838183161783525050505093505050610645565b60405162461bcd60e51b8152600401808060200182810382526034815260200180610cb16034913960400191505060405180910390fd5b509550959350505050565b610658610b30565b6001600160a01b031663893d20e86040518163ffffffff1660e01b815260040160206040518083038186803b15801561069057600080fd5b505afa1580156106a4573d6000803e3d6000fd5b505050506040513d60208110156106ba57600080fd5b50516001600160a01b031633146107025760405162461bcd60e51b8152600401808060200182810382526030815260200180610d866030913960400191505060405180910390fd5b61070b81610bc7565b604080516001600160a01b038316815290517fce6de52b779ce41beea76a6e7a997211f0006af21ed2e2924caa5bdc92dac3189181900360200190a150565b7ff25d88d51901d7fabc9924b03f4c2fe4300e6fe1aae4b5134c0a90b68cd8e81c90565b60008061077a89610b3f565b90507f000000000000000000000000a2b4c827de13d4e9801ea1ca837524a1a148dec36001600160a01b0316816001600160a01b0316141561090357886001600160a01b0316635a53e3486040518163ffffffff1660e01b815260040160206040518083038186803b1580156107ef57600080fd5b505afa158015610803573d6000803e3d6000fd5b505050506040513d602081101561081957600080fd5b50516001600160a01b03878116911614610837576000915050610909565b6001600160e01b03198516633462fcc160e01b148061086657506001600160e01b03198516636af8e7eb60e01b145b610874576000915050610909565b6000808585604081101561088757600080fd5b506001600160a01b0381358116935060209091013591508a1661aaaa148015906108c35750816001600160a01b03168a6001600160a01b031614155b156108d45760009350505050610909565b60011989148015906108e65750808914155b156108f75760009350505050610909565b60019350505050610909565b60009150505b979650505050505050565b60006060600061092386610b3f565b90507f000000000000000000000000a2b4c827de13d4e9801ea1ca837524a1a148dec36001600160a01b0316816001600160a01b03161415610acb576000866001600160a01b0316635a53e3486040518163ffffffff1660e01b815260040160206040518083038186803b15801561099a57600080fd5b505afa1580156109ae573d6000803e3d6000fd5b505050506040513d60208110156109c457600080fd5b505160408051637134e1eb60e11b815290519192506001600160a01b0383169163e269c3d691600480820192602092909190829003018186803b158015610a0a57600080fd5b505afa158015610a1e573d6000803e3d6000fd5b505050506040513d6020811015610a3457600080fd5b50516001600160a01b03878116911614610a7f5760405162461bcd60e51b815260040180806020018281038252602c815260200180610d5a602c913960400191505060405180910390fd5b604080516024810187905260016044808301919091528251808303909101815260649091019091526020810180516001600160e01b0316635f75e2ed60e11b1790529093509150610b02565b60405162461bcd60e51b8152600401808060200182810382526026815260200180610db66026913960400191505060405180910390fd5b50935093915050565b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5490565b6000546001600160a01b031690565b6000610b49610b30565b6001600160a01b0316633d7c74f8836040518263ffffffff1660e01b815260040180826001600160a01b0316815260200191505060206040518083038186803b158015610b9557600080fd5b505afa158015610ba9573d6000803e3d6000fd5b505050506040513d6020811015610bbf57600080fd5b505192915050565b7ff25d88d51901d7fabc9924b03f4c2fe4300e6fe1aae4b5134c0a90b68cd8e81c60001b816001600160a01b03166352d1902d6040518163ffffffff1660e01b815260040160206040518083038186803b158015610c2457600080fd5b505afa158015610c38573d6000803e3d6000fd5b505050506040513d6020811015610c4e57600080fd5b505114610c8c5760405162461bcd60e51b8152600401808060200182810382526038815260200180610d226038913960400191505060405180910390fd5b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5556fe666f726d617453696e676c654173736574526564656d7074696f6e43616c6c3a20556e737570706f727465642072656c65617365666f726d617453696e676c654173736574526564656d7074696f6e43616c6c3a205f616d6f756e744973536861726573206d75737420626520747275655f5f757064617465436f6465416464726573733a205f6e657874476c6f62616c436f6e6669674c6962206e6f7420636f6d70617469626c65666f726d61744465706f73697443616c6c3a20556e737570706f72746564205f6465706f73697441737365744f6e6c79207468652044697370617463686572206f776e65722063616e2063616c6c20746869732066756e6374696f6e666f726d61744465706f73697443616c6c3a20556e737570706f727465642072656c65617365a164736f6c634300060c000a",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "github_repository_metadata": null,
+  "compiler_settings": {
+    "evmVersion": "istanbul",
+    "libraries": {},
+    "metadata": {
+      "bytecodeHash": "none",
+      "useLiteralContent": false
+    },
+    "optimizer": {
+      "details": {
+        "yul": false
+      },
+      "enabled": true,
+      "runs": 200
+    },
+    "outputSelection": {
+      "*": {
+        "*": [
+          "abi",
+          "evm.bytecode",
+          "evm.deployedBytecode",
+          "evm.methodIdentifiers",
+          "metadata"
+        ]
+      }
+    },
+    "remappings": [
+      "@openzeppelin/contracts/=lib/openzeppelin-solc-0.6/contracts/",
+      "@uniswap/v3-core/=lib/uniswap-v3-core/",
+      "@opengsn/=lib/opengsn/packages/contracts/src/",
+      "@openzeppelin-4.2.0/contracts/=lib/openzeppelin-contracts/contracts/",
+      "ds-test/=lib/forge-std/lib/ds-test/src/",
+      "forge-std/=lib/forge-std/src/",
+      "openzeppelin-solc-0.6/=lib/openzeppelin-solc-0.6/contracts/",
+      "openzeppelin-solc-0.7/=lib/openzeppelin-solc-0.7/contracts/",
+      "openzeppelin-solc-0.8/=lib/openzeppelin-solc-0.8/contracts/",
+      "uniswap-v3-core/=lib/uniswap-v3-core/",
+      "uniswap-v3-core-0.8/=lib/uniswap-v3-core-0.8/",
+      "uniswap-v3-periphery/=lib/uniswap-v3-periphery/contracts/",
+      "uniswap-v3-periphery-0.8/=lib/uniswap-v3-periphery-0.8/contracts/"
+    ]
+  },
+  "optimization_runs": 200,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "0xa2B4c827dE13D4e9801eA1Ca837524a1A148Dec3",
+      {
+        "internalType": "address",
+        "name": "_fundDeployerV4",
+        "type": "address"
+      }
+    ]
+  ],
+  "compiler_version": "v0.6.12+commit.27d51765",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-02-14T21:38:08.000200Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x60a060405234801561001057600080fd5b50604051610e59380380610e598339818101604052602081101561003357600080fd5b5051606081901b6001600160601b0319166080526001600160a01b0316610de8610071600039806103b6528061077e52806109275250610de86000f3fe608060405234801561001057600080fd5b50600436106100885760003560e01c80635d4755dc1161005b5780635d4755dc146101c15780637f1804331461027a5780639528ee16146102b0578063ebb3d589146102d457610088565b806319ab453c1461008d5780632441593c146100b557806343233f011461018157806352d1902d146101a7575b600080fd5b6100b3600480360360208110156100a357600080fd5b50356001600160a01b03166102dc565b005b6100f9600480360360a08110156100cb57600080fd5b506001600160a01b0381358116916020810135821691604082013516906060810135906080013515156103a3565b60405180836001600160a01b0316815260200180602001828103825283818151815260200191508051906020019080838360005b8381101561014557818101518382015260200161012d565b50505050905090810190601f1680156101725780820380516001836020036101000a031916815260200191505b50935050505060405180910390f35b6100b36004803603602081101561019757600080fd5b50356001600160a01b0316610650565b6101af61074a565b60408051918252519081900360200190f35b610266600480360360c08110156101d757600080fd5b6001600160a01b0382358116926020810135821692604082013592606083013516916001600160e01b03196080820135169181019060c0810160a082013564010000000081111561022757600080fd5b82018360208201111561023957600080fd5b8035906020019184600183028401116401000000008311171561025b57600080fd5b50909250905061076e565b604080519115158252519081900360200190f35b6100f96004803603606081101561029057600080fd5b506001600160a01b03813581169160208101359091169060400135610914565b6102b8610b0b565b604080516001600160a01b039092168252519081900360200190f35b6102b8610b30565b60006102e6610b30565b6001600160a01b031614610341576040805162461bcd60e51b815260206004820152601f60248201527f696e69743a2050726f787920616c726561647920696e697469616c697a656400604482015290519081900360640190fd5b600080546001600160a01b0319166001600160a01b0383161790557fce6de52b779ce41beea76a6e7a997211f0006af21ed2e2924caa5bdc92dac318610385610b0b565b604080516001600160a01b039092168252519081900360200190a150565b6000606060006103b288610b3f565b90507f00000000000000000000000000000000000000000000000000000000000000006001600160a01b0316816001600160a01b0316141561060e578361042a5760405162461bcd60e51b815260040180806020018281038252603d815260200180610ce5603d913960400191505060405180910390fd5b876001600160a01b0316635a53e3486040518163ffffffff1660e01b815260040160206040518083038186803b15801561046357600080fd5b505afa158015610477573d6000803e3d6000fd5b505050506040513d602081101561048d57600080fd5b5051604080516001808252818301909252919450606091906020808301908036833701905050905086816000815181106104c357fe5b6001600160a01b0392909216602092830291909101909101526040805160018082528183019092526060918160200160208202803683370190505090506127108160008151811061051057fe5b602002602001018181525050633462fcc160e01b8988848460405160240180856001600160a01b031681526020018481526020018060200180602001838103835285818151815260200191508051906020019060200280838360005b8381101561058457818101518382015260200161056c565b50505050905001838103825284818151815260200191508051906020019060200280838360005b838110156105c35781810151838201526020016105ab565b505050509050019650505050505050604051602081830303815290604052906001600160e01b0319166020820180516001600160e01b03838183161783525050505093505050610645565b60405162461bcd60e51b8152600401808060200182810382526034815260200180610cb16034913960400191505060405180910390fd5b509550959350505050565b610658610b30565b6001600160a01b031663893d20e86040518163ffffffff1660e01b815260040160206040518083038186803b15801561069057600080fd5b505afa1580156106a4573d6000803e3d6000fd5b505050506040513d60208110156106ba57600080fd5b50516001600160a01b031633146107025760405162461bcd60e51b8152600401808060200182810382526030815260200180610d866030913960400191505060405180910390fd5b61070b81610bc7565b604080516001600160a01b038316815290517fce6de52b779ce41beea76a6e7a997211f0006af21ed2e2924caa5bdc92dac3189181900360200190a150565b7ff25d88d51901d7fabc9924b03f4c2fe4300e6fe1aae4b5134c0a90b68cd8e81c90565b60008061077a89610b3f565b90507f00000000000000000000000000000000000000000000000000000000000000006001600160a01b0316816001600160a01b0316141561090357886001600160a01b0316635a53e3486040518163ffffffff1660e01b815260040160206040518083038186803b1580156107ef57600080fd5b505afa158015610803573d6000803e3d6000fd5b505050506040513d602081101561081957600080fd5b50516001600160a01b03878116911614610837576000915050610909565b6001600160e01b03198516633462fcc160e01b148061086657506001600160e01b03198516636af8e7eb60e01b145b610874576000915050610909565b6000808585604081101561088757600080fd5b506001600160a01b0381358116935060209091013591508a1661aaaa148015906108c35750816001600160a01b03168a6001600160a01b031614155b156108d45760009350505050610909565b60011989148015906108e65750808914155b156108f75760009350505050610909565b60019350505050610909565b60009150505b979650505050505050565b60006060600061092386610b3f565b90507f00000000000000000000000000000000000000000000000000000000000000006001600160a01b0316816001600160a01b03161415610acb576000866001600160a01b0316635a53e3486040518163ffffffff1660e01b815260040160206040518083038186803b15801561099a57600080fd5b505afa1580156109ae573d6000803e3d6000fd5b505050506040513d60208110156109c457600080fd5b505160408051637134e1eb60e11b815290519192506001600160a01b0383169163e269c3d691600480820192602092909190829003018186803b158015610a0a57600080fd5b505afa158015610a1e573d6000803e3d6000fd5b505050506040513d6020811015610a3457600080fd5b50516001600160a01b03878116911614610a7f5760405162461bcd60e51b815260040180806020018281038252602c815260200180610d5a602c913960400191505060405180910390fd5b604080516024810187905260016044808301919091528251808303909101815260649091019091526020810180516001600160e01b0316635f75e2ed60e11b1790529093509150610b02565b60405162461bcd60e51b8152600401808060200182810382526026815260200180610db66026913960400191505060405180910390fd5b50935093915050565b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5490565b6000546001600160a01b031690565b6000610b49610b30565b6001600160a01b0316633d7c74f8836040518263ffffffff1660e01b815260040180826001600160a01b0316815260200191505060206040518083038186803b158015610b9557600080fd5b505afa158015610ba9573d6000803e3d6000fd5b505050506040513d6020811015610bbf57600080fd5b505192915050565b7ff25d88d51901d7fabc9924b03f4c2fe4300e6fe1aae4b5134c0a90b68cd8e81c60001b816001600160a01b03166352d1902d6040518163ffffffff1660e01b815260040160206040518083038186803b158015610c2457600080fd5b505afa158015610c38573d6000803e3d6000fd5b505050506040513d6020811015610c4e57600080fd5b505114610c8c5760405162461bcd60e51b8152600401808060200182810382526038815260200180610d226038913960400191505060405180910390fd5b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5556fe666f726d617453696e676c654173736574526564656d7074696f6e43616c6c3a20556e737570706f727465642072656c65617365666f726d617453696e676c654173736574526564656d7074696f6e43616c6c3a205f616d6f756e744973536861726573206d75737420626520747275655f5f757064617465436f6465416464726573733a205f6e657874476c6f62616c436f6e6669674c6962206e6f7420636f6d70617469626c65666f726d61744465706f73697443616c6c3a20556e737570706f72746564205f6465706f73697441737365744f6e6c79207468652044697370617463686572206f776e65722063616e2063616c6c20746869732066756e6374696f6e666f726d61744465706f73697443616c6c3a20556e737570706f727465642072656c65617365a164736f6c634300060c000a000000000000000000000000a2b4c827de13d4e9801ea1ca837524a1a148dec3",
+  "name": "GlobalConfigLib",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": true,
+  "language": "solidity",
+  "evm_version": "istanbul",
+  "can_be_visualized_via_sol2uml": true,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [
+    {
+      "file_path": "contracts/persistent/vault/interfaces/IVaultCore.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IVaultCore interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Interface for getters of core vault storage\n/// @dev DO NOT EDIT CONTRACT\ninterface IVaultCore {\n    function getAccessor() external view returns (address accessor_);\n\n    function getCreator() external view returns (address creator_);\n\n    function getMigrator() external view returns (address migrator_);\n\n    function getOwner() external view returns (address owner_);\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/dispatcher/IDispatcher.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IDispatcher Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IDispatcher {\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function claimOwnership() external;\n\n    function deployVaultProxy(address _vaultLib, address _owner, address _vaultAccessor, string calldata _fundName)\n        external\n        returns (address vaultProxy_);\n\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function getCurrentFundDeployer() external view returns (address currentFundDeployer_);\n\n    function getFundDeployerForVaultProxy(address _vaultProxy) external view returns (address fundDeployer_);\n\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        );\n\n    function getMigrationTimelock() external view returns (uint256 migrationTimelock_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getOwner() external view returns (address owner_);\n\n    function getSharesTokenSymbol() external view returns (string memory sharesTokenSymbol_);\n\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (uint256 secondsRemaining_);\n\n    function hasExecutableMigrationRequest(address _vaultProxy) external view returns (bool hasExecutableRequest_);\n\n    function hasMigrationRequest(address _vaultProxy) external view returns (bool hasMigrationRequest_);\n\n    function removeNominatedOwner() external;\n\n    function setCurrentFundDeployer(address _nextFundDeployer) external;\n\n    function setMigrationTimelock(uint256 _nextTimelock) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSharesTokenSymbol(string calldata _nextSymbol) external;\n\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external;\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/global-config/bases/GlobalConfigLibBase1.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"./GlobalConfigLibBaseCore.sol\";\n\n/// @title GlobalConfigLibBase1 Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A base implementation for GlobalConfigLib\n/// @dev Each next base implementation inherits the previous base implementation,\n/// e.g., `GlobalConfigLibBase2 is GlobalConfigLibBase1`\n/// DO NOT EDIT CONTRACT.\nabstract contract GlobalConfigLibBase1 is GlobalConfigLibBaseCore {\n    address internal constant NO_VALIDATION_DUMMY_ADDRESS = 0x000000000000000000000000000000000000aaaa;\n    // Don't use max, since a max value can be valid\n    uint256 internal constant NO_VALIDATION_DUMMY_AMOUNT = type(uint256).max - 1;\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/global-config/bases/GlobalConfigLibBaseCore.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"../../../persistent/dispatcher/IDispatcher.sol\";\nimport \"../utils/ProxiableGlobalConfigLib.sol\";\n\n/// @title GlobalConfigLibBaseCore Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice The core implementation of GlobalConfigLib\n/// @dev To be inherited by the first GlobalConfigLibBase implementation only.\n/// DO NOT EDIT CONTRACT.\nabstract contract GlobalConfigLibBaseCore is ProxiableGlobalConfigLib {\n    event GlobalConfigLibSet(address nextGlobalConfigLib);\n\n    address internal dispatcher;\n\n    modifier onlyDispatcherOwner() {\n        require(\n            msg.sender == IDispatcher(getDispatcher()).getOwner(), \"Only the Dispatcher owner can call this function\"\n        );\n\n        _;\n    }\n\n    /// @notice Initializes the GlobalConfigProxy with core configuration\n    /// @param _dispatcher The Dispatcher contract\n    /// @dev Serves as a pseudo-constructor\n    function init(address _dispatcher) external {\n        require(getDispatcher() == address(0), \"init: Proxy already initialized\");\n\n        dispatcher = _dispatcher;\n\n        emit GlobalConfigLibSet(getGlobalConfigLib());\n    }\n\n    /// @notice Sets the GlobalConfigLib target for the GlobalConfigProxy\n    /// @param _nextGlobalConfigLib The address to set as the GlobalConfigLib\n    /// @dev This function is absolutely critical. __updateCodeAddress() validates that the\n    /// target is a valid Proxiable contract instance.\n    /// Does not block _nextGlobalConfigLib from being the same as the current GlobalConfigLib\n    function setGlobalConfigLib(address _nextGlobalConfigLib) external onlyDispatcherOwner {\n        __updateCodeAddress(_nextGlobalConfigLib);\n\n        emit GlobalConfigLibSet(_nextGlobalConfigLib);\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the `dispatcher` variable\n    /// @return dispatcher_ The `dispatcher` variable value\n    function getDispatcher() public view returns (address dispatcher_) {\n        return dispatcher;\n    }\n\n    /// @notice Gets the GlobalConfigLib target for the GlobalConfigProxy\n    /// @return globalConfigLib_ The address of the GlobalConfigLib target\n    function getGlobalConfigLib() public view returns (address globalConfigLib_) {\n        assembly {\n            globalConfigLib_ := sload(EIP_1967_SLOT)\n        }\n\n        return globalConfigLib_;\n    }\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/global-config/interfaces/IGlobalConfig1.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IGlobalConfig1 Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @dev Each interface should inherit the previous interface,\n/// e.g., `IGlobalConfig2 is IGlobalConfig1`\ninterface IGlobalConfig1 {\n    function isValidRedeemSharesCall(\n        address _vaultProxy,\n        address _recipientToValidate,\n        uint256 _sharesAmountToValidate,\n        address _redeemContract,\n        bytes4 _redeemSelector,\n        bytes calldata _redeemData\n    ) external view returns (bool isValid_);\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/global-config/interfaces/IGlobalConfig2.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport \"./IGlobalConfig1.sol\";\n\n/// @title IGlobalConfig2 Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @dev Each interface should inherit the previous interface,\n/// e.g., `IGlobalConfig2 is IGlobalConfig1`\ninterface IGlobalConfig2 is IGlobalConfig1 {\n    function formatDepositCall(address _vaultProxy, address _depositAsset, uint256 _depositAssetAmount)\n        external\n        view\n        returns (address target_, bytes memory payload_);\n\n    function formatSingleAssetRedemptionCall(\n        address _vaultProxy,\n        address _recipient,\n        address _asset,\n        uint256 _amount,\n        bool _amountIsShares\n    ) external view returns (address target_, bytes memory payload_);\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/global-config/interfaces/IGlobalConfigLibComptrollerV4.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IGlobalConfigLibComptrollerV4 Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Limited interface for GlobalConfigLib's required Enzyme v4 ComptrollerLib calls\ninterface IGlobalConfigLibComptrollerV4 {\n    function buyShares(uint256 _investmentAmount, uint256 _minSharesQuantity)\n        external\n        returns (uint256 sharesReceived_);\n\n    function getDenominationAsset() external view returns (address denominationAsset_);\n\n    function redeemSharesForSpecificAssets(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _payoutAssets,\n        uint256[] calldata _payoutAssetPercentages\n    ) external returns (uint256[] memory payoutAmounts_);\n\n    function redeemSharesInKind(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _additionalAssets,\n        address[] calldata _assetsToSkip\n    ) external returns (address[] memory payoutAssets_, uint256[] memory payoutAmounts_);\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/global-config/utils/GlobalConfigProxyConstants.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title GlobalConfigProxyConstants Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Constant values used in GlobalConfig proxy-related contracts\nabstract contract GlobalConfigProxyConstants {\n    // `bytes32(keccak256('mln.proxiable.globalConfigLib'))`\n    bytes32 internal constant EIP_1822_PROXIABLE_UUID =\n        0xf25d88d51901d7fabc9924b03f4c2fe4300e6fe1aae4b5134c0a90b68cd8e81c;\n    // `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`\n    bytes32 internal constant EIP_1967_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;\n}\n"
+    },
+    {
+      "file_path": "contracts/persistent/global-config/utils/ProxiableGlobalConfigLib.sol",
+      "source_code": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"./GlobalConfigProxyConstants.sol\";\n\n/// @title ProxiableGlobalConfigLib Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A contract that defines the upgrade behavior for GlobalConfigLib instances\n/// @dev The recommended implementation of the target of a proxy according to EIP-1822 and EIP-1967\n/// See: https://eips.ethereum.org/EIPS/eip-1822\n/// See: https://eips.ethereum.org/EIPS/eip-1967\nabstract contract ProxiableGlobalConfigLib is GlobalConfigProxyConstants {\n    /// @dev Updates the target of the proxy to be the contract at _nextGlobalConfigLib\n    function __updateCodeAddress(address _nextGlobalConfigLib) internal {\n        require(\n            ProxiableGlobalConfigLib(_nextGlobalConfigLib).proxiableUUID() == bytes32(EIP_1822_PROXIABLE_UUID),\n            \"__updateCodeAddress: _nextGlobalConfigLib not compatible\"\n        );\n        assembly {\n            sstore(EIP_1967_SLOT, _nextGlobalConfigLib)\n        }\n    }\n\n    /// @notice Returns a unique bytes32 hash for GlobalConfigLib instances\n    /// @return uuid_ The bytes32 hash representing the UUID\n    function proxiableUUID() public pure returns (bytes32 uuid_) {\n        return EIP_1822_PROXIABLE_UUID;\n    }\n}\n"
+    }
+  ],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_fundDeployerV4",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "address",
+          "name": "nextGlobalConfigLib",
+          "type": "address"
+        }
+      ],
+      "name": "GlobalConfigLibSet",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_vaultProxy",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "_depositAsset",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_depositAssetAmount",
+          "type": "uint256"
+        }
+      ],
+      "name": "formatDepositCall",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "target_",
+          "type": "address"
+        },
+        {
+          "internalType": "bytes",
+          "name": "payload_",
+          "type": "bytes"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_vaultProxy",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "_recipient",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "_asset",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_amount",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bool",
+          "name": "_amountIsShares",
+          "type": "bool"
+        }
+      ],
+      "name": "formatSingleAssetRedemptionCall",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "target_",
+          "type": "address"
+        },
+        {
+          "internalType": "bytes",
+          "name": "payload_",
+          "type": "bytes"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getDispatcher",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "dispatcher_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getGlobalConfigLib",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "globalConfigLib_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_dispatcher",
+          "type": "address"
+        }
+      ],
+      "name": "init",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_vaultProxy",
+          "type": "address"
+        },
+        {
+          "internalType": "address",
+          "name": "_recipientToValidate",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "_sharesAmountToValidate",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "_redeemContract",
+          "type": "address"
+        },
+        {
+          "internalType": "bytes4",
+          "name": "_redeemSelector",
+          "type": "bytes4"
+        },
+        {
+          "internalType": "bytes",
+          "name": "_redeemData",
+          "type": "bytes"
+        }
+      ],
+      "name": "isValidRedeemSharesCall",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "isValid_",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "proxiableUUID",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "uuid_",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "_nextGlobalConfigLib",
+          "type": "address"
+        }
+      ],
+      "name": "setGlobalConfigLib",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "is_changed_bytecode": true,
+  "is_partially_verified": true,
+  "package_name": null,
+  "constructor_args": "000000000000000000000000a2b4c827de13d4e9801ea1ca837524a1a148dec3",
+  "sources": {
+    "contracts/persistent/global-config/GlobalConfigLib.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"../vault/interfaces/IVaultCore.sol\";\nimport \"./bases/GlobalConfigLibBase1.sol\";\nimport \"./interfaces/IGlobalConfig2.sol\";\nimport \"./interfaces/IGlobalConfigLibComptrollerV4.sol\";\n\n/// @title GlobalConfigLib Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice The proxiable library contract for GlobalConfigProxy\n/// @dev Only supports releases v4 and higher\ncontract GlobalConfigLib is IGlobalConfig2, GlobalConfigLibBase1 {\n    uint256 private constant ONE_HUNDRED_PERCENT_IN_BPS = 10000;\n\n    address private immutable FUND_DEPLOYER_V4;\n\n    constructor(address _fundDeployerV4) public {\n        FUND_DEPLOYER_V4 = _fundDeployerV4;\n    }\n\n    /// @notice Formats a deposit call, relative to a vault's current version\n    /// @param _vaultProxy The VaultProxy (shares token)\n    /// @param _depositAsset The token to deposit for shares\n    /// @param _depositAssetAmount The exact amount of _depositAsset to deposit\n    /// @dev Caller must validate expected shares received if required\n    function formatDepositCall(address _vaultProxy, address _depositAsset, uint256 _depositAssetAmount)\n        external\n        view\n        override\n        returns (address target_, bytes memory payload_)\n    {\n        // Get release for _vaultProxy\n        address fundDeployer = __getFundDeployerForVaultProxy(_vaultProxy);\n\n        if (fundDeployer == FUND_DEPLOYER_V4) {\n            address comptrollerProxy = IVaultCore(_vaultProxy).getAccessor();\n\n            // Deposit asset must be denominationAsset\n            require(\n                _depositAsset == IGlobalConfigLibComptrollerV4(comptrollerProxy).getDenominationAsset(),\n                \"formatDepositCall: Unsupported _depositAsset\"\n            );\n\n            target_ = comptrollerProxy;\n            payload_ = abi.encodeWithSelector(IGlobalConfigLibComptrollerV4.buyShares.selector, _depositAssetAmount, 1);\n        } else {\n            revert(\"formatDepositCall: Unsupported release\");\n        }\n\n        return (target_, payload_);\n    }\n\n    /// @notice Formats a redemption call to receive a single asset, relative to a vault's current version\n    /// @param _vaultProxy The VaultProxy (shares token)\n    /// @param _recipient The recipient of _asset\n    /// @param _asset The asset to receive\n    /// @param _amount The exact amount of either shares or _asset, determined by _amountIsShares\n    /// @param _amountIsShares True if _amount is shares (to redeem), false if _asset (to receive)\n    /// @dev Caller must validate expected shares received if required\n    function formatSingleAssetRedemptionCall(\n        address _vaultProxy,\n        address _recipient,\n        address _asset,\n        uint256 _amount,\n        bool _amountIsShares\n    ) external view override returns (address target_, bytes memory payload_) {\n        // Get release for _vaultProxy\n        address fundDeployer = __getFundDeployerForVaultProxy(_vaultProxy);\n\n        if (fundDeployer == FUND_DEPLOYER_V4) {\n            // `_amountIsShares == false` is not yet unsupported\n            require(_amountIsShares, \"formatSingleAssetRedemptionCall: _amountIsShares must be true\");\n\n            target_ = IVaultCore(_vaultProxy).getAccessor();\n\n            address[] memory assets = new address[](1);\n            assets[0] = _asset;\n\n            uint256[] memory percentages = new uint256[](1);\n            percentages[0] = ONE_HUNDRED_PERCENT_IN_BPS;\n\n            payload_ = abi.encodeWithSelector(\n                IGlobalConfigLibComptrollerV4.redeemSharesForSpecificAssets.selector,\n                _recipient,\n                _amount,\n                assets,\n                percentages\n            );\n        } else {\n            revert(\"formatSingleAssetRedemptionCall: Unsupported release\");\n        }\n\n        return (target_, payload_);\n    }\n\n    /// @notice Validates whether a call to redeem shares is valid for the shares version\n    /// @param _vaultProxy The VaultProxy (shares token)\n    /// @param _recipientToValidate The intended recipient of the assets received from the redemption\n    /// @param _sharesAmountToValidate The intended amount of shares to redeem\n    /// @param _redeemContract The contract to call\n    /// @param _redeemSelector The selector to call\n    /// @param _redeemData The encoded params to call\n    /// @return isValid_ True if valid\n    /// @dev Use  NO_VALIDATION_ constants to skip optional validation of recipient and/or amount\n    function isValidRedeemSharesCall(\n        address _vaultProxy,\n        address _recipientToValidate,\n        uint256 _sharesAmountToValidate,\n        address _redeemContract,\n        bytes4 _redeemSelector,\n        bytes calldata _redeemData\n    ) external view override returns (bool isValid_) {\n        // Get release for _vaultProxy\n        address fundDeployer = __getFundDeployerForVaultProxy(_vaultProxy);\n\n        // Validate call data based on release\n        if (fundDeployer == FUND_DEPLOYER_V4) {\n            // Validate contract\n            if (_redeemContract != IVaultCore(_vaultProxy).getAccessor()) {\n                return false;\n            }\n\n            // Validate selector\n            if (\n                !(\n                    _redeemSelector == IGlobalConfigLibComptrollerV4.redeemSharesForSpecificAssets.selector\n                        || _redeemSelector == IGlobalConfigLibComptrollerV4.redeemSharesInKind.selector\n                )\n            ) {\n                return false;\n            }\n\n            // Both functions have the same first two params so we can ignore the rest of _redeemData\n            (address encodedRecipient, uint256 encodedSharesAmount) = abi.decode(_redeemData, (address, uint256));\n\n            // Optionally validate recipient\n            if (_recipientToValidate != NO_VALIDATION_DUMMY_ADDRESS && _recipientToValidate != encodedRecipient) {\n                return false;\n            }\n\n            // Optionally validate shares amount\n            if (_sharesAmountToValidate != NO_VALIDATION_DUMMY_AMOUNT && _sharesAmountToValidate != encodedSharesAmount)\n            {\n                return false;\n            }\n\n            return true;\n        }\n\n        return false;\n    }\n\n    /// @dev Helper to get the FundDeployer (release) for a given vault\n    function __getFundDeployerForVaultProxy(address _vaultProxy) private view returns (address fundDeployer_) {\n        return IDispatcher(getDispatcher()).getFundDeployerForVaultProxy(_vaultProxy);\n    }\n}\n"
+    },
+    "contracts/persistent/vault/interfaces/IVaultCore.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IVaultCore interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Interface for getters of core vault storage\n/// @dev DO NOT EDIT CONTRACT\ninterface IVaultCore {\n    function getAccessor() external view returns (address accessor_);\n\n    function getCreator() external view returns (address creator_);\n\n    function getMigrator() external view returns (address migrator_);\n\n    function getOwner() external view returns (address owner_);\n}\n"
+    },
+    "contracts/persistent/dispatcher/IDispatcher.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IDispatcher Interface\n/// @author Enzyme Council <security@enzyme.finance>\ninterface IDispatcher {\n    function cancelMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function claimOwnership() external;\n\n    function deployVaultProxy(address _vaultLib, address _owner, address _vaultAccessor, string calldata _fundName)\n        external\n        returns (address vaultProxy_);\n\n    function executeMigration(address _vaultProxy, bool _bypassFailure) external;\n\n    function getCurrentFundDeployer() external view returns (address currentFundDeployer_);\n\n    function getFundDeployerForVaultProxy(address _vaultProxy) external view returns (address fundDeployer_);\n\n    function getMigrationRequestDetailsForVaultProxy(address _vaultProxy)\n        external\n        view\n        returns (\n            address nextFundDeployer_,\n            address nextVaultAccessor_,\n            address nextVaultLib_,\n            uint256 executableTimestamp_\n        );\n\n    function getMigrationTimelock() external view returns (uint256 migrationTimelock_);\n\n    function getNominatedOwner() external view returns (address nominatedOwner_);\n\n    function getOwner() external view returns (address owner_);\n\n    function getSharesTokenSymbol() external view returns (string memory sharesTokenSymbol_);\n\n    function getTimelockRemainingForMigrationRequest(address _vaultProxy)\n        external\n        view\n        returns (uint256 secondsRemaining_);\n\n    function hasExecutableMigrationRequest(address _vaultProxy) external view returns (bool hasExecutableRequest_);\n\n    function hasMigrationRequest(address _vaultProxy) external view returns (bool hasMigrationRequest_);\n\n    function removeNominatedOwner() external;\n\n    function setCurrentFundDeployer(address _nextFundDeployer) external;\n\n    function setMigrationTimelock(uint256 _nextTimelock) external;\n\n    function setNominatedOwner(address _nextNominatedOwner) external;\n\n    function setSharesTokenSymbol(string calldata _nextSymbol) external;\n\n    function signalMigration(\n        address _vaultProxy,\n        address _nextVaultAccessor,\n        address _nextVaultLib,\n        bool _bypassFailure\n    ) external;\n}\n"
+    },
+    "contracts/persistent/global-config/bases/GlobalConfigLibBase1.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"./GlobalConfigLibBaseCore.sol\";\n\n/// @title GlobalConfigLibBase1 Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A base implementation for GlobalConfigLib\n/// @dev Each next base implementation inherits the previous base implementation,\n/// e.g., `GlobalConfigLibBase2 is GlobalConfigLibBase1`\n/// DO NOT EDIT CONTRACT.\nabstract contract GlobalConfigLibBase1 is GlobalConfigLibBaseCore {\n    address internal constant NO_VALIDATION_DUMMY_ADDRESS = 0x000000000000000000000000000000000000aaaa;\n    // Don't use max, since a max value can be valid\n    uint256 internal constant NO_VALIDATION_DUMMY_AMOUNT = type(uint256).max - 1;\n}\n"
+    },
+    "contracts/persistent/global-config/bases/GlobalConfigLibBaseCore.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"../../../persistent/dispatcher/IDispatcher.sol\";\nimport \"../utils/ProxiableGlobalConfigLib.sol\";\n\n/// @title GlobalConfigLibBaseCore Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice The core implementation of GlobalConfigLib\n/// @dev To be inherited by the first GlobalConfigLibBase implementation only.\n/// DO NOT EDIT CONTRACT.\nabstract contract GlobalConfigLibBaseCore is ProxiableGlobalConfigLib {\n    event GlobalConfigLibSet(address nextGlobalConfigLib);\n\n    address internal dispatcher;\n\n    modifier onlyDispatcherOwner() {\n        require(\n            msg.sender == IDispatcher(getDispatcher()).getOwner(), \"Only the Dispatcher owner can call this function\"\n        );\n\n        _;\n    }\n\n    /// @notice Initializes the GlobalConfigProxy with core configuration\n    /// @param _dispatcher The Dispatcher contract\n    /// @dev Serves as a pseudo-constructor\n    function init(address _dispatcher) external {\n        require(getDispatcher() == address(0), \"init: Proxy already initialized\");\n\n        dispatcher = _dispatcher;\n\n        emit GlobalConfigLibSet(getGlobalConfigLib());\n    }\n\n    /// @notice Sets the GlobalConfigLib target for the GlobalConfigProxy\n    /// @param _nextGlobalConfigLib The address to set as the GlobalConfigLib\n    /// @dev This function is absolutely critical. __updateCodeAddress() validates that the\n    /// target is a valid Proxiable contract instance.\n    /// Does not block _nextGlobalConfigLib from being the same as the current GlobalConfigLib\n    function setGlobalConfigLib(address _nextGlobalConfigLib) external onlyDispatcherOwner {\n        __updateCodeAddress(_nextGlobalConfigLib);\n\n        emit GlobalConfigLibSet(_nextGlobalConfigLib);\n    }\n\n    ///////////////////\n    // STATE GETTERS //\n    ///////////////////\n\n    /// @notice Gets the `dispatcher` variable\n    /// @return dispatcher_ The `dispatcher` variable value\n    function getDispatcher() public view returns (address dispatcher_) {\n        return dispatcher;\n    }\n\n    /// @notice Gets the GlobalConfigLib target for the GlobalConfigProxy\n    /// @return globalConfigLib_ The address of the GlobalConfigLib target\n    function getGlobalConfigLib() public view returns (address globalConfigLib_) {\n        assembly {\n            globalConfigLib_ := sload(EIP_1967_SLOT)\n        }\n\n        return globalConfigLib_;\n    }\n}\n"
+    },
+    "contracts/persistent/global-config/interfaces/IGlobalConfig1.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IGlobalConfig1 Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @dev Each interface should inherit the previous interface,\n/// e.g., `IGlobalConfig2 is IGlobalConfig1`\ninterface IGlobalConfig1 {\n    function isValidRedeemSharesCall(\n        address _vaultProxy,\n        address _recipientToValidate,\n        uint256 _sharesAmountToValidate,\n        address _redeemContract,\n        bytes4 _redeemSelector,\n        bytes calldata _redeemData\n    ) external view returns (bool isValid_);\n}\n"
+    },
+    "contracts/persistent/global-config/interfaces/IGlobalConfig2.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\nimport \"./IGlobalConfig1.sol\";\n\n/// @title IGlobalConfig2 Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @dev Each interface should inherit the previous interface,\n/// e.g., `IGlobalConfig2 is IGlobalConfig1`\ninterface IGlobalConfig2 is IGlobalConfig1 {\n    function formatDepositCall(address _vaultProxy, address _depositAsset, uint256 _depositAssetAmount)\n        external\n        view\n        returns (address target_, bytes memory payload_);\n\n    function formatSingleAssetRedemptionCall(\n        address _vaultProxy,\n        address _recipient,\n        address _asset,\n        uint256 _amount,\n        bool _amountIsShares\n    ) external view returns (address target_, bytes memory payload_);\n}\n"
+    },
+    "contracts/persistent/global-config/interfaces/IGlobalConfigLibComptrollerV4.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity >=0.6.0 <0.9.0;\n\n/// @title IGlobalConfigLibComptrollerV4 Interface\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Limited interface for GlobalConfigLib's required Enzyme v4 ComptrollerLib calls\ninterface IGlobalConfigLibComptrollerV4 {\n    function buyShares(uint256 _investmentAmount, uint256 _minSharesQuantity)\n        external\n        returns (uint256 sharesReceived_);\n\n    function getDenominationAsset() external view returns (address denominationAsset_);\n\n    function redeemSharesForSpecificAssets(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _payoutAssets,\n        uint256[] calldata _payoutAssetPercentages\n    ) external returns (uint256[] memory payoutAmounts_);\n\n    function redeemSharesInKind(\n        address _recipient,\n        uint256 _sharesQuantity,\n        address[] calldata _additionalAssets,\n        address[] calldata _assetsToSkip\n    ) external returns (address[] memory payoutAssets_, uint256[] memory payoutAmounts_);\n}\n"
+    },
+    "contracts/persistent/global-config/utils/GlobalConfigProxyConstants.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n\n    (c) Enzyme Council <council@enzyme.finance>\n\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\n/// @title GlobalConfigProxyConstants Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice Constant values used in GlobalConfig proxy-related contracts\nabstract contract GlobalConfigProxyConstants {\n    // `bytes32(keccak256('mln.proxiable.globalConfigLib'))`\n    bytes32 internal constant EIP_1822_PROXIABLE_UUID =\n        0xf25d88d51901d7fabc9924b03f4c2fe4300e6fe1aae4b5134c0a90b68cd8e81c;\n    // `bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`\n    bytes32 internal constant EIP_1967_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;\n}\n"
+    },
+    "contracts/persistent/global-config/utils/ProxiableGlobalConfigLib.sol": {
+      "content": "// SPDX-License-Identifier: GPL-3.0\n\n/*\n    This file is part of the Enzyme Protocol.\n    (c) Enzyme Council <council@enzyme.finance>\n    For the full license information, please view the LICENSE\n    file that was distributed with this source code.\n*/\n\npragma solidity 0.6.12;\n\nimport \"./GlobalConfigProxyConstants.sol\";\n\n/// @title ProxiableGlobalConfigLib Contract\n/// @author Enzyme Council <security@enzyme.finance>\n/// @notice A contract that defines the upgrade behavior for GlobalConfigLib instances\n/// @dev The recommended implementation of the target of a proxy according to EIP-1822 and EIP-1967\n/// See: https://eips.ethereum.org/EIPS/eip-1822\n/// See: https://eips.ethereum.org/EIPS/eip-1967\nabstract contract ProxiableGlobalConfigLib is GlobalConfigProxyConstants {\n    /// @dev Updates the target of the proxy to be the contract at _nextGlobalConfigLib\n    function __updateCodeAddress(address _nextGlobalConfigLib) internal {\n        require(\n            ProxiableGlobalConfigLib(_nextGlobalConfigLib).proxiableUUID() == bytes32(EIP_1822_PROXIABLE_UUID),\n            \"__updateCodeAddress: _nextGlobalConfigLib not compatible\"\n        );\n        assembly {\n            sstore(EIP_1967_SLOT, _nextGlobalConfigLib)\n        }\n    }\n\n    /// @notice Returns a unique bytes32 hash for GlobalConfigLib instances\n    /// @return uuid_ The bytes32 hash representing the UUID\n    function proxiableUUID() public pure returns (bytes32 uuid_) {\n        return EIP_1822_PROXIABLE_UUID;\n    }\n}\n"
+    }
+  }
+}
