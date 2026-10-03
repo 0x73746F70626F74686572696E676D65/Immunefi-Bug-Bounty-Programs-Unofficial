@@ -138,6 +138,8 @@ def archive_repo(owner, repo, ref):
 
 def github(entry):
     url=entry['url'];repair_reason=None
+    if url=='https://github.com/Gearbox-protocol/security/tree/main/disclosure':
+        url='https://github.com/Gearbox-protocol/security/tree/main/disclosures';repair_reason='The current security repository uses the disclosures directory, while the metadata links to disclosure.'
     if url.startswith('https://github.com/sky-ecosystem/mip21-toolkit'):
         url=url.replace('/sky-ecosystem/mip21-toolkit','/sky-ecosystem/rwa-toolkit',1);repair_reason='The current canonical RWA Toolkit repository identifies itself as the MakerDAO MIP21 Toolkit.'
     if url=='https://github.com/has...edera-transaction-tool':
