@@ -1,0 +1,406 @@
+{
+  "file_path": "modules/syrup-router/contracts/SyrupRouter.sol",
+  "creation_status": "success",
+  "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { ERC20Helper } from \"../modules/erc20-helper/src/ERC20Helper.sol\";\n\nimport { ISyrupRouter } from \"./interfaces/ISyrupRouter.sol\";\n\nimport {\n    IERC20Like,\n    IPoolLike,\n    IPoolManagerLike,\n    IPoolPermissionManagerLike\n} from \"./interfaces/Interfaces.sol\";\n\n/*\n\n███████╗██╗   ██╗██████╗ ██╗   ██╗██████╗     ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗\n██╔════╝╚██╗ ██╔╝██╔══██╗██║   ██║██╔══██╗    ██╔══██╗██╔═══██╗██║   ██║╚══██╔══╝██╔════╝██╔══██╗\n███████╗ ╚████╔╝ ██████╔╝██║   ██║██████╔╝    ██████╔╝██║   ██║██║   ██║   ██║   █████╗  ██████╔╝\n╚════██║  ╚██╔╝  ██╔══██╗██║   ██║██╔═══╝     ██╔══██╗██║   ██║██║   ██║   ██║   ██╔══╝  ██╔══██╗\n███████║   ██║   ██║  ██║╚██████╔╝██║         ██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║\n╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝         ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝\n\n*/\n\ncontract SyrupRouter is ISyrupRouter {\n\n    address public immutable override asset;\n    address public immutable override pool;\n    address public immutable override poolManager;\n    address public immutable override poolPermissionManager;\n\n    mapping(address => uint256) public override nonces;\n\n    constructor(address pool_) {\n        pool = pool_;\n\n        // Get the addresses of all the associated contracts.\n        address asset_ = asset = IPoolLike(pool_).asset();\n        address poolManager_ = poolManager = IPoolLike(pool_).manager();\n\n        poolPermissionManager = IPoolManagerLike(poolManager_).poolPermissionManager();\n\n        // Perform an infinite approval.\n        require(ERC20Helper.approve(asset_, pool_, type(uint256).max), \"SR:C:APPROVE_FAIL\");\n    }\n\n    /**************************************************************************************************************************************/\n    /*** External Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function authorizeAndDeposit(\n        uint256 bitmap_,\n        uint256 deadline_,\n        uint8   auth_v,\n        bytes32 auth_r,\n        bytes32 auth_s,\n        uint256 amount_,\n        bytes32 depositData_\n    )\n        external override returns (uint256 shares_)\n    {\n        _authorize(deadline_, bitmap_, auth_v, auth_r, auth_s);\n\n        shares_ = _deposit(msg.sender, amount_, depositData_);\n    }\n\n    function authorizeAndDepositWithPermit(\n        uint256 bitmap_,\n        uint256 auth_deadline_,\n        uint8   auth_v,\n        bytes32 auth_r,\n        bytes32 auth_s,\n        uint256 amount_,\n        bytes32 depositData_,\n        uint256 permit_deadline,\n        uint8   permit_v_,\n        bytes32 permit_r_,\n        bytes32 permit_s_\n    )\n        external override returns (uint256 shares_)\n    {\n        _authorize(auth_deadline_, bitmap_, auth_v, auth_r, auth_s);\n        _permit(asset, permit_deadline, amount_, permit_v_, permit_r_, permit_s_);\n\n        shares_ = _deposit(msg.sender, amount_, depositData_);\n    }\n\n    function deposit(uint256 amount_, bytes32 depositData_) external override returns (uint256 shares_) {\n        shares_ = _deposit(msg.sender, amount_, depositData_);\n    }\n\n    function depositWithPermit(\n        uint256 amount_,\n        uint256 deadline_,\n        uint8   v_,\n        bytes32 r_,\n        bytes32 s_,\n        bytes32 depositData_\n    )\n        external override returns (uint256 shares_)\n    {\n        _permit(asset, deadline_, amount_, v_, r_, s_);\n\n        shares_ = _deposit(msg.sender, amount_, depositData_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Internal Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function _authorize(uint256 deadline_, uint256 bitmap_, uint8 v_, bytes32 r_, bytes32 s_) internal {\n        require(deadline_ >= block.timestamp, \"SR:A:EXPIRED\");\n\n        // Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}.\n        require(\n            uint256(s_) <= uint256(0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) &&\n            (v_ == 27 || v_ == 28),\n            \"SR:A:MALLEABLE\"\n        );\n\n        bytes32 digest_ = keccak256(abi.encodePacked(\n            \"\\x19\\x01\",\n            block.chainid,  // Chain id + address(this) serves as domain separator to avoid replay attacks.\n            address(this),\n            msg.sender,\n            nonces[msg.sender]++,\n            bitmap_,\n            deadline_\n        ));\n\n        address recoveredAddress_ = ecrecover(digest_, v_, r_, s_);\n\n        IPoolPermissionManagerLike ppm_ = IPoolPermissionManagerLike(poolPermissionManager);\n\n        // Any valid permission admin can authorize the deposit.\n        require(recoveredAddress_ != address(0) && ppm_.permissionAdmins(recoveredAddress_), \"SR:A:NOT_PERMISSION_ADMIN\");\n\n        address[] memory lender = new address[](1);\n        uint256[] memory bitmap = new uint256[](1);\n\n        lender[0] = msg.sender;\n        bitmap[0] = bitmap_;\n\n        ppm_.setLenderBitmaps(lender, bitmap);\n    }\n\n    function _deposit(address owner_, uint256 amount_, bytes32 depositData_) internal returns (uint256 shares_) {\n        // Check the owner has permission to deposit into the pool.\n        require(\n            IPoolPermissionManagerLike(poolPermissionManager).hasPermission(poolManager, owner_, \"P:deposit\"),\n            \"SR:D:NOT_AUTHORIZED\"\n        );\n\n        // Pull assets from the owner to the router.\n        require(ERC20Helper.transferFrom(asset, owner_, address(this), amount_), \"SR:D:TRANSFER_FROM_FAIL\");\n\n        // Deposit assets into the pool and receive the shares personally.\n        address pool_ = pool;\n\n        shares_ = IPoolLike(pool_).deposit(amount_, address(this));\n\n        // Route shares back to the caller.\n        require(ERC20Helper.transfer(pool_, owner_, shares_), \"SR:D:TRANSFER_FAIL\");\n\n        emit DepositData(owner_, amount_, depositData_);\n    }\n\n    function _permit(address asset_, uint256 deadline_, uint256 amount_, uint8 v_, bytes32 r_, bytes32 s_) internal {\n        uint256 allowance_ = IERC20Like(asset_).allowance(msg.sender, address(this));\n\n        if (allowance_ < amount_) {\n            IERC20Like(asset_).permit(msg.sender, address(this), amount_, deadline_, v_, r_, s_);\n        }\n    }\n\n}\n",
+  "deployed_bytecode": "0x608060405234801561001057600080fd5b50600436106100935760003560e01c8063a6d061fb11610066578063a6d061fb14610144578063c9630cb014610157578063d5db8c671461016a578063dc4c90d31461017d578063e15e990a146101a457600080fd5b806316f0115b1461009857806338d52e0f146100dc5780636807c8dc146101035780637ecebe0014610124575b600080fd5b6100bf7f00000000000000000000000080ac24aa929eaf5013f6436cda2a7ba190f5cc0b81565b6040516001600160a01b0390911681526020015b60405180910390f35b6100bf7f000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb4881565b610116610111366004610ca9565b6101cb565b6040519081526020016100d3565b610116610132366004610c23565b60006020819052908152604090205481565b610116610152366004610d54565b610211565b610116610165366004610c87565b610269565b610116610178366004610cfa565b61027d565b6100bf7f0000000000000000000000007ad5ffa5fdf509e30186f4609c2f6269f4b6158f81565b6100bf7f000000000000000000000000be10adce8b6e3e02db384e7fada5395dd113d8b381565b60006101fb7f000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48878988888861035a565b610206338884610472565b979650505050505050565b60006102208b8d8c8c8c610745565b61024e7f000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48868987878761035a565b610259338888610472565b9c9b505050505050505050505050565b6000610276338484610472565b9392505050565b600061028c8789888888610745565b610297338484610472565b98975050505050505050565b6040516001600160a01b03831660248201526000604482018190529061030990859063095ea7b360e01b906064015b60408051601f198184030181529190526020810180516001600160e01b03166001600160e01b031990931692909217909152610aec565b61031557506000610276565b8161032257506001610276565b6040516001600160a01b03841660248201526044810183905261035290859063095ea7b360e01b906064016102d2565b949350505050565b604051636eb1769f60e11b81523360048201523060248201526000906001600160a01b0388169063dd62ed3e9060440160206040518083038186803b1580156103a257600080fd5b505afa1580156103b6573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906103da9190610c6e565b9050848110156104695760405163d505accf60e01b8152336004820152306024820152604481018690526064810187905260ff8516608482015260a4810184905260c481018390526001600160a01b0388169063d505accf9060e401600060405180830381600087803b15801561045057600080fd5b505af1158015610464573d6000803e3d6000fd5b505050505b50505050505050565b604051630dace25b60e31b81526001600160a01b037f0000000000000000000000007ad5ffa5fdf509e30186f4609c2f6269f4b6158f81166004830152848116602483015268140e99195c1bdcda5d60ba1b60448301526000917f000000000000000000000000be10adce8b6e3e02db384e7fada5395dd113d8b390911690636d6712d89060640160206040518083038186803b15801561051257600080fd5b505afa158015610526573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061054a9190610c4c565b6105915760405162461bcd60e51b815260206004820152601360248201527214d48e910e9393d517d055551213d492569151606a1b60448201526064015b60405180910390fd5b6105bd7f000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48853086610b96565b6106095760405162461bcd60e51b815260206004820152601760248201527f53523a443a5452414e534645525f46524f4d5f4641494c0000000000000000006044820152606401610588565b604051636e553f6560e01b8152600481018490523060248201527f00000000000000000000000080ac24aa929eaf5013f6436cda2a7ba190f5cc0b906001600160a01b03821690636e553f6590604401602060405180830381600087803b15801561067357600080fd5b505af1158015610687573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906106ab9190610c6e565b91506106b8818684610bda565b6106f95760405162461bcd60e51b815260206004820152601260248201527114d48e910e9514905394d1915497d190525360721b6044820152606401610588565b60408051858152602081018590526001600160a01b038716917fec286cce32dfa9d8e469ef4d4bb77854e3225bc050e97e66bb30fe1e4c2819cb910160405180910390a2509392505050565b428510156107845760405162461bcd60e51b815260206004820152600c60248201526b14d48e904e9156141254915160a21b6044820152606401610588565b7f7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a081118015906107c457508260ff16601b14806107c457508260ff16601c145b6108015760405162461bcd60e51b815260206004820152600e60248201526d53523a413a4d414c4c4541424c4560901b6044820152606401610588565b33600081815260208190526040812080549192469230928561082283610ea0565b9091555060405161190160f01b602082015260228101949094526bffffffffffffffffffffffff19606093841b811660428601529190921b166056830152606a820152608a810186905260aa810187905260ca0160408051601f198184030181528282528051602091820120600080855291840180845281905260ff88169284019290925260608301869052608083018590529092509060019060a0016020604051602081039080840390855afa1580156108e1573d6000803e3d6000fd5b5050604051601f19015191507f000000000000000000000000be10adce8b6e3e02db384e7fada5395dd113d8b390506001600160a01b0382161580159061099c57506040516329206d6f60e01b81526001600160a01b0383811660048301528216906329206d6f9060240160206040518083038186803b15801561096457600080fd5b505afa158015610978573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061099c9190610c4c565b6109e85760405162461bcd60e51b815260206004820152601960248201527f53523a413a4e4f545f5045524d495353494f4e5f41444d494e000000000000006044820152606401610588565b6040805160018082528183019092526000916020808301908036833750506040805160018082528183019092529293506000929150602080830190803683370190505090503382600081518110610a4157610a41610ec9565b60200260200101906001600160a01b031690816001600160a01b0316815250508881600081518110610a7557610a75610ec9565b6020908102919091010152604051638551366360e01b81526001600160a01b03841690638551366390610aae9085908590600401610e1c565b600060405180830381600087803b158015610ac857600080fd5b505af1158015610adc573d6000803e3d6000fd5b5050505050505050505050505050565b60006001600160a01b0383163b610b0557506000610b90565b6060836001600160a01b031683604051610b1f9190610de1565b6000604051808303816000865af19150503d8060008114610b5c576040519150601f19603f3d011682016040523d82523d6000602084013e610b61565b606091505b509092509050818015610b8c575080511580610b8c575080806020019051810190610b8c9190610c4c565b9150505b92915050565b6040516001600160a01b0380851660248301528316604482015260648101829052600090610bd19086906323b872dd60e01b906084016102d2565b95945050505050565b6040516001600160a01b03831660248201526044810182905260009061035290859063a9059cbb60e01b906064016102d2565b803560ff81168114610c1e57600080fd5b919050565b600060208284031215610c3557600080fd5b81356001600160a01b038116811461027657600080fd5b600060208284031215610c5e57600080fd5b8151801515811461027657600080fd5b600060208284031215610c8057600080fd5b5051919050565b60008060408385031215610c9a57600080fd5b50508035926020909101359150565b60008060008060008060c08789031215610cc257600080fd5b8635955060208701359450610cd960408801610c0d565b9350606087013592506080870135915060a087013590509295509295509295565b600080600080600080600060e0888a031215610d1557600080fd5b8735965060208801359550610d2c60408901610c0d565b969995985095966060810135965060808101359560a0820135955060c0909101359350915050565b60008060008060008060008060008060006101608c8e031215610d7657600080fd5b8b359a5060208c01359950610d8d60408d01610c0d565b985060608c0135975060808c0135965060a08c0135955060c08c0135945060e08c01359350610dbf6101008d01610c0d565b92506101208c013591506101408c013590509295989b509295989b9093969950565b6000825160005b81811015610e025760208186018101518583015201610de8565b81811115610e11576000828501525b509190910192915050565b604080825283519082018190526000906020906060840190828701845b82811015610e5e5781516001600160a01b031684529284019290840190600101610e39565b5050508381038285015284518082528583019183019060005b81811015610e9357835183529284019291840191600101610e77565b5090979650505050505050565b6000600019821415610ec257634e487b7160e01b600052601160045260246000fd5b5060010190565b634e487b7160e01b600052603260045260246000fdfea2646970667358221220a38b58891ab7994168d4c9e23749cf5df2af465e466744a21c09684cd35b881e64736f6c63430008070033",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "evmVersion": "london",
+    "libraries": {},
+    "metadata": {
+      "bytecodeHash": "ipfs"
+    },
+    "optimizer": {
+      "enabled": true,
+      "runs": 200
+    },
+    "remappings": [
+      ":address-registry/=modules/address-registry/src/",
+      ":contract-test-utils/=modules/erc20/modules/contract-test-utils/contracts/",
+      ":ds-test/=modules/forge-std/lib/ds-test/src/",
+      ":erc20-helper/=modules/erc20-helper/src/",
+      ":erc20/=modules/erc20/",
+      ":fixed-term-loan-manager/=modules/fixed-term-loan-manager/contracts/",
+      ":fixed-term-loan/=modules/fixed-term-loan/contracts/",
+      ":forge-std/=modules/forge-std/src/",
+      ":globals/=modules/globals/contracts/",
+      ":liquidations/=modules/liquidations/contracts/",
+      ":maple-proxy-factory/=modules/open-term-loan/modules/maple-proxy-factory/",
+      ":non-transparent-proxy/=modules/globals/modules/non-transparent-proxy/",
+      ":ntp/=modules/pool-permission-manager/modules/ntp/",
+      ":open-term-loan-manager/=modules/open-term-loan-manager/contracts/",
+      ":open-term-loan/=modules/open-term-loan/contracts/",
+      ":pool-permission-manager/=modules/pool-permission-manager/contracts/",
+      ":pool/=modules/pool/contracts/",
+      ":proxy-factory/=modules/open-term-loan/modules/maple-proxy-factory/modules/proxy-factory/",
+      ":syrup-router/=modules/syrup-router/",
+      ":withdrawal-manager-cyclical/=modules/withdrawal-manager-cyclical/contracts/",
+      ":withdrawal-manager-queue/=modules/withdrawal-manager-queue/contracts/"
+    ]
+  },
+  "optimization_runs": 200,
+  "sourcify_repo_url": "https://repo.sourcify.dev/contracts/full_match/1/0x134cCaaA4F1e4552eC8aEcb9E4A2360dDcF8df76/",
+  "decoded_constructor_args": [
+    [
+      "0x80ac24aA929eaF5013f6436cdA2a7ba190f5Cc0b",
+      {
+        "internalType": "address",
+        "name": "pool_",
+        "type": "address"
+      }
+    ]
+  ],
+  "compiler_version": "0.8.7+commit.e28d00a7",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2024-06-25T12:55:51.528621Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x6101006040523480156200001257600080fd5b5060405162001400380380620014008339810160408190526200003591620003e9565b806001600160a01b031660a0816001600160a01b031660601b815250506000816001600160a01b03166338d52e0f6040518163ffffffff1660e01b815260040160206040518083038186803b1580156200008e57600080fd5b505afa158015620000a3573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190620000c99190620003e9565b6001600160a01b03166080816001600160a01b031660601b81525090506000826001600160a01b031663481c6a756040518163ffffffff1660e01b815260040160206040518083038186803b1580156200012257600080fd5b505afa15801562000137573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906200015d9190620003e9565b6001600160a01b031660c0816001600160a01b031660601b8152509050806001600160a01b031663e15e990a6040518163ffffffff1660e01b815260040160206040518083038186803b158015620001b457600080fd5b505afa158015620001c9573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190620001ef9190620003e9565b6001600160a01b031660e0816001600160a01b031660601b815250506200022582846000196200027360201b620002a31760201c565b6200026a5760405162461bcd60e51b815260206004820152601160248201527014d48e90ce9054141493d59157d1905253607a1b604482015260640160405180910390fd5b50505062000476565b6040516001600160a01b038316602482015260006044820181905290620002dc90859063095ea7b360e01b906064015b60408051808303601f190181529190526020810180516001600160e01b0319939093166001600160e01b03938416179052906200033516565b620002ea575060006200032e565b81620002f9575060016200032e565b6040516001600160a01b0384166024820152604481018390526200032b90859063095ea7b360e01b90606401620002a3565b90505b9392505050565b60006001600160a01b0383163b6200035057506000620003e3565b6060836001600160a01b0316836040516200036c919062000438565b6000604051808303816000865af19150503d8060008114620003ab576040519150601f19603f3d011682016040523d82523d6000602084013e620003b0565b606091505b509092509050818015620003df575080511580620003df575080806020019051810190620003df919062000414565b9150505b92915050565b600060208284031215620003fc57600080fd5b81516001600160a01b03811681146200032e57600080fd5b6000602082840312156200042757600080fd5b815180151581146200032e57600080fd5b6000825160005b818110156200045b57602081860181015185830152016200043f565b818111156200046b576000828501525b509190910192915050565b60805160601c60a05160601c60c05160601c60e05160601c610f15620004eb600039600081816101a9015281816104ce01526108ef0152600081816101820152610489015260008181609d015261062501526000818160e1015281816101d20152818161022501526105960152610f156000f3fe608060405234801561001057600080fd5b50600436106100935760003560e01c8063a6d061fb11610066578063a6d061fb14610144578063c9630cb014610157578063d5db8c671461016a578063dc4c90d31461017d578063e15e990a146101a457600080fd5b806316f0115b1461009857806338d52e0f146100dc5780636807c8dc146101035780637ecebe0014610124575b600080fd5b6100bf7f000000000000000000000000000000000000000000000000000000000000000081565b6040516001600160a01b0390911681526020015b60405180910390f35b6100bf7f000000000000000000000000000000000000000000000000000000000000000081565b610116610111366004610ca9565b6101cb565b6040519081526020016100d3565b610116610132366004610c23565b60006020819052908152604090205481565b610116610152366004610d54565b610211565b610116610165366004610c87565b610269565b610116610178366004610cfa565b61027d565b6100bf7f000000000000000000000000000000000000000000000000000000000000000081565b6100bf7f000000000000000000000000000000000000000000000000000000000000000081565b60006101fb7f0000000000000000000000000000000000000000000000000000000000000000878988888861035a565b610206338884610472565b979650505050505050565b60006102208b8d8c8c8c610745565b61024e7f0000000000000000000000000000000000000000000000000000000000000000868987878761035a565b610259338888610472565b9c9b505050505050505050505050565b6000610276338484610472565b9392505050565b600061028c8789888888610745565b610297338484610472565b98975050505050505050565b6040516001600160a01b03831660248201526000604482018190529061030990859063095ea7b360e01b906064015b60408051601f198184030181529190526020810180516001600160e01b03166001600160e01b031990931692909217909152610aec565b61031557506000610276565b8161032257506001610276565b6040516001600160a01b03841660248201526044810183905261035290859063095ea7b360e01b906064016102d2565b949350505050565b604051636eb1769f60e11b81523360048201523060248201526000906001600160a01b0388169063dd62ed3e9060440160206040518083038186803b1580156103a257600080fd5b505afa1580156103b6573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906103da9190610c6e565b9050848110156104695760405163d505accf60e01b8152336004820152306024820152604481018690526064810187905260ff8516608482015260a4810184905260c481018390526001600160a01b0388169063d505accf9060e401600060405180830381600087803b15801561045057600080fd5b505af1158015610464573d6000803e3d6000fd5b505050505b50505050505050565b604051630dace25b60e31b81526001600160a01b037f000000000000000000000000000000000000000000000000000000000000000081166004830152848116602483015268140e99195c1bdcda5d60ba1b60448301526000917f000000000000000000000000000000000000000000000000000000000000000090911690636d6712d89060640160206040518083038186803b15801561051257600080fd5b505afa158015610526573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061054a9190610c4c565b6105915760405162461bcd60e51b815260206004820152601360248201527214d48e910e9393d517d055551213d492569151606a1b60448201526064015b60405180910390fd5b6105bd7f0000000000000000000000000000000000000000000000000000000000000000853086610b96565b6106095760405162461bcd60e51b815260206004820152601760248201527f53523a443a5452414e534645525f46524f4d5f4641494c0000000000000000006044820152606401610588565b604051636e553f6560e01b8152600481018490523060248201527f0000000000000000000000000000000000000000000000000000000000000000906001600160a01b03821690636e553f6590604401602060405180830381600087803b15801561067357600080fd5b505af1158015610687573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906106ab9190610c6e565b91506106b8818684610bda565b6106f95760405162461bcd60e51b815260206004820152601260248201527114d48e910e9514905394d1915497d190525360721b6044820152606401610588565b60408051858152602081018590526001600160a01b038716917fec286cce32dfa9d8e469ef4d4bb77854e3225bc050e97e66bb30fe1e4c2819cb910160405180910390a2509392505050565b428510156107845760405162461bcd60e51b815260206004820152600c60248201526b14d48e904e9156141254915160a21b6044820152606401610588565b7f7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a081118015906107c457508260ff16601b14806107c457508260ff16601c145b6108015760405162461bcd60e51b815260206004820152600e60248201526d53523a413a4d414c4c4541424c4560901b6044820152606401610588565b33600081815260208190526040812080549192469230928561082283610ea0565b9091555060405161190160f01b602082015260228101949094526bffffffffffffffffffffffff19606093841b811660428601529190921b166056830152606a820152608a810186905260aa810187905260ca0160408051601f198184030181528282528051602091820120600080855291840180845281905260ff88169284019290925260608301869052608083018590529092509060019060a0016020604051602081039080840390855afa1580156108e1573d6000803e3d6000fd5b5050604051601f19015191507f000000000000000000000000000000000000000000000000000000000000000090506001600160a01b0382161580159061099c57506040516329206d6f60e01b81526001600160a01b0383811660048301528216906329206d6f9060240160206040518083038186803b15801561096457600080fd5b505afa158015610978573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061099c9190610c4c565b6109e85760405162461bcd60e51b815260206004820152601960248201527f53523a413a4e4f545f5045524d495353494f4e5f41444d494e000000000000006044820152606401610588565b6040805160018082528183019092526000916020808301908036833750506040805160018082528183019092529293506000929150602080830190803683370190505090503382600081518110610a4157610a41610ec9565b60200260200101906001600160a01b031690816001600160a01b0316815250508881600081518110610a7557610a75610ec9565b6020908102919091010152604051638551366360e01b81526001600160a01b03841690638551366390610aae9085908590600401610e1c565b600060405180830381600087803b158015610ac857600080fd5b505af1158015610adc573d6000803e3d6000fd5b5050505050505050505050505050565b60006001600160a01b0383163b610b0557506000610b90565b6060836001600160a01b031683604051610b1f9190610de1565b6000604051808303816000865af19150503d8060008114610b5c576040519150601f19603f3d011682016040523d82523d6000602084013e610b61565b606091505b509092509050818015610b8c575080511580610b8c575080806020019051810190610b8c9190610c4c565b9150505b92915050565b6040516001600160a01b0380851660248301528316604482015260648101829052600090610bd19086906323b872dd60e01b906084016102d2565b95945050505050565b6040516001600160a01b03831660248201526044810182905260009061035290859063a9059cbb60e01b906064016102d2565b803560ff81168114610c1e57600080fd5b919050565b600060208284031215610c3557600080fd5b81356001600160a01b038116811461027657600080fd5b600060208284031215610c5e57600080fd5b8151801515811461027657600080fd5b600060208284031215610c8057600080fd5b5051919050565b60008060408385031215610c9a57600080fd5b50508035926020909101359150565b60008060008060008060c08789031215610cc257600080fd5b8635955060208701359450610cd960408801610c0d565b9350606087013592506080870135915060a087013590509295509295509295565b600080600080600080600060e0888a031215610d1557600080fd5b8735965060208801359550610d2c60408901610c0d565b969995985095966060810135965060808101359560a0820135955060c0909101359350915050565b60008060008060008060008060008060006101608c8e031215610d7657600080fd5b8b359a5060208c01359950610d8d60408d01610c0d565b985060608c0135975060808c0135965060a08c0135955060c08c0135945060e08c01359350610dbf6101008d01610c0d565b92506101208c013591506101408c013590509295989b509295989b9093969950565b6000825160005b81811015610e025760208186018101518583015201610de8565b81811115610e11576000828501525b509190910192915050565b604080825283519082018190526000906020906060840190828701845b82811015610e5e5781516001600160a01b031684529284019290840190600101610e39565b5050508381038285015284518082528583019183019060005b81811015610e9357835183529284019291840191600101610e77565b5090979650505050505050565b6000600019821415610ec257634e487b7160e01b600052601160045260246000fd5b5060010190565b634e487b7160e01b600052603260045260246000fdfea2646970667358221220a38b58891ab7994168d4c9e23749cf5df2af465e466744a21c09684cd35b881e64736f6c6343000807003300000000000000000000000080ac24aa929eaf5013f6436cda2a7ba190f5cc0b",
+  "name": "SyrupRouter",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": true,
+  "is_verified_via_eth_bytecode_db": true,
+  "language": "solidity",
+  "evm_version": "london",
+  "can_be_visualized_via_sol2uml": true,
+  "is_verified_via_sourcify": true,
+  "additional_sources": [
+    {
+      "file_path": "modules/syrup-router/modules/erc20-helper/src/ERC20Helper.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nimport { IERC20Like } from \"./interfaces/IERC20Like.sol\";\n\n/**\n * @title Small Library to standardize erc20 token interactions.\n */\nlibrary ERC20Helper {\n\n    /**************************************************************************************************************************************/\n    /*** Internal Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function transfer(address token_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transfer.selector, to_, amount_));\n    }\n\n    function transferFrom(address token_, address from_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transferFrom.selector, from_, to_, amount_));\n    }\n\n    function approve(address token_, address spender_, uint256 amount_) internal returns (bool success_) {\n        // If setting approval to zero fails, return false.\n        if (!_call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, uint256(0)))) return false;\n\n        // If `amount_` is zero, return true as the previous step already did this.\n        if (amount_ == uint256(0)) return true;\n\n        // Return the result of setting the approval to `amount_`.\n        return _call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, amount_));\n    }\n\n    function _call(address token_, bytes memory data_) private returns (bool success_) {\n        if (token_.code.length == uint256(0)) return false;\n\n        bytes memory returnData;\n        ( success_, returnData ) = token_.call(data_);\n\n        return success_ && (returnData.length == uint256(0) || abi.decode(returnData, (bool)));\n    }\n\n}\n"
+    },
+    {
+      "file_path": "modules/syrup-router/modules/erc20-helper/src/interfaces/IERC20Like.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title Interface of the ERC20 standard as needed by ERC20Helper.\ninterface IERC20Like {\n\n    function approve(address spender_, uint256 amount_) external returns (bool success_);\n\n    function transfer(address recipient_, uint256 amount_) external returns (bool success_);\n\n    function transferFrom(address owner_, address recipient_, uint256 amount_) external returns (bool success_);\n\n}\n"
+    },
+    {
+      "file_path": "modules/syrup-router/contracts/interfaces/ISyrupRouter.sol",
+      "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface ISyrupRouter {\n\n    /**\n     *  @dev   Optional Deposit Data for off-chain processing.\n     *  @param owner       The receiver of the shares.\n     *  @param amount      The amount of assets to deposit.\n     *  @param depositData Optional deposit data.\n     */\n    event DepositData(address indexed owner, uint256 amount, bytes32 depositData);\n\n    /**\n     *  @dev    The address of the underlying asset used by the ERC4626 Vault.\n     *  @return asset The address of the underlying asset.\n     */\n    function asset() external view returns (address asset);\n\n    /**\n     *  @dev    Authorizes and deposits assets into the Vault.\n     *  @param  bitmap_      The bitmap of the permission.\n     *  @param  deadline_    The timestamp after which the `authorize` signature is no longer valid.\n     *  @param  auth_v       ECDSA signature v component.\n     *  @param  auth_r       ECDSA signature r component.\n     *  @param  auth_s       ECDSA signature s component.\n     *  @param  amount_      The amount of assets to deposit.\n     *  @param  depositData_ Optional deposit data.\n     *  @return shares_      The amount of shares minted.\n     */\n    function authorizeAndDeposit(\n        uint256 bitmap_,\n        uint256 deadline_,\n        uint8   auth_v,\n        bytes32 auth_r,\n        bytes32 auth_s,\n        uint256 amount_,\n        bytes32 depositData_\n    ) external returns (uint256 shares_);\n\n    /**\n     *  @dev    Authorizes and deposits assets into the Vault with a ERC-2612 `permit`.\n     *  @param  bitmap_         The bitmap of the permission.\n     *  @param  auth_deadline_  The timestamp after which the `authorize` signature is no longer valid.\n     *  @param  auth_v          ECDSA signature v component of the authorization.\n     *  @param  auth_r          ECDSA signature r component of the authorization.\n     *  @param  auth_s          ECDSA signature s component of the authorization.\n     *  @param  amount_         The amount of assets to deposit.\n     *  @param  depositData_    Optional deposit data.\n     *  @param  permit_deadline The timestamp after which the `permit` signature is no longer valid.\n     *  @param  permit_v_       ECDSA signature v component of the token permit.\n     *  @param  permit_r_       ECDSA signature r component of the token permit.\n     *  @param  permit_s_       ECDSA signature s component of the token permit.\n     *  @return shares_         The amount of shares minted.\n     */\n    function authorizeAndDepositWithPermit(\n        uint256 bitmap_,\n        uint256 auth_deadline_,\n        uint8   auth_v,\n        bytes32 auth_r,\n        bytes32 auth_s,\n        uint256 amount_,\n        bytes32 depositData_,\n        uint256 permit_deadline,\n        uint8   permit_v_,\n        bytes32 permit_r_,\n        bytes32 permit_s_\n    ) external returns (uint256 shares_);\n\n    /**\n     *  @dev    Mints `shares` to sender by depositing `assets` into the Vault.\n     *  @param  assets      The amount of assets to deposit.\n     *  @param  depositData Optional deposit data.\n     *  @return shares      The amount of shares minted.\n     */\n    function deposit(uint256 assets, bytes32 depositData) external returns (uint256 shares);\n\n    /**\n     *  @dev    Does a ERC4626 `deposit` into a Maple Pool with a ERC-2612 `permit`.\n     *  @param  amount     The amount of assets to deposit.\n     *  @param  deadline   The timestamp after which the `permit` signature is no longer valid.\n     *  @param  v          ECDSA signature v component.\n     *  @param  r          ECDSA signature r component.\n     *  @param  s          ECDSA signature s component.\n     *  @param depositData Optional deposit data.\n     *  @return shares     The amount of shares minted.\n     */\n    function depositWithPermit(uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s, bytes32 depositData)\n        external returns (uint256 shares);\n\n    /**\n      *  @dev    Returns the nonce for the given owner.\n      *  @param  owner_ The address of the owner account.\n      *  @return nonce_ The nonce for the given owner.\n     */\n    function nonces(address owner_) external view returns (uint256 nonce_);\n\n    /**\n     *  @dev    The address of the ERC4626 Vault.\n     *  @return pool The address of the ERC4626 Vault.\n     */\n    function pool() external view returns (address pool);\n\n    /**\n     *  @dev    The address of the Pool Manager.\n     *  @return poolManager The address of the Pool Manager.\n     */\n    function poolManager() external view returns (address poolManager);\n\n    /**\n     *  @dev    The address of the Pool Permission Manager.\n     *  @return poolPermissionManager The address of the Pool Permission Manager.\n     */\n    function poolPermissionManager() external view returns (address poolPermissionManager);\n\n}\n\n"
+    },
+    {
+      "file_path": "modules/syrup-router/contracts/interfaces/Interfaces.sol",
+      "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface IERC20Like {\n\n    function allowance(address owner, address spender) external view returns (uint256 allowance);\n\n    function approve(address spender, uint256 amount) external returns (bool success);\n\n    function permit(address owner, address spender, uint amount, uint deadline, uint8 v, bytes32 r, bytes32 s) external;\n\n    function transfer(address recipient, uint256 amount) external returns (bool success);\n\n    function transferFrom(address owner, address recipient, uint256 amount) external returns (bool success);\n\n}\n\ninterface IPoolLike is IERC20Like {\n\n    function asset() external view returns (address asset);\n\n    function convertToExitAssets(uint256 shares) external view returns (uint256);\n\n    function deposit(uint256 assets, address receiver) external returns (uint256 shares);\n\n    function manager() external view returns (address manager);\n\n}\n\ninterface IPoolManagerLike {\n\n    function poolPermissionManager() external view returns (address poolPermissionManager);\n\n}\n\ninterface IPoolPermissionManagerLike {\n\n    function hasPermission(address poolManager, address lender, bytes32 functionId) external view returns (bool hasPermission);\n\n    function permissionAdmins(address account) external view returns (bool isAdmin);\n\n    function setLenderBitmaps(address[] calldata lenders, uint256[] calldata bitmaps) external;\n\n}\n"
+    }
+  ],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "pool_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "owner",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes32",
+          "name": "depositData",
+          "type": "bytes32"
+        }
+      ],
+      "name": "DepositData",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "asset",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "bitmap_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "deadline_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint8",
+          "name": "auth_v",
+          "type": "uint8"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "auth_r",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "auth_s",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "depositData_",
+          "type": "bytes32"
+        }
+      ],
+      "name": "authorizeAndDeposit",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "shares_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "bitmap_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "auth_deadline_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint8",
+          "name": "auth_v",
+          "type": "uint8"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "auth_r",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "auth_s",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint256",
+          "name": "amount_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "depositData_",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint256",
+          "name": "permit_deadline",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint8",
+          "name": "permit_v_",
+          "type": "uint8"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "permit_r_",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "permit_s_",
+          "type": "bytes32"
+        }
+      ],
+      "name": "authorizeAndDepositWithPermit",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "shares_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "amount_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "depositData_",
+          "type": "bytes32"
+        }
+      ],
+      "name": "deposit",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "shares_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "amount_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "deadline_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint8",
+          "name": "v_",
+          "type": "uint8"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "r_",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "s_",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "depositData_",
+          "type": "bytes32"
+        }
+      ],
+      "name": "depositWithPermit",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "shares_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "nonces",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pool",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "poolManager",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "poolPermissionManager",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": false,
+  "constructor_args": "00000000000000000000000080ac24aa929eaf5013f6436cda2a7ba190f5cc0b",
+  "sources": {
+    "modules/syrup-router/contracts/SyrupRouter.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { ERC20Helper } from \"../modules/erc20-helper/src/ERC20Helper.sol\";\n\nimport { ISyrupRouter } from \"./interfaces/ISyrupRouter.sol\";\n\nimport {\n    IERC20Like,\n    IPoolLike,\n    IPoolManagerLike,\n    IPoolPermissionManagerLike\n} from \"./interfaces/Interfaces.sol\";\n\n/*\n\n███████╗██╗   ██╗██████╗ ██╗   ██╗██████╗     ██████╗  ██████╗ ██╗   ██╗████████╗███████╗██████╗\n██╔════╝╚██╗ ██╔╝██╔══██╗██║   ██║██╔══██╗    ██╔══██╗██╔═══██╗██║   ██║╚══██╔══╝██╔════╝██╔══██╗\n███████╗ ╚████╔╝ ██████╔╝██║   ██║██████╔╝    ██████╔╝██║   ██║██║   ██║   ██║   █████╗  ██████╔╝\n╚════██║  ╚██╔╝  ██╔══██╗██║   ██║██╔═══╝     ██╔══██╗██║   ██║██║   ██║   ██║   ██╔══╝  ██╔══██╗\n███████║   ██║   ██║  ██║╚██████╔╝██║         ██║  ██║╚██████╔╝╚██████╔╝   ██║   ███████╗██║  ██║\n╚══════╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝         ╚═╝  ╚═╝ ╚═════╝  ╚═════╝    ╚═╝   ╚══════╝╚═╝  ╚═╝\n\n*/\n\ncontract SyrupRouter is ISyrupRouter {\n\n    address public immutable override asset;\n    address public immutable override pool;\n    address public immutable override poolManager;\n    address public immutable override poolPermissionManager;\n\n    mapping(address => uint256) public override nonces;\n\n    constructor(address pool_) {\n        pool = pool_;\n\n        // Get the addresses of all the associated contracts.\n        address asset_ = asset = IPoolLike(pool_).asset();\n        address poolManager_ = poolManager = IPoolLike(pool_).manager();\n\n        poolPermissionManager = IPoolManagerLike(poolManager_).poolPermissionManager();\n\n        // Perform an infinite approval.\n        require(ERC20Helper.approve(asset_, pool_, type(uint256).max), \"SR:C:APPROVE_FAIL\");\n    }\n\n    /**************************************************************************************************************************************/\n    /*** External Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function authorizeAndDeposit(\n        uint256 bitmap_,\n        uint256 deadline_,\n        uint8   auth_v,\n        bytes32 auth_r,\n        bytes32 auth_s,\n        uint256 amount_,\n        bytes32 depositData_\n    )\n        external override returns (uint256 shares_)\n    {\n        _authorize(deadline_, bitmap_, auth_v, auth_r, auth_s);\n\n        shares_ = _deposit(msg.sender, amount_, depositData_);\n    }\n\n    function authorizeAndDepositWithPermit(\n        uint256 bitmap_,\n        uint256 auth_deadline_,\n        uint8   auth_v,\n        bytes32 auth_r,\n        bytes32 auth_s,\n        uint256 amount_,\n        bytes32 depositData_,\n        uint256 permit_deadline,\n        uint8   permit_v_,\n        bytes32 permit_r_,\n        bytes32 permit_s_\n    )\n        external override returns (uint256 shares_)\n    {\n        _authorize(auth_deadline_, bitmap_, auth_v, auth_r, auth_s);\n        _permit(asset, permit_deadline, amount_, permit_v_, permit_r_, permit_s_);\n\n        shares_ = _deposit(msg.sender, amount_, depositData_);\n    }\n\n    function deposit(uint256 amount_, bytes32 depositData_) external override returns (uint256 shares_) {\n        shares_ = _deposit(msg.sender, amount_, depositData_);\n    }\n\n    function depositWithPermit(\n        uint256 amount_,\n        uint256 deadline_,\n        uint8   v_,\n        bytes32 r_,\n        bytes32 s_,\n        bytes32 depositData_\n    )\n        external override returns (uint256 shares_)\n    {\n        _permit(asset, deadline_, amount_, v_, r_, s_);\n\n        shares_ = _deposit(msg.sender, amount_, depositData_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Internal Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function _authorize(uint256 deadline_, uint256 bitmap_, uint8 v_, bytes32 r_, bytes32 s_) internal {\n        require(deadline_ >= block.timestamp, \"SR:A:EXPIRED\");\n\n        // Appendix F in the Ethereum Yellow paper (https://ethereum.github.io/yellowpaper/paper.pdf), defines\n        // the valid range for s in (301): 0 < s < secp256k1n ÷ 2 + 1, and for v in (302): v ∈ {27, 28}.\n        require(\n            uint256(s_) <= uint256(0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) &&\n            (v_ == 27 || v_ == 28),\n            \"SR:A:MALLEABLE\"\n        );\n\n        bytes32 digest_ = keccak256(abi.encodePacked(\n            \"\\x19\\x01\",\n            block.chainid,  // Chain id + address(this) serves as domain separator to avoid replay attacks.\n            address(this),\n            msg.sender,\n            nonces[msg.sender]++,\n            bitmap_,\n            deadline_\n        ));\n\n        address recoveredAddress_ = ecrecover(digest_, v_, r_, s_);\n\n        IPoolPermissionManagerLike ppm_ = IPoolPermissionManagerLike(poolPermissionManager);\n\n        // Any valid permission admin can authorize the deposit.\n        require(recoveredAddress_ != address(0) && ppm_.permissionAdmins(recoveredAddress_), \"SR:A:NOT_PERMISSION_ADMIN\");\n\n        address[] memory lender = new address[](1);\n        uint256[] memory bitmap = new uint256[](1);\n\n        lender[0] = msg.sender;\n        bitmap[0] = bitmap_;\n\n        ppm_.setLenderBitmaps(lender, bitmap);\n    }\n\n    function _deposit(address owner_, uint256 amount_, bytes32 depositData_) internal returns (uint256 shares_) {\n        // Check the owner has permission to deposit into the pool.\n        require(\n            IPoolPermissionManagerLike(poolPermissionManager).hasPermission(poolManager, owner_, \"P:deposit\"),\n            \"SR:D:NOT_AUTHORIZED\"\n        );\n\n        // Pull assets from the owner to the router.\n        require(ERC20Helper.transferFrom(asset, owner_, address(this), amount_), \"SR:D:TRANSFER_FROM_FAIL\");\n\n        // Deposit assets into the pool and receive the shares personally.\n        address pool_ = pool;\n\n        shares_ = IPoolLike(pool_).deposit(amount_, address(this));\n\n        // Route shares back to the caller.\n        require(ERC20Helper.transfer(pool_, owner_, shares_), \"SR:D:TRANSFER_FAIL\");\n\n        emit DepositData(owner_, amount_, depositData_);\n    }\n\n    function _permit(address asset_, uint256 deadline_, uint256 amount_, uint8 v_, bytes32 r_, bytes32 s_) internal {\n        uint256 allowance_ = IERC20Like(asset_).allowance(msg.sender, address(this));\n\n        if (allowance_ < amount_) {\n            IERC20Like(asset_).permit(msg.sender, address(this), amount_, deadline_, v_, r_, s_);\n        }\n    }\n\n}\n"
+    },
+    "modules/syrup-router/modules/erc20-helper/src/ERC20Helper.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nimport { IERC20Like } from \"./interfaces/IERC20Like.sol\";\n\n/**\n * @title Small Library to standardize erc20 token interactions.\n */\nlibrary ERC20Helper {\n\n    /**************************************************************************************************************************************/\n    /*** Internal Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function transfer(address token_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transfer.selector, to_, amount_));\n    }\n\n    function transferFrom(address token_, address from_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transferFrom.selector, from_, to_, amount_));\n    }\n\n    function approve(address token_, address spender_, uint256 amount_) internal returns (bool success_) {\n        // If setting approval to zero fails, return false.\n        if (!_call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, uint256(0)))) return false;\n\n        // If `amount_` is zero, return true as the previous step already did this.\n        if (amount_ == uint256(0)) return true;\n\n        // Return the result of setting the approval to `amount_`.\n        return _call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, amount_));\n    }\n\n    function _call(address token_, bytes memory data_) private returns (bool success_) {\n        if (token_.code.length == uint256(0)) return false;\n\n        bytes memory returnData;\n        ( success_, returnData ) = token_.call(data_);\n\n        return success_ && (returnData.length == uint256(0) || abi.decode(returnData, (bool)));\n    }\n\n}\n"
+    },
+    "modules/syrup-router/modules/erc20-helper/src/interfaces/IERC20Like.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title Interface of the ERC20 standard as needed by ERC20Helper.\ninterface IERC20Like {\n\n    function approve(address spender_, uint256 amount_) external returns (bool success_);\n\n    function transfer(address recipient_, uint256 amount_) external returns (bool success_);\n\n    function transferFrom(address owner_, address recipient_, uint256 amount_) external returns (bool success_);\n\n}\n"
+    },
+    "modules/syrup-router/contracts/interfaces/ISyrupRouter.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface ISyrupRouter {\n\n    /**\n     *  @dev   Optional Deposit Data for off-chain processing.\n     *  @param owner       The receiver of the shares.\n     *  @param amount      The amount of assets to deposit.\n     *  @param depositData Optional deposit data.\n     */\n    event DepositData(address indexed owner, uint256 amount, bytes32 depositData);\n\n    /**\n     *  @dev    The address of the underlying asset used by the ERC4626 Vault.\n     *  @return asset The address of the underlying asset.\n     */\n    function asset() external view returns (address asset);\n\n    /**\n     *  @dev    Authorizes and deposits assets into the Vault.\n     *  @param  bitmap_      The bitmap of the permission.\n     *  @param  deadline_    The timestamp after which the `authorize` signature is no longer valid.\n     *  @param  auth_v       ECDSA signature v component.\n     *  @param  auth_r       ECDSA signature r component.\n     *  @param  auth_s       ECDSA signature s component.\n     *  @param  amount_      The amount of assets to deposit.\n     *  @param  depositData_ Optional deposit data.\n     *  @return shares_      The amount of shares minted.\n     */\n    function authorizeAndDeposit(\n        uint256 bitmap_,\n        uint256 deadline_,\n        uint8   auth_v,\n        bytes32 auth_r,\n        bytes32 auth_s,\n        uint256 amount_,\n        bytes32 depositData_\n    ) external returns (uint256 shares_);\n\n    /**\n     *  @dev    Authorizes and deposits assets into the Vault with a ERC-2612 `permit`.\n     *  @param  bitmap_         The bitmap of the permission.\n     *  @param  auth_deadline_  The timestamp after which the `authorize` signature is no longer valid.\n     *  @param  auth_v          ECDSA signature v component of the authorization.\n     *  @param  auth_r          ECDSA signature r component of the authorization.\n     *  @param  auth_s          ECDSA signature s component of the authorization.\n     *  @param  amount_         The amount of assets to deposit.\n     *  @param  depositData_    Optional deposit data.\n     *  @param  permit_deadline The timestamp after which the `permit` signature is no longer valid.\n     *  @param  permit_v_       ECDSA signature v component of the token permit.\n     *  @param  permit_r_       ECDSA signature r component of the token permit.\n     *  @param  permit_s_       ECDSA signature s component of the token permit.\n     *  @return shares_         The amount of shares minted.\n     */\n    function authorizeAndDepositWithPermit(\n        uint256 bitmap_,\n        uint256 auth_deadline_,\n        uint8   auth_v,\n        bytes32 auth_r,\n        bytes32 auth_s,\n        uint256 amount_,\n        bytes32 depositData_,\n        uint256 permit_deadline,\n        uint8   permit_v_,\n        bytes32 permit_r_,\n        bytes32 permit_s_\n    ) external returns (uint256 shares_);\n\n    /**\n     *  @dev    Mints `shares` to sender by depositing `assets` into the Vault.\n     *  @param  assets      The amount of assets to deposit.\n     *  @param  depositData Optional deposit data.\n     *  @return shares      The amount of shares minted.\n     */\n    function deposit(uint256 assets, bytes32 depositData) external returns (uint256 shares);\n\n    /**\n     *  @dev    Does a ERC4626 `deposit` into a Maple Pool with a ERC-2612 `permit`.\n     *  @param  amount     The amount of assets to deposit.\n     *  @param  deadline   The timestamp after which the `permit` signature is no longer valid.\n     *  @param  v          ECDSA signature v component.\n     *  @param  r          ECDSA signature r component.\n     *  @param  s          ECDSA signature s component.\n     *  @param depositData Optional deposit data.\n     *  @return shares     The amount of shares minted.\n     */\n    function depositWithPermit(uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s, bytes32 depositData)\n        external returns (uint256 shares);\n\n    /**\n      *  @dev    Returns the nonce for the given owner.\n      *  @param  owner_ The address of the owner account.\n      *  @return nonce_ The nonce for the given owner.\n     */\n    function nonces(address owner_) external view returns (uint256 nonce_);\n\n    /**\n     *  @dev    The address of the ERC4626 Vault.\n     *  @return pool The address of the ERC4626 Vault.\n     */\n    function pool() external view returns (address pool);\n\n    /**\n     *  @dev    The address of the Pool Manager.\n     *  @return poolManager The address of the Pool Manager.\n     */\n    function poolManager() external view returns (address poolManager);\n\n    /**\n     *  @dev    The address of the Pool Permission Manager.\n     *  @return poolPermissionManager The address of the Pool Permission Manager.\n     */\n    function poolPermissionManager() external view returns (address poolPermissionManager);\n\n}\n\n"
+    },
+    "modules/syrup-router/contracts/interfaces/Interfaces.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface IERC20Like {\n\n    function allowance(address owner, address spender) external view returns (uint256 allowance);\n\n    function approve(address spender, uint256 amount) external returns (bool success);\n\n    function permit(address owner, address spender, uint amount, uint deadline, uint8 v, bytes32 r, bytes32 s) external;\n\n    function transfer(address recipient, uint256 amount) external returns (bool success);\n\n    function transferFrom(address owner, address recipient, uint256 amount) external returns (bool success);\n\n}\n\ninterface IPoolLike is IERC20Like {\n\n    function asset() external view returns (address asset);\n\n    function convertToExitAssets(uint256 shares) external view returns (uint256);\n\n    function deposit(uint256 assets, address receiver) external returns (uint256 shares);\n\n    function manager() external view returns (address manager);\n\n}\n\ninterface IPoolManagerLike {\n\n    function poolPermissionManager() external view returns (address poolPermissionManager);\n\n}\n\ninterface IPoolPermissionManagerLike {\n\n    function hasPermission(address poolManager, address lender, bytes32 functionId) external view returns (bool hasPermission);\n\n    function permissionAdmins(address account) external view returns (bool isAdmin);\n\n    function setLenderBitmaps(address[] calldata lenders, uint256[] calldata bitmaps) external;\n\n}\n"
+    }
+  }
+}
