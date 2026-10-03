@@ -157,7 +157,7 @@ def github(entry):
             try:snapshots.append(archive_repo(*r['full_name'].split('/'),r['default_branch']))
             except Exception as e:failures.append({'repository':r['full_name'],'error':str(e)})
         return {'status':'partial' if failures else 'fetched','kind':'github_organization','repositories':snapshots,'failures':failures}
-    owner,repo=parts[:2];repo=repo.removesuffix('.git');info=repo_info(owner,repo);ref=info['default_branch'];path=''
+    owner,repo=parts[:2];repo=repo.removesuffix('.git');info=repo_info(owner,repo);ref=info['default_branch'];path='';ref_fallback=None
     if len(parts)>3 and parts[2] in ('blob','tree'):
         tail=parts[3:];resolved=None
         for count in range(len(tail),0,-1):
@@ -166,7 +166,10 @@ def github(entry):
                 resolved=(candidate,'/'.join(tail[count:]));break
         if not resolved:
             # Historic refs can disappear from advertised branches and tags.
-            candidate=tail[0];resolve_commit(owner,repo,candidate,info);resolved=(candidate,'/'.join(tail[1:]))
+            candidate=tail[0]
+            try:resolve_commit(owner,repo,candidate,info);resolved=(candidate,'/'.join(tail[1:]))
+            except Exception as e:
+                resolved=(info['default_branch'],'/'.join(tail[1:]));ref_fallback={'metadata_ref':candidate,'archived_ref':info['default_branch'],'error':str(e)}
         ref,path=resolved
     elif len(parts)>2 and parts[2]=='releases':
         if len(parts)>4 and parts[3]=='tag':ref='/'.join(parts[4:])
@@ -175,7 +178,19 @@ def github(entry):
     snapshot=archive_repo(owner,repo,ref)
     files=json.loads((ROOT/snapshot['file_index']).read_text())
     exists=not path or any(x['path']==path or x['path'].startswith(path.rstrip('/')+'/') for x in files)
-    return {'status':'fetched' if exists else 'missing_scoped_path','kind':'github','scope_path':path,'scope_path_present':exists,'resolved_repository_url':info['html_url'],**({'metadata_url_repair':{'original_url':entry['url'],'resolved_url':url,'reason':'The upstream metadata truncates the hashgraph/hedera-transaction-tool URL.'}} if url!=entry['url'] else {}),**snapshot}
+    historical=None
+    if not exists and path:
+        try:
+            history=get_json(f'https://api.github.com/repos/{owner}/{repo}/commits?path={urllib.parse.quote(path,safe="")}&per_page=1')
+            if history:
+                event=history[0]
+                for candidate in [event['sha']]+[v['sha'] for v in event.get('parents',[])]:
+                    old=archive_repo(owner,repo,candidate)
+                    old_files=json.loads((ROOT/old['file_index']).read_text())
+                    if any(x['path']==path or x['path'].startswith(path.rstrip('/')+'/') for x in old_files):
+                        historical={'current_snapshot':snapshot['snapshot'],'recovery_commit':candidate,'reason':'The scoped path is missing at the currently advertised ref; archive the last available source from Git history.'};snapshot=old;exists=True;break
+        except Exception:pass
+    return {'status':'fetched' if exists else 'missing_scoped_path','kind':'github','scope_ref_fallback':ref_fallback,'historical_scope_recovery':historical,'scope_path':path,'scope_path_present':exists,'resolved_repository_url':info['html_url'],**({'metadata_url_repair':{'original_url':entry['url'],'resolved_url':url,'reason':'The upstream metadata truncates the hashgraph/hedera-transaction-tool URL.'}} if url!=entry['url'] else {}),**snapshot}
 
 class PreParser(__import__('html.parser',fromlist=['HTMLParser']).HTMLParser):
     def __init__(self):super().__init__();self.depth=0;self.current=None;self.items=[]
@@ -417,7 +432,7 @@ def push_head():
         print('Push retry',attempt+1,error,flush=True)
         if 'non-fast-forward' in error or 'fetch first' in error:
             fetched=subprocess.run(['git','fetch','origin','main'],cwd=ROOT,capture_output=True,text=True)
-            if fetched.returncode==0:subprocess.run(['git','rebase','origin/main'],cwd=ROOT,check=True,stdout=subprocess.DEVNULL)
+            if fetched.returncode==0:subprocess.run(['git','rebase','--autostash','origin/main'],cwd=ROOT,check=True,stdout=subprocess.DEVNULL)
         time.sleep(min(2**(attempt+1),30))
     raise RuntimeError('Git push remains unavailable after retries: '+error)
 
