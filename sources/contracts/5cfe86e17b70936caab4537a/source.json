@@ -1,0 +1,1652 @@
+{
+  "sources": {
+    "contracts/MapleLoan.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { IERC20 }                from \"../modules/erc20/contracts/interfaces/IERC20.sol\";\nimport { ERC20Helper }           from \"../modules/erc20-helper/src/ERC20Helper.sol\";\nimport { IMapleProxyFactory }    from \"../modules/maple-proxy-factory/contracts/interfaces/IMapleProxyFactory.sol\";\nimport { MapleProxiedInternals } from \"../modules/maple-proxy-factory/contracts/MapleProxiedInternals.sol\";\n\nimport { IMapleLoan } from \"./interfaces/IMapleLoan.sol\";\n\nimport { IGlobalsLike, ILenderLike, IMapleProxyFactoryLike } from \"./interfaces/Interfaces.sol\";\n\nimport { MapleLoanStorage } from \"./MapleLoanStorage.sol\";\n\n/*\n\n    ███╗   ███╗ █████╗ ██████╗ ██╗     ███████╗\n    ████╗ ████║██╔══██╗██╔══██╗██║     ██╔════╝\n    ██╔████╔██║███████║██████╔╝██║     █████╗\n    ██║╚██╔╝██║██╔══██║██╔═══╝ ██║     ██╔══╝\n    ██║ ╚═╝ ██║██║  ██║██║     ███████╗███████╗\n    ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚══════╝\n\n     ██████╗ ██████╗ ███████╗███╗   ██╗    ████████╗███████╗██████╗ ███╗   ███╗    ██╗      ██████╗  █████╗ ███╗   ██╗    ██╗   ██╗ ██╗\n    ██╔═══██╗██╔══██╗██╔════╝████╗  ██║    ╚══██╔══╝██╔════╝██╔══██╗████╗ ████║    ██║     ██╔═══██╗██╔══██╗████╗  ██║    ██║   ██║███║\n    ██║   ██║██████╔╝█████╗  ██╔██╗ ██║       ██║   █████╗  ██████╔╝██╔████╔██║    ██║     ██║   ██║███████║██╔██╗ ██║    ██║   ██║╚██║\n    ██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║       ██║   ██╔══╝  ██╔══██╗██║╚██╔╝██║    ██║     ██║   ██║██╔══██║██║╚██╗██║    ╚██╗ ██╔╝ ██║\n    ╚██████╔╝██║     ███████╗██║ ╚████║       ██║   ███████╗██║  ██║██║ ╚═╝ ██║    ███████╗╚██████╔╝██║  ██║██║ ╚████║     ╚████╔╝  ██║\n     ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝       ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝    ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝      ╚═══╝   ╚═╝\n\n*/\n\n/// @title MapleLoan implements an open term loan, and is intended to be proxied.\ncontract MapleLoan is IMapleLoan, MapleProxiedInternals, MapleLoanStorage {\n\n    uint256 public constant override HUNDRED_PERCENT = 1e6;\n\n    modifier onlyBorrower() {\n        _revertIfNotBorrower();\n        _;\n    }\n\n    modifier onlyLender() {\n        _revertIfNotLender();\n        _;\n    }\n\n    modifier whenNotPaused() {\n        _revertIfPaused();\n        _;\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Administrative Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    function migrate(address migrator_, bytes calldata arguments_) external override whenNotPaused {\n        require(msg.sender == _factory(),        \"ML:M:NOT_FACTORY\");\n        require(_migrate(migrator_, arguments_), \"ML:M:FAILED\");\n    }\n\n    function setImplementation(address newImplementation_) external override whenNotPaused {\n        require(msg.sender == _factory(),               \"ML:SI:NOT_FACTORY\");\n        require(_setImplementation(newImplementation_), \"ML:SI:FAILED\");\n    }\n\n    function upgrade(uint256 toVersion_, bytes calldata arguments_) external override whenNotPaused {\n        require(msg.sender == IGlobalsLike(globals()).securityAdmin(), \"ML:U:NO_AUTH\");\n\n        emit Upgraded(toVersion_, arguments_);\n\n        IMapleProxyFactory(_factory()).upgradeInstance(toVersion_, arguments_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Borrow Functions                                                                                                               ***/\n    /**************************************************************************************************************************************/\n\n    function acceptBorrower() external override whenNotPaused {\n        require(msg.sender == pendingBorrower, \"ML:AB:NOT_PENDING_BORROWER\");\n\n        delete pendingBorrower;\n\n        emit BorrowerAccepted(borrower = msg.sender);\n    }\n\n    function acceptNewTerms(address refinancer_, uint256 deadline_, bytes[] calldata calls_)\n        external override whenNotPaused onlyBorrower returns (bytes32 refinanceCommitment_)\n    {\n        require(refinancer_.code.length != uint256(0), \"ML:ANT:INVALID_REFINANCER\");\n        require(block.timestamp <= deadline_,          \"ML:ANT:EXPIRED_COMMITMENT\");\n\n        // NOTE: A zero refinancer address and/or empty calls array will never (probabilistically) match a refinance commitment in storage.\n        require(\n            refinanceCommitment == (refinanceCommitment_ = _getRefinanceCommitment(refinancer_, deadline_, calls_)),\n            \"ML:ANT:COMMITMENT_MISMATCH\"\n        );\n\n        uint256 previousPrincipal_ = principal;\n\n        (\n            ,\n            uint256 interest_,\n            uint256 lateInterest_,\n            uint256 delegateServiceFee_,\n            uint256 platformServiceFee_\n        ) = getPaymentBreakdown(block.timestamp);\n\n        // Clear refinance commitment to prevent implications of re-acceptance of another call to `_acceptNewTerms`.\n        delete refinanceCommitment;\n\n        for (uint256 i_; i_ < calls_.length; ++i_) {\n            ( bool success_, ) = refinancer_.delegatecall(calls_[i_]);\n            require(success_, \"ML:ANT:FAILED\");\n        }\n\n        // TODO: Emit this before the refinance calls in order to adhere to the CEI pattern.\n        emit NewTermsAccepted(refinanceCommitment_, refinancer_, deadline_, calls_);\n\n        address fundsAsset_   = fundsAsset;\n        uint256 newPrincipal_ = principal;\n\n        int256 netPrincipalToReturnToLender_ = _int256(previousPrincipal_) - _int256(newPrincipal_);\n\n        uint256 interestAndFees_ = interest_ + lateInterest_ + delegateServiceFee_ + platformServiceFee_;\n\n        address borrower_ = borrower;\n\n        ILenderLike lender_ = ILenderLike(lender);\n\n        require(\n            ERC20Helper.transferFrom(\n                fundsAsset_,\n                borrower_,\n                address(lender_),\n                (netPrincipalToReturnToLender_ > 0 ? _uint256(netPrincipalToReturnToLender_) : 0) + interestAndFees_\n            ),\n            \"ML:ANT:TRANSFER_FAILED\"\n        );\n\n        platformServiceFeeRate = uint64(IGlobalsLike(globals()).platformServiceFeeRate(lender_.poolManager()));\n\n        if (newPrincipal_ == 0) {\n            // NOTE: All the principal has been paid back therefore clear the loan accounting.\n            _clearLoanAccounting();\n        } else {\n            datePaid = _uint40(block.timestamp);\n\n            // NOTE: Accepting new terms always results in the a call and/or impairment being removed.\n            delete calledPrincipal;\n            delete dateCalled;\n            delete dateImpaired;\n        }\n\n        lender_.claim(\n            netPrincipalToReturnToLender_,\n            interest_ + lateInterest_,\n            delegateServiceFee_,\n            platformServiceFee_,\n            paymentDueDate()\n        );\n\n        // Principal has increased in the Loan, so Loan pulls funds from Lender.\n        if (netPrincipalToReturnToLender_ < 0) {\n            require(\n                ERC20Helper.transferFrom(fundsAsset_, address(lender_), borrower_, _uint256(netPrincipalToReturnToLender_ * -1)),\n                \"ML:ANT:TRANSFER_FAILED\"\n            );\n        }\n    }\n\n    function makePayment(uint256 principalToReturn_)\n        external override whenNotPaused\n        returns (\n            uint256 interest_,\n            uint256 lateInterest_,\n            uint256 delegateServiceFee_,\n            uint256 platformServiceFee_\n        )\n    {\n        require(dateFunded != 0, \"ML:MP:LOAN_INACTIVE\");\n\n        uint256 calledPrincipal_;\n\n        ( calledPrincipal_, interest_, lateInterest_, delegateServiceFee_, platformServiceFee_ ) = getPaymentBreakdown(block.timestamp);\n\n        // If the loan is called, the principal being returned must be greater than the portion called.\n        require(principalToReturn_ <= principal,        \"ML:MP:RETURNING_TOO_MUCH\");\n        require(principalToReturn_ >= calledPrincipal_, \"ML:MP:INSUFFICIENT_FOR_CALL\");\n\n        uint256 total_ = principalToReturn_ + interest_ + lateInterest_ + delegateServiceFee_ + platformServiceFee_;\n\n        if (principalToReturn_ == principal) {\n            _clearLoanAccounting();\n            emit PrincipalReturned(principalToReturn_, 0);\n        } else {\n            datePaid = _uint40(block.timestamp);\n\n            // NOTE: Making a payment always results in the a call and/or impairment being removed.\n            delete calledPrincipal;\n            delete dateCalled;\n            delete dateImpaired;\n\n            if (principalToReturn_ != 0) {\n                emit PrincipalReturned(principalToReturn_, principal -= principalToReturn_);\n            }\n        }\n\n        address lender_         = lender;\n        uint40  paymentDueDate_ = paymentDueDate();\n\n        emit PaymentMade(\n            lender_,\n            principalToReturn_,\n            interest_,\n            lateInterest_,\n            delegateServiceFee_,\n            platformServiceFee_,\n            paymentDueDate_,\n            defaultDate()\n        );\n\n        require(ERC20Helper.transferFrom(fundsAsset, msg.sender, lender_, total_), \"ML:MP:TRANSFER_FROM_FAILED\");\n\n        ILenderLike(lender_).claim(\n            _int256(principalToReturn_),\n            interest_ + lateInterest_,\n            delegateServiceFee_,\n            platformServiceFee_,\n            paymentDueDate_\n        );\n    }\n\n    function setPendingBorrower(address pendingBorrower_) external override whenNotPaused onlyBorrower {\n        require(IGlobalsLike(globals()).isBorrower(pendingBorrower_), \"ML:SPB:INVALID_BORROWER\");\n\n        emit PendingBorrowerSet(pendingBorrower = pendingBorrower_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Lend Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    function acceptLender() external override whenNotPaused {\n        require(msg.sender == pendingLender, \"ML:AL:NOT_PENDING_LENDER\");\n\n        delete pendingLender;\n\n        emit LenderAccepted(lender = msg.sender);\n    }\n\n    function callPrincipal(uint256 principalToReturn_)\n        external override whenNotPaused onlyLender\n        returns (uint40 paymentDueDate_, uint40 defaultDate_)\n    {\n        require(dateFunded != 0,                                            \"ML:C:LOAN_INACTIVE\");\n        require(principalToReturn_ != 0 && principalToReturn_ <= principal, \"ML:C:INVALID_AMOUNT\");\n\n        dateCalled = _uint40(block.timestamp);\n\n        emit PrincipalCalled(\n            calledPrincipal = principalToReturn_,\n            paymentDueDate_ = paymentDueDate(),\n            defaultDate_    = defaultDate()\n        );\n    }\n\n    function fund() external override whenNotPaused onlyLender returns (uint256 fundsLent_, uint40 paymentDueDate_, uint40 defaultDate_) {\n        require(dateFunded == 0, \"ML:F:LOAN_ACTIVE\");\n        require(principal != 0,  \"ML:F:LOAN_CLOSED\");\n\n        dateFunded = _uint40(block.timestamp);\n\n        emit Funded(\n            fundsLent_      = principal,\n            paymentDueDate_ = paymentDueDate(),\n            defaultDate_    = defaultDate()\n        );\n\n        require(ERC20Helper.transferFrom(fundsAsset, msg.sender, borrower, fundsLent_), \"ML:F:TRANSFER_FROM_FAILED\");\n    }\n\n    function impair() external override whenNotPaused onlyLender returns (uint40 paymentDueDate_, uint40 defaultDate_) {\n        require(dateFunded != 0, \"ML:I:LOAN_INACTIVE\");\n\n        // NOTE: Impairing an already-impaired loan simply updates the `dateImpaired`, which can push the due date further.\n        dateImpaired = _uint40(block.timestamp);\n\n        emit Impaired(\n            paymentDueDate_ = paymentDueDate(),\n            defaultDate_    = defaultDate()\n        );\n    }\n\n    function proposeNewTerms(address refinancer_, uint256 deadline_, bytes[] calldata calls_)\n        external override whenNotPaused onlyLender returns (bytes32 refinanceCommitment_)\n    {\n        require(dateFunded != 0,                                                    \"ML:PNT:LOAN_INACTIVE\");\n        require(block.timestamp <= deadline_,                                       \"ML:PNT:INVALID_DEADLINE\");\n        require(IGlobalsLike(globals()).isInstanceOf(\"OT_REFINANCER\", refinancer_), \"ML:PNT:INVALID_REFINANCER\");\n        require(calls_.length > 0,                                                  \"ML:PNT:EMPTY_CALLS\");\n\n        emit NewTermsProposed(\n            refinanceCommitment = refinanceCommitment_ = _getRefinanceCommitment(refinancer_, deadline_, calls_),\n            refinancer_,\n            deadline_,\n            calls_\n        );\n    }\n\n    function removeCall() external override whenNotPaused onlyLender returns (uint40 paymentDueDate_, uint40 defaultDate_) {\n        require(dateCalled != 0, \"ML:RC:NOT_CALLED\");\n\n        delete dateCalled;\n        delete calledPrincipal;\n\n        emit CallRemoved(\n            paymentDueDate_ = paymentDueDate(),\n            defaultDate_    = defaultDate()\n        );\n    }\n\n    function removeImpairment() external override whenNotPaused onlyLender returns (uint40 paymentDueDate_, uint40 defaultDate_) {\n        require(dateImpaired != 0, \"ML:RI:NOT_IMPAIRED\");\n\n        delete dateImpaired;\n\n        emit ImpairmentRemoved(\n            paymentDueDate_ = paymentDueDate(),\n            defaultDate_    = defaultDate()\n        );\n    }\n\n    function repossess(address destination_) external override whenNotPaused onlyLender returns (uint256 fundsRepossessed_) {\n        require(isInDefault(), \"ML:R:NOT_IN_DEFAULT\");\n\n        _clearLoanAccounting();\n\n        address fundsAsset_ = fundsAsset;\n\n        emit Repossessed(\n            fundsRepossessed_ = IERC20(fundsAsset_).balanceOf(address(this)),\n            destination_\n        );\n\n        // Either there are no funds to repossess, or the transfer of the funds succeeds.\n        require((fundsRepossessed_ == 0) || ERC20Helper.transfer(fundsAsset_, destination_, fundsRepossessed_), \"ML:R:TRANSFER_FAILED\");\n    }\n\n    function setPendingLender(address pendingLender_) external override whenNotPaused onlyLender {\n        emit PendingLenderSet(pendingLender = pendingLender_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Miscellaneous Functions                                                                                                        ***/\n    /**************************************************************************************************************************************/\n\n    function rejectNewTerms(address refinancer_, uint256 deadline_, bytes[] calldata calls_)\n        external override whenNotPaused returns (bytes32 refinanceCommitment_)\n    {\n        require((msg.sender == borrower) || (msg.sender == lender), \"ML:RNT:NO_AUTH\");\n\n        require(\n            refinanceCommitment == (refinanceCommitment_ = _getRefinanceCommitment(refinancer_, deadline_, calls_)),\n            \"ML:RNT:COMMITMENT_MISMATCH\"\n        );\n\n        delete refinanceCommitment;\n\n        emit NewTermsRejected(refinanceCommitment_, refinancer_, deadline_, calls_);\n    }\n\n    function skim(address token_, address destination_) external override whenNotPaused returns (uint256 skimmed_) {\n        require(destination_ != address(0), \"ML:S:ZERO_ADDRESS\");\n\n        address governor_ = IGlobalsLike(globals()).governor();\n\n        require(msg.sender == governor_ || msg.sender == borrower, \"ML:S:NO_AUTH\");\n\n        skimmed_ = IERC20(token_).balanceOf(address(this));\n\n        require(skimmed_ != 0, \"ML:S:NO_TOKEN_TO_SKIM\");\n\n        emit Skimmed(token_, skimmed_, destination_);\n\n        require(ERC20Helper.transfer(token_, destination_, skimmed_), \"ML:S:TRANSFER_FAILED\");\n    }\n\n    /**************************************************************************************************************************************/\n    /*** View Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    function defaultDate() public view override returns (uint40 paymentDefaultDate_) {\n        ( uint40 callDefaultDate_, uint40 impairedDefaultDate_, uint40 normalPaymentDueDate_ ) = _defaultDates();\n\n        paymentDefaultDate_ = _minDate(callDefaultDate_, impairedDefaultDate_, normalPaymentDueDate_);\n    }\n\n    function factory() external view override returns (address factory_) {\n        return _factory();\n    }\n\n    function getPaymentBreakdown(uint256 timestamp_)\n        public view override returns (\n            uint256 principal_,\n            uint256 interest_,\n            uint256 lateInterest_,\n            uint256 delegateServiceFee_,\n            uint256 platformServiceFee_\n        )\n    {\n        uint40 startDate_ = _maxDate(datePaid, dateFunded);  // Timestamp when new interest starts accruing.\n\n        // Return all zeros if the loan has not been funded yet or if the given timestamp is not greater than the start date.\n        if (startDate_ == 0 || timestamp_ <= startDate_) return ( calledPrincipal, 0, 0, 0, 0 );\n\n        uint40 paymentDueDate_ = paymentDueDate();\n\n        // \"Current\" interval and late interval respectively.\n        ( uint32 interval_, uint32 lateInterval_ ) =\n            ( _uint32(timestamp_ - startDate_), timestamp_ > paymentDueDate_ ? _uint32(timestamp_ - paymentDueDate_) : 0 );\n\n        ( interest_, lateInterest_, delegateServiceFee_, platformServiceFee_ ) = _getPaymentBreakdown(\n            principal,\n            interestRate,\n            lateInterestPremiumRate,\n            lateFeeRate,\n            delegateServiceFeeRate,\n            platformServiceFeeRate,\n            interval_,\n            lateInterval_\n        );\n\n        principal_ = calledPrincipal;\n    }\n\n    function globals() public view override returns (address globals_) {\n        globals_ = IMapleProxyFactoryLike(_factory()).mapleGlobals();\n    }\n\n    function implementation() external view override returns (address implementation_) {\n        return _implementation();\n    }\n\n    function isCalled() public view override returns (bool isCalled_) {\n        isCalled_ = dateCalled != 0;\n    }\n\n    function isImpaired() public view override returns (bool isImpaired_) {\n        isImpaired_ = dateImpaired != 0;\n    }\n\n    function isInDefault() public view override returns (bool isInDefault_) {\n        uint40 defaultDate_ = defaultDate();\n\n        isInDefault_ = (defaultDate_ != 0) && (block.timestamp > defaultDate_);\n    }\n\n    function paymentDueDate() public view override returns (uint40 paymentDueDate_) {\n        ( uint40 callDueDate_, uint40 impairedDueDate_, uint40 normalDueDate_ ) = _dueDates();\n\n        paymentDueDate_ = _minDate(callDueDate_, impairedDueDate_, normalDueDate_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Internal Helper Functions                                                                                                      ***/\n    /**************************************************************************************************************************************/\n\n    /// @dev Clears all state variables to end a loan, but keep borrower and lender withdrawal functionality intact.\n    function _clearLoanAccounting() internal {\n        delete refinanceCommitment;\n\n        delete gracePeriod;\n        delete noticePeriod;\n        delete paymentInterval;\n\n        delete dateCalled;\n        delete dateFunded;\n        delete dateImpaired;\n        delete datePaid;\n\n        delete calledPrincipal;\n        delete principal;\n\n        delete delegateServiceFeeRate;\n        delete interestRate;\n        delete lateFeeRate;\n        delete lateInterestPremiumRate;\n        delete platformServiceFeeRate;\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Internal View Functions                                                                                                        ***/\n    /**************************************************************************************************************************************/\n\n    function _defaultDates() internal view returns (uint40 callDefaultDate_, uint40 impairedDefaultDate_, uint40 normalDefaultDate_) {\n        ( uint40 callDueDate_, uint40 impairedDueDate_, uint40 normalDueDate_ ) = _dueDates();\n\n        callDefaultDate_     = _getCallDefaultDate(callDueDate_);\n        impairedDefaultDate_ = _getImpairedDefaultDate(impairedDueDate_, gracePeriod);\n        normalDefaultDate_   = _getNormalDefaultDate(normalDueDate_, gracePeriod);\n    }\n\n    function _dueDates() internal view returns (uint40 callDueDate_, uint40 impairedDueDate_, uint40 normalDueDate_) {\n        callDueDate_     = _getCallDueDate(dateCalled, noticePeriod);\n        impairedDueDate_ = _getImpairedDueDate(dateImpaired);\n        normalDueDate_   = _getNormalDueDate(dateFunded, datePaid, paymentInterval);\n    }\n\n    function _getRefinanceCommitment(address refinancer_, uint256 deadline_, bytes[] calldata calls_)\n        internal pure returns (bytes32 refinanceCommitment_)\n    {\n        return keccak256(abi.encode(refinancer_, deadline_, calls_));\n    }\n\n    function _revertIfNotBorrower() internal view {\n        require(msg.sender == borrower, \"ML:NOT_BORROWER\");\n    }\n\n    function _revertIfNotLender() internal view {\n        require(msg.sender == lender, \"ML:NOT_LENDER\");\n    }\n\n    function _revertIfPaused() internal view {\n        require(!IGlobalsLike(globals()).isFunctionPaused(msg.sig), \"ML:PAUSED\");\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Internal Pure Functions                                                                                                        ***/\n    /**************************************************************************************************************************************/\n\n    function _getCallDefaultDate(uint40 callDueDate_) internal pure returns (uint40 defaultDate_) {\n        defaultDate_ = callDueDate_;\n    }\n\n    function _getCallDueDate(uint40 dateCalled_, uint32 noticePeriod_) internal pure returns (uint40 dueDate_) {\n        dueDate_ = dateCalled_ != 0 ? dateCalled_ + noticePeriod_ : 0;\n    }\n\n    function _getImpairedDefaultDate(uint40 impairedDueDate_, uint32 gracePeriod_) internal pure returns (uint40 defaultDate_) {\n        defaultDate_ = impairedDueDate_ != 0 ? impairedDueDate_ + gracePeriod_ : 0;\n    }\n\n    function _getImpairedDueDate(uint40 dateImpaired_) internal pure returns (uint40 dueDate_) {\n        dueDate_ = dateImpaired_ != 0 ? dateImpaired_: 0;\n    }\n\n    function _getNormalDefaultDate(uint40 normalDueDate_, uint32 gracePeriod_) internal pure returns (uint40 defaultDate_) {\n        defaultDate_ = normalDueDate_ != 0 ? normalDueDate_ + gracePeriod_ : 0;\n    }\n\n    function _getNormalDueDate(uint40 dateFunded_, uint40 datePaid_, uint32 paymentInterval_) internal pure returns (uint40 dueDate_) {\n        uint40 paidOrFundedDate_ = _maxDate(dateFunded_, datePaid_);\n\n        dueDate_ = paidOrFundedDate_ != 0 ? paidOrFundedDate_ + paymentInterval_ : 0;\n    }\n\n    /// @dev Returns an amount by applying an annualized and scaled interest rate, to a principal, over an interval of time.\n    function _getPaymentBreakdown(\n        uint256 principal_,\n        uint256 interestRate_,\n        uint256 lateInterestPremiumRate_,\n        uint256 lateFeeRate_,\n        uint256 delegateServiceFeeRate_,\n        uint256 platformServiceFeeRate_,\n        uint32  interval_,\n        uint32  lateInterval_\n    )\n        internal pure returns (uint256 interest_, uint256 lateInterest_, uint256 delegateServiceFee_, uint256 platformServiceFee_)\n    {\n        interest_           = _getProRatedAmount(principal_, interestRate_,           interval_);\n        delegateServiceFee_ = _getProRatedAmount(principal_, delegateServiceFeeRate_, interval_);\n        platformServiceFee_ = _getProRatedAmount(principal_, platformServiceFeeRate_, interval_);\n\n        if (lateInterval_ == 0) return (interest_, 0, delegateServiceFee_, platformServiceFee_);\n\n        lateInterest_ =\n            _getProRatedAmount(principal_, lateInterestPremiumRate_, lateInterval_) +\n            ((principal_ * lateFeeRate_) / HUNDRED_PERCENT);\n    }\n\n    function _getProRatedAmount(uint256 amount_, uint256 rate_, uint32 interval_) internal pure returns (uint256 proRatedAmount_) {\n        proRatedAmount_ = (amount_ * rate_ * interval_) / (365 days * HUNDRED_PERCENT);\n    }\n\n    function _int256(uint256 input_) internal pure returns (int256 output_) {\n        require(input_ <= uint256(type(int256).max), \"ML:UINT256_CAST\");\n        output_ = int256(input_);\n    }\n\n    function _maxDate(uint40 a_, uint40 b_) internal pure returns (uint40 max_) {\n        max_ = a_ == 0 ? b_ : (b_ == 0 ? a_ : (a_ > b_ ? a_ : b_));\n    }\n\n    function _minDate(uint40 a_, uint40 b_) internal pure returns (uint40 min_) {\n        min_ = a_ == 0 ? b_ : (b_ == 0 ? a_ : (a_ < b_ ? a_ : b_));\n    }\n\n    function _minDate(uint40 a_, uint40 b_, uint40 c_) internal pure returns (uint40 min_) {\n        min_ = _minDate(a_, _minDate(b_, c_));\n    }\n\n    function _uint32(uint256 input_) internal pure returns (uint32 output_) {\n        require(input_ <= type(uint32).max, \"ML:UINT256_OOB_FOR_UINT32\");\n        output_ = uint32(input_);\n    }\n\n    function _uint40(uint256 input_) internal pure returns (uint40 output_) {\n        require(input_ <= type(uint40).max, \"ML:UINT256_OOB_FOR_UINT40\");\n        output_ = uint40(input_);\n    }\n\n    function _uint256(int256 input_) internal pure returns (uint256 output_) {\n        require(input_ >= 0, \"ML:INT256_CAST\");\n        output_ = uint256(input_);\n    }\n\n}\n"
+    },
+    "contracts/MapleLoanStorage.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { IMapleLoanStorage } from \"./interfaces/IMapleLoanStorage.sol\";\n\n/// @title MapleLoanStorage defines the storage layout of MapleLoan.\nabstract contract MapleLoanStorage is IMapleLoanStorage {\n\n    address public override fundsAsset;       // The address of the asset used as funds.\n    address public override borrower;         // The address of the borrower.\n    address public override lender;           // The address of the lender.\n    address public override pendingBorrower;  // The address of the pendingBorrower, the only address that can accept the borrower role.\n    address public override pendingLender;    // The address of the pendingLender, the only address that can accept the lender role.\n\n    bytes32 public override refinanceCommitment;  // The commitment hash of the refinance proposal.\n\n    uint32 public override gracePeriod;      // The number of seconds a payment can be late.\n    uint32 public override noticePeriod;     // The number of seconds after a loan is called after which the borrower can be considered in default.\n    uint32 public override paymentInterval;  // The number of seconds between payments.\n\n    uint40 public override dateCalled;    // The date the loan was called.\n    uint40 public override dateFunded;    // The date the loan was funded.\n    uint40 public override dateImpaired;  // The date the loan was impaired.\n    uint40 public override datePaid;      // The date the loan was paid.\n\n    uint256 public override calledPrincipal;  // The amount of principal yet to be returned to satisfy the loan call.\n    uint256 public override principal;        // The amount of principal yet to be paid down.\n\n    uint64 public override delegateServiceFeeRate;   // The annualized delegate service fee rate.\n    uint64 public override interestRate;             // The annualized interest rate of the loan.\n    uint64 public override lateFeeRate;              // The fee rate for late payments.\n    uint64 public override lateInterestPremiumRate;  // The amount to increase the interest rate by for late payments.\n    uint64 public override platformServiceFeeRate;   // The annualized platform service fee rate.\n\n}\n"
+    },
+    "contracts/interfaces/IMapleLoan.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { IMapleProxied } from \"../../modules/maple-proxy-factory/contracts/interfaces/IMapleProxied.sol\";\n\nimport { IMapleLoanEvents }  from \"./IMapleLoanEvents.sol\";\nimport { IMapleLoanStorage } from \"./IMapleLoanStorage.sol\";\n\n/// @title MapleLoan implements an open term loan, and is intended to be proxied.\ninterface IMapleLoan is IMapleProxied, IMapleLoanEvents, IMapleLoanStorage {\n\n    /**************************************************************************************************************************************/\n    /*** State Changing Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev Accept the borrower role, must be called by pendingBorrower.\n     */\n    function acceptBorrower() external;\n\n    /**\n     *  @dev Accept the lender role, must be called by pendingLender.\n     */\n    function acceptLender() external;\n\n    /**\n     *  @dev    Accept the proposed terms and trigger refinance execution.\n     *  @param  refinancer_          The address of the refinancer contract.\n     *  @param  deadline_            The deadline for accepting the new terms.\n     *  @param  calls_               The encoded arguments to be passed to refinancer.\n     *  @return refinanceCommitment_ The hash of the accepted refinance agreement.\n     */\n    function acceptNewTerms(address refinancer_, uint256 deadline_, bytes[] calldata calls_)\n        external returns (bytes32 refinanceCommitment_);\n\n    /**\n     *  @dev    The lender called the loan, giving the borrower a notice period within which to return principal and pro-rata interest.\n     *  @param  principalToReturn_ The minimum amount of principal the borrower must return.\n     *  @return paymentDueDate_    The new payment due date for returning the principal and pro-rate interest to the lender.\n     *  @return defaultDate_       The date the loan will be in default.\n     */\n    function callPrincipal(uint256 principalToReturn_) external returns (uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev    Lend funds to the loan/borrower.\n     *  @return fundsLent_      The amount funded.\n     *  @return paymentDueDate_ The due date of the first payment.\n     *  @return defaultDate_    The timestamp of the date the loan will be in default.\n     */\n    function fund() external returns (uint256 fundsLent_, uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev    Fast forward the payment due date to the current time.\n     *          This enables the pool delegate to force a payment (or default).\n     *  @return paymentDueDate_ The new payment due date to result in the removal of the loan's impairment status.\n     *  @return defaultDate_    The timestamp of the date the loan will be in default.\n     */\n    function impair() external returns (uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev    Make a payment to the loan.\n     *  @param  principalToReturn_  The amount of principal to return, to the lender to reduce future interest payments.\n     *  @return interest_           The portion of the amount paying interest.\n     *  @return lateInterest_       The portion of the amount paying late interest.\n     *  @return delegateServiceFee_ The portion of the amount paying delegate service fees.\n     *  @return platformServiceFee_ The portion of the amount paying platform service fees.\n     */\n    function makePayment(uint256 principalToReturn_)\n        external returns (\n            uint256 interest_,\n            uint256 lateInterest_,\n            uint256 delegateServiceFee_,\n            uint256 platformServiceFee_\n        );\n\n    /**\n     *  @dev    Propose new terms for refinance.\n     *  @param  refinancer_          The address of the refinancer contract.\n     *  @param  deadline_            The deadline for accepting the new terms.\n     *  @param  calls_               The encoded arguments to be passed to refinancer.\n     *  @return refinanceCommitment_ The hash of the proposed refinance agreement.\n     */\n    function proposeNewTerms(address refinancer_, uint256 deadline_, bytes[] calldata calls_)\n        external returns (bytes32 refinanceCommitment_);\n\n    /**\n     *  @dev    Nullify the current proposed terms.\n     *  @param  refinancer_          The address of the refinancer contract.\n     *  @param  deadline_            The deadline for accepting the new terms.\n     *  @param  calls_               The encoded arguments to be passed to refinancer.\n     *  @return refinanceCommitment_ The hash of the rejected refinance agreement.\n     */\n    function rejectNewTerms(address refinancer_, uint256 deadline_, bytes[] calldata calls_)\n        external returns (bytes32 refinanceCommitment_);\n\n    /**\n     *  @dev    Remove the loan's called status.\n     *  @return paymentDueDate_ The restored payment due date.\n     *  @return defaultDate_    The date the loan will be in default.\n     */\n    function removeCall() external returns (uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev    Remove the loan impairment by restoring the original payment due date.\n     *  @return paymentDueDate_ The restored payment due date.\n     *  @return defaultDate_    The timestamp of the date the loan will be in default.\n     */\n    function removeImpairment() external returns (uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev    Repossess collateral, and any funds, for a loan in default.\n     *  @param  destination_      The address where the collateral and funds asset is to be sent, if any.\n     *  @return fundsRepossessed_ The amount of funds asset repossessed.\n     */\n    function repossess(address destination_) external returns (uint256 fundsRepossessed_);\n\n    /**\n     *  @dev   Set the `pendingBorrower` to a new account.\n     *  @param pendingBorrower_ The address of the new pendingBorrower.\n     */\n    function setPendingBorrower(address pendingBorrower_) external;\n\n    /**\n     *  @dev   Set the `pendingLender` to a new account.\n     *  @param pendingLender_ The address of the new pendingLender.\n     */\n    function setPendingLender(address pendingLender_) external;\n\n    /**\n     *  @dev    Remove all available balance of a specified token.\n     *          NOTE: Open Term Loans are not designed to hold custody of tokens, so this is designed as a safety feature.\n     *  @param  token_       The address of the token contract.\n     *  @param  destination_ The recipient of the token.\n     *  @return skimmed_     The amount of token removed from the loan.\n     */\n    function skim(address token_, address destination_) external returns (uint256 skimmed_);\n\n    /**************************************************************************************************************************************/\n    /*** View Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev The timestamp of the date the loan will be in default.\n     */\n    function defaultDate() external view returns (uint40 defaultDate_);\n\n    /**\n     *  @dev The Maple globals address\n     */\n    function globals() external view returns (address globals_);\n\n    /**\n     *  @dev The value that represents 100%, to be easily comparable with the loan rates.\n     */\n    function HUNDRED_PERCENT() external pure returns (uint256 hundredPercent_);\n\n    /**\n     *  @dev Whether the loan is called.\n     */\n    function isCalled() external view returns (bool isCalled_);\n\n    /**\n     *  @dev Whether the loan is impaired.\n     */\n    function isImpaired() external view returns (bool isImpaired_);\n\n    /**\n     *  @dev Whether the loan is in default.\n     */\n    function isInDefault() external view returns (bool isInDefault_);\n\n    /**\n     *  @dev    Get the breakdown of the total payment needed to satisfy the next payment installment.\n     *  @param  timestamp_          The timestamp that corresponds to when the payment is to be made.\n     *  @return principal_          The portion of the total amount that will go towards principal.\n     *  @return interest_           The portion of the total amount that will go towards interest fees.\n     *  @return lateInterest_       The portion of the total amount that will go towards late interest fees.\n     *  @return delegateServiceFee_ The portion of the total amount that will go towards delegate service fees.\n     *  @return platformServiceFee_ The portion of the total amount that will go towards platform service fees.\n     */\n    function getPaymentBreakdown(uint256 timestamp_)\n        external view returns (\n            uint256 principal_,\n            uint256 interest_,\n            uint256 lateInterest_,\n            uint256 delegateServiceFee_,\n            uint256 platformServiceFee_\n        );\n\n    /**\n     *  @dev The timestamp of the due date of the next payment.\n     */\n    function paymentDueDate() external view returns (uint40 paymentDueDate_);\n\n}\n"
+    },
+    "contracts/interfaces/Interfaces.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface IGlobalsLike {\n\n    function canDeploy(address caller_) external view returns (bool canDeploy_);\n\n    function governor() external view returns (address governor_);\n\n    function isBorrower(address account_) external view returns (bool isBorrower_);\n\n    function isFunctionPaused(bytes4 sig_) external view returns (bool isFunctionPaused_);\n\n    function isInstanceOf(bytes32 instanceId_, address instance_) external view returns (bool isInstance_);\n\n    function isPoolAsset(address poolAsset_) external view returns (bool isPoolAsset_);\n\n    function platformServiceFeeRate(address poolManager) external view returns (uint256 platformServiceFeeRate_);\n\n    function securityAdmin() external view returns (address securityAdmin_);\n\n}\n\ninterface ILenderLike {\n\n    function claim(\n        int256  principal_,\n        uint256 interest_,\n        uint256 delegateServiceFee_,\n        uint256 platformServiceFee_,\n        uint40  paymentDueDate_\n    ) external;\n\n    function factory() external view returns (address factory_);\n\n    function fundsAsset() external view returns (address fundsAsset_);\n\n    function poolManager() external view returns (address poolManager_);\n\n}\n\ninterface IMapleProxyFactoryLike {\n\n    function isInstance(address instance_) external view returns (bool isInstance_);\n\n    function mapleGlobals() external view returns (address mapleGlobals_);\n\n}\n"
+    },
+    "modules/erc20-helper/src/ERC20Helper.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nimport { IERC20Like } from \"./interfaces/IERC20Like.sol\";\n\n/**\n * @title Small Library to standardize erc20 token interactions.\n */\nlibrary ERC20Helper {\n\n    /**************************************************************************************************************************************/\n    /*** Internal Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function transfer(address token_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transfer.selector, to_, amount_));\n    }\n\n    function transferFrom(address token_, address from_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transferFrom.selector, from_, to_, amount_));\n    }\n\n    function approve(address token_, address spender_, uint256 amount_) internal returns (bool success_) {\n        // If setting approval to zero fails, return false.\n        if (!_call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, uint256(0)))) return false;\n\n        // If `amount_` is zero, return true as the previous step already did this.\n        if (amount_ == uint256(0)) return true;\n\n        // Return the result of setting the approval to `amount_`.\n        return _call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, amount_));\n    }\n\n    function _call(address token_, bytes memory data_) private returns (bool success_) {\n        if (token_.code.length == uint256(0)) return false;\n\n        bytes memory returnData;\n        ( success_, returnData ) = token_.call(data_);\n\n        return success_ && (returnData.length == uint256(0) || abi.decode(returnData, (bool)));\n    }\n\n}\n"
+    },
+    "contracts/interfaces/IMapleLoanEvents.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\n/// @title IMapleLoanEvents defines the events for a MapleLoan.\ninterface IMapleLoanEvents {\n\n    /**\n     *  @dev   Borrower was accepted, and set to a new account.\n     *  @param borrower_ The address of the new borrower.\n     */\n    event BorrowerAccepted(address indexed borrower_);\n\n    /**\n     *  @dev   The lender reverted the action of the loan being called and the payment due date was restored to it's original value.\n     *  @param paymentDueDate_ The restored payment due date.\n     *  @param defaultDate_    The date the loan will be in default.\n     */\n    event CallRemoved(uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev   The loan was funded.\n     *  @param amount_         The amount funded.\n     *  @param paymentDueDate_ The due date of the first payment.\n     *  @param defaultDate_    The date the loan will be in default.\n     */\n    event Funded(uint256 amount_, uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev   The payment due date was fast forwarded to the current time, activating the grace period.\n     *         This is emitted when the pool delegate wants to force a payment (or default).\n     *  @param paymentDueDate_ The new payment due date.\n     *  @param defaultDate_    The date the loan will be in default.\n     */\n    event Impaired(uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev   The payment due date was restored to it's original value, reverting the action of loan impairment.\n     *  @param paymentDueDate_ The restored payment due date.\n     *  @param defaultDate_    The date the loan will be in default.\n     */\n    event ImpairmentRemoved(uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev   Loan was initialized.\n     *  @param borrower_           The address of the borrower.\n     *  @param lender_             The address of the lender.\n     *  @param fundsAsset_         The address of the lent asset.\n     *  @param principalRequested_ The amount of principal requested.\n     *  @param termDetails_        Array of loan parameters:\n     *                                 [0]: gracePeriod,\n     *                                 [1]: noticePeriod,\n     *                                 [2]: paymentInterval\n     *  @param rates_              Array of rate parameters:\n     *                                 [0]: delegateServiceFeeRate,\n     *                                 [1]: interestRate,\n     *                                 [2]: lateFeeRate,\n     *                                 [3]: lateInterestPremiumRate\n     */\n    event Initialized(\n        address   indexed borrower_,\n        address   indexed lender_,\n        address   indexed fundsAsset_,\n        uint256           principalRequested_,\n        uint32[3]         termDetails_,\n        uint64[4]         rates_\n    );\n\n    /**\n     *  @dev   Lender was accepted, and set to a new account.\n     *  @param lender_ The address of the new lender.\n     */\n    event LenderAccepted(address indexed lender_);\n\n    /**\n     *  @dev   The terms of the refinance proposal were accepted.\n     *  @param refinanceCommitment_ The hash of the refinancer, deadline, and calls proposed.\n     *  @param refinancer_          The address that will execute the refinance.\n     *  @param deadline_            The deadline for accepting the new terms.\n     *  @param calls_               The individual calls for the refinancer contract.\n     */\n    event NewTermsAccepted(bytes32 refinanceCommitment_, address refinancer_, uint256 deadline_, bytes[] calls_);\n\n    /**\n     *  @dev   A refinance was proposed.\n     *  @param refinanceCommitment_ The hash of the refinancer, deadline, and calls proposed.\n     *  @param refinancer_          The address that will execute the refinance.\n     *  @param deadline_            The deadline for accepting the new terms.\n     *  @param calls_               The individual calls for the refinancer contract.\n     */\n    event NewTermsProposed(bytes32 refinanceCommitment_, address refinancer_, uint256 deadline_, bytes[] calls_);\n\n    /**\n     *  @dev   The terms of the refinance proposal were rejected.\n     *  @param refinanceCommitment_ The hash of the refinancer, deadline, and calls proposed.\n     *  @param refinancer_          The address that will execute the refinance.\n     *  @param deadline_            The deadline for accepting the new terms.\n     *  @param calls_               The individual calls for the refinancer contract.\n     */\n    event NewTermsRejected(bytes32 refinanceCommitment_, address refinancer_, uint256 deadline_, bytes[] calls_);\n\n    /**\n     *  @dev   Payments were made.\n     *  @param lender_             The address of the lender the payment was made to.\n     *  @param principalPaid_      The portion of the total amount that went towards paying down principal.\n     *  @param interestPaid_       The portion of the total amount that went towards interest.\n     *  @param lateInterestPaid_   The portion of the total amount that went towards late interest.\n     *  @param delegateServiceFee_ The portion of the total amount that went towards delegate service fees.\n     *  @param platformServiceFee_ The portion of the total amount that went towards platform service fee.\n     *  @param paymentDueDate_     The new payment due date.\n     *  @param defaultDate_        The date the loan will be in default.\n     */\n    event PaymentMade(\n        address indexed lender_,\n        uint256         principalPaid_,\n        uint256         interestPaid_,\n        uint256         lateInterestPaid_,\n        uint256         delegateServiceFee_,\n        uint256         platformServiceFee_,\n        uint40          paymentDueDate_,\n        uint40          defaultDate_\n    );\n\n    /**\n     *  @dev   Pending borrower was set.\n     *  @param pendingBorrower_ Address that can accept the borrower role.\n     */\n    event PendingBorrowerSet(address indexed pendingBorrower_);\n\n    /**\n     *  @dev   Pending lender was set.\n     *  @param pendingLender_ The address that can accept the lender role.\n     */\n    event PendingLenderSet(address indexed pendingLender_);\n\n    /**\n     *  @dev   The lender called the loan, giving the borrower a notice period within which to return principal and pro-rata interest.\n     *  @param principalToReturn_ The minimum amount of principal the borrower must return.\n     *  @param paymentDueDate_    The new payment due date.\n     *  @param defaultDate_       The date the loan will be in default.\n     */\n    event PrincipalCalled(uint256 principalToReturn_, uint40 paymentDueDate_, uint40 defaultDate_);\n\n    /**\n     *  @dev   Principal was returned to lender, to close the loan or return future interest payments.\n     *  @param principalReturned_  The amount of principal returned.\n     *  @param principalRemaining_ The amount of principal remaining on the loan.\n     */\n    event PrincipalReturned(uint256 principalReturned_, uint256 principalRemaining_);\n\n    /**\n     *  @dev   The loan was in default and funds and collateral was repossessed by the lender.\n     *  @param fundsRepossessed_ The amount of funds asset repossessed.\n     *  @param destination_      The address of the recipient of the funds, if any.\n     */\n    event Repossessed(uint256 fundsRepossessed_, address indexed destination_);\n\n    /**\n     *  @dev   Some token was removed from the loan.\n     *  @param token_       The address of the token contract.\n     *  @param amount_      The amount of token remove from the loan.\n     *  @param destination_ The recipient of the token.\n     */\n    event Skimmed(address indexed token_, uint256 amount_, address indexed destination_);\n\n}\n"
+    },
+    "contracts/interfaces/IMapleLoanStorage.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\n/// @title MapleLoanStorage define the storage slots for MapleLoan, which is intended to be proxied.\ninterface IMapleLoanStorage {\n\n    /**************************************************************************************************************************************/\n    /*** State Variables                                                                                                                ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev The borrower of the loan, responsible for repayments.\n     */\n    function borrower() external view returns (address borrower_);\n\n    /**\n     *  @dev The amount of principal yet to be returned to satisfy the loan call.\n     */\n    function calledPrincipal() external view returns (uint256 calledPrincipal_);\n\n    /**\n     *  @dev The timestamp of the date the loan was called.\n     */\n    function dateCalled() external view returns (uint40 dateCalled_);\n\n    /**\n     *  @dev The timestamp of the date the loan was funded.\n     */\n    function dateFunded() external view returns (uint40 dateFunded_);\n\n    /**\n     *  @dev The timestamp of the date the loan was impaired.\n     */\n    function dateImpaired() external view returns (uint40 dateImpaired_);\n\n    /**\n     *  @dev The timestamp of the date the loan was last paid.\n     */\n    function datePaid() external view returns (uint40 datePaid_);\n\n    /**\n     *  @dev The annualized delegate service fee rate.\n     */\n    function delegateServiceFeeRate() external view returns (uint64 delegateServiceFeeRate_);\n\n    /**\n     *  @dev The address of the fundsAsset funding the loan.\n     */\n    function fundsAsset() external view returns (address asset_);\n\n    /**\n     *  @dev The amount of time the borrower has, after a payment is due, to make a payment before being in default.\n     */\n    function gracePeriod() external view returns (uint32 gracePeriod_);\n\n    /**\n     *  @dev The annualized interest rate (APR), in units of 1e18, (i.e. 1% is 0.01e18).\n     */\n    function interestRate() external view returns (uint64 interestRate_);\n\n    /**\n     *  @dev The rate charged at late payments.\n     */\n    function lateFeeRate() external view returns (uint64 lateFeeRate_);\n\n    /**\n     *  @dev The premium over the regular interest rate applied when paying late.\n     */\n    function lateInterestPremiumRate() external view returns (uint64 lateInterestPremiumRate_);\n\n    /**\n     *  @dev The lender of the Loan.\n     */\n    function lender() external view returns (address lender_);\n\n    /**\n     *  @dev The amount of time the borrower has, after the loan is called, to make a payment, paying back the called principal.\n     */\n    function noticePeriod() external view returns (uint32 noticePeriod_);\n\n    /**\n     *  @dev The specified time between loan payments.\n     */\n    function paymentInterval() external view returns (uint32 paymentInterval_);\n\n    /**\n     *  @dev The address of the pending borrower.\n     */\n    function pendingBorrower() external view returns (address pendingBorrower_);\n\n    /**\n     *  @dev The address of the pending lender.\n     */\n    function pendingLender() external view returns (address pendingLender_);\n\n    /**\n     *  @dev The annualized platform service fee rate.\n     */\n    function platformServiceFeeRate() external view returns (uint64 platformServiceFeeRate_);\n\n    /**\n     *  @dev The amount of principal owed (initially, the requested amount), which needs to be paid back.\n     */\n    function principal() external view returns (uint256 principal_);\n\n    /**\n     *  @dev The hash of the proposed refinance agreement.\n     */\n    function refinanceCommitment() external view returns (bytes32 refinanceCommitment_);\n\n}\n"
+    },
+    "modules/erc20/contracts/interfaces/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title Interface of the ERC20 standard as defined in the EIP, including EIP-2612 permit functionality.\ninterface IERC20 {\n\n    /**************************************************************************************************************************************/\n    /*** Events                                                                                                                         ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev   Emitted when one account has set the allowance of another account over their tokens.\n     *  @param owner_   Account that tokens are approved from.\n     *  @param spender_ Account that tokens are approved for.\n     *  @param amount_  Amount of tokens that have been approved.\n     */\n    event Approval(address indexed owner_, address indexed spender_, uint256 amount_);\n\n    /**\n     *  @dev   Emitted when tokens have moved from one account to another.\n     *  @param owner_     Account that tokens have moved from.\n     *  @param recipient_ Account that tokens have moved to.\n     *  @param amount_    Amount of tokens that have been transferred.\n     */\n    event Transfer(address indexed owner_, address indexed recipient_, uint256 amount_);\n\n    /**************************************************************************************************************************************/\n    /*** External Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Function that allows one account to set the allowance of another account over their tokens.\n     *          Emits an {Approval} event.\n     *  @param  spender_ Account that tokens are approved for.\n     *  @param  amount_  Amount of tokens that have been approved.\n     *  @return success_ Boolean indicating whether the operation succeeded.\n     */\n    function approve(address spender_, uint256 amount_) external returns (bool success_);\n\n    /**\n     *  @dev    Function that allows one account to decrease the allowance of another account over their tokens.\n     *          Emits an {Approval} event.\n     *  @param  spender_          Account that tokens are approved for.\n     *  @param  subtractedAmount_ Amount to decrease approval by.\n     *  @return success_          Boolean indicating whether the operation succeeded.\n     */\n    function decreaseAllowance(address spender_, uint256 subtractedAmount_) external returns (bool success_);\n\n    /**\n     *  @dev    Function that allows one account to increase the allowance of another account over their tokens.\n     *          Emits an {Approval} event.\n     *  @param  spender_     Account that tokens are approved for.\n     *  @param  addedAmount_ Amount to increase approval by.\n     *  @return success_     Boolean indicating whether the operation succeeded.\n     */\n    function increaseAllowance(address spender_, uint256 addedAmount_) external returns (bool success_);\n\n    /**\n     *  @dev   Approve by signature.\n     *  @param owner_    Owner address that signed the permit.\n     *  @param spender_  Spender of the permit.\n     *  @param amount_   Permit approval spend limit.\n     *  @param deadline_ Deadline after which the permit is invalid.\n     *  @param v_        ECDSA signature v component.\n     *  @param r_        ECDSA signature r component.\n     *  @param s_        ECDSA signature s component.\n     */\n    function permit(address owner_, address spender_, uint amount_, uint deadline_, uint8 v_, bytes32 r_, bytes32 s_) external;\n\n    /**\n     *  @dev    Moves an amount of tokens from `msg.sender` to a specified account.\n     *          Emits a {Transfer} event.\n     *  @param  recipient_ Account that receives tokens.\n     *  @param  amount_    Amount of tokens that are transferred.\n     *  @return success_   Boolean indicating whether the operation succeeded.\n     */\n    function transfer(address recipient_, uint256 amount_) external returns (bool success_);\n\n    /**\n     *  @dev    Moves a pre-approved amount of tokens from a sender to a specified account.\n     *          Emits a {Transfer} event.\n     *          Emits an {Approval} event.\n     *  @param  owner_     Account that tokens are moving from.\n     *  @param  recipient_ Account that receives tokens.\n     *  @param  amount_    Amount of tokens that are transferred.\n     *  @return success_   Boolean indicating whether the operation succeeded.\n     */\n    function transferFrom(address owner_, address recipient_, uint256 amount_) external returns (bool success_);\n\n    /**************************************************************************************************************************************/\n    /*** View Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Returns the allowance that one account has given another over their tokens.\n     *  @param  owner_     Account that tokens are approved from.\n     *  @param  spender_   Account that tokens are approved for.\n     *  @return allowance_ Allowance that one account has given another over their tokens.\n     */\n    function allowance(address owner_, address spender_) external view returns (uint256 allowance_);\n\n    /**\n     *  @dev    Returns the amount of tokens owned by a given account.\n     *  @param  account_ Account that owns the tokens.\n     *  @return balance_ Amount of tokens owned by a given account.\n     */\n    function balanceOf(address account_) external view returns (uint256 balance_);\n\n    /**\n     *  @dev    Returns the decimal precision used by the token.\n     *  @return decimals_ The decimal precision used by the token.\n     */\n    function decimals() external view returns (uint8 decimals_);\n\n    /**\n     *  @dev    Returns the signature domain separator.\n     *  @return domainSeparator_ The signature domain separator.\n     */\n    function DOMAIN_SEPARATOR() external view returns (bytes32 domainSeparator_);\n\n    /**\n     *  @dev    Returns the name of the token.\n     *  @return name_ The name of the token.\n     */\n    function name() external view returns (string memory name_);\n\n    /**\n      *  @dev    Returns the nonce for the given owner.\n      *  @param  owner_  The address of the owner account.\n      *  @return nonce_ The nonce for the given owner.\n     */\n    function nonces(address owner_) external view returns (uint256 nonce_);\n\n    /**\n     *  @dev    Returns the permit type hash.\n     *  @return permitTypehash_ The permit type hash.\n     */\n    function PERMIT_TYPEHASH() external view returns (bytes32 permitTypehash_);\n\n    /**\n     *  @dev    Returns the symbol of the token.\n     *  @return symbol_ The symbol of the token.\n     */\n    function symbol() external view returns (string memory symbol_);\n\n    /**\n     *  @dev    Returns the total amount of tokens in existence.\n     *  @return totalSupply_ The total amount of tokens in existence.\n     */\n    function totalSupply() external view returns (uint256 totalSupply_);\n\n}\n"
+    },
+    "modules/erc20-helper/src/interfaces/IERC20Like.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title Interface of the ERC20 standard as needed by ERC20Helper.\ninterface IERC20Like {\n\n    function approve(address spender_, uint256 amount_) external returns (bool success_);\n\n    function transfer(address recipient_, uint256 amount_) external returns (bool success_);\n\n    function transferFrom(address owner_, address recipient_, uint256 amount_) external returns (bool success_);\n\n}\n"
+    },
+    "modules/maple-proxy-factory/contracts/MapleProxiedInternals.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { ProxiedInternals } from \"../modules/proxy-factory/contracts/ProxiedInternals.sol\";\n\n/// @title A Maple implementation that is to be proxied, will need MapleProxiedInternals.\nabstract contract MapleProxiedInternals is ProxiedInternals { }\n"
+    },
+    "modules/maple-proxy-factory/contracts/interfaces/IMapleProxied.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { IProxied } from \"../../modules/proxy-factory/contracts/interfaces/IProxied.sol\";\n\n/// @title A Maple implementation that is to be proxied, must implement IMapleProxied.\ninterface IMapleProxied is IProxied {\n\n    /**\n     *  @dev   The instance was upgraded.\n     *  @param toVersion_ The new version of the loan.\n     *  @param arguments_ The upgrade arguments, if any.\n     */\n    event Upgraded(uint256 toVersion_, bytes arguments_);\n\n    /**\n     *  @dev   Upgrades a contract implementation to a specific version.\n     *         Access control logic critical since caller can force a selfdestruct via a malicious `migrator_` which is delegatecalled.\n     *  @param toVersion_ The version to upgrade to.\n     *  @param arguments_ Some encoded arguments to use for the upgrade.\n     */\n    function upgrade(uint256 toVersion_, bytes calldata arguments_) external;\n\n}\n"
+    },
+    "modules/maple-proxy-factory/contracts/interfaces/IMapleProxyFactory.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { IDefaultImplementationBeacon } from \"../../modules/proxy-factory/contracts/interfaces/IDefaultImplementationBeacon.sol\";\n\n/// @title A Maple factory for Proxy contracts that proxy MapleProxied implementations.\ninterface IMapleProxyFactory is IDefaultImplementationBeacon {\n\n    /**************************************************************************************************************************************/\n    /*** Events                                                                                                                         ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev   A default version was set.\n     *  @param version_ The default version.\n     */\n    event DefaultVersionSet(uint256 indexed version_);\n\n    /**\n     *  @dev   A version of an implementation, at some address, was registered, with an optional initializer.\n     *  @param version_               The version registered.\n     *  @param implementationAddress_ The address of the implementation.\n     *  @param initializer_           The address of the initializer, if any.\n     */\n    event ImplementationRegistered(uint256 indexed version_, address indexed implementationAddress_, address indexed initializer_);\n\n    /**\n     *  @dev   A proxy contract was deployed with some initialization arguments.\n     *  @param version_                 The version of the implementation being proxied by the deployed proxy contract.\n     *  @param instance_                The address of the proxy contract deployed.\n     *  @param initializationArguments_ The arguments used to initialize the proxy contract, if any.\n     */\n    event InstanceDeployed(uint256 indexed version_, address indexed instance_, bytes initializationArguments_);\n\n    /**\n     *  @dev   A instance has upgraded by proxying to a new implementation, with some migration arguments.\n     *  @param instance_           The address of the proxy contract.\n     *  @param fromVersion_        The initial implementation version being proxied.\n     *  @param toVersion_          The new implementation version being proxied.\n     *  @param migrationArguments_ The arguments used to migrate, if any.\n     */\n    event InstanceUpgraded(address indexed instance_, uint256 indexed fromVersion_, uint256 indexed toVersion_, bytes migrationArguments_);\n\n    /**\n     *  @dev   The MapleGlobals was set.\n     *  @param mapleGlobals_ The address of a Maple Globals contract.\n     */\n    event MapleGlobalsSet(address indexed mapleGlobals_);\n\n    /**\n     *  @dev   An upgrade path was disabled, with an optional migrator contract.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     */\n    event UpgradePathDisabled(uint256 indexed fromVersion_, uint256 indexed toVersion_);\n\n    /**\n     *  @dev   An upgrade path was enabled, with an optional migrator contract.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     *  @param migrator_    The address of the migrator, if any.\n     */\n    event UpgradePathEnabled(uint256 indexed fromVersion_, uint256 indexed toVersion_, address indexed migrator_);\n\n    /**************************************************************************************************************************************/\n    /*** State Variables                                                                                                                ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev The default version.\n     */\n    function defaultVersion() external view returns (uint256 defaultVersion_);\n\n    /**\n     *  @dev The address of the MapleGlobals contract.\n     */\n    function mapleGlobals() external view returns (address mapleGlobals_);\n\n    /**\n     *  @dev    Whether the upgrade is enabled for a path from a version to another version.\n     *  @param  toVersion_   The initial version.\n     *  @param  fromVersion_ The destination version.\n     *  @return allowed_     Whether the upgrade is enabled.\n     */\n    function upgradeEnabledForPath(uint256 toVersion_, uint256 fromVersion_) external view returns (bool allowed_);\n\n    /**************************************************************************************************************************************/\n    /*** State Changing Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Deploys a new instance proxying the default implementation version, with some initialization arguments.\n     *          Uses a nonce and `msg.sender` as a salt for the CREATE2 opcode during instantiation to produce deterministic addresses.\n     *  @param  arguments_ The initialization arguments to use for the instance deployment, if any.\n     *  @param  salt_      The salt to use in the contract creation process.\n     *  @return instance_  The address of the deployed proxy contract.\n     */\n    function createInstance(bytes calldata arguments_, bytes32 salt_) external returns (address instance_);\n\n    /**\n     *  @dev   Enables upgrading from a version to a version of an implementation, with an optional migrator.\n     *         Only the Governor can call this function.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     *  @param migrator_    The address of the migrator, if any.\n     */\n    function enableUpgradePath(uint256 fromVersion_, uint256 toVersion_, address migrator_) external;\n\n    /**\n     *  @dev   Disables upgrading from a version to a version of a implementation.\n     *         Only the Governor can call this function.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     */\n    function disableUpgradePath(uint256 fromVersion_, uint256 toVersion_) external;\n\n    /**\n     *  @dev   Registers the address of an implementation contract as a version, with an optional initializer.\n     *         Only the Governor can call this function.\n     *  @param version_               The version to register.\n     *  @param implementationAddress_ The address of the implementation.\n     *  @param initializer_           The address of the initializer, if any.\n     */\n    function registerImplementation(uint256 version_, address implementationAddress_, address initializer_) external;\n\n    /**\n     *  @dev   Sets the default version.\n     *         Only the Governor can call this function.\n     *  @param version_ The implementation version to set as the default.\n     */\n    function setDefaultVersion(uint256 version_) external;\n\n    /**\n     *  @dev   Sets the Maple Globals contract.\n     *         Only the Governor can call this function.\n     *  @param mapleGlobals_ The address of a Maple Globals contract.\n     */\n    function setGlobals(address mapleGlobals_) external;\n\n    /**\n     *  @dev   Upgrades the calling proxy contract's implementation, with some migration arguments.\n     *  @param toVersion_ The implementation version to upgrade the proxy contract to.\n     *  @param arguments_ The migration arguments, if any.\n     */\n    function upgradeInstance(uint256 toVersion_, bytes calldata arguments_) external;\n\n    /**************************************************************************************************************************************/\n    /*** View Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Returns the deterministic address of a potential proxy, given some arguments and salt.\n     *  @param  arguments_       The initialization arguments to be used when deploying the proxy.\n     *  @param  salt_            The salt to be used when deploying the proxy.\n     *  @return instanceAddress_ The deterministic address of a potential proxy.\n     */\n    function getInstanceAddress(bytes calldata arguments_, bytes32 salt_) external view returns (address instanceAddress_);\n\n    /**\n     *  @dev    Returns the address of an implementation version.\n     *  @param  version_        The implementation version.\n     *  @return implementation_ The address of the implementation.\n     */\n    function implementationOf(uint256 version_) external view returns (address implementation_);\n\n    /**\n     *  @dev    Returns if a given address has been deployed by this factory/\n     *  @param  instance_   The address to check.\n     *  @return isInstance_ A boolean indication if the address has been deployed by this factory.\n     */\n    function isInstance(address instance_) external view returns (bool isInstance_);\n\n    /**\n     *  @dev    Returns the address of a migrator contract for a migration path (from version, to version).\n     *          If oldVersion_ == newVersion_, the migrator is an initializer.\n     *  @param  oldVersion_ The old version.\n     *  @param  newVersion_ The new version.\n     *  @return migrator_   The address of a migrator contract.\n     */\n    function migratorForPath(uint256 oldVersion_, uint256 newVersion_) external view returns (address migrator_);\n\n    /**\n     *  @dev    Returns the version of an implementation contract.\n     *  @param  implementation_ The address of an implementation contract.\n     *  @return version_        The version of the implementation contract.\n     */\n    function versionOf(address implementation_) external view returns (uint256 version_);\n\n}\n"
+    },
+    "modules/maple-proxy-factory/modules/proxy-factory/contracts/ProxiedInternals.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nimport { SlotManipulatable } from \"./SlotManipulatable.sol\";\n\n/// @title An implementation that is to be proxied, will need ProxiedInternals.\nabstract contract ProxiedInternals is SlotManipulatable {\n\n    /// @dev Storage slot with the address of the current factory. `keccak256('eip1967.proxy.factory') - 1`.\n    bytes32 private constant FACTORY_SLOT = bytes32(0x7a45a402e4cb6e08ebc196f20f66d5d30e67285a2a8aa80503fa409e727a4af1);\n\n    /// @dev Storage slot with the address of the current factory. `keccak256('eip1967.proxy.implementation') - 1`.\n    bytes32 private constant IMPLEMENTATION_SLOT = bytes32(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc);\n\n    /// @dev Delegatecalls to a migrator contract to manipulate storage during an initialization or migration.\n    function _migrate(address migrator_, bytes calldata arguments_) internal virtual returns (bool success_) {\n        uint256 size;\n\n        assembly {\n            size := extcodesize(migrator_)\n        }\n\n        if (size == uint256(0)) return false;\n\n        ( success_, ) = migrator_.delegatecall(arguments_);\n    }\n\n    /// @dev Sets the factory address in storage.\n    function _setFactory(address factory_) internal virtual returns (bool success_) {\n        _setSlotValue(FACTORY_SLOT, bytes32(uint256(uint160(factory_))));\n        return true;\n    }\n\n    /// @dev Sets the implementation address in storage.\n    function _setImplementation(address implementation_) internal virtual returns (bool success_) {\n        _setSlotValue(IMPLEMENTATION_SLOT, bytes32(uint256(uint160(implementation_))));\n        return true;\n    }\n\n    /// @dev Returns the factory address.\n    function _factory() internal view virtual returns (address factory_) {\n        return address(uint160(uint256(_getSlotValue(FACTORY_SLOT))));\n    }\n\n    /// @dev Returns the implementation address.\n    function _implementation() internal view virtual returns (address implementation_) {\n        return address(uint160(uint256(_getSlotValue(IMPLEMENTATION_SLOT))));\n    }\n\n}\n"
+    },
+    "modules/maple-proxy-factory/modules/proxy-factory/contracts/SlotManipulatable.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nabstract contract SlotManipulatable {\n\n    function _getReferenceTypeSlot(bytes32 slot_, bytes32 key_) internal pure returns (bytes32 value_) {\n        return keccak256(abi.encodePacked(key_, slot_));\n    }\n\n    function _getSlotValue(bytes32 slot_) internal view returns (bytes32 value_) {\n        assembly {\n            value_ := sload(slot_)\n        }\n    }\n\n    function _setSlotValue(bytes32 slot_, bytes32 value_) internal {\n        assembly {\n            sstore(slot_, value_)\n        }\n    }\n\n}\n"
+    },
+    "modules/maple-proxy-factory/modules/proxy-factory/contracts/interfaces/IProxied.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title An implementation that is to be proxied, must implement IProxied.\ninterface IProxied {\n\n    /**\n     *  @dev The address of the proxy factory.\n     */\n    function factory() external view returns (address factory_);\n\n    /**\n     *  @dev The address of the implementation contract being proxied.\n     */\n    function implementation() external view returns (address implementation_);\n\n    /**\n     *  @dev   Modifies the proxy's implementation address.\n     *  @param newImplementation_ The address of an implementation contract.\n     */\n    function setImplementation(address newImplementation_) external;\n\n    /**\n     *  @dev   Modifies the proxy's storage by delegate-calling a migrator contract with some arguments.\n     *         Access control logic critical since caller can force a selfdestruct via a malicious `migrator_` which is delegatecalled.\n     *  @param migrator_  The address of a migrator contract.\n     *  @param arguments_ Some encoded arguments to use for the migration.\n     */\n    function migrate(address migrator_, bytes calldata arguments_) external;\n\n}\n"
+    },
+    "modules/maple-proxy-factory/modules/proxy-factory/contracts/interfaces/IDefaultImplementationBeacon.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title An beacon that provides a default implementation for proxies, must implement IDefaultImplementationBeacon.\ninterface IDefaultImplementationBeacon {\n\n    /// @dev The address of an implementation for proxies.\n    function defaultImplementation() external view returns (address defaultImplementation_);\n\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.7+commit.e28d00a7"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "borrower_",
+              "type": "address"
+            }
+          ],
+          "name": "BorrowerAccepted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "name": "CallRemoved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "name": "Funded",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "name": "Impaired",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "name": "ImpairmentRemoved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "borrower_",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "lender_",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "fundsAsset_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "principalRequested_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint32[3]",
+              "name": "termDetails_",
+              "type": "uint32[3]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint64[4]",
+              "name": "rates_",
+              "type": "uint64[4]"
+            }
+          ],
+          "name": "Initialized",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "lender_",
+              "type": "address"
+            }
+          ],
+          "name": "LenderAccepted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "refinanceCommitment_",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "refinancer_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "deadline_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes[]",
+              "name": "calls_",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "NewTermsAccepted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "refinanceCommitment_",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "refinancer_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "deadline_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes[]",
+              "name": "calls_",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "NewTermsProposed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "refinanceCommitment_",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "refinancer_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "deadline_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes[]",
+              "name": "calls_",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "NewTermsRejected",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "lender_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "principalPaid_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "interestPaid_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "lateInterestPaid_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "delegateServiceFee_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "platformServiceFee_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "name": "PaymentMade",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "pendingBorrower_",
+              "type": "address"
+            }
+          ],
+          "name": "PendingBorrowerSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "pendingLender_",
+              "type": "address"
+            }
+          ],
+          "name": "PendingLenderSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "principalToReturn_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "name": "PrincipalCalled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "principalReturned_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "principalRemaining_",
+              "type": "uint256"
+            }
+          ],
+          "name": "PrincipalReturned",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "fundsRepossessed_",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "destination_",
+              "type": "address"
+            }
+          ],
+          "name": "Repossessed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token_",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount_",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "destination_",
+              "type": "address"
+            }
+          ],
+          "name": "Skimmed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "toVersion_",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "arguments_",
+              "type": "bytes"
+            }
+          ],
+          "name": "Upgraded",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "HUNDRED_PERCENT",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "acceptBorrower",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "acceptLender",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "refinancer_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "calls_",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "acceptNewTerms",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "refinanceCommitment_",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "borrower",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "principalToReturn_",
+              "type": "uint256"
+            }
+          ],
+          "name": "callPrincipal",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "calledPrincipal",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "dateCalled",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "dateFunded",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "dateImpaired",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "datePaid",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "defaultDate",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "paymentDefaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "delegateServiceFeeRate",
+          "outputs": [
+            {
+              "internalType": "uint64",
+              "name": "",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "factory",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "factory_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "fund",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "fundsLent_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "fundsAsset",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "timestamp_",
+              "type": "uint256"
+            }
+          ],
+          "name": "getPaymentBreakdown",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "principal_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "interest_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "lateInterest_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "delegateServiceFee_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "platformServiceFee_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "globals",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "globals_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gracePeriod",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "impair",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "implementation",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "implementation_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "interestRate",
+          "outputs": [
+            {
+              "internalType": "uint64",
+              "name": "",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isCalled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isCalled_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isImpaired",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isImpaired_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "isInDefault",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "isInDefault_",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lateFeeRate",
+          "outputs": [
+            {
+              "internalType": "uint64",
+              "name": "",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lateInterestPremiumRate",
+          "outputs": [
+            {
+              "internalType": "uint64",
+              "name": "",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lender",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "principalToReturn_",
+              "type": "uint256"
+            }
+          ],
+          "name": "makePayment",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "interest_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "lateInterest_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "delegateServiceFee_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "platformServiceFee_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "migrator_",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "arguments_",
+              "type": "bytes"
+            }
+          ],
+          "name": "migrate",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "noticePeriod",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "paymentDueDate",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "paymentInterval",
+          "outputs": [
+            {
+              "internalType": "uint32",
+              "name": "",
+              "type": "uint32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pendingBorrower",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pendingLender",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "platformServiceFeeRate",
+          "outputs": [
+            {
+              "internalType": "uint64",
+              "name": "",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "principal",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "refinancer_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "calls_",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "proposeNewTerms",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "refinanceCommitment_",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "refinanceCommitment",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "refinancer_",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "calls_",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "rejectNewTerms",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "refinanceCommitment_",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "removeCall",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "removeImpairment",
+          "outputs": [
+            {
+              "internalType": "uint40",
+              "name": "paymentDueDate_",
+              "type": "uint40"
+            },
+            {
+              "internalType": "uint40",
+              "name": "defaultDate_",
+              "type": "uint40"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "destination_",
+              "type": "address"
+            }
+          ],
+          "name": "repossess",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "fundsRepossessed_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newImplementation_",
+              "type": "address"
+            }
+          ],
+          "name": "setImplementation",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "pendingBorrower_",
+              "type": "address"
+            }
+          ],
+          "name": "setPendingBorrower",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "pendingLender_",
+              "type": "address"
+            }
+          ],
+          "name": "setPendingLender",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token_",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "destination_",
+              "type": "address"
+            }
+          ],
+          "name": "skim",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "skimmed_",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "toVersion_",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "arguments_",
+              "type": "bytes"
+            }
+          ],
+          "name": "upgrade",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "acceptBorrower()": {
+            "details": "Accept the borrower role, must be called by pendingBorrower."
+          },
+          "acceptLender()": {
+            "details": "Accept the lender role, must be called by pendingLender."
+          },
+          "acceptNewTerms(address,uint256,bytes[])": {
+            "details": "Accept the proposed terms and trigger refinance execution.",
+            "params": {
+              "calls_": "The encoded arguments to be passed to refinancer.",
+              "deadline_": "The deadline for accepting the new terms.",
+              "refinancer_": "The address of the refinancer contract."
+            },
+            "returns": {
+              "refinanceCommitment_": "The hash of the accepted refinance agreement."
+            }
+          },
+          "callPrincipal(uint256)": {
+            "details": "The lender called the loan, giving the borrower a notice period within which to return principal and pro-rata interest.",
+            "params": {
+              "principalToReturn_": "The minimum amount of principal the borrower must return."
+            },
+            "returns": {
+              "defaultDate_": "      The date the loan will be in default.",
+              "paymentDueDate_": "   The new payment due date for returning the principal and pro-rate interest to the lender."
+            }
+          },
+          "defaultDate()": {
+            "details": "The timestamp of the date the loan will be in default."
+          },
+          "factory()": {
+            "details": "The address of the proxy factory."
+          },
+          "fund()": {
+            "details": "Lend funds to the loan/borrower.",
+            "returns": {
+              "defaultDate_": "   The timestamp of the date the loan will be in default.",
+              "fundsLent_": "     The amount funded.",
+              "paymentDueDate_": "The due date of the first payment."
+            }
+          },
+          "getPaymentBreakdown(uint256)": {
+            "details": "Get the breakdown of the total payment needed to satisfy the next payment installment.",
+            "params": {
+              "timestamp_": "The timestamp that corresponds to when the payment is to be made."
+            },
+            "returns": {
+              "delegateServiceFee_": "The portion of the total amount that will go towards delegate service fees.",
+              "interest_": "          The portion of the total amount that will go towards interest fees.",
+              "lateInterest_": "      The portion of the total amount that will go towards late interest fees.",
+              "platformServiceFee_": "The portion of the total amount that will go towards platform service fees.",
+              "principal_": "         The portion of the total amount that will go towards principal."
+            }
+          },
+          "globals()": {
+            "details": "The Maple globals address"
+          },
+          "impair()": {
+            "details": "Fast forward the payment due date to the current time.          This enables the pool delegate to force a payment (or default).",
+            "returns": {
+              "defaultDate_": "   The timestamp of the date the loan will be in default.",
+              "paymentDueDate_": "The new payment due date to result in the removal of the loan's impairment status."
+            }
+          },
+          "implementation()": {
+            "details": "The address of the implementation contract being proxied."
+          },
+          "isCalled()": {
+            "details": "Whether the loan is called."
+          },
+          "isImpaired()": {
+            "details": "Whether the loan is impaired."
+          },
+          "isInDefault()": {
+            "details": "Whether the loan is in default."
+          },
+          "makePayment(uint256)": {
+            "details": "Make a payment to the loan.",
+            "params": {
+              "principalToReturn_": "The amount of principal to return, to the lender to reduce future interest payments."
+            },
+            "returns": {
+              "delegateServiceFee_": "The portion of the amount paying delegate service fees.",
+              "interest_": "          The portion of the amount paying interest.",
+              "lateInterest_": "      The portion of the amount paying late interest.",
+              "platformServiceFee_": "The portion of the amount paying platform service fees."
+            }
+          },
+          "migrate(address,bytes)": {
+            "details": "Modifies the proxy's storage by delegate-calling a migrator contract with some arguments.         Access control logic critical since caller can force a selfdestruct via a malicious `migrator_` which is delegatecalled.",
+            "params": {
+              "arguments_": "Some encoded arguments to use for the migration.",
+              "migrator_": "The address of a migrator contract."
+            }
+          },
+          "paymentDueDate()": {
+            "details": "The timestamp of the due date of the next payment."
+          },
+          "proposeNewTerms(address,uint256,bytes[])": {
+            "details": "Propose new terms for refinance.",
+            "params": {
+              "calls_": "The encoded arguments to be passed to refinancer.",
+              "deadline_": "The deadline for accepting the new terms.",
+              "refinancer_": "The address of the refinancer contract."
+            },
+            "returns": {
+              "refinanceCommitment_": "The hash of the proposed refinance agreement."
+            }
+          },
+          "rejectNewTerms(address,uint256,bytes[])": {
+            "details": "Nullify the current proposed terms.",
+            "params": {
+              "calls_": "The encoded arguments to be passed to refinancer.",
+              "deadline_": "The deadline for accepting the new terms.",
+              "refinancer_": "The address of the refinancer contract."
+            },
+            "returns": {
+              "refinanceCommitment_": "The hash of the rejected refinance agreement."
+            }
+          },
+          "removeCall()": {
+            "details": "Remove the loan's called status.",
+            "returns": {
+              "defaultDate_": "   The date the loan will be in default.",
+              "paymentDueDate_": "The restored payment due date."
+            }
+          },
+          "removeImpairment()": {
+            "details": "Remove the loan impairment by restoring the original payment due date.",
+            "returns": {
+              "defaultDate_": "   The timestamp of the date the loan will be in default.",
+              "paymentDueDate_": "The restored payment due date."
+            }
+          },
+          "repossess(address)": {
+            "details": "Repossess collateral, and any funds, for a loan in default.",
+            "params": {
+              "destination_": "The address where the collateral and funds asset is to be sent, if any."
+            },
+            "returns": {
+              "fundsRepossessed_": "The amount of funds asset repossessed."
+            }
+          },
+          "setImplementation(address)": {
+            "details": "Modifies the proxy's implementation address.",
+            "params": {
+              "newImplementation_": "The address of an implementation contract."
+            }
+          },
+          "setPendingBorrower(address)": {
+            "details": "Set the `pendingBorrower` to a new account.",
+            "params": {
+              "pendingBorrower_": "The address of the new pendingBorrower."
+            }
+          },
+          "setPendingLender(address)": {
+            "details": "Set the `pendingLender` to a new account.",
+            "params": {
+              "pendingLender_": "The address of the new pendingLender."
+            }
+          },
+          "skim(address,address)": {
+            "details": "Remove all available balance of a specified token.          NOTE: Open Term Loans are not designed to hold custody of tokens, so this is designed as a safety feature.",
+            "params": {
+              "destination_": "The recipient of the token.",
+              "token_": "The address of the token contract."
+            },
+            "returns": {
+              "skimmed_": "    The amount of token removed from the loan."
+            }
+          },
+          "upgrade(uint256,bytes)": {
+            "details": "Upgrades a contract implementation to a specific version.         Access control logic critical since caller can force a selfdestruct via a malicious `migrator_` which is delegatecalled.",
+            "params": {
+              "arguments_": "Some encoded arguments to use for the upgrade.",
+              "toVersion_": "The version to upgrade to."
+            }
+          }
+        },
+        "stateVariables": {
+          "HUNDRED_PERCENT": {
+            "details": "The value that represents 100%, to be easily comparable with the loan rates."
+          }
+        },
+        "title": "MapleLoan implements an open term loan, and is intended to be proxied.",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {},
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/MapleLoan.sol": "MapleLoan"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":contract-test-utils/=modules/erc20/modules/contract-test-utils/contracts/",
+        ":ds-test/=modules/forge-std/lib/ds-test/src/",
+        ":erc20-helper/=modules/erc20-helper/src/",
+        ":erc20/=modules/erc20/",
+        ":forge-std/=modules/forge-std/src/",
+        ":maple-proxy-factory/=modules/maple-proxy-factory/",
+        ":proxy-factory/=modules/maple-proxy-factory/modules/proxy-factory/"
+      ]
+    },
+    "sources": {
+      "contracts/MapleLoan.sol": {
+        "keccak256": "0xa8e63db2fb664dd89e50334b4489dd4e6e8b39bfc21c00a86dad48a02175a7c2",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://541a4b474b1ac6282061d41ff726402e6555d5169885b0c3340aae87995d10a8",
+          "dweb:/ipfs/QmQcfFndw5LDHUGMhgGG2pF2SuFM8ZNqH8g473kTsTJSAw"
+        ]
+      },
+      "contracts/MapleLoanStorage.sol": {
+        "keccak256": "0x78bb36c1f969ce2744bb58596dfce8ac104a5d851856097ce03ed7cd478512ce",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://bd5c0eb20ae962805aacf39d5e1ebd002649d35403899b53597055ce522c281b",
+          "dweb:/ipfs/QmemE5qYkfd2mxXiZA7Q3V6HQSiFj3GS6omUMabzVVt2gd"
+        ]
+      },
+      "contracts/interfaces/IMapleLoan.sol": {
+        "keccak256": "0xe2a8b3bb199a5dec0fd2cf14f72beabf36356eedce995babd1b4b2f82725114a",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://6eceb9d033c86d1fde33021bb7ce347327bfcb1c540f0fa6c0b93c6e0aba3fa8",
+          "dweb:/ipfs/QmbhoytqenzFdHSEnfgPBnx6fYvcT5oVb4UCda7ZUTbk5y"
+        ]
+      },
+      "contracts/interfaces/IMapleLoanEvents.sol": {
+        "keccak256": "0xc05aa8fc3dec5e272cdf7e05bcaf3d9737d1dde50ab3e9130e3329346918189e",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://1aa912286913d57af40a0b00af0f666f7e61bd4683faf3bf1310167bb71bb552",
+          "dweb:/ipfs/QmdBuqKLLNpDw1UF59zvfVuX6KMMuwKMwYXS9jGXfDhGDL"
+        ]
+      },
+      "contracts/interfaces/IMapleLoanStorage.sol": {
+        "keccak256": "0xa52a02bcf1f5d1b02940afe1f5630247a7c0c39f4a16deeb32c6a046765de8d3",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://f06ce9420061f33b8c0dc5e964d3f57eb1ba8edc8ee1c334b9895fcbe8301726",
+          "dweb:/ipfs/QmWUzMrXP3dbRSRBbtLFfDSanbqoj9V7NeY5UbHaADQb83"
+        ]
+      },
+      "contracts/interfaces/Interfaces.sol": {
+        "keccak256": "0x668b47d7dcacdcae182a72cad3dd5b3c7ecef176674aa083868de8e8bc917a1f",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://a7595c76f55aacebc3f49a15f86b56851fc1d911745fdc1335c20492b35b64e7",
+          "dweb:/ipfs/QmXRvLxmVSun8Za91FabSuScenbmMivUBNe1PNGD4xueLJ"
+        ]
+      },
+      "modules/erc20-helper/src/ERC20Helper.sol": {
+        "keccak256": "0xf51564932095a9028b87721020b395b9705b443cfcc63857eb2fab4e559733a5",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://e70950dc479a9a07bb1a377c3cda72dcc80d3377e24cdfd4bf0dd690dc923881",
+          "dweb:/ipfs/QmTL381G2p7mqzwcWGA6hqi7TWhp1xKBcPGZTSmtYo1qmK"
+        ]
+      },
+      "modules/erc20-helper/src/interfaces/IERC20Like.sol": {
+        "keccak256": "0xde8c26d922034e67479add16d9d318e7779080d9b79edb249372690b3a24b01d",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://993df2017058a75315160f27e1780a76ff631759deb1821b90f97e45e5ebf2f4",
+          "dweb:/ipfs/QmWngnokG6A5UGztXTKwAXRHEWP1tKqmSCf7a4ZeWV4MSG"
+        ]
+      },
+      "modules/erc20/contracts/interfaces/IERC20.sol": {
+        "keccak256": "0x65b6132d62bb92696dd18d1a7f59926c2a505d30724d1f934d63d00ac604e772",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://b1a6d94e820ed6960a89ef1509ffcdca38eb4530cb5454a4d4f4c508f3b206f0",
+          "dweb:/ipfs/QmZ3QmJKJ6DJmdynfrR2jGSr1GMoHqU7VcSM2PhyrQJwnx"
+        ]
+      },
+      "modules/maple-proxy-factory/contracts/MapleProxiedInternals.sol": {
+        "keccak256": "0x5c2cfc572a1a43e6da1a9821baabb423c9cc8ca26fe870c801f19db1b5823283",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://dd99e1c293b942fc56aaecf52d8b49ea754ed3eb7bd76ad8fae45e84a3feee70",
+          "dweb:/ipfs/QmYvvm1XjrpLWBbYjusWXFVXuVTYdGPZRtCnXSfuckch6K"
+        ]
+      },
+      "modules/maple-proxy-factory/contracts/interfaces/IMapleProxied.sol": {
+        "keccak256": "0x5e8f839da3085e4c70133f81c534ff4d9b177ab46f07858e6c1fbf866b7dcd78",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://bfb21ddeea12b1509fb7be2a7f543d3f77630a76174eae58f79a7cb87067d250",
+          "dweb:/ipfs/QmVmX4kBSL1oT7DzPRW8fbyNDquz3XRZF9QHJgcAdXovAg"
+        ]
+      },
+      "modules/maple-proxy-factory/contracts/interfaces/IMapleProxyFactory.sol": {
+        "keccak256": "0x28bc388866c2a2f2a6ef86c5e2625d8ba2e93ddefaed69c009cb44d6f2c3bb99",
+        "license": "AGPL-3.0-or-later",
+        "urls": [
+          "bzz-raw://9c03ee5c0a2710feb3ad96f428c7d2be14172490e2de802beb5c8e03ee220bed",
+          "dweb:/ipfs/QmYu2NK7CmM6Ahu6L2w8c57xraKtWEdbELHFoLVcY4xpnz"
+        ]
+      },
+      "modules/maple-proxy-factory/modules/proxy-factory/contracts/ProxiedInternals.sol": {
+        "keccak256": "0x7cbc8d11d606028361654369554902accacb478ac0fb0f0830923173eb474e93",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://61af35db72a6fa963eac54f4b17d1d659df154d9d0409e111b5af2eab674f6ab",
+          "dweb:/ipfs/QmbiXcucpH7vfDaqRMLhzef5U8tP5AJa5RKzQsiLjkpYHp"
+        ]
+      },
+      "modules/maple-proxy-factory/modules/proxy-factory/contracts/SlotManipulatable.sol": {
+        "keccak256": "0x7aa562bcb76d230dcd462b8913833ff60f90dd53a62264623d7841f61cc272d6",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://b7681ee494d406dcbe554836441894b36f4ed4da76721df607901ff5ad510fcc",
+          "dweb:/ipfs/Qmb45DtWB5yRQJnT9t6gbT5TeE9ATGqXGbjTw3oYpmgzYH"
+        ]
+      },
+      "modules/maple-proxy-factory/modules/proxy-factory/contracts/interfaces/IDefaultImplementationBeacon.sol": {
+        "keccak256": "0xce61f9e645ac2e4d61670907070e753068ed51cb4be0c5b294b23377928efe35",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://e352a21b66847304521f9fcde4980d0b874ed714796c3168baf827d130be290e",
+          "dweb:/ipfs/QmbGzdQqVB73g6bZVdH7F99g4dswisykwdYUptqmr8DQ8S"
+        ]
+      },
+      "modules/maple-proxy-factory/modules/proxy-factory/contracts/interfaces/IProxied.sol": {
+        "keccak256": "0x63fd170f19c598cfe33459fc703b17046191764ccf5c94e0ef06f42405304ccf",
+        "license": "AGPL-3.0-only",
+        "urls": [
+          "bzz-raw://075480b11db3f647cddad503bba6e15e647e178c2f82558503307be7d5e708d9",
+          "dweb:/ipfs/QmXdATu6gZkXYCLeE7EGwBGNmPfDsej7pJxJhyN1ASDtqg"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.7+commit.e28d00a7",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "london",
+      "remappings": [
+        ":contract-test-utils/=modules/erc20/modules/contract-test-utils/contracts/",
+        ":ds-test/=modules/forge-std/lib/ds-test/src/",
+        ":erc20-helper/=modules/erc20-helper/src/",
+        ":erc20/=modules/erc20/",
+        ":forge-std/=modules/forge-std/src/",
+        ":maple-proxy-factory/=modules/maple-proxy-factory/",
+        ":proxy-factory/=modules/maple-proxy-factory/modules/proxy-factory/"
+      ]
+    },
+    "name": "MapleLoan",
+    "fullyQualifiedName": "contracts/MapleLoan.sol:MapleLoan"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "465349",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2024-08-08T11:25:25Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0x085176E2a201c90cE506be00BFc4f411bf9b3998"
+}
