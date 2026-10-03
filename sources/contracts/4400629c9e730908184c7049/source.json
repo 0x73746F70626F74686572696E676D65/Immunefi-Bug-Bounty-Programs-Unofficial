@@ -1,0 +1,1868 @@
+{
+  "sources": {
+    "contracts/globalMarkets/portfolioToken/portfolioOrchestrator/PortfolioOrchestrator.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity 0.8.33;\n\nimport {IGMTokenManager} from \"contracts/globalMarkets/tokenManager/IGMTokenManager.sol\";\nimport {\n  IPortfolioOrchestrator\n} from \"contracts/globalMarkets/portfolioToken/portfolioOrchestrator/IPortfolioOrchestrator.sol\";\nimport {\n  IPortfolioVault\n} from \"contracts/globalMarkets/portfolioToken/portfolioVault/IPortfolioVault.sol\";\nimport {\n  ReentrancyGuardTransient\n} from \"contracts/external/openzeppelin/contracts/security/ReentrancyGuardTransient.sol\";\nimport {\n  Initializable\n} from \"contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol\";\nimport {\n  AccessControlEnumerableUpgradeable\n} from \"contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol\";\nimport {IERC20} from \"contracts/external/openzeppelin/contracts/token/IERC20.sol\";\nimport {SafeERC20} from \"contracts/external/openzeppelin/contracts/token/SafeERC20.sol\";\n\n/**\n * @title  PortfolioOrchestrator\n * @author Ondo Finance\n * @notice Stateless execution engine that the off-chain orchestrator calls to\n *         invest, divest, and rebalance underlying GM token positions for\n *         portfolio tokens. Per-portfolio custody is handled by an\n *         IPortfolioVault contract; the orchestrator only holds tokens\n *         transiently within a single transaction.\n *\n *         Fund flows:\n *          - invest()    pulls the exact USDon needed from the wallet, mints GM\n *                        tokens, approves the vault for the minted GM tokens, then\n *                        calls vault.deposit() — the vault pulls and forwards the\n *                        tokens to its custody destination in a single step.\n *          - divest()    calls vault.withdraw() to pull GM tokens back from\n *                        the vault, redeems them for USDon, and sends the\n *                        proceeds to the wallet\n *          - rebalance() runs a divest leg then an invest leg, keeping USDon\n *                        in the orchestrator between the two; sends only the\n *                        surplus (sold − invested) to the wallet. Reverts if the\n *                        divest proceeds don't fully cover the invest leg.\n */\ncontract PortfolioOrchestrator is\n  IPortfolioOrchestrator,\n  Initializable,\n  ReentrancyGuardTransient,\n  AccessControlEnumerableUpgradeable\n{\n  using SafeERC20 for IERC20;\n\n  /// Role for the off-chain operator that drives invest / divest / rebalance.\n  bytes32 public constant OPERATOR_ROLE = keccak256(\"OPERATOR_ROLE\");\n\n  /// Role to configure the contract\n  bytes32 public constant CONFIGURER_ROLE = keccak256(\"CONFIGURER_ROLE\");\n\n  /// Role to pause the orchestrator\n  bytes32 public constant PAUSER_ROLE = keccak256(\"PAUSER_ROLE\");\n\n  /// Role to unpause the orchestrator\n  bytes32 public constant UNPAUSER_ROLE = keccak256(\"UNPAUSER_ROLE\");\n\n  /// The decimals normalizer for price calculations\n  uint256 public constant PRICE_NORMALIZER = 1e18;\n\n  /// The USDon token address\n  address public usdon;\n\n  /// The GMTokenManager contract\n  IGMTokenManager public gmTokenManager;\n\n  /// Whether the orchestrator is globally paused\n  bool public globalPaused;\n\n  /// Whether a specific portfolio token is paused\n  mapping(address => bool) public portfolioTokenPaused;\n\n  /// Whether a portfolio token is accepted for rebalancing\n  mapping(address => bool) public portfolioTokenAccepted;\n\n  /// IPortfolioVault contract address per portfolio token\n  mapping(address => address) public vaultAddress;\n\n  /// The wallet that holds USDon liquidity\n  address public wallet;\n\n  /// @custom:oz-upgrades-unsafe-allow constructor\n  constructor() {\n    _disableInitializers();\n  }\n\n  /**\n   * @param _defaultAdmin   The default admin role for the contract\n   * @param _usdon          The address of the USDon token\n   * @param _gmTokenManager The address of the GMTokenManager contract\n   */\n  function initialize(address _defaultAdmin, address _usdon, address _gmTokenManager)\n    external\n    initializer\n  {\n    __AccessControlEnumerable_init();\n    if (_defaultAdmin == address(0)) revert DefaultAdminZeroAddress();\n    if (_usdon == address(0)) revert USDonAddressCantBeZero();\n    if (_gmTokenManager == address(0)) revert GMTokenManagerAddressCantBeZero();\n\n    usdon = _usdon;\n    gmTokenManager = IGMTokenManager(_gmTokenManager);\n    _grantRole(DEFAULT_ADMIN_ROLE, _defaultAdmin);\n  }\n\n  /*//////////////////////////////////////////////////////////////\n                      Invest / Divest / Rebalance\n  //////////////////////////////////////////////////////////////*/\n\n  /**\n   * @notice Invest USDon into GM token positions. USDon is pulled from the\n   *         wallet, used to mint GM tokens, and the GM tokens are deposited\n   *         into the portfolio's vault.\n   * @param  portfolioToken The portfolio token the investment is for\n   * @param  quotes         Array of GM token quotes to execute\n   * @param  signatures     Array of signatures corresponding to each quote\n   */\n  function invest(\n    address portfolioToken,\n    IGMTokenManager.Quote[] calldata quotes,\n    bytes[] calldata signatures\n  ) external nonReentrant onlyRole(OPERATOR_ROLE) whenNotPaused(portfolioToken) {\n    if (!portfolioTokenAccepted[portfolioToken]) revert PortfolioTokenNotAccepted();\n    address vault = vaultAddress[portfolioToken];\n    if (vault == address(0)) revert VaultAddressNotSet();\n    if (wallet == address(0)) revert WalletNotSet();\n\n    uint256 totalUsdon = _sumUsdonCost(quotes);\n\n    // Pull the exact USDon needed from the wallet; _invest consumes from the local balance.\n    IERC20(usdon).safeTransferFrom(wallet, address(this), totalUsdon);\n\n    _invest(portfolioToken, vault, totalUsdon, quotes, signatures);\n  }\n\n  /**\n   * @notice Divests GM token positions for USDon and send the proceeds to the wallet.\n   * @param  portfolioToken The portfolio token the divestment is for\n   * @param  quotes         Array of GM token quotes to execute\n   * @param  signatures     Array of signatures corresponding to each quote\n   */\n  function divest(\n    address portfolioToken,\n    IGMTokenManager.Quote[] calldata quotes,\n    bytes[] calldata signatures\n  ) external nonReentrant onlyRole(OPERATOR_ROLE) whenNotPaused(portfolioToken) {\n    if (!portfolioTokenAccepted[portfolioToken]) revert PortfolioTokenNotAccepted();\n    address vault = vaultAddress[portfolioToken];\n    if (vault == address(0)) revert VaultAddressNotSet();\n    if (wallet == address(0)) revert WalletNotSet();\n\n    uint256 totalUsdon = _divest(portfolioToken, vault, quotes, signatures);\n\n    // Send divest proceeds out to the wallet.\n    if (totalUsdon > 0) IERC20(usdon).safeTransfer(wallet, totalUsdon);\n  }\n\n  /**\n   * @notice Batch sell and invest in a single transaction for rebalancing.\n   * @param  portfolioToken   The portfolio token to rebalance\n   * @param  sellQuotes       Array of GM token sell quotes to execute\n   * @param  sellSignatures   Array of signatures for sell quotes\n   * @param  investQuotes     Array of GM token invest quotes to execute\n   * @param  investSignatures Array of signatures for invest quotes\n   */\n  function rebalance(\n    address portfolioToken,\n    IGMTokenManager.Quote[] calldata sellQuotes,\n    bytes[] calldata sellSignatures,\n    IGMTokenManager.Quote[] calldata investQuotes,\n    bytes[] calldata investSignatures\n  ) external nonReentrant onlyRole(OPERATOR_ROLE) whenNotPaused(portfolioToken) {\n    if (!portfolioTokenAccepted[portfolioToken]) revert PortfolioTokenNotAccepted();\n    address vault = vaultAddress[portfolioToken];\n    if (vault == address(0)) revert VaultAddressNotSet();\n    if (wallet == address(0)) revert WalletNotSet();\n\n    uint256 totalUsdonSold = _divest(portfolioToken, vault, sellQuotes, sellSignatures);\n    uint256 totalUsdonInvested = _sumUsdonCost(investQuotes);\n\n    if (totalUsdonSold < totalUsdonInvested) {\n      revert InsufficientDivestProceeds(totalUsdonInvested, totalUsdonSold);\n    }\n\n    _invest(portfolioToken, vault, totalUsdonInvested, investQuotes, investSignatures);\n\n    // Forward surplus from this rebalance back to the wallet\n    uint256 surplus = totalUsdonSold - totalUsdonInvested;\n    if (surplus > 0) IERC20(usdon).safeTransfer(wallet, surplus);\n\n    emit PortfolioRebalanced(portfolioToken, totalUsdonSold, totalUsdonInvested);\n  }\n\n  /*//////////////////////////////////////////////////////////////\n                        Internal Helpers\n  //////////////////////////////////////////////////////////////*/\n\n  /**\n   * @notice Internal invest logic — consumes `totalUsdon` of the orchestrator's\n   *         local USDon balance to mint GM tokens via GMTokenManager, then\n   *         deposits them into the vault.\n   * @param  portfolioToken The portfolio token the investment is for\n   * @param  vault          The vault to receive GM tokens\n   * @param  totalUsdon     Total USDon to spend (also used to pre-approve GMTM)\n   * @param  quotes         Array of GM token quotes to execute\n   * @param  signatures     Array of signatures corresponding to each quote\n   */\n  function _invest(\n    address portfolioToken,\n    address vault,\n    uint256 totalUsdon,\n    IGMTokenManager.Quote[] calldata quotes,\n    bytes[] calldata signatures\n  ) internal {\n    if (quotes.length != signatures.length) {\n      revert ArrayLengthMismatch();\n    }\n\n    IERC20(usdon).forceApprove(address(gmTokenManager), totalUsdon);\n\n    for (uint256 i = 0; i < quotes.length; ++i) {\n      uint256 usdonAmount = (quotes[i].quantity * quotes[i].price) / PRICE_NORMALIZER;\n\n      uint256 gmTokensReceived =\n        gmTokenManager.mintWithAttestation(quotes[i], signatures[i], usdon, usdonAmount);\n\n      address gmToken = quotes[i].asset;\n      IERC20(gmToken).forceApprove(vault, gmTokensReceived);\n      IPortfolioVault(vault).deposit(gmToken, gmTokensReceived);\n\n      emit PortfolioInvested(portfolioToken, gmToken, usdonAmount, gmTokensReceived);\n    }\n  }\n\n  /**\n   * @notice Internal divest logic — pulls GM tokens from the vault via\n   *         vault.withdraw() and redeems them via GMTokenManager. The\n   *         resulting USDon is left in the orchestrator; the caller is\n   *         responsible for sending it onwards (typically to the wallet).\n   * @param  portfolioToken The portfolio token the divestment is for\n   * @param  vault          The vault holding the GM tokens\n   * @param  quotes         Array of GM token quotes to execute\n   * @param  signatures     Array of signatures corresponding to each quote\n   * @return totalUsdon     Total USDon received\n   */\n  function _divest(\n    address portfolioToken,\n    address vault,\n    IGMTokenManager.Quote[] calldata quotes,\n    bytes[] calldata signatures\n  ) internal returns (uint256 totalUsdon) {\n    if (quotes.length != signatures.length) {\n      revert ArrayLengthMismatch();\n    }\n\n    for (uint256 i = 0; i < quotes.length; ++i) {\n      address gmToken = quotes[i].asset;\n      uint256 gmTokenAmount = quotes[i].quantity;\n\n      IPortfolioVault(vault).withdraw(gmToken, gmTokenAmount);\n      IERC20(gmToken).forceApprove(address(gmTokenManager), gmTokenAmount);\n\n      uint256 usdonReceived =\n        gmTokenManager.redeemWithAttestation(quotes[i], signatures[i], usdon, 0);\n\n      totalUsdon += usdonReceived;\n\n      emit PortfolioDivested(portfolioToken, gmToken, gmTokenAmount, usdonReceived);\n    }\n  }\n\n  /**\n   * @notice Sum the USDon cost across a quote array\n   * @param  quotes         Array of GM token quotes to sum\n   * @return total          Total USDon cost\n   */\n  function _sumUsdonCost(IGMTokenManager.Quote[] calldata quotes)\n    internal\n    pure\n    returns (uint256 total)\n  {\n    for (uint256 i = 0; i < quotes.length; ++i) {\n      total += (quotes[i].quantity * quotes[i].price) / PRICE_NORMALIZER;\n    }\n  }\n\n  /*//////////////////////////////////////////////////////////////\n                      Admin Configuration\n  //////////////////////////////////////////////////////////////*/\n\n  /**\n   * @notice Sets the GMTokenManager contract\n   * @param  _gmTokenManager The GMTokenManager address\n   */\n  function setGMTokenManager(address _gmTokenManager) external onlyRole(DEFAULT_ADMIN_ROLE) {\n    if (_gmTokenManager == address(0)) revert GMTokenManagerAddressCantBeZero();\n    emit GMTokenManagerSet(address(gmTokenManager), _gmTokenManager);\n    gmTokenManager = IGMTokenManager(_gmTokenManager);\n  }\n\n  /**\n   * @notice Sets the wallet that holds USDon liquidity\n   * @param  _wallet The wallet address\n   */\n  function setWallet(address _wallet) external onlyRole(DEFAULT_ADMIN_ROLE) {\n    if (_wallet == address(0)) revert WalletCantBeZero();\n    emit WalletSet(wallet, _wallet);\n    wallet = _wallet;\n  }\n\n  /**\n   * @notice Sets the IPortfolioVault address for a specific portfolio token\n   * @param  portfolioToken The portfolio token address\n   * @param  _vaultAddress  The vault contract address\n   */\n  function setVaultAddress(address portfolioToken, address _vaultAddress)\n    external\n    onlyRole(DEFAULT_ADMIN_ROLE)\n  {\n    if (_vaultAddress == address(0)) revert VaultAddressCantBeZero();\n    if (IPortfolioVault(_vaultAddress).portfolioToken() != portfolioToken) {\n      revert VaultPortfolioMismatch();\n    }\n    emit VaultAddressSet(portfolioToken, vaultAddress[portfolioToken], _vaultAddress);\n    vaultAddress[portfolioToken] = _vaultAddress;\n  }\n\n  /**\n   * @notice Sets whether a portfolio token is accepted for rebalancing\n   * @param  portfolioToken The portfolio token address\n   * @param  accepted       Whether the token is accepted\n   */\n  function setPortfolioTokenAccepted(address portfolioToken, bool accepted)\n    external\n    onlyRole(CONFIGURER_ROLE)\n  {\n    if (portfolioToken == address(0)) revert TokenAddressCantBeZero();\n    portfolioTokenAccepted[portfolioToken] = accepted;\n    emit PortfolioTokenAcceptedSet(portfolioToken, accepted);\n  }\n\n  /**\n   * @notice Rescue and transfer tokens locked in this contract\n   * @param  token  The address of the token\n   * @param  to     The address of the recipient\n   * @param  amount The amount of token to transfer\n   */\n  function retrieveTokens(address token, address to, uint256 amount)\n    external\n    onlyRole(DEFAULT_ADMIN_ROLE)\n  {\n    IERC20(token).safeTransfer(to, amount);\n    emit TokensRetrieved(token, to, amount);\n  }\n\n  /*//////////////////////////////////////////////////////////////\n                          Pause/Unpause\n  //////////////////////////////////////////////////////////////*/\n\n  /**\n   * @notice Globally pause all orchestrator operations\n   */\n  function pauseGlobal() external onlyRole(PAUSER_ROLE) {\n    globalPaused = true;\n    emit GlobalPaused();\n  }\n\n  /**\n   * @notice Globally unpause all orchestrator operations\n   */\n  function unpauseGlobal() external onlyRole(UNPAUSER_ROLE) {\n    globalPaused = false;\n    emit GlobalUnpaused();\n  }\n\n  /**\n   * @notice Pause operations for a specific portfolio token\n   * @param  portfolioToken The address of the portfolio token\n   */\n  function pausePortfolioToken(address portfolioToken) external onlyRole(PAUSER_ROLE) {\n    portfolioTokenPaused[portfolioToken] = true;\n    emit PortfolioTokenPaused(portfolioToken);\n  }\n\n  /**\n   * @notice Unpause operations for a specific portfolio token\n   * @param  portfolioToken The address of the portfolio token\n   */\n  function unpausePortfolioToken(address portfolioToken) external onlyRole(UNPAUSER_ROLE) {\n    portfolioTokenPaused[portfolioToken] = false;\n    emit PortfolioTokenUnpaused(portfolioToken);\n  }\n\n  /*//////////////////////////////////////////////////////////////\n                          Modifiers\n  //////////////////////////////////////////////////////////////*/\n\n  /**\n   * @notice Ensure that the orchestrator is not paused\n   * @param  portfolioToken The address of the portfolio token to check\n   * @dev    Reverts if either globally paused or the specific portfolio token is paused\n   */\n  modifier whenNotPaused(address portfolioToken) {\n    if (globalPaused) revert GloballyPaused();\n    if (portfolioTokenPaused[portfolioToken]) revert PortfolioTokenIsPaused();\n    _;\n  }\n\n  /**\n   * @dev Reserved storage gap for future upgrades.\n   */\n  uint256[50] private __gap;\n}\n"
+    },
+    "contracts/globalMarkets/tokenManager/IGMTokenManager.sol": {
+      "content": "/**\n * SPDX-License-Identifier: BUSL-1.1\n *\n *       ▄▄█████████▄\n *    ╓██▀└ ,╓▄▄▄, '▀██▄\n *   ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n *  ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n * ██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n * ██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n * ╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n *  ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n *   ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n *    ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n *       ╙▀▀██████R⌐\n *\n */\n\npragma solidity ^0.8.4;\n\n/**\n * @title  IGMTokenManager\n * @author Ondo Finance\n * @notice Interface for interacting with the GMTokenManager contract\n */\ninterface IGMTokenManager {\n  enum QuoteSide {\n    /// Indicates that the user is buying GM tokens\n    BUY,\n    /// Indicates that the user is selling GM tokens\n    SELL\n  }\n\n  /**\n   * @notice Quote struct that is signed by the attestation signer\n   * @param  attestationId  The ID of the quote\n   * @param  chainId        The chain ID of the quote is intended for\n   * @param  userId         The user ID the quote is intended for\n   * @param  asset          The address of the GM token being bought or sold\n   * @param  price          The price of the GM token in USD with 18 decimals\n   * @param  quantity       The quantity of GM tokens being bought or sold\n   * @param  expiration     The expiration of the quote in seconds since the epoch\n   * @param  side           The direction of the quote (BUY or SELL)\n   * @param  additionalData Any additional data that is needed for the quote\n   */\n  struct Quote {\n    uint256 chainId;\n    uint256 attestationId;\n    bytes32 userId;\n    address asset;\n    uint256 price;\n    uint256 quantity;\n    uint256 expiration;\n    QuoteSide side;\n    bytes32 additionalData;\n  }\n\n  /**\n   * @notice Event emitted when a trade is executed with an attestation\n   * @param  executionId    The monotonically increasing ID of the trade\n   * @param  attestationId  The ID of the quote\n   * @param  chainId        The chain ID the quote is intended to be used\n   * @param  userId         The user ID the quote is intended for\n   * @param  side           The direction of the quote (BUY or SELL)\n   * @param  asset          The address of the GM token being bought or sold\n   * @param  price          The price of the GM token in USD with 18 decimals\n   * @param  quantity       The quantity of GM tokens being bought or sold\n   * @param  expiration     The expiration of the quote in seconds since the epoch\n   * @param  additionalData Any additional data that is needed for the quote\n   */\n  event TradeExecuted(\n    uint256 executionId,\n    uint256 attestationId,\n    uint256 chainId,\n    bytes32 userId,\n    QuoteSide side,\n    address asset,\n    uint256 price,\n    uint256 quantity,\n    uint256 expiration,\n    bytes32 additionalData\n  );\n\n  function mintWithAttestation(\n    Quote calldata quote,\n    bytes memory signature,\n    address depositToken,\n    uint256 depositAmount\n  ) external returns (uint256 receivedGmTokenAmount);\n\n  function redeemWithAttestation(\n    Quote calldata quote,\n    bytes memory signature,\n    address receiveToken,\n    uint256 minimumReceiveAmount\n  ) external returns (uint256 redemptionUSDonValue);\n\n  function gmTokenAccepted(address token) external view returns (bool);\n}\n"
+    },
+    "contracts/globalMarkets/portfolioToken/portfolioOrchestrator/IPortfolioOrchestrator.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity ^0.8.4;\n\nimport {IGMTokenManager} from \"contracts/globalMarkets/tokenManager/IGMTokenManager.sol\";\n\n/**\n * @title  IPortfolioOrchestrator\n * @author Ondo Finance\n * @notice Interface for interacting with the PortfolioOrchestrator contract\n */\ninterface IPortfolioOrchestrator {\n  // ─────────────────────────────────────────────────────────────────────────────\n  // Events\n  // ─────────────────────────────────────────────────────────────────────────────\n\n  /**\n   * @notice Event emitted when an `invest` leg mints a GM token position\n   * @param  portfolioToken The portfolio token the investment is for\n   * @param  gmToken        The GM token that was minted\n   * @param  usdonAmount    The USDon spent on this leg, in USDon's native decimals\n   * @param  gmTokenAmount  The amount of GM tokens received, in the GM token's decimals\n   */\n  event PortfolioInvested(\n    address indexed portfolioToken,\n    address indexed gmToken,\n    uint256 usdonAmount,\n    uint256 gmTokenAmount\n  );\n\n  /**\n   * @notice Event emitted when a `divest` leg redeems a GM token position\n   * @param  portfolioToken The portfolio token the divestment is for\n   * @param  gmToken        The GM token that was redeemed\n   * @param  gmTokenAmount  The amount of GM tokens redeemed, in the GM token's decimals\n   * @param  usdonAmount    The USDon received from this leg, in USDon's native decimals\n   */\n  event PortfolioDivested(\n    address indexed portfolioToken,\n    address indexed gmToken,\n    uint256 gmTokenAmount,\n    uint256 usdonAmount\n  );\n\n  /**\n   * @notice Event emitted when the vault for a portfolio token is set or updated\n   * @param  portfolioToken The portfolio token the vault belongs to\n   * @param  oldVault       The previous vault address\n   * @param  newVault       The new vault address\n   */\n  event VaultAddressSet(\n    address indexed portfolioToken, address indexed oldVault, address indexed newVault\n  );\n\n  /**\n   * @notice Event emitted when the wallet is set or updated\n   * @param  oldWallet The previous wallet address\n   * @param  newWallet The new wallet address\n   */\n  event WalletSet(address indexed oldWallet, address indexed newWallet);\n\n  /**\n   * @notice Event emitted when the `GMTokenManager` contract is set or updated\n   * @param  oldManager The previous `GMTokenManager` address\n   * @param  newManager The new `GMTokenManager` address\n   */\n  event GMTokenManagerSet(address indexed oldManager, address indexed newManager);\n\n  /**\n   * @notice Event emitted when a portfolio token's accepted status is set\n   * @param  portfolioToken The portfolio token address\n   * @param  accepted       Whether the portfolio token is accepted\n   */\n  event PortfolioTokenAcceptedSet(address indexed portfolioToken, bool accepted);\n\n  /**\n   * @notice Event emitted when tokens are rescued from the contract via `retrieveTokens`\n   * @param  token     The address of the token that was retrieved\n   * @param  recipient The address that received the tokens\n   * @param  amount    The amount of tokens retrieved, in the token's native decimals\n   */\n  event TokensRetrieved(address indexed token, address indexed recipient, uint256 amount);\n\n  /// Event emitted when the orchestrator is globally paused\n  event GlobalPaused();\n\n  /// Event emitted when the orchestrator is globally unpaused\n  event GlobalUnpaused();\n\n  /**\n   * @notice Event emitted at the end of a successful `rebalance`\n   * @param  portfolioToken     The portfolio token that was rebalanced\n   * @param  totalUsdonSold     Total USDon received from the divest leg\n   * @param  totalUsdonInvested Total USDon spent on the invest leg\n   */\n  event PortfolioRebalanced(\n    address indexed portfolioToken, uint256 totalUsdonSold, uint256 totalUsdonInvested\n  );\n\n  /**\n   * @notice Event emitted when operations are paused for a specific portfolio token\n   * @param  portfolioToken The portfolio token whose operations were paused\n   */\n  event PortfolioTokenPaused(address indexed portfolioToken);\n\n  /**\n   * @notice Event emitted when operations are unpaused for a specific portfolio token\n   * @param  portfolioToken The portfolio token whose operations were unpaused\n   */\n  event PortfolioTokenUnpaused(address indexed portfolioToken);\n\n  // ─────────────────────────────────────────────────────────────────────────────\n  // Errors\n  // ─────────────────────────────────────────────────────────────────────────────\n\n  /// Error emitted when the portfolio token is not registered as accepted\n  error PortfolioTokenNotAccepted();\n\n  /// Error emitted when attempting to set the `GMTokenManager` address to zero\n  error GMTokenManagerAddressCantBeZero();\n\n  /// Error emitted when quote and signature array lengths do not match\n  error ArrayLengthMismatch();\n\n  /// Error emitted when the orchestrator is globally paused\n  error GloballyPaused();\n\n  /// Error emitted when operations are paused for a specific portfolio token\n  error PortfolioTokenIsPaused();\n\n  /// Error emitted when the token address provided is zero\n  error TokenAddressCantBeZero();\n\n  /// Error emitted when the USDon address provided to `initialize` is zero\n  error USDonAddressCantBeZero();\n\n  /// Error emitted when the default admin address provided to `initialize` is zero\n  error DefaultAdminZeroAddress();\n\n  /// Error emitted when attempting to set a vault address to zero\n  error VaultAddressCantBeZero();\n\n  /// Error emitted when the vault's `portfolioToken()` does not match the portfolio token being configured\n  error VaultPortfolioMismatch();\n\n  /// Error emitted when invest / divest / rebalance is called before the vault is configured\n  error VaultAddressNotSet();\n\n  /// Error emitted when invest / divest / rebalance is called before the wallet is configured\n  error WalletNotSet();\n\n  /// Error emitted when attempting to set the wallet to zero\n  error WalletCantBeZero();\n\n  /// Error emitted when divest proceeds are insufficient to cover the invest leg of a rebalance\n  error InsufficientDivestProceeds(uint256 required, uint256 available);\n\n  // ─────────────────────────────────────────────────────────────────────────────\n  // Core Functions\n  // ─────────────────────────────────────────────────────────────────────────────\n\n  function invest(\n    address portfolioToken,\n    IGMTokenManager.Quote[] calldata quotes,\n    bytes[] calldata signatures\n  ) external;\n\n  function divest(\n    address portfolioToken,\n    IGMTokenManager.Quote[] calldata quotes,\n    bytes[] calldata signatures\n  ) external;\n\n  function rebalance(\n    address portfolioToken,\n    IGMTokenManager.Quote[] calldata sellQuotes,\n    bytes[] calldata sellSignatures,\n    IGMTokenManager.Quote[] calldata investQuotes,\n    bytes[] calldata investSignatures\n  ) external;\n\n  // ─────────────────────────────────────────────────────────────────────────────\n  // View Functions\n  // ─────────────────────────────────────────────────────────────────────────────\n\n  function portfolioTokenAccepted(address portfolioToken) external view returns (bool);\n\n  function vaultAddress(address portfolioToken) external view returns (address);\n\n  function wallet() external view returns (address);\n}\n"
+    },
+    "contracts/globalMarkets/portfolioToken/portfolioVault/IPortfolioVault.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity ^0.8.4;\n\n/**\n * @title  IPortfolioVault\n * @author Ondo Finance\n * @notice Standardized custody interface for a portfolio token's vault.\n *         Each portfolio token has one vault. The orchestrator pushes assets\n *         in via `deposit` and pulls them back out via `withdraw`. Vaults\n *         implement their own custody policy behind this interface (e.g.\n *         immediate forwarding to an external custody address).\n *\n *         Deposits require the caller to approve the vault first — the vault\n *         pulls tokens via `safeTransferFrom`. Withdrawals push tokens out\n *         of the vault directly.\n */\ninterface IPortfolioVault {\n  // ─────────────────────────────────────────────────────────────────────────────\n  // Core Functions\n  // ─────────────────────────────────────────────────────────────────────────────\n\n  function deposit(address token, uint256 amount) external;\n\n  function withdraw(address token, uint256 amount) external;\n\n  function retrieveTokens(address token, address to, uint256 amount) external;\n\n  // ─────────────────────────────────────────────────────────────────────────────\n  // View Functions\n  // ─────────────────────────────────────────────────────────────────────────────\n\n  function custodyAddress() external view returns (address);\n\n  function portfolioToken() external view returns (address);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/security/ReentrancyGuardTransient.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.5.0) (utils/ReentrancyGuardTransient.sol)\n\npragma solidity ^0.8.24;\n\nimport {TransientSlot} from \"./TransientSlot.sol\";\n\n/**\n * @dev Variant of {ReentrancyGuard} that uses transient storage.\n *\n * NOTE: This variant only works on networks where EIP-1153 is available.\n *\n * _Available since v5.1._\n *\n * @custom:stateless\n */\nabstract contract ReentrancyGuardTransient {\n    using TransientSlot for *;\n\n    // keccak256(abi.encode(uint256(keccak256(\"openzeppelin.storage.ReentrancyGuard\")) - 1)) & ~bytes32(uint256(0xff))\n    bytes32 private constant REENTRANCY_GUARD_STORAGE =\n        0x9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00;\n\n    /**\n     * @dev Unauthorized reentrant call.\n     */\n    error ReentrancyGuardReentrantCall();\n\n    /**\n     * @dev Prevents a contract from calling itself, directly or indirectly.\n     * Calling a `nonReentrant` function from another `nonReentrant`\n     * function is not supported. It is possible to prevent this from happening\n     * by making the `nonReentrant` function external, and making it call a\n     * `private` function that does the actual work.\n     */\n    modifier nonReentrant() {\n        _nonReentrantBefore();\n        _;\n        _nonReentrantAfter();\n    }\n\n    /**\n     * @dev A `view` only version of {nonReentrant}. Use to block view functions\n     * from being called, preventing reading from inconsistent contract state.\n     *\n     * CAUTION: This is a \"view\" modifier and does not change the reentrancy\n     * status. Use it only on view functions. For payable or non-payable functions,\n     * use the standard {nonReentrant} modifier instead.\n     */\n    modifier nonReentrantView() {\n        _nonReentrantBeforeView();\n        _;\n    }\n\n    function _nonReentrantBeforeView() private view {\n        if (_reentrancyGuardEntered()) {\n            revert ReentrancyGuardReentrantCall();\n        }\n    }\n\n    function _nonReentrantBefore() private {\n        // On the first call to nonReentrant, REENTRANCY_GUARD_STORAGE.asBoolean().tload() will be false\n        _nonReentrantBeforeView();\n\n        // Any calls to nonReentrant after this point will fail\n        _reentrancyGuardStorageSlot().asBoolean().tstore(true);\n    }\n\n    function _nonReentrantAfter() private {\n        _reentrancyGuardStorageSlot().asBoolean().tstore(false);\n    }\n\n    /**\n     * @dev Returns true if the reentrancy guard is currently set to \"entered\", which indicates there is a\n     * `nonReentrant` function in the call stack.\n     */\n    function _reentrancyGuardEntered() internal view returns (bool) {\n        return _reentrancyGuardStorageSlot().asBoolean().tload();\n    }\n\n    function _reentrancyGuardStorageSlot() internal pure virtual returns (bytes32) {\n        return REENTRANCY_GUARD_STORAGE;\n    }\n}"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.7.0) (proxy/utils/Initializable.sol)\n\npragma solidity ^0.8.2;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol\";\n\n/**\n * @dev This is a base contract to aid in writing upgradeable contracts, or any kind of contract that will be deployed\n * behind a proxy. Since proxied contracts do not make use of a constructor, it's common to move constructor logic to an\n * external initializer function, usually called `initialize`. It then becomes necessary to protect this initializer\n * function so it can only be called once. The {initializer} modifier provided by this contract will have this effect.\n *\n * The initialization functions use a version number. Once a version number is used, it is consumed and cannot be\n * reused. This mechanism prevents re-execution of each \"step\" but allows the creation of new initialization steps in\n * case an upgrade adds a module that needs to be initialized.\n *\n * For example:\n *\n * [.hljs-theme-light.nopadding]\n * ```\n * contract MyToken is ERC20Upgradeable {\n *     function initialize() initializer public {\n *         __ERC20_init(\"MyToken\", \"MTK\");\n *     }\n * }\n * contract MyTokenV2 is MyToken, ERC20PermitUpgradeable {\n *     function initializeV2() reinitializer(2) public {\n *         __ERC20Permit_init(\"MyToken\");\n *     }\n * }\n * ```\n *\n * TIP: To avoid leaving the proxy in an uninitialized state, the initializer function should be called as early as\n * possible by providing the encoded function call as the `_data` argument to {ERC1967Proxy-constructor}.\n *\n * CAUTION: When used with inheritance, manual care must be taken to not invoke a parent initializer twice, or to ensure\n * that all initializers are idempotent. This is not verified automatically as constructors are by Solidity.\n *\n * [CAUTION]\n * ====\n * Avoid leaving a contract uninitialized.\n *\n * An uninitialized contract can be taken over by an attacker. This applies to both a proxy and its implementation\n * contract, which may impact the proxy. To prevent the implementation contract from being used, you should invoke\n * the {_disableInitializers} function in the constructor to automatically lock it when it is deployed:\n *\n * [.hljs-theme-light.nopadding]\n * ```\n * /// @custom:oz-upgrades-unsafe-allow constructor\n * constructor() {\n *     _disableInitializers();\n * }\n * ```\n * ====\n */\nabstract contract Initializable {\n  /**\n   * @dev Indicates that the contract has been initialized.\n   * @custom:oz-retyped-from bool\n   */\n  uint8 private _initialized;\n\n  /**\n   * @dev Indicates that the contract is in the process of being initialized.\n   */\n  bool private _initializing;\n\n  /**\n   * @dev Triggered when the contract has been initialized or reinitialized.\n   */\n  event Initialized(uint8 version);\n\n  /**\n   * @dev A modifier that defines a protected initializer function that can be invoked at most once. In its scope,\n   * `onlyInitializing` functions can be used to initialize parent contracts. Equivalent to `reinitializer(1)`.\n   */\n  modifier initializer() {\n    bool isTopLevelCall = !_initializing;\n    require(\n      (isTopLevelCall && _initialized < 1) ||\n        (!AddressUpgradeable.isContract(address(this)) && _initialized == 1),\n      \"Initializable: contract is already initialized\"\n    );\n    _initialized = 1;\n    if (isTopLevelCall) {\n      _initializing = true;\n    }\n    _;\n    if (isTopLevelCall) {\n      _initializing = false;\n      emit Initialized(1);\n    }\n  }\n\n  /**\n   * @dev A modifier that defines a protected reinitializer function that can be invoked at most once, and only if the\n   * contract hasn't been initialized to a greater version before. In its scope, `onlyInitializing` functions can be\n   * used to initialize parent contracts.\n   *\n   * `initializer` is equivalent to `reinitializer(1)`, so a reinitializer may be used after the original\n   * initialization step. This is essential to configure modules that are added through upgrades and that require\n   * initialization.\n   *\n   * Note that versions can jump in increments greater than 1; this implies that if multiple reinitializers coexist in\n   * a contract, executing them in the right order is up to the developer or operator.\n   */\n  modifier reinitializer(uint8 version) {\n    require(\n      !_initializing && _initialized < version,\n      \"Initializable: contract is already initialized\"\n    );\n    _initialized = version;\n    _initializing = true;\n    _;\n    _initializing = false;\n    emit Initialized(version);\n  }\n\n  /**\n   * @dev Modifier to protect an initialization function so that it can only be invoked by functions with the\n   * {initializer} and {reinitializer} modifiers, directly or indirectly.\n   */\n  modifier onlyInitializing() {\n    require(_initializing, \"Initializable: contract is not initializing\");\n    _;\n  }\n\n  /**\n   * @dev Locks the contract, preventing any future reinitialization. This cannot be part of an initializer call.\n   * Calling this in the constructor of a contract will prevent that contract from being initialized or reinitialized\n   * to any version. It is recommended to use this to lock implementation contracts that are designed to be called\n   * through proxies.\n   */\n  function _disableInitializers() internal virtual {\n    require(!_initializing, \"Initializable: contract is initializing\");\n    if (_initialized < type(uint8).max) {\n      _initialized = type(uint8).max;\n      emit Initialized(type(uint8).max);\n    }\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControlEnumerable.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlEnumerableUpgradeable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/utils/EnumerableSetUpgradeable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol\";\n\n/**\n * @dev Extension of {AccessControl} that allows enumerating the members of each role.\n */\nabstract contract AccessControlEnumerableUpgradeable is\n  Initializable,\n  IAccessControlEnumerableUpgradeable,\n  AccessControlUpgradeable\n{\n  function __AccessControlEnumerable_init() internal onlyInitializing {}\n\n  function __AccessControlEnumerable_init_unchained()\n    internal\n    onlyInitializing\n  {}\n\n  using EnumerableSetUpgradeable for EnumerableSetUpgradeable.AddressSet;\n\n  mapping(bytes32 => EnumerableSetUpgradeable.AddressSet) private _roleMembers;\n\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return\n      interfaceId == type(IAccessControlEnumerableUpgradeable).interfaceId ||\n      super.supportsInterface(interfaceId);\n  }\n\n  /**\n   * @dev Returns one of the accounts that have `role`. `index` must be a\n   * value between 0 and {getRoleMemberCount}, non-inclusive.\n   *\n   * Role bearers are not sorted in any particular way, and their ordering may\n   * change at any point.\n   *\n   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure\n   * you perform all queries on the same block. See the following\n   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]\n   * for more information.\n   */\n  function getRoleMember(bytes32 role, uint256 index)\n    public\n    view\n    virtual\n    override\n    returns (address)\n  {\n    return _roleMembers[role].at(index);\n  }\n\n  /**\n   * @dev Returns the number of accounts that have `role`. Can be used\n   * together with {getRoleMember} to enumerate all bearers of a role.\n   */\n  function getRoleMemberCount(bytes32 role)\n    public\n    view\n    virtual\n    override\n    returns (uint256)\n  {\n    return _roleMembers[role].length();\n  }\n\n  /**\n   * @dev Overload {_grantRole} to track enumerable memberships\n   */\n  function _grantRole(bytes32 role, address account) internal virtual override {\n    super._grantRole(role, account);\n    _roleMembers[role].add(account);\n  }\n\n  /**\n   * @dev Overload {_revokeRole} to track enumerable memberships\n   */\n  function _revokeRole(bytes32 role, address account)\n    internal\n    virtual\n    override\n  {\n    super._revokeRole(role, account);\n    _roleMembers[role].remove(account);\n  }\n\n  /**\n   * @dev This empty reserved space is put in place to allow future versions to add new\n   * variables without shifting down storage in the inheritance chain.\n   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps\n   */\n  uint256[49] private __gap;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/token/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n  /**\n   * @dev Returns the amount of tokens in existence.\n   */\n  function totalSupply() external view returns (uint256);\n\n  /**\n   * @dev Returns the amount of tokens owned by `account`.\n   */\n  function balanceOf(address account) external view returns (uint256);\n\n  /**\n   * @dev Moves `amount` tokens from the caller's account to `to`.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * Emits a {Transfer} event.\n   */\n  function transfer(address to, uint256 amount) external returns (bool);\n\n  /**\n   * @dev Returns the remaining number of tokens that `spender` will be\n   * allowed to spend on behalf of `owner` through {transferFrom}. This is\n   * zero by default.\n   *\n   * This value changes when {approve} or {transferFrom} are called.\n   */\n  function allowance(address owner, address spender)\n    external\n    view\n    returns (uint256);\n\n  /**\n   * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * IMPORTANT: Beware that changing an allowance with this method brings the risk\n   * that someone may use both the old and the new allowance by unfortunate\n   * transaction ordering. One possible solution to mitigate this race\n   * condition is to first reduce the spender's allowance to 0 and set the\n   * desired value afterwards:\n   * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n   *\n   * Emits an {Approval} event.\n   */\n  function approve(address spender, uint256 amount) external returns (bool);\n\n  /**\n   * @dev Moves `amount` tokens from `from` to `to` using the\n   * allowance mechanism. `amount` is then deducted from the caller's\n   * allowance.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * Emits a {Transfer} event.\n   */\n  function transferFrom(\n    address from,\n    address to,\n    uint256 amount\n  ) external returns (bool);\n\n  /**\n   * @dev Emitted when `value` tokens are moved from one account (`from`) to\n   * another (`to`).\n   *\n   * Note that `value` may be zero.\n   */\n  event Transfer(address indexed from, address indexed to, uint256 value);\n\n  /**\n   * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n   * a call to {approve}. `value` is the new allowance.\n   */\n  event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/token/SafeERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.2.0) (token/ERC20/utils/SafeERC20.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/token/IERC20.sol\";\n\n/**\n * @title SafeERC20\n * @dev Wrappers around ERC-20 operations that throw on failure (when the token\n * contract returns false). Tokens that return no value (and instead revert or\n * throw on failure) are also supported, non-reverting calls are assumed to be\n * successful.\n * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,\n * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.\n */\nlibrary SafeERC20 {\n    /**\n     * @dev An operation with an ERC-20 token failed.\n     */\n    error SafeERC20FailedOperation(address token);\n\n    /**\n     * @dev Indicates a failed `decreaseAllowance` request.\n     */\n    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);\n\n    /**\n     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful.\n     */\n    function safeTransfer(IERC20 token, address to, uint256 value) internal {\n        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));\n    }\n\n    /**\n     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the\n     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.\n     */\n    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {\n        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));\n    }\n\n    /**\n     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful.\n     *\n     * IMPORTANT: If the token implements ERC-7674 (ERC-20 with temporary allowance), and if the \"client\"\n     * smart contract uses ERC-7674 to set temporary allowances, then the \"client\" smart contract should avoid using\n     * this function. Performing a {safeIncreaseAllowance} or {safeDecreaseAllowance} operation on a token contract\n     * that has a non-zero temporary allowance (for that particular owner-spender) will result in unexpected behavior.\n     */\n    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {\n        uint256 oldAllowance = token.allowance(address(this), spender);\n        forceApprove(token, spender, oldAllowance + value);\n    }\n\n    /**\n     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no\n     * value, non-reverting calls are assumed to be successful.\n     *\n     * IMPORTANT: If the token implements ERC-7674 (ERC-20 with temporary allowance), and if the \"client\"\n     * smart contract uses ERC-7674 to set temporary allowances, then the \"client\" smart contract should avoid using\n     * this function. Performing a {safeIncreaseAllowance} or {safeDecreaseAllowance} operation on a token contract\n     * that has a non-zero temporary allowance (for that particular owner-spender) will result in unexpected behavior.\n     */\n    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {\n        unchecked {\n            uint256 currentAllowance = token.allowance(address(this), spender);\n            if (currentAllowance < requestedDecrease) {\n                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);\n            }\n            forceApprove(token, spender, currentAllowance - requestedDecrease);\n        }\n    }\n\n    /**\n     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval\n     * to be set to zero before setting it to a non-zero value, such as USDT.\n     *\n     * NOTE: If the token implements ERC-7674, this function will not modify any temporary allowance. This function\n     * only sets the \"standard\" allowance. Any temporary allowance will remain active, in addition to the value being\n     * set here.\n     */\n    function forceApprove(IERC20 token, address spender, uint256 value) internal {\n        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));\n\n        if (!_callOptionalReturnBool(token, approvalCall)) {\n            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));\n            _callOptionalReturn(token, approvalCall);\n        }\n    }\n\n    /**\n     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement\n     * on the return value: the return value is optional (but if data is returned, it must not be false).\n     * @param token The token targeted by the call.\n     * @param data The call data (encoded using abi.encode or one of its variants).\n     *\n     * This is a variant of {_callOptionalReturnBool} that reverts if call fails to meet the requirements.\n     */\n    function _callOptionalReturn(IERC20 token, bytes memory data) private {\n        uint256 returnSize;\n        uint256 returnValue;\n        assembly (\"memory-safe\") {\n            let success := call(gas(), token, 0, add(data, 0x20), mload(data), 0, 0x20)\n            // bubble errors\n            if iszero(success) {\n                let ptr := mload(0x40)\n                returndatacopy(ptr, 0, returndatasize())\n                revert(ptr, returndatasize())\n            }\n            returnSize := returndatasize()\n            returnValue := mload(0)\n        }\n\n        if (returnSize == 0 ? address(token).code.length == 0 : returnValue != 1) {\n            revert SafeERC20FailedOperation(address(token));\n        }\n    }\n\n    /**\n     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement\n     * on the return value: the return value is optional (but if data is returned, it must not be false).\n     * @param token The token targeted by the call.\n     * @param data The call data (encoded using abi.encode or one of its variants).\n     *\n     * This is a variant of {_callOptionalReturn} that silently catches all reverts and returns a bool instead.\n     */\n    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {\n        bool success;\n        uint256 returnSize;\n        uint256 returnValue;\n        assembly (\"memory-safe\") {\n            success := call(gas(), token, 0, add(data, 0x20), mload(data), 0, 0x20)\n            returnSize := returndatasize()\n            returnValue := mload(0)\n        }\n        return success && (returnSize == 0 ? address(token).code.length > 0 : returnValue == 1);\n    }\n}"
+    },
+    "contracts/external/openzeppelin/contracts/security/TransientSlot.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.3.0) (utils/TransientSlot.sol)\n// This file was procedurally generated from scripts/generate/templates/TransientSlot.js.\n\npragma solidity ^0.8.24;\n\n/**\n * @dev Library for reading and writing value-types to specific transient storage slots.\n *\n * Transient slots are often used to store temporary values that are removed after the current transaction.\n * This library helps with reading and writing to such slots without the need for inline assembly.\n *\n *  * Example reading and writing values using transient storage:\n * ```solidity\n * contract Lock {\n *     using TransientSlot for *;\n *\n *     // Define the slot. Alternatively, use the SlotDerivation library to derive the slot.\n *     bytes32 internal constant _LOCK_SLOT = 0xf4678858b2b588224636b8522b729e7722d32fc491da849ed75b3fdf3c84f542;\n *\n *     modifier locked() {\n *         require(!_LOCK_SLOT.asBoolean().tload());\n *\n *         _LOCK_SLOT.asBoolean().tstore(true);\n *         _;\n *         _LOCK_SLOT.asBoolean().tstore(false);\n *     }\n * }\n * ```\n *\n * TIP: Consider using this library along with {SlotDerivation}.\n */\nlibrary TransientSlot {\n    /**\n     * @dev UDVT that represents a slot holding an address.\n     */\n    type AddressSlot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a AddressSlot.\n     */\n    function asAddress(bytes32 slot) internal pure returns (AddressSlot) {\n        return AddressSlot.wrap(slot);\n    }\n\n    /**\n     * @dev UDVT that represents a slot holding a bool.\n     */\n    type BooleanSlot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a BooleanSlot.\n     */\n    function asBoolean(bytes32 slot) internal pure returns (BooleanSlot) {\n        return BooleanSlot.wrap(slot);\n    }\n\n    /**\n     * @dev UDVT that represents a slot holding a bytes32.\n     */\n    type Bytes32Slot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a Bytes32Slot.\n     */\n    function asBytes32(bytes32 slot) internal pure returns (Bytes32Slot) {\n        return Bytes32Slot.wrap(slot);\n    }\n\n    /**\n     * @dev UDVT that represents a slot holding a uint256.\n     */\n    type Uint256Slot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a Uint256Slot.\n     */\n    function asUint256(bytes32 slot) internal pure returns (Uint256Slot) {\n        return Uint256Slot.wrap(slot);\n    }\n\n    /**\n     * @dev UDVT that represents a slot holding a int256.\n     */\n    type Int256Slot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a Int256Slot.\n     */\n    function asInt256(bytes32 slot) internal pure returns (Int256Slot) {\n        return Int256Slot.wrap(slot);\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(AddressSlot slot) internal view returns (address value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(AddressSlot slot, address value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(BooleanSlot slot) internal view returns (bool value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(BooleanSlot slot, bool value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(Bytes32Slot slot) internal view returns (bytes32 value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(Bytes32Slot slot, bytes32 value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(Uint256Slot slot) internal view returns (uint256 value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(Uint256Slot slot, uint256 value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(Int256Slot slot) internal view returns (int256 value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(Int256Slot slot, int256 value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n}"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.7.0) (utils/Address.sol)\n\npragma solidity ^0.8.1;\n\n/**\n * @dev Collection of functions related to the address type\n */\nlibrary AddressUpgradeable {\n  /**\n   * @dev Returns true if `account` is a contract.\n   *\n   * [IMPORTANT]\n   * ====\n   * It is unsafe to assume that an address for which this function returns\n   * false is an externally-owned account (EOA) and not a contract.\n   *\n   * Among others, `isContract` will return false for the following\n   * types of addresses:\n   *\n   *  - an externally-owned account\n   *  - a contract in construction\n   *  - an address where a contract will be created\n   *  - an address where a contract lived, but was destroyed\n   * ====\n   *\n   * [IMPORTANT]\n   * ====\n   * You shouldn't rely on `isContract` to protect against flash loan attacks!\n   *\n   * Preventing calls from contracts is highly discouraged. It breaks composability, breaks support for smart wallets\n   * like Gnosis Safe, and does not provide security since it can be circumvented by calling from a contract\n   * constructor.\n   * ====\n   */\n  function isContract(address account) internal view returns (bool) {\n    // This method relies on extcodesize/address.code.length, which returns 0\n    // for contracts in construction, since the code is only stored at the end\n    // of the constructor execution.\n\n    return account.code.length > 0;\n  }\n\n  /**\n   * @dev Replacement for Solidity's `transfer`: sends `amount` wei to\n   * `recipient`, forwarding all available gas and reverting on errors.\n   *\n   * https://eips.ethereum.org/EIPS/eip-1884[EIP1884] increases the gas cost\n   * of certain opcodes, possibly making contracts go over the 2300 gas limit\n   * imposed by `transfer`, making them unable to receive funds via\n   * `transfer`. {sendValue} removes this limitation.\n   *\n   * https://diligence.consensys.net/posts/2019/09/stop-using-soliditys-transfer-now/[Learn more].\n   *\n   * IMPORTANT: because control is transferred to `recipient`, care must be\n   * taken to not create reentrancy vulnerabilities. Consider using\n   * {ReentrancyGuard} or the\n   * https://solidity.readthedocs.io/en/v0.5.11/security-considerations.html#use-the-checks-effects-interactions-pattern[checks-effects-interactions pattern].\n   */\n  function sendValue(address payable recipient, uint256 amount) internal {\n    require(address(this).balance >= amount, \"Address: insufficient balance\");\n\n    (bool success, ) = recipient.call{value: amount}(\"\");\n    require(\n      success,\n      \"Address: unable to send value, recipient may have reverted\"\n    );\n  }\n\n  /**\n   * @dev Performs a Solidity function call using a low level `call`. A\n   * plain `call` is an unsafe replacement for a function call: use this\n   * function instead.\n   *\n   * If `target` reverts with a revert reason, it is bubbled up by this\n   * function (like regular Solidity function calls).\n   *\n   * Returns the raw returned data. To convert to the expected return value,\n   * use https://solidity.readthedocs.io/en/latest/units-and-global-variables.html?highlight=abi.decode#abi-encoding-and-decoding-functions[`abi.decode`].\n   *\n   * Requirements:\n   *\n   * - `target` must be a contract.\n   * - calling `target` with `data` must not revert.\n   *\n   * _Available since v3.1._\n   */\n  function functionCall(address target, bytes memory data)\n    internal\n    returns (bytes memory)\n  {\n    return functionCall(target, data, \"Address: low-level call failed\");\n  }\n\n  /**\n   * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`], but with\n   * `errorMessage` as a fallback revert reason when `target` reverts.\n   *\n   * _Available since v3.1._\n   */\n  function functionCall(\n    address target,\n    bytes memory data,\n    string memory errorMessage\n  ) internal returns (bytes memory) {\n    return functionCallWithValue(target, data, 0, errorMessage);\n  }\n\n  /**\n   * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],\n   * but also transferring `value` wei to `target`.\n   *\n   * Requirements:\n   *\n   * - the calling contract must have an ETH balance of at least `value`.\n   * - the called Solidity function must be `payable`.\n   *\n   * _Available since v3.1._\n   */\n  function functionCallWithValue(\n    address target,\n    bytes memory data,\n    uint256 value\n  ) internal returns (bytes memory) {\n    return\n      functionCallWithValue(\n        target,\n        data,\n        value,\n        \"Address: low-level call with value failed\"\n      );\n  }\n\n  /**\n   * @dev Same as {xref-Address-functionCallWithValue-address-bytes-uint256-}[`functionCallWithValue`], but\n   * with `errorMessage` as a fallback revert reason when `target` reverts.\n   *\n   * _Available since v3.1._\n   */\n  function functionCallWithValue(\n    address target,\n    bytes memory data,\n    uint256 value,\n    string memory errorMessage\n  ) internal returns (bytes memory) {\n    require(\n      address(this).balance >= value,\n      \"Address: insufficient balance for call\"\n    );\n    require(isContract(target), \"Address: call to non-contract\");\n\n    (bool success, bytes memory returndata) = target.call{value: value}(data);\n    return verifyCallResult(success, returndata, errorMessage);\n  }\n\n  /**\n   * @dev Same as {xref-Address-functionCall-address-bytes-}[`functionCall`],\n   * but performing a static call.\n   *\n   * _Available since v3.3._\n   */\n  function functionStaticCall(address target, bytes memory data)\n    internal\n    view\n    returns (bytes memory)\n  {\n    return\n      functionStaticCall(target, data, \"Address: low-level static call failed\");\n  }\n\n  /**\n   * @dev Same as {xref-Address-functionCall-address-bytes-string-}[`functionCall`],\n   * but performing a static call.\n   *\n   * _Available since v3.3._\n   */\n  function functionStaticCall(\n    address target,\n    bytes memory data,\n    string memory errorMessage\n  ) internal view returns (bytes memory) {\n    require(isContract(target), \"Address: static call to non-contract\");\n\n    (bool success, bytes memory returndata) = target.staticcall(data);\n    return verifyCallResult(success, returndata, errorMessage);\n  }\n\n  /**\n   * @dev Tool to verifies that a low level call was successful, and revert if it wasn't, either by bubbling the\n   * revert reason using the provided one.\n   *\n   * _Available since v4.3._\n   */\n  function verifyCallResult(\n    bool success,\n    bytes memory returndata,\n    string memory errorMessage\n  ) internal pure returns (bytes memory) {\n    if (success) {\n      return returndata;\n    } else {\n      // Look for revert reason and bubble it up if present\n      if (returndata.length > 0) {\n        // The easiest way to bubble the revert reason is using memory via assembly\n        /// @solidity memory-safe-assembly\n        assembly {\n          let returndata_size := mload(returndata)\n          revert(add(32, returndata), returndata_size)\n        }\n      } else {\n        revert(errorMessage);\n      }\n    }\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlEnumerableUpgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (access/IAccessControlEnumerable.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"./IAccessControlUpgradeable.sol\";\n\n/**\n * @dev External interface of AccessControlEnumerable declared to support ERC165 detection.\n */\ninterface IAccessControlEnumerableUpgradeable is IAccessControlUpgradeable {\n  /**\n   * @dev Returns one of the accounts that have `role`. `index` must be a\n   * value between 0 and {getRoleMemberCount}, non-inclusive.\n   *\n   * Role bearers are not sorted in any particular way, and their ordering may\n   * change at any point.\n   *\n   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure\n   * you perform all queries on the same block. See the following\n   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]\n   * for more information.\n   */\n  function getRoleMember(bytes32 role, uint256 index)\n    external\n    view\n    returns (address);\n\n  /**\n   * @dev Returns the number of accounts that have `role`. Can be used\n   * together with {getRoleMember} to enumerate all bearers of a role.\n   */\n  function getRoleMemberCount(bytes32 role) external view returns (uint256);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.7.0) (access/AccessControl.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlUpgradeable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/utils/ERC165Upgradeable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol\";\n\n/**\n * @dev Contract module that allows children to implement role-based access\n * control mechanisms. This is a lightweight version that doesn't allow enumerating role\n * members except through off-chain means by accessing the contract event logs. Some\n * applications may benefit from on-chain enumerability, for those cases see\n * {AccessControlEnumerable}.\n *\n * Roles are referred to by their `bytes32` identifier. These should be exposed\n * in the external API and be unique. The best way to achieve this is by\n * using `public constant` hash digests:\n *\n * ```\n * bytes32 public constant MY_ROLE = keccak256(\"MY_ROLE\");\n * ```\n *\n * Roles can be used to represent a set of permissions. To restrict access to a\n * function call, use {hasRole}:\n *\n * ```\n * function foo() public {\n *     require(hasRole(MY_ROLE, msg.sender));\n *     ...\n * }\n * ```\n *\n * Roles can be granted and revoked dynamically via the {grantRole} and\n * {revokeRole} functions. Each role has an associated admin role, and only\n * accounts that have a role's admin role can call {grantRole} and {revokeRole}.\n *\n * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means\n * that only accounts with this role will be able to grant or revoke other\n * roles. More complex role relationships can be created by using\n * {_setRoleAdmin}.\n *\n * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to\n * grant and revoke this role. Extra precautions should be taken to secure\n * accounts that have been granted it.\n */\nabstract contract AccessControlUpgradeable is\n  Initializable,\n  ContextUpgradeable,\n  IAccessControlUpgradeable,\n  ERC165Upgradeable\n{\n  function __AccessControl_init() internal onlyInitializing {}\n\n  function __AccessControl_init_unchained() internal onlyInitializing {}\n\n  struct RoleData {\n    mapping(address => bool) members;\n    bytes32 adminRole;\n  }\n\n  mapping(bytes32 => RoleData) private _roles;\n\n  bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;\n\n  /**\n   * @dev Modifier that checks that an account has a specific role. Reverts\n   * with a standardized message including the required role.\n   *\n   * The format of the revert reason is given by the following regular expression:\n   *\n   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/\n   *\n   * _Available since v4.1._\n   */\n  modifier onlyRole(bytes32 role) {\n    _checkRole(role);\n    _;\n  }\n\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return\n      interfaceId == type(IAccessControlUpgradeable).interfaceId ||\n      super.supportsInterface(interfaceId);\n  }\n\n  /**\n   * @dev Returns `true` if `account` has been granted `role`.\n   */\n  function hasRole(bytes32 role, address account)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return _roles[role].members[account];\n  }\n\n  /**\n   * @dev Revert with a standard message if `_msgSender()` is missing `role`.\n   * Overriding this function changes the behavior of the {onlyRole} modifier.\n   *\n   * Format of the revert message is described in {_checkRole}.\n   *\n   * _Available since v4.6._\n   */\n  function _checkRole(bytes32 role) internal view virtual {\n    _checkRole(role, _msgSender());\n  }\n\n  /**\n   * @dev Revert with a standard message if `account` is missing `role`.\n   *\n   * The format of the revert reason is given by the following regular expression:\n   *\n   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/\n   */\n  function _checkRole(bytes32 role, address account) internal view virtual {\n    if (!hasRole(role, account)) {\n      revert(\n        string(\n          abi.encodePacked(\n            \"AccessControl: account \",\n            StringsUpgradeable.toHexString(uint160(account), 20),\n            \" is missing role \",\n            StringsUpgradeable.toHexString(uint256(role), 32)\n          )\n        )\n      );\n    }\n  }\n\n  /**\n   * @dev Returns the admin role that controls `role`. See {grantRole} and\n   * {revokeRole}.\n   *\n   * To change a role's admin, use {_setRoleAdmin}.\n   */\n  function getRoleAdmin(bytes32 role)\n    public\n    view\n    virtual\n    override\n    returns (bytes32)\n  {\n    return _roles[role].adminRole;\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   *\n   * May emit a {RoleGranted} event.\n   */\n  function grantRole(bytes32 role, address account)\n    public\n    virtual\n    override\n    onlyRole(getRoleAdmin(role))\n  {\n    _grantRole(role, account);\n  }\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * If `account` had been granted `role`, emits a {RoleRevoked} event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   *\n   * May emit a {RoleRevoked} event.\n   */\n  function revokeRole(bytes32 role, address account)\n    public\n    virtual\n    override\n    onlyRole(getRoleAdmin(role))\n  {\n    _revokeRole(role, account);\n  }\n\n  /**\n   * @dev Revokes `role` from the calling account.\n   *\n   * Roles are often managed via {grantRole} and {revokeRole}: this function's\n   * purpose is to provide a mechanism for accounts to lose their privileges\n   * if they are compromised (such as when a trusted device is misplaced).\n   *\n   * If the calling account had been revoked `role`, emits a {RoleRevoked}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must be `account`.\n   *\n   * May emit a {RoleRevoked} event.\n   */\n  function renounceRole(bytes32 role, address account) public virtual override {\n    require(\n      account == _msgSender(),\n      \"AccessControl: can only renounce roles for self\"\n    );\n\n    _revokeRole(role, account);\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event. Note that unlike {grantRole}, this function doesn't perform any\n   * checks on the calling account.\n   *\n   * May emit a {RoleGranted} event.\n   *\n   * [WARNING]\n   * ====\n   * This function should only be called from the constructor when setting\n   * up the initial roles for the system.\n   *\n   * Using this function in any other way is effectively circumventing the admin\n   * system imposed by {AccessControl}.\n   * ====\n   *\n   * NOTE: This function is deprecated in favor of {_grantRole}.\n   */\n  function _setupRole(bytes32 role, address account) internal virtual {\n    _grantRole(role, account);\n  }\n\n  /**\n   * @dev Sets `adminRole` as ``role``'s admin role.\n   *\n   * Emits a {RoleAdminChanged} event.\n   */\n  function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {\n    bytes32 previousAdminRole = getRoleAdmin(role);\n    _roles[role].adminRole = adminRole;\n    emit RoleAdminChanged(role, previousAdminRole, adminRole);\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * Internal function without access restriction.\n   *\n   * May emit a {RoleGranted} event.\n   */\n  function _grantRole(bytes32 role, address account) internal virtual {\n    if (!hasRole(role, account)) {\n      _roles[role].members[account] = true;\n      emit RoleGranted(role, account, _msgSender());\n    }\n  }\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * Internal function without access restriction.\n   *\n   * May emit a {RoleRevoked} event.\n   */\n  function _revokeRole(bytes32 role, address account) internal virtual {\n    if (hasRole(role, account)) {\n      _roles[role].members[account] = false;\n      emit RoleRevoked(role, account, _msgSender());\n    }\n  }\n\n  /**\n   * @dev This empty reserved space is put in place to allow future versions to add new\n   * variables without shifting down storage in the inheritance chain.\n   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps\n   */\n  uint256[49] private __gap;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/utils/EnumerableSetUpgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.7.0) (utils/structs/EnumerableSet.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Library for managing\n * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive\n * types.\n *\n * Sets have the following properties:\n *\n * - Elements are added, removed, and checked for existence in constant time\n * (O(1)).\n * - Elements are enumerated in O(n). No guarantees are made on the ordering.\n *\n * ```\n * contract Example {\n *     // Add the library methods\n *     using EnumerableSet for EnumerableSet.AddressSet;\n *\n *     // Declare a set state variable\n *     EnumerableSet.AddressSet private mySet;\n * }\n * ```\n *\n * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)\n * and `uint256` (`UintSet`) are supported.\n *\n * [WARNING]\n * ====\n *  Trying to delete such a structure from storage will likely result in data corruption, rendering the structure unusable.\n *  See https://github.com/ethereum/solidity/pull/11843[ethereum/solidity#11843] for more info.\n *\n *  In order to clean an EnumerableSet, you can either remove all elements one by one or create a fresh instance using an array of EnumerableSet.\n * ====\n */\nlibrary EnumerableSetUpgradeable {\n  // To implement this library for multiple types with as little code\n  // repetition as possible, we write it in terms of a generic Set type with\n  // bytes32 values.\n  // The Set implementation uses private functions, and user-facing\n  // implementations (such as AddressSet) are just wrappers around the\n  // underlying Set.\n  // This means that we can only create new EnumerableSets for types that fit\n  // in bytes32.\n\n  struct Set {\n    // Storage of set values\n    bytes32[] _values;\n    // Position of the value in the `values` array, plus 1 because index 0\n    // means a value is not in the set.\n    mapping(bytes32 => uint256) _indexes;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function _add(Set storage set, bytes32 value) private returns (bool) {\n    if (!_contains(set, value)) {\n      set._values.push(value);\n      // The value is stored at length-1, but we add 1 to all indexes\n      // and use 0 as a sentinel value\n      set._indexes[value] = set._values.length;\n      return true;\n    } else {\n      return false;\n    }\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function _remove(Set storage set, bytes32 value) private returns (bool) {\n    // We read and store the value's index to prevent multiple reads from the same storage slot\n    uint256 valueIndex = set._indexes[value];\n\n    if (valueIndex != 0) {\n      // Equivalent to contains(set, value)\n      // To delete an element from the _values array in O(1), we swap the element to delete with the last one in\n      // the array, and then remove the last element (sometimes called as 'swap and pop').\n      // This modifies the order of the array, as noted in {at}.\n\n      uint256 toDeleteIndex = valueIndex - 1;\n      uint256 lastIndex = set._values.length - 1;\n\n      if (lastIndex != toDeleteIndex) {\n        bytes32 lastValue = set._values[lastIndex];\n\n        // Move the last value to the index where the value to delete is\n        set._values[toDeleteIndex] = lastValue;\n        // Update the index for the moved value\n        set._indexes[lastValue] = valueIndex; // Replace lastValue's index to valueIndex\n      }\n\n      // Delete the slot where the moved value was stored\n      set._values.pop();\n\n      // Delete the index for the deleted slot\n      delete set._indexes[value];\n\n      return true;\n    } else {\n      return false;\n    }\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function _contains(Set storage set, bytes32 value)\n    private\n    view\n    returns (bool)\n  {\n    return set._indexes[value] != 0;\n  }\n\n  /**\n   * @dev Returns the number of values on the set. O(1).\n   */\n  function _length(Set storage set) private view returns (uint256) {\n    return set._values.length;\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function _at(Set storage set, uint256 index) private view returns (bytes32) {\n    return set._values[index];\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function _values(Set storage set) private view returns (bytes32[] memory) {\n    return set._values;\n  }\n\n  // Bytes32Set\n\n  struct Bytes32Set {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {\n    return _add(set._inner, value);\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(Bytes32Set storage set, bytes32 value)\n    internal\n    returns (bool)\n  {\n    return _remove(set._inner, value);\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(Bytes32Set storage set, bytes32 value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, value);\n  }\n\n  /**\n   * @dev Returns the number of values in the set. O(1).\n   */\n  function length(Bytes32Set storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(Bytes32Set storage set, uint256 index)\n    internal\n    view\n    returns (bytes32)\n  {\n    return _at(set._inner, index);\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(Bytes32Set storage set)\n    internal\n    view\n    returns (bytes32[] memory)\n  {\n    return _values(set._inner);\n  }\n\n  // AddressSet\n\n  struct AddressSet {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(AddressSet storage set, address value) internal returns (bool) {\n    return _add(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(AddressSet storage set, address value)\n    internal\n    returns (bool)\n  {\n    return _remove(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(AddressSet storage set, address value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Returns the number of values in the set. O(1).\n   */\n  function length(AddressSet storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(AddressSet storage set, uint256 index)\n    internal\n    view\n    returns (address)\n  {\n    return address(uint160(uint256(_at(set._inner, index))));\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(AddressSet storage set)\n    internal\n    view\n    returns (address[] memory)\n  {\n    bytes32[] memory store = _values(set._inner);\n    address[] memory result;\n\n    /// @solidity memory-safe-assembly\n    assembly {\n      result := store\n    }\n\n    return result;\n  }\n\n  // UintSet\n\n  struct UintSet {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(UintSet storage set, uint256 value) internal returns (bool) {\n    return _add(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(UintSet storage set, uint256 value) internal returns (bool) {\n    return _remove(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(UintSet storage set, uint256 value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Returns the number of values on the set. O(1).\n   */\n  function length(UintSet storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(UintSet storage set, uint256 index)\n    internal\n    view\n    returns (uint256)\n  {\n    return uint256(_at(set._inner, index));\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(UintSet storage set)\n    internal\n    view\n    returns (uint256[] memory)\n  {\n    bytes32[] memory store = _values(set._inner);\n    uint256[] memory result;\n\n    /// @solidity memory-safe-assembly\n    assembly {\n      result := store\n    }\n\n    return result;\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlUpgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev External interface of AccessControl declared to support ERC165 detection.\n */\ninterface IAccessControlUpgradeable {\n  /**\n   * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`\n   *\n   * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite\n   * {RoleAdminChanged} not being emitted signaling this.\n   *\n   * _Available since v3.1._\n   */\n  event RoleAdminChanged(\n    bytes32 indexed role,\n    bytes32 indexed previousAdminRole,\n    bytes32 indexed newAdminRole\n  );\n\n  /**\n   * @dev Emitted when `account` is granted `role`.\n   *\n   * `sender` is the account that originated the contract call, an admin role\n   * bearer except when using {AccessControl-_setupRole}.\n   */\n  event RoleGranted(\n    bytes32 indexed role,\n    address indexed account,\n    address indexed sender\n  );\n\n  /**\n   * @dev Emitted when `account` is revoked `role`.\n   *\n   * `sender` is the account that originated the contract call:\n   *   - if using `revokeRole`, it is the admin role bearer\n   *   - if using `renounceRole`, it is the role bearer (i.e. `account`)\n   */\n  event RoleRevoked(\n    bytes32 indexed role,\n    address indexed account,\n    address indexed sender\n  );\n\n  /**\n   * @dev Returns `true` if `account` has been granted `role`.\n   */\n  function hasRole(bytes32 role, address account) external view returns (bool);\n\n  /**\n   * @dev Returns the admin role that controls `role`. See {grantRole} and\n   * {revokeRole}.\n   *\n   * To change a role's admin, use {AccessControl-_setRoleAdmin}.\n   */\n  function getRoleAdmin(bytes32 role) external view returns (bytes32);\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function grantRole(bytes32 role, address account) external;\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * If `account` had been granted `role`, emits a {RoleRevoked} event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function revokeRole(bytes32 role, address account) external;\n\n  /**\n   * @dev Revokes `role` from the calling account.\n   *\n   * Roles are often managed via {grantRole} and {revokeRole}: this function's\n   * purpose is to provide a mechanism for accounts to lose their privileges\n   * if they are compromised (such as when a trusted device is misplaced).\n   *\n   * If the calling account had been granted `role`, emits a {RoleRevoked}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must be `account`.\n   */\n  function renounceRole(bytes32 role, address account) external;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)\n\npragma solidity ^0.8.0;\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol\";\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract ContextUpgradeable is Initializable {\n  function __Context_init() internal onlyInitializing {}\n\n  function __Context_init_unchained() internal onlyInitializing {}\n\n  function _msgSender() internal view virtual returns (address) {\n    return msg.sender;\n  }\n\n  function _msgData() internal view virtual returns (bytes calldata) {\n    return msg.data;\n  }\n\n  /**\n   * @dev This empty reserved space is put in place to allow future versions to add new\n   * variables without shifting down storage in the inheritance chain.\n   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps\n   */\n  uint256[50] private __gap;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.7.0) (utils/Strings.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev String operations.\n */\nlibrary StringsUpgradeable {\n  bytes16 private constant _HEX_SYMBOLS = \"0123456789abcdef\";\n  uint8 private constant _ADDRESS_LENGTH = 20;\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` decimal representation.\n   */\n  function toString(uint256 value) internal pure returns (string memory) {\n    // Inspired by OraclizeAPI's implementation - MIT licence\n    // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol\n\n    if (value == 0) {\n      return \"0\";\n    }\n    uint256 temp = value;\n    uint256 digits;\n    while (temp != 0) {\n      digits++;\n      temp /= 10;\n    }\n    bytes memory buffer = new bytes(digits);\n    while (value != 0) {\n      digits -= 1;\n      // forge-lint: disable-next-line(unsafe-typecast)\n      buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));\n      value /= 10;\n    }\n    return string(buffer);\n  }\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.\n   */\n  function toHexString(uint256 value) internal pure returns (string memory) {\n    if (value == 0) {\n      return \"0x00\";\n    }\n    uint256 temp = value;\n    uint256 length = 0;\n    while (temp != 0) {\n      length++;\n      temp >>= 8;\n    }\n    return toHexString(value, length);\n  }\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.\n   */\n  function toHexString(uint256 value, uint256 length)\n    internal\n    pure\n    returns (string memory)\n  {\n    bytes memory buffer = new bytes(2 * length + 2);\n    buffer[0] = \"0\";\n    buffer[1] = \"x\";\n    for (uint256 i = 2 * length + 1; i > 1; --i) {\n      buffer[i] = _HEX_SYMBOLS[value & 0xf];\n      value >>= 4;\n    }\n    require(value == 0, \"Strings: hex length insufficient\");\n    return string(buffer);\n  }\n\n  /**\n   * @dev Converts an `address` with fixed length of 20 bytes to its not checksummed ASCII `string` hexadecimal representation.\n   */\n  function toHexString(address addr) internal pure returns (string memory) {\n    return toHexString(uint256(uint160(addr)), _ADDRESS_LENGTH);\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/utils/ERC165Upgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/utils/IERC165Upgradeable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol\";\n\n/**\n * @dev Implementation of the {IERC165} interface.\n *\n * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check\n * for the additional interface id that will be supported. For example:\n *\n * ```solidity\n * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {\n *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);\n * }\n * ```\n *\n * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.\n */\nabstract contract ERC165Upgradeable is Initializable, IERC165Upgradeable {\n  function __ERC165_init() internal onlyInitializing {}\n\n  function __ERC165_init_unchained() internal onlyInitializing {}\n\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return interfaceId == type(IERC165Upgradeable).interfaceId;\n  }\n\n  /**\n   * @dev This empty reserved space is put in place to allow future versions to add new\n   * variables without shifting down storage in the inheritance chain.\n   * See https://docs.openzeppelin.com/contracts/4.x/upgradeable#storage_gaps\n   */\n  uint256[50] private __gap;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts-upgradeable/utils/IERC165Upgradeable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165Upgradeable {\n  /**\n   * @dev Returns true if this contract implements the interface defined by\n   * `interfaceId`. See the corresponding\n   * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n   * to learn more about how these ids are created.\n   *\n   * This function call must use less than 30 000 gas.\n   */\n  function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.33+commit.64118f21"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "ArrayLengthMismatch",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DefaultAdminZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GMTokenManagerAddressCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "GloballyPaused",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "required",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "available",
+              "type": "uint256"
+            }
+          ],
+          "name": "InsufficientDivestProceeds",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "PortfolioTokenIsPaused",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "PortfolioTokenNotAccepted",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ReentrancyGuardReentrantCall",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "SafeERC20FailedOperation",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TokenAddressCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "USDonAddressCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "VaultAddressCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "VaultAddressNotSet",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "VaultPortfolioMismatch",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "WalletCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "WalletNotSet",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "oldManager",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newManager",
+              "type": "address"
+            }
+          ],
+          "name": "GMTokenManagerSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "GlobalPaused",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "GlobalUnpaused",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint8",
+              "name": "version",
+              "type": "uint8"
+            }
+          ],
+          "name": "Initialized",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "gmToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "gmTokenAmount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "usdonAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "PortfolioDivested",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "gmToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "usdonAmount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "gmTokenAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "PortfolioInvested",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "totalUsdonSold",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "totalUsdonInvested",
+              "type": "uint256"
+            }
+          ],
+          "name": "PortfolioRebalanced",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "accepted",
+              "type": "bool"
+            }
+          ],
+          "name": "PortfolioTokenAcceptedSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            }
+          ],
+          "name": "PortfolioTokenPaused",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            }
+          ],
+          "name": "PortfolioTokenUnpaused",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "previousAdminRole",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "newAdminRole",
+              "type": "bytes32"
+            }
+          ],
+          "name": "RoleAdminChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            }
+          ],
+          "name": "RoleGranted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            }
+          ],
+          "name": "RoleRevoked",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokensRetrieved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "oldVault",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newVault",
+              "type": "address"
+            }
+          ],
+          "name": "VaultAddressSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "oldWallet",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newWallet",
+              "type": "address"
+            }
+          ],
+          "name": "WalletSet",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "CONFIGURER_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DEFAULT_ADMIN_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "OPERATOR_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "PAUSER_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "PRICE_NORMALIZER",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "UNPAUSER_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "chainId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "attestationId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "userId",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "address",
+                  "name": "asset",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "price",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "quantity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "expiration",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "enum IGMTokenManager.QuoteSide",
+                  "name": "side",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "additionalData",
+                  "type": "bytes32"
+                }
+              ],
+              "internalType": "struct IGMTokenManager.Quote[]",
+              "name": "quotes",
+              "type": "tuple[]"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "signatures",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "divest",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getRoleAdmin",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "index",
+              "type": "uint256"
+            }
+          ],
+          "name": "getRoleMember",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getRoleMemberCount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "globalPaused",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "gmTokenManager",
+          "outputs": [
+            {
+              "internalType": "contract IGMTokenManager",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "grantRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "hasRole",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_defaultAdmin",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_usdon",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_gmTokenManager",
+              "type": "address"
+            }
+          ],
+          "name": "initialize",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "chainId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "attestationId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "userId",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "address",
+                  "name": "asset",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "price",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "quantity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "expiration",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "enum IGMTokenManager.QuoteSide",
+                  "name": "side",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "additionalData",
+                  "type": "bytes32"
+                }
+              ],
+              "internalType": "struct IGMTokenManager.Quote[]",
+              "name": "quotes",
+              "type": "tuple[]"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "signatures",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "invest",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pauseGlobal",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            }
+          ],
+          "name": "pausePortfolioToken",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "portfolioTokenAccepted",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "portfolioTokenPaused",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "chainId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "attestationId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "userId",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "address",
+                  "name": "asset",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "price",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "quantity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "expiration",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "enum IGMTokenManager.QuoteSide",
+                  "name": "side",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "additionalData",
+                  "type": "bytes32"
+                }
+              ],
+              "internalType": "struct IGMTokenManager.Quote[]",
+              "name": "sellQuotes",
+              "type": "tuple[]"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "sellSignatures",
+              "type": "bytes[]"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "uint256",
+                  "name": "chainId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "attestationId",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "userId",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "address",
+                  "name": "asset",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "price",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "quantity",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "expiration",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "enum IGMTokenManager.QuoteSide",
+                  "name": "side",
+                  "type": "uint8"
+                },
+                {
+                  "internalType": "bytes32",
+                  "name": "additionalData",
+                  "type": "bytes32"
+                }
+              ],
+              "internalType": "struct IGMTokenManager.Quote[]",
+              "name": "investQuotes",
+              "type": "tuple[]"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "investSignatures",
+              "type": "bytes[]"
+            }
+          ],
+          "name": "rebalance",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "renounceRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "retrieveTokens",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "revokeRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_gmTokenManager",
+              "type": "address"
+            }
+          ],
+          "name": "setGMTokenManager",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "internalType": "bool",
+              "name": "accepted",
+              "type": "bool"
+            }
+          ],
+          "name": "setPortfolioTokenAccepted",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_vaultAddress",
+              "type": "address"
+            }
+          ],
+          "name": "setVaultAddress",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_wallet",
+              "type": "address"
+            }
+          ],
+          "name": "setWallet",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes4",
+              "name": "interfaceId",
+              "type": "bytes4"
+            }
+          ],
+          "name": "supportsInterface",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "unpauseGlobal",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "portfolioToken",
+              "type": "address"
+            }
+          ],
+          "name": "unpausePortfolioToken",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "usdon",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "vaultAddress",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "wallet",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Ondo Finance",
+        "errors": {
+          "ReentrancyGuardReentrantCall()": [
+            {
+              "details": "Unauthorized reentrant call."
+            }
+          ],
+          "SafeERC20FailedOperation(address)": [
+            {
+              "details": "An operation with an ERC-20 token failed."
+            }
+          ]
+        },
+        "events": {
+          "GMTokenManagerSet(address,address)": {
+            "params": {
+              "newManager": "The new `GMTokenManager` address",
+              "oldManager": "The previous `GMTokenManager` address"
+            }
+          },
+          "Initialized(uint8)": {
+            "details": "Triggered when the contract has been initialized or reinitialized."
+          },
+          "PortfolioDivested(address,address,uint256,uint256)": {
+            "params": {
+              "gmToken": "The GM token that was redeemed",
+              "gmTokenAmount": "The amount of GM tokens redeemed, in the GM token's decimals",
+              "portfolioToken": "The portfolio token the divestment is for",
+              "usdonAmount": "The USDon received from this leg, in USDon's native decimals"
+            }
+          },
+          "PortfolioInvested(address,address,uint256,uint256)": {
+            "params": {
+              "gmToken": "The GM token that was minted",
+              "gmTokenAmount": "The amount of GM tokens received, in the GM token's decimals",
+              "portfolioToken": "The portfolio token the investment is for",
+              "usdonAmount": "The USDon spent on this leg, in USDon's native decimals"
+            }
+          },
+          "PortfolioRebalanced(address,uint256,uint256)": {
+            "params": {
+              "portfolioToken": "The portfolio token that was rebalanced",
+              "totalUsdonInvested": "Total USDon spent on the invest leg",
+              "totalUsdonSold": "Total USDon received from the divest leg"
+            }
+          },
+          "PortfolioTokenAcceptedSet(address,bool)": {
+            "params": {
+              "accepted": "Whether the portfolio token is accepted",
+              "portfolioToken": "The portfolio token address"
+            }
+          },
+          "PortfolioTokenPaused(address)": {
+            "params": {
+              "portfolioToken": "The portfolio token whose operations were paused"
+            }
+          },
+          "PortfolioTokenUnpaused(address)": {
+            "params": {
+              "portfolioToken": "The portfolio token whose operations were unpaused"
+            }
+          },
+          "RoleAdminChanged(bytes32,bytes32,bytes32)": {
+            "details": "Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole` `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite {RoleAdminChanged} not being emitted signaling this. _Available since v3.1._"
+          },
+          "RoleGranted(bytes32,address,address)": {
+            "details": "Emitted when `account` is granted `role`. `sender` is the account that originated the contract call, an admin role bearer except when using {AccessControl-_setupRole}."
+          },
+          "RoleRevoked(bytes32,address,address)": {
+            "details": "Emitted when `account` is revoked `role`. `sender` is the account that originated the contract call:   - if using `revokeRole`, it is the admin role bearer   - if using `renounceRole`, it is the role bearer (i.e. `account`)"
+          },
+          "TokensRetrieved(address,address,uint256)": {
+            "params": {
+              "amount": "The amount of tokens retrieved, in the token's native decimals",
+              "recipient": "The address that received the tokens",
+              "token": "The address of the token that was retrieved"
+            }
+          },
+          "VaultAddressSet(address,address,address)": {
+            "params": {
+              "newVault": "The new vault address",
+              "oldVault": "The previous vault address",
+              "portfolioToken": "The portfolio token the vault belongs to"
+            }
+          },
+          "WalletSet(address,address)": {
+            "params": {
+              "newWallet": "The new wallet address",
+              "oldWallet": "The previous wallet address"
+            }
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "constructor": {
+            "custom:oz-upgrades-unsafe-allow": "constructor"
+          },
+          "divest(address,(uint256,uint256,bytes32,address,uint256,uint256,uint256,uint8,bytes32)[],bytes[])": {
+            "params": {
+              "portfolioToken": "The portfolio token the divestment is for",
+              "quotes": "Array of GM token quotes to execute",
+              "signatures": "Array of signatures corresponding to each quote"
+            }
+          },
+          "getRoleAdmin(bytes32)": {
+            "details": "Returns the admin role that controls `role`. See {grantRole} and {revokeRole}. To change a role's admin, use {_setRoleAdmin}."
+          },
+          "getRoleMember(bytes32,uint256)": {
+            "details": "Returns one of the accounts that have `role`. `index` must be a value between 0 and {getRoleMemberCount}, non-inclusive. Role bearers are not sorted in any particular way, and their ordering may change at any point. WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure you perform all queries on the same block. See the following https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post] for more information."
+          },
+          "getRoleMemberCount(bytes32)": {
+            "details": "Returns the number of accounts that have `role`. Can be used together with {getRoleMember} to enumerate all bearers of a role."
+          },
+          "grantRole(bytes32,address)": {
+            "details": "Grants `role` to `account`. If `account` had not been already granted `role`, emits a {RoleGranted} event. Requirements: - the caller must have ``role``'s admin role. May emit a {RoleGranted} event."
+          },
+          "hasRole(bytes32,address)": {
+            "details": "Returns `true` if `account` has been granted `role`."
+          },
+          "initialize(address,address,address)": {
+            "params": {
+              "_defaultAdmin": "The default admin role for the contract",
+              "_gmTokenManager": "The address of the GMTokenManager contract",
+              "_usdon": "The address of the USDon token"
+            }
+          },
+          "invest(address,(uint256,uint256,bytes32,address,uint256,uint256,uint256,uint8,bytes32)[],bytes[])": {
+            "params": {
+              "portfolioToken": "The portfolio token the investment is for",
+              "quotes": "Array of GM token quotes to execute",
+              "signatures": "Array of signatures corresponding to each quote"
+            }
+          },
+          "pausePortfolioToken(address)": {
+            "params": {
+              "portfolioToken": "The address of the portfolio token"
+            }
+          },
+          "rebalance(address,(uint256,uint256,bytes32,address,uint256,uint256,uint256,uint8,bytes32)[],bytes[],(uint256,uint256,bytes32,address,uint256,uint256,uint256,uint8,bytes32)[],bytes[])": {
+            "params": {
+              "investQuotes": "Array of GM token invest quotes to execute",
+              "investSignatures": "Array of signatures for invest quotes",
+              "portfolioToken": "The portfolio token to rebalance",
+              "sellQuotes": "Array of GM token sell quotes to execute",
+              "sellSignatures": "Array of signatures for sell quotes"
+            }
+          },
+          "renounceRole(bytes32,address)": {
+            "details": "Revokes `role` from the calling account. Roles are often managed via {grantRole} and {revokeRole}: this function's purpose is to provide a mechanism for accounts to lose their privileges if they are compromised (such as when a trusted device is misplaced). If the calling account had been revoked `role`, emits a {RoleRevoked} event. Requirements: - the caller must be `account`. May emit a {RoleRevoked} event."
+          },
+          "retrieveTokens(address,address,uint256)": {
+            "params": {
+              "amount": "The amount of token to transfer",
+              "to": "The address of the recipient",
+              "token": "The address of the token"
+            }
+          },
+          "revokeRole(bytes32,address)": {
+            "details": "Revokes `role` from `account`. If `account` had been granted `role`, emits a {RoleRevoked} event. Requirements: - the caller must have ``role``'s admin role. May emit a {RoleRevoked} event."
+          },
+          "setGMTokenManager(address)": {
+            "params": {
+              "_gmTokenManager": "The GMTokenManager address"
+            }
+          },
+          "setPortfolioTokenAccepted(address,bool)": {
+            "params": {
+              "accepted": "Whether the token is accepted",
+              "portfolioToken": "The portfolio token address"
+            }
+          },
+          "setVaultAddress(address,address)": {
+            "params": {
+              "_vaultAddress": "The vault contract address",
+              "portfolioToken": "The portfolio token address"
+            }
+          },
+          "setWallet(address)": {
+            "params": {
+              "_wallet": "The wallet address"
+            }
+          },
+          "supportsInterface(bytes4)": {
+            "details": "See {IERC165-supportsInterface}."
+          },
+          "unpausePortfolioToken(address)": {
+            "params": {
+              "portfolioToken": "The address of the portfolio token"
+            }
+          }
+        },
+        "stateVariables": {
+          "__gap": {
+            "details": "Reserved storage gap for future upgrades."
+          }
+        },
+        "title": "PortfolioOrchestrator",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "ArrayLengthMismatch()": [
+            {
+              "notice": "Error emitted when quote and signature array lengths do not match"
+            }
+          ],
+          "DefaultAdminZeroAddress()": [
+            {
+              "notice": "Error emitted when the default admin address provided to `initialize` is zero"
+            }
+          ],
+          "GMTokenManagerAddressCantBeZero()": [
+            {
+              "notice": "Error emitted when attempting to set the `GMTokenManager` address to zero"
+            }
+          ],
+          "GloballyPaused()": [
+            {
+              "notice": "Error emitted when the orchestrator is globally paused"
+            }
+          ],
+          "InsufficientDivestProceeds(uint256,uint256)": [
+            {
+              "notice": "Error emitted when divest proceeds are insufficient to cover the invest leg of a rebalance"
+            }
+          ],
+          "PortfolioTokenIsPaused()": [
+            {
+              "notice": "Error emitted when operations are paused for a specific portfolio token"
+            }
+          ],
+          "PortfolioTokenNotAccepted()": [
+            {
+              "notice": "Error emitted when the portfolio token is not registered as accepted"
+            }
+          ],
+          "TokenAddressCantBeZero()": [
+            {
+              "notice": "Error emitted when the token address provided is zero"
+            }
+          ],
+          "USDonAddressCantBeZero()": [
+            {
+              "notice": "Error emitted when the USDon address provided to `initialize` is zero"
+            }
+          ],
+          "VaultAddressCantBeZero()": [
+            {
+              "notice": "Error emitted when attempting to set a vault address to zero"
+            }
+          ],
+          "VaultAddressNotSet()": [
+            {
+              "notice": "Error emitted when invest / divest / rebalance is called before the vault is configured"
+            }
+          ],
+          "VaultPortfolioMismatch()": [
+            {
+              "notice": "Error emitted when the vault's `portfolioToken()` does not match the portfolio token being configured"
+            }
+          ],
+          "WalletCantBeZero()": [
+            {
+              "notice": "Error emitted when attempting to set the wallet to zero"
+            }
+          ],
+          "WalletNotSet()": [
+            {
+              "notice": "Error emitted when invest / divest / rebalance is called before the wallet is configured"
+            }
+          ]
+        },
+        "events": {
+          "GMTokenManagerSet(address,address)": {
+            "notice": "Event emitted when the `GMTokenManager` contract is set or updated"
+          },
+          "GlobalPaused()": {
+            "notice": "Event emitted when the orchestrator is globally paused"
+          },
+          "GlobalUnpaused()": {
+            "notice": "Event emitted when the orchestrator is globally unpaused"
+          },
+          "PortfolioDivested(address,address,uint256,uint256)": {
+            "notice": "Event emitted when a `divest` leg redeems a GM token position"
+          },
+          "PortfolioInvested(address,address,uint256,uint256)": {
+            "notice": "Event emitted when an `invest` leg mints a GM token position"
+          },
+          "PortfolioRebalanced(address,uint256,uint256)": {
+            "notice": "Event emitted at the end of a successful `rebalance`"
+          },
+          "PortfolioTokenAcceptedSet(address,bool)": {
+            "notice": "Event emitted when a portfolio token's accepted status is set"
+          },
+          "PortfolioTokenPaused(address)": {
+            "notice": "Event emitted when operations are paused for a specific portfolio token"
+          },
+          "PortfolioTokenUnpaused(address)": {
+            "notice": "Event emitted when operations are unpaused for a specific portfolio token"
+          },
+          "TokensRetrieved(address,address,uint256)": {
+            "notice": "Event emitted when tokens are rescued from the contract via `retrieveTokens`"
+          },
+          "VaultAddressSet(address,address,address)": {
+            "notice": "Event emitted when the vault for a portfolio token is set or updated"
+          },
+          "WalletSet(address,address)": {
+            "notice": "Event emitted when the wallet is set or updated"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "CONFIGURER_ROLE()": {
+            "notice": "Role to configure the contract"
+          },
+          "OPERATOR_ROLE()": {
+            "notice": "Role for the off-chain operator that drives invest / divest / rebalance."
+          },
+          "PAUSER_ROLE()": {
+            "notice": "Role to pause the orchestrator"
+          },
+          "PRICE_NORMALIZER()": {
+            "notice": "The decimals normalizer for price calculations"
+          },
+          "UNPAUSER_ROLE()": {
+            "notice": "Role to unpause the orchestrator"
+          },
+          "divest(address,(uint256,uint256,bytes32,address,uint256,uint256,uint256,uint8,bytes32)[],bytes[])": {
+            "notice": "Divests GM token positions for USDon and send the proceeds to the wallet."
+          },
+          "globalPaused()": {
+            "notice": "Whether the orchestrator is globally paused"
+          },
+          "gmTokenManager()": {
+            "notice": "The GMTokenManager contract"
+          },
+          "invest(address,(uint256,uint256,bytes32,address,uint256,uint256,uint256,uint8,bytes32)[],bytes[])": {
+            "notice": "Invest USDon into GM token positions. USDon is pulled from the         wallet, used to mint GM tokens, and the GM tokens are deposited         into the portfolio's vault."
+          },
+          "pauseGlobal()": {
+            "notice": "Globally pause all orchestrator operations"
+          },
+          "pausePortfolioToken(address)": {
+            "notice": "Pause operations for a specific portfolio token"
+          },
+          "portfolioTokenAccepted(address)": {
+            "notice": "Whether a portfolio token is accepted for rebalancing"
+          },
+          "portfolioTokenPaused(address)": {
+            "notice": "Whether a specific portfolio token is paused"
+          },
+          "rebalance(address,(uint256,uint256,bytes32,address,uint256,uint256,uint256,uint8,bytes32)[],bytes[],(uint256,uint256,bytes32,address,uint256,uint256,uint256,uint8,bytes32)[],bytes[])": {
+            "notice": "Batch sell and invest in a single transaction for rebalancing."
+          },
+          "retrieveTokens(address,address,uint256)": {
+            "notice": "Rescue and transfer tokens locked in this contract"
+          },
+          "setGMTokenManager(address)": {
+            "notice": "Sets the GMTokenManager contract"
+          },
+          "setPortfolioTokenAccepted(address,bool)": {
+            "notice": "Sets whether a portfolio token is accepted for rebalancing"
+          },
+          "setVaultAddress(address,address)": {
+            "notice": "Sets the IPortfolioVault address for a specific portfolio token"
+          },
+          "setWallet(address)": {
+            "notice": "Sets the wallet that holds USDon liquidity"
+          },
+          "unpauseGlobal()": {
+            "notice": "Globally unpause all orchestrator operations"
+          },
+          "unpausePortfolioToken(address)": {
+            "notice": "Unpause operations for a specific portfolio token"
+          },
+          "usdon()": {
+            "notice": "The USDon token address"
+          },
+          "vaultAddress(address)": {
+            "notice": "IPortfolioVault contract address per portfolio token"
+          },
+          "wallet()": {
+            "notice": "The wallet that holds USDon liquidity"
+          }
+        },
+        "notice": "Stateless execution engine that the off-chain orchestrator calls to         invest, divest, and rebalance underlying GM token positions for         portfolio tokens. Per-portfolio custody is handled by an         IPortfolioVault contract; the orchestrator only holds tokens         transiently within a single transaction.         Fund flows:          - invest()    pulls the exact USDon needed from the wallet, mints GM                        tokens, approves the vault for the minted GM tokens, then                        calls vault.deposit() — the vault pulls and forwards the                        tokens to its custody destination in a single step.          - divest()    calls vault.withdraw() to pull GM tokens back from                        the vault, redeems them for USDon, and sends the                        proceeds to the wallet          - rebalance() runs a divest leg then an invest leg, keeping USDon                        in the orchestrator between the two; sends only the                        surplus (sold − invested) to the wallet. Reverts if the                        divest proceeds don't fully cover the invest leg.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/globalMarkets/portfolioToken/portfolioOrchestrator/PortfolioOrchestrator.sol": "PortfolioOrchestrator"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":@uniswap/=node_modules/@uniswap/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":forge-tests/=forge-tests/",
+        ":hardhat-deploy/=node_modules/hardhat-deploy/",
+        ":hardhat/=node_modules/hardhat/",
+        ":lib/=lib/",
+        ":solidity-bytes-utils/=node_modules/solidity-bytes-utils/",
+        ":truffle/=node_modules/truffle/"
+      ]
+    },
+    "sources": {
+      "contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlEnumerableUpgradeable.sol": {
+        "keccak256": "0x969854364a270e18c8c42fc57614be0288f6be86923d75e9043d43b498e6230b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4c3cb69417426f0111a201917b735daccf42a59c45e51ced76aed40149ebedc1",
+          "dweb:/ipfs/QmXQQ7ESy2vvTE9ddtL5PqqCLnqRY1HmT5pPw8sSNMd4qF"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol": {
+        "keccak256": "0xe756b46e4579eaf1746114e78079cf7c043c466e3d7f34d2d7bf6da4236fcda7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://23452840aaa468e4d12c2acf854f5d2b8a451b664ee156853b6d605fc5542d0d",
+          "dweb:/ipfs/QmdeXrivopZnM1dYrg8Uc83cDrnnHMU3pXSXwvKdsuDP2c"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlEnumerableUpgradeable.sol": {
+        "keccak256": "0x1aad29d0961d6c73d6e665f194473b50abf14b7fa0acc929b8cf9b4a92c8072f",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://9b9ba3441a14023b202e30cca8536a99df864161dbd1db55be2a7fba1b842ff6",
+          "dweb:/ipfs/QmbUDvkvJMF4xTDJEEN5UAsWHpMY7kMJNHifF1K1e6qygx"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/access/IAccessControlUpgradeable.sol": {
+        "keccak256": "0x82ced39d1596c05d590b7ca07c3817cf45cd27c08668c4ed630897861a394897",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b7d20aed60e30f2778879f83613192e7ab1c530ece62cc25641bac3cc2a7e97f",
+          "dweb:/ipfs/QmQsHMDBdgeat7YbXzrGT9SdmppY2u4kUJiXy2SkwZEBDE"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/proxy/Initializable.sol": {
+        "keccak256": "0xeb0045f0a9e7072d564b6afbbdd2467a0bbeac89ab00fa3eeab6739dff9abf5b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://898fed3d9099daf731c01fc6d6247da2fccac6a6316978b55b0fcb40ff247a05",
+          "dweb:/ipfs/QmYTQoTatCT27iVUJg1au3tfrwz8NfBhyuUwCCHcr3Yb5k"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/utils/AddressUpgradeable.sol": {
+        "keccak256": "0xaf21ac76d103d3d1174d2bd26dde385c09f1bab9a60ec291c130efc8ccb20d36",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e5c99abcf2c4cae25d8b95996bdeab83f381d3560b3b4eefa666b8e2e2876333",
+          "dweb:/ipfs/QmR1Cpn98bQ2k31t3Mm9Njh4SiatBY36svRPKgPpedbNfk"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/utils/ContextUpgradeable.sol": {
+        "keccak256": "0x260769c9dfd7f0f1a303f789fc8ead8af329a37ae9e44473b8f5a2b8cf9a70c3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4d3d5c03b161f31fcab872e82e6ee796f7cc24f738883d59aa13be4014a231cd",
+          "dweb:/ipfs/QmNmXxoyJTBbbm3aBDLi53r64AcUmdawddLfTXzDitnn2L"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/utils/ERC165Upgradeable.sol": {
+        "keccak256": "0x5fe80ed57c74761b47fb502ce5ab5900fb786781ea211cbef1dbcbde0dd439b0",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4e8387eb750ecba72623b3ff0cbdba55542c201081b4ddb74bd52e37e133ffd9",
+          "dweb:/ipfs/QmQsXHMi3hkBpgYfGivTx2VGJV8quaebaL6v4f8Tu9iqsV"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/utils/EnumerableSetUpgradeable.sol": {
+        "keccak256": "0xcfd889f86aa7523f1a9b7903c24ced3512ed3ba14d27372a75a07e9c49ed141b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://030850091a35c9e58f71fd0bf74a355cf5756ad8ac89856f5ea1ba26b7179829",
+          "dweb:/ipfs/QmTZGLo3HHoa3W2PEo8qpZUuzdvnPwBEL4K5CnZzAD3KHK"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/utils/IERC165Upgradeable.sol": {
+        "keccak256": "0x26751ffef7dd0b030529f36b653b20561de1eff524eea9b401b614d454a33c5b",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://19cbe38f8f2c1157139459a9d8d7935c5c2a4b08486496e0dc9448b3cf25a9bb",
+          "dweb:/ipfs/QmeyavLyBHSyCYXrjUD4iVFz5U2hDbtLdHhssVAbSzRikq"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts-upgradeable/utils/StringsUpgradeable.sol": {
+        "keccak256": "0xb6f449b4ebdcc75722a9686555d42267875f58a5f6593d6c2ab5cbeda8f33018",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6a6920ae0f4e53c49db0f29ff3b8ed4b8604a115aa2b79845f175e74f0204fa3",
+          "dweb:/ipfs/QmdmoC8fbu25PxKcTyi7mLk2rhJxntYeoFLchCuQKBH5B5"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/security/ReentrancyGuardTransient.sol": {
+        "keccak256": "0x10de7e7169d86736df699af7f900a43471b42ea3e6b0c8820f0805b4008a601d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://80abedf4e8ca2a4d675f77ca5aa7c8c436af98d0f5c9d9a4a1d7aa67aa2c303e",
+          "dweb:/ipfs/QmSZDQDr43atdf4QcYifHgdWE1GfTs8xffMZcGm38v4yRj"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/security/TransientSlot.sol": {
+        "keccak256": "0x5fb018394594d6a7aec655c3c86cbac02d71b16c8bb8964c99e85016cb728e84",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://71c6b1f75e0c269799d2da52bd04cb71cb8859344f87d731bd7e3e65bd922d4d",
+          "dweb:/ipfs/QmRT4fF3HVoG4hYey2acV9PLvs3hsKFjxwCTShdoVQXNU5"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/IERC20.sol": {
+        "keccak256": "0x2d0b233e43b64bb4afb057ccc16493c9b3c22d334a4ac6636915c7ef7f06b118",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f0702af2d619b4cbbc417b89fb215c64b2f0a2db8d1af1d3a23f2e3cabb077f0",
+          "dweb:/ipfs/QmYVTreLMBhqZH78xnqiZyr3FLbfNrrSsG7bHiSQk9dRRW"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/SafeERC20.sol": {
+        "keccak256": "0x390ad37e2acef7855f36907f6b16331e35115ac0d1a4a8641fee248019ab98ac",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://fb4c92c03e1c539c1ce103b87239db36807ab097741538cc84df989b180f2854",
+          "dweb:/ipfs/QmSGeNmEopK8aTeJboEqcJpePYddJphTiMFvUN3Q1UuWLW"
+        ]
+      },
+      "contracts/globalMarkets/portfolioToken/portfolioOrchestrator/IPortfolioOrchestrator.sol": {
+        "keccak256": "0xcfbb14438c58749335c1b682d60a2538cbf52351671ede0c42f9af8d20495fc2",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://2eca3bd95001e7234ab462c07b0e2a594e82e00a6b8219b7ca2e861dc55164fd",
+          "dweb:/ipfs/QmbkouYYkujPMrf9AbW3bLWagkMwK2sE7KuuEQBBGEYRrA"
+        ]
+      },
+      "contracts/globalMarkets/portfolioToken/portfolioOrchestrator/PortfolioOrchestrator.sol": {
+        "keccak256": "0x7a942babeeefd8bba1208bd2903ce02856cefe35baf15163e6f258a739fb925f",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://dfdc2538be2e007e5aa0e90cdbd1622dcb79cc8154e7f31649b254650cf89b30",
+          "dweb:/ipfs/QmfZ7vB9NQmD81rk4S5uJ9k2xRFRztUvQKNs7j1raGmKoP"
+        ]
+      },
+      "contracts/globalMarkets/portfolioToken/portfolioVault/IPortfolioVault.sol": {
+        "keccak256": "0xad2bfda440957d47210d5c17df7dad013ebab39d252c825ec9cdd7ff960e8755",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://514d136bdc975bf20d6ec6457a1b528b31a75679c68e1cc34b39210c080a0361",
+          "dweb:/ipfs/QmUFsEm7uYavHCbDkctKSFnjN43S8zDxVMdJeAvuKECoBT"
+        ]
+      },
+      "contracts/globalMarkets/tokenManager/IGMTokenManager.sol": {
+        "keccak256": "0x02b8a23ed8a0923c620512a231b170fe8675dc7cb7b67e95c433870a9d5267d0",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://947335320677cef4b3610f70ad02bef4af14213305bb18014fbd8300004fe403",
+          "dweb:/ipfs/QmThroZwUQmrgeeXTzayUyn1JWp7ygvcFdQfVBCwjSm4fh"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.33+commit.64118f21",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        "forge-tests/=forge-tests/",
+        "lib/=lib/",
+        "@openzeppelin/=node_modules/@openzeppelin/",
+        "@uniswap/=node_modules/@uniswap/",
+        "forge-std/=lib/forge-std/src/",
+        "hardhat-deploy/=node_modules/hardhat-deploy/",
+        "hardhat/=node_modules/hardhat/",
+        "solidity-bytes-utils/=node_modules/solidity-bytes-utils/",
+        "truffle/=node_modules/truffle/"
+      ]
+    },
+    "name": "PortfolioOrchestrator",
+    "fullyQualifiedName": "contracts/globalMarkets/portfolioToken/portfolioOrchestrator/PortfolioOrchestrator.sol:PortfolioOrchestrator"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "53977280",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-09-29T14:02:58Z",
+  "match": "match",
+  "chainId": "56",
+  "address": "0x10c1d4a631C37dB1Ae290Be4B16E0453c84cf8b3"
+}
