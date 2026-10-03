@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Archive publicly available sources for programs explicitly active in metadata."""
+import base64
 import tempfile
 import argparse, concurrent.futures, datetime as dt, gzip, hashlib, html, io, json, os, pathlib, re, shutil, subprocess, tarfile, threading, time, urllib.parse
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -19,13 +20,14 @@ def relative(path): return str(path.relative_to(ROOT))
 def temporary(prefix='response-'):
     fd,path=tempfile.mkstemp(prefix=prefix,dir=WORK);os.close(fd);return pathlib.Path(path)
 
-def download(url, target=None, retries=3, timeout=90):
+def download(url, target=None, retries=3, timeout=90, post_json=None):
     target = target or temporary()
     target.parent.mkdir(parents=True, exist_ok=True)
     transfer = temporary('transfer-')
     last = ''
     for attempt in range(retries):
-        proc = subprocess.run(['curl','--location','--silent','--show-error','--compressed','--connect-timeout','20','--max-time',str(timeout),'--output',str(transfer),'--write-out','%{http_code}',url], capture_output=True, text=True)
+        extra=['-H','Content-Type: application/json','--data',json.dumps(post_json)] if post_json is not None else []
+        proc = subprocess.run(['curl','--location','--silent','--show-error','--compressed','--connect-timeout','20','--max-time',str(timeout),'--output',str(transfer),'--write-out','%{http_code}',*extra,url], capture_output=True, text=True)
         code = proc.stdout[-3:]
         if proc.returncode == 0 and code.startswith('2'):
             transfer.replace(target); return target, int(code)
@@ -35,8 +37,8 @@ def download(url, target=None, retries=3, timeout=90):
     transfer.unlink(missing_ok=True)
     target.unlink(missing_ok=True)
     raise RuntimeError(last)
-def get_json(url):
-    path, _ = download(url)
+def get_json(url, post_json=None):
+    path, _ = download(url,post_json=post_json)
     try: return json.loads(path.read_bytes())
     finally: path.unlink(missing_ok=True)
 def is_active(p, now):
@@ -301,23 +303,14 @@ def zksync(entry):
 
 def tron(entry):
     address=re.search(r'/contract/(T[a-zA-Z0-9]{33})',entry['url']).group(1)
-    endpoint='https://apilist.tronscanapi.com/api/contracts/code?contract='+address
-    obj=get_json(endpoint).get('data') or {}
-    # Tronscan serves the multi-file source via the contract-source endpoint.
-    endpoint='https://apilist.tronscanapi.com/api/contract/code?contract='+address
-    data=get_json(endpoint)
-    obj['source_response']=data
-    sources={}
-    def collect(value):
-        if isinstance(value,dict):
-            for key in ('source_code','sourceCode','code','content'):
-                v=value.get(key)
-                if isinstance(v,str) and any(t in v for t in ('pragma solidity','contract ','SPDX-License-Identifier')):
-                    name=value.get('name') or value.get('fileName') or value.get('filename') or 'Contract.sol';sources[name]={'content':v}
-            for v in value.values():collect(v)
-        elif isinstance(value,list):
-            for v in value:collect(v)
-    collect(data)
+    endpoint='https://apilist.tronscanapi.com/api/solidity/contract/info'
+    data=get_json(endpoint,post_json={'contractAddress':address})
+    obj=data.get('data') or {};sources={}
+    for item in obj.get('contract_code') or []:
+        code=item.get('code') or ''
+        try:code=base64.b64decode(code,validate=True).decode('utf-8')
+        except Exception:pass
+        if isinstance(code,str) and code.strip():sources[item.get('name') or 'Contract.sol']={'content':code}
     if not sources:raise RuntimeError('Tronscan did not return verified source text')
     obj['sources']=sources;return persist_contract(entry,obj,'tron_verified_contract',endpoint)
 
@@ -342,7 +335,7 @@ def alternate_contract(entry):
     parsed=urllib.parse.urlsplit(entry['url']);host=parsed.netloc.lower();m=re.search(r'0x[a-fA-F0-9]{40}(?![a-fA-F0-9])',entry['url'])
     if not m:raise RuntimeError('No EVM address; no alternate verification endpoint')
     address=m.group();chain=CHAIN_IDS.get(host)
-    if host=='www.oklink.com':chain={'x-layer':196,'okc':66,'ethereum':1,'polygon':137,'arbitrum':42161}.get(parsed.path.strip('/').split('/')[0])
+    if host=='www.oklink.com':chain={'x-layer':196,'xlayer':196,'okc':66,'ethereum':1,'polygon':137,'arbitrum':42161}.get(parsed.path.strip('/').split('/')[0])
     if host=='blockscout.com':
         if '/eth/mainnet/' in parsed.path:chain=1
         if '/xdai/mainnet/' in parsed.path:chain=100
@@ -431,7 +424,7 @@ def main():
                 summarize(entries,results)
                 if args.push:push(f'Archive active program sources: {len(results)}/{len(entries)} URLs processed')
                 last=time.time()
-            next_entry=next(queue,None)
+            next_entry=next(queue,None) if not (WORK/'stop-after-checkpoint').exists() else None
             if next_entry is not None:futures[pool.submit(fetch,next_entry)]=next_entry
     summarize(entries,results)
     if args.push:push(f'Archive active program sources: {len(results)}/{len(entries)} URLs processed')
