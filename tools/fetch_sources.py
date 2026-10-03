@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Archive publicly available sources for programs explicitly active in metadata."""
+import tempfile
 import argparse, concurrent.futures, datetime as dt, gzip, hashlib, html, io, json, os, pathlib, re, shutil, subprocess, tarfile, threading, time, urllib.parse
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OUT = ROOT / 'sources'
@@ -15,17 +16,24 @@ def save_json(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix+'.tmp'); tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False)+'\n'); tmp.replace(path)
 def relative(path): return str(path.relative_to(ROOT))
+def temporary(prefix='response-'):
+    fd,path=tempfile.mkstemp(prefix=prefix,dir=WORK);os.close(fd);return pathlib.Path(path)
+
 def download(url, target=None, retries=3, timeout=90):
-    target = target or WORK / (digest(url)+'.response')
+    target = target or temporary()
     target.parent.mkdir(parents=True, exist_ok=True)
+    transfer = temporary('transfer-')
     last = ''
     for attempt in range(retries):
-        proc = subprocess.run(['curl','--location','--silent','--show-error','--compressed','--connect-timeout','20','--max-time',str(timeout),'-A',UA,'--output',str(target),'--write-out','%{http_code}',url], capture_output=True, text=True)
+        proc = subprocess.run(['curl','--location','--silent','--show-error','--compressed','--connect-timeout','20','--max-time',str(timeout),'--output',str(transfer),'--write-out','%{http_code}',url], capture_output=True, text=True)
         code = proc.stdout[-3:]
-        if proc.returncode == 0 and code.startswith('2'): return target, int(code)
+        if proc.returncode == 0 and code.startswith('2'):
+            transfer.replace(target); return target, int(code)
         last = f'HTTP {code}; curl {proc.returncode}: {proc.stderr[:200]}'
         if code in ('404','410'): break
         time.sleep(min(2**attempt, 4))
+    transfer.unlink(missing_ok=True)
+    target.unlink(missing_ok=True)
     raise RuntimeError(last)
 def get_json(url):
     path, _ = download(url)
@@ -96,7 +104,7 @@ def archive_repo(owner, repo, ref):
         with tmp.open('rb') as source:
             while block:=source.read(45*1024*1024):
                 n+=1;part=dest/('source.tar.gz' if tmp.stat().st_size<=45*1024*1024 else f'source.tar.gz.part{n:03d}')
-                part.write_bytes(block);sha.update(block);chunks.append(relative(part))
+                temp_part=WORK/(digest(str(part))+'.part');temp_part.write_bytes(block);temp_part.replace(part);sha.update(block);chunks.append(relative(part))
         tmp.unlink()
         save_json(dest/'files.json',file_index)
         result={'repository':info['html_url'],'requested_ref':ref,'commit':commit,'fetched_at':stamp(),'archive_parts':chunks,'archive_sha256':sha.hexdigest(),'file_count':len(file_index),'file_index':relative(dest/'files.json'),'submodule_configuration':modules,'snapshot':relative(index)}
@@ -259,12 +267,72 @@ def generic(entry):
         if bundles:save_json(dest/'scripts.json',bundles);result['browser_scripts']=relative(dest/'scripts.json');result['script_count']=sum('path' in b for b in bundles)
     return result
 
+CHAIN_IDS = {
+ 'etherscan.io':1,'polygonscan.com':137,'arbiscan.io':42161,'snowtrace.io':43114,
+ 'snowscan.xyz':43114,'basescan.org':8453,'bscscan.com':56,'optimistic.etherscan.io':10,
+ 'gnosisscan.io':100,'scrollscan.com':534352,'sonicscan.org':146,'celoscan.io':42220,
+ 'katanascan.com':747474,'moonscan.io':1284,'moonriver.moonscan.io':1285,'hyperevmscan.io':999,
+ 'uniscan.xyz':130,'ftmscan.com':250,'explorer.mantle.xyz':5000,'mantlescan.xyz':5000,
+ 'modescan.io':34443,'berascan.com':80094,'unichain.blockscout.com':130,'worldscan.org':480,
+ 'lineascan.build':59144,'fraxscan.com':252,'plasmascan.to':9745,'explorer.zksync.io':324,
+ 'rootstock.blockscout.com':30,'explorer.inkonchain.com':57073,'explorer.gobob.xyz':60808,
+ 'explorer.plume.org':98866,'explorer.hemi.xyz':43111,'sepolia.etherscan.io':11155111,
+ 'sepolia.basescan.org':84532,'hoodi.etherscan.io':560048,'testnet.snowtrace.io':43113,
+ 'seitrace.com':1329,'explorer.optimism.io':10,'pacific-explorer.manta.network':169,
+ 'explorer.lyra.finance':957,'robinhoodchain.blockscout.com':46630,'explorer.tac.build':239,
+ 'megaeth.blockscout.com':4326,'explorer.intuition.systems':1155,'explorer.morphl2.io':2818,
+}
+BLOCKSCOUT_ALIASES={'optimistic.etherscan.io':'optimism.blockscout.com','explorer.optimism.io':'optimism.blockscout.com','basescan.org':'base.blockscout.com','etherscan.io':'eth.blockscout.com','gnosisscan.io':'gnosis.blockscout.com','polygonscan.com':'polygon.blockscout.com','arbiscan.io':'arbitrum.blockscout.com','scrollscan.com':'scroll.blockscout.com','uniscan.xyz':'unichain.blockscout.com','worldscan.org':'worldchain-mainnet.explorer.alchemy.com'}
+def alternate_contract(entry):
+    parsed=urllib.parse.urlsplit(entry['url']);host=parsed.netloc.lower();m=re.search(r'0x[a-fA-F0-9]{40}',entry['url'])
+    if not m:raise RuntimeError('No EVM address; no alternate verification endpoint')
+    address=m.group();chain=CHAIN_IDS.get(host)
+    if host=='blockscout.com':
+        if '/eth/mainnet/' in parsed.path:chain=1
+        if '/xdai/mainnet/' in parsed.path:chain=100
+    errors=[]
+    if chain:
+        endpoint=f'https://sourcify.dev/server/v2/contract/{chain}/{address}?fields=sources,metadata,compilation,proxyResolution'
+        try:
+            obj=get_json(endpoint)
+            if obj.get('sources'):
+                implementations={}
+                for impl in (obj.get('proxyResolution') or {}).get('implementations',[]):
+                    a=impl['address'];ep=f'https://sourcify.dev/server/v2/contract/{chain}/{a}?fields=sources,metadata,compilation,proxyResolution'
+                    try:
+                        data=get_json(ep)
+                        if data.get('sources'):implementations[a]=data
+                    except Exception as e:implementations[a]={'error':str(e),'retrieval_url':ep}
+                if implementations:obj['implementation_sources']=implementations
+                return persist_contract(entry,obj,'sourcify_verified_contract',endpoint)
+            errors.append('Sourcify has no source')
+        except Exception as e:errors.append('Sourcify: '+str(e))
+    alias=BLOCKSCOUT_ALIASES.get(host)
+    if alias:
+        try:return blockscout(entry,alias,address)
+        except Exception as e:errors.append('Blockscout: '+str(e))
+    if chain in (43114,43113):
+        endpoint=f'https://api.routescan.io/v2/network/{"mainnet" if chain==43114 else "testnet"}/evm/{chain}/etherscan/api?module=contract&action=getsourcecode&address={address}'
+        try:
+            data=get_json(endpoint);obj=data['result'][0];code=obj.get('SourceCode')
+            if code:
+                try:obj['sources']=json.loads(code[1:-1] if code.startswith('{{') else code)['sources']
+                except Exception:obj['sources']={obj.get('ContractName','Contract')+'.sol':{'content':code}}
+                return persist_contract(entry,obj,'routescan_verified_contract',endpoint)
+        except Exception as e:errors.append('Routescan: '+str(e))
+    raise RuntimeError('; '.join(errors) or 'No supported alternate source endpoint for '+host)
+
 def fetch(entry):
     start=time.time()
     try:
         host=urllib.parse.urlsplit(entry['url']).netloc.lower()
         result=github(entry) if host in ('github.com','www.github.com') else generic(entry)
-    except Exception as e:result={'status':'failed','error':str(e),'fetched_at':stamp()}
+    except Exception as e:
+        try:result=alternate_contract(entry)
+        except Exception as alternate:result={'status':'failed','error':str(e),'alternate_error':str(alternate),'fetched_at':stamp()}
+    if result.get('status') in ('source_unavailable','unverified_contract'):
+        try:result=alternate_contract(entry)
+        except Exception as e:result['alternate_error']=str(e)
     return {**entry,**result,'elapsed_seconds':round(time.time()-start,2)}
 
 def push(message):
@@ -296,14 +364,19 @@ def main():
     if args.push:push('Initialize source inventory for metadata-active Immunefi programs')
     last=time.time();n=0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures={pool.submit(fetch,e):e for e in pending}
-        for future in concurrent.futures.as_completed(futures):
+        queue=iter(pending)
+        futures={pool.submit(fetch,e):e for e in [next(queue,None) for _ in range(args.workers)] if e is not None}
+        while futures:
+            future=next(concurrent.futures.as_completed(futures))
+            futures.pop(future)
             r=future.result();results[r['id']]=r;n+=1
             print(f"{n}/{len(pending)} {r['status']} {r['url']}"+((' '+r['error']) if 'error' in r else ''),flush=True)
             if n%75==0 or time.time()-last>90:
                 summarize(entries,results)
                 if args.push:push(f'Archive active program sources: {len(results)}/{len(entries)} URLs processed')
                 last=time.time()
+            next_entry=next(queue,None)
+            if next_entry is not None:futures[pool.submit(fetch,next_entry)]=next_entry
     summarize(entries,results)
     if args.push:push(f'Archive active program sources: {len(results)}/{len(entries)} URLs processed')
 
