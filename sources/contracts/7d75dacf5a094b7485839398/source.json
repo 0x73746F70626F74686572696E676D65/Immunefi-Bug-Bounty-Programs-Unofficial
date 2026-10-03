@@ -1,0 +1,439 @@
+{
+  "sources": {
+    "contracts/oracles/BalancerPriceOracle.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\ninterface IVault {\n    function getPoolTokens(bytes32 poolId) external view\n        returns (address[] memory tokens, uint256[] memory balances, uint256 lastChangeBlock);\n}\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Provided zero value.\nerror ZeroValue();\n\n/// @dev Provided wrong pool.\n/// @param tokens Token addresses.\nerror WrongPool(address[] tokens);\n\n/// @dev Value overflow.\n/// @param provided Overflow value.\n/// @param max Maximum possible value.\nerror Overflow(uint256 provided, uint256 max);\n\n\n/// @title BalancerPriceOracle - a smart contract oracle for Balancer V2 pools (BPS version)\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\n/// @dev This contract acts as an oracle for a specific Balancer V2 pool. It allows:\n///      1) Getting the spot price (balance ratio) in 1e18 format\n///      2) Getting the TWAP price in 1e18 format\n///\n///      Fixes vs the original version:\n///      - TWAP is computed from two independent observations (delta_cumulative / delta_t).\n///      - No state mutation on rejected updates (commit-on-success).\n///      - Avoids permanent freeze after large market moves by allowing baseline to adapt via rolling-window TWAP.\n///      - updatePrice() is rate-limited to prevent griefing resets of the observation.\n///      - Adds freshness constraints for TWAP retrieval.\ncontract BalancerPriceOracle {\n    event ObservationUpdated(address indexed sender, uint256 priceCumulative, uint256 timestamp);\n\n    // Minimum time between successful updatePrice() calls (seconds)\n    uint256 public immutable minUpdateInterval;\n    // Minimum TWAP window required for validation (seconds)\n    uint256 public immutable minTwapWindow;\n    // Maximum allowed staleness of the last observation (seconds)\n    uint256 public immutable maxStaleness;\n\n    // LP token direction:\n    //   direction==0 => balances[0] is secondToken (in), balances[1] is OLAS (out)\n    //   direction==1 => balances[1] is secondToken (in), balances[0] is OLAS (out)\n    uint256 public immutable direction;\n\n    // Balancer vault address\n    address public immutable balancerVault;\n    // Balancer pool Id\n    bytes32 public immutable balancerPoolId;\n\n    struct Observation {\n        // Time-weighted cumulative price (1e18 * seconds)\n        uint256 priceCumulative;\n        // Timestamp of the observation\n        uint256 timestamp;\n    }\n\n    // Previous observation for rolling TWAP window\n    Observation public prevObservation;\n    // Stored last observation used for TWAP\n    Observation public lastObservation;\n\n    /// @dev BalancerPriceOracle constructor.\n    /// @param _balancerVault Balancer vault address.\n    /// @param _balancerPoolId Balancer pool Id.\n    /// @param _olas OLAS address.\n    /// @param _minTwapWindowSeconds Min TWAP window in seconds.\n    /// @param _minUpdateIntervalSeconds Min price update interval in seconds.\n    /// @param _maxStalenessSeconds Max staleness in seconds.\n    constructor(\n        address _balancerVault,\n        bytes32 _balancerPoolId,\n        address _olas,\n        uint256 _minTwapWindowSeconds,\n        uint256 _minUpdateIntervalSeconds,\n        uint256 _maxStalenessSeconds\n    ) {\n        // Check for zero address\n        if (_balancerVault == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Check for zero values\n        if (_minTwapWindowSeconds == 0 || _minUpdateIntervalSeconds == 0) {\n            revert ZeroValue();\n        }\n\n        // Check for update interval\n        if (_minTwapWindowSeconds > _minUpdateIntervalSeconds) {\n            revert Overflow(_minTwapWindowSeconds, _minUpdateIntervalSeconds);\n        }\n\n        // Check for maxStaleness consistency\n        if (_minTwapWindowSeconds > _maxStalenessSeconds) {\n            revert Overflow(_minTwapWindowSeconds, _maxStalenessSeconds);\n        }\n\n        minUpdateInterval = _minUpdateIntervalSeconds;\n        minTwapWindow = _minTwapWindowSeconds;\n        maxStaleness = _maxStalenessSeconds;\n        balancerVault = _balancerVault;\n        balancerPoolId = _balancerPoolId;\n\n        // Get tokens from pool\n        (address[] memory tokens, , ) = IVault(balancerVault).getPoolTokens(_balancerPoolId);\n\n        // Check for pool validity\n        if (tokens.length != 2 || (tokens[0] != _olas && tokens[1] != _olas)) {\n            revert WrongPool(tokens);\n        }\n\n        // Get token direction\n        if (tokens[0] == _olas) {\n            direction = 1;\n        }\n    }\n\n    /// @dev Gets the current OLAS token price in 1e18 format.\n    /// @return Current spot price in 1e18 format.\n    function getPrice() public view returns (uint256) {\n        // Get pool balances\n        (, uint256[] memory balances, ) = IVault(balancerVault).getPoolTokens(balancerPoolId);\n\n        // Second token balance\n        uint256 balanceIn = balances[direction];\n        // OLAS balance\n        uint256 balanceOut = balances[(direction + 1) % 2];\n\n        // Check for zero values\n        if (balanceIn == 0 || balanceOut == 0) {\n            revert ZeroValue();\n        }\n\n        return (balanceOut * 1e18) / balanceIn;\n    }\n\n    /// @dev Records a new rolling TWAP observation from the Balancer V2 pool.\n    /// @notice Permissionless but rate-limited to prevent griefing resets.\n    /// @return True if price update is successful.\n    function updatePrice() external returns (bool) {\n        // Get last observation\n        Observation memory last = lastObservation;\n        // Calculate dt\n        uint256 dt = block.timestamp - last.timestamp;\n\n        // Check if dt is lower than min update interval\n        if (last.timestamp > 0 && dt < minUpdateInterval) {\n            return false;\n        }\n\n        // Get current spot price\n        uint256 spot = getPrice();\n\n        // Check for zero value\n        if (spot == 0) {\n            revert ZeroValue();\n        }\n\n        // Compute prospective cumulative at now based on last observation + spot * dt (commit-on-success)\n        uint256 priceCumulativeNow = last.priceCumulative;\n        if (dt > 0) {\n            priceCumulativeNow += spot * dt;\n        }\n\n        // Shift window: previous becomes last, current becomes new last\n        prevObservation = last;\n        lastObservation = Observation({priceCumulative: priceCumulativeNow, timestamp: block.timestamp});\n\n        emit ObservationUpdated(msg.sender, priceCumulativeNow, block.timestamp);\n\n        return true;\n    }\n\n    /// @dev Gets the current TWAP price in 1e18 format.\n    ///      Reverts if the oracle is not initialized, observations are stale, or the TWAP window is insufficient.\n    /// @return TWAP price in 1e18 format (OLAS per secondToken).\n    function getTWAP() external view returns (uint256) {\n        // Get observations\n        Observation memory prev = prevObservation;\n        Observation memory last = lastObservation;\n\n        // Check if initialized\n        if (prev.timestamp == 0 || last.timestamp == 0) {\n            revert ZeroValue();\n        }\n\n        // Freshness: require that last observation is not too old\n        uint256 age = block.timestamp - last.timestamp;\n        if (age > maxStaleness) {\n            revert Overflow(age, maxStaleness);\n        }\n\n        // TWAP history check: need a usable window\n        uint256 dtWin = block.timestamp - prev.timestamp;\n        if (dtWin < minTwapWindow) {\n            revert ZeroValue();\n        }\n\n        // Get spot price for counterfactual cumulative\n        uint256 spot = getPrice();\n\n        // Counterfactual cumulative at now using last observation + current spot over elapsed time\n        uint256 priceCumulativeNow = last.priceCumulative + spot * age;\n\n        // Rolling TWAP over [prev.timestamp, now]\n        uint256 twap = (priceCumulativeNow - prev.priceCumulative) / dtWin;\n\n        // Check for zero value\n        if (twap == 0) {\n            revert ZeroValue();\n        }\n\n        return twap;\n    }\n\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.30+commit.73712a01"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_balancerVault",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "_balancerPoolId",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "_olas",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_minTwapWindowSeconds",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_minUpdateIntervalSeconds",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxStalenessSeconds",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "max",
+              "type": "uint256"
+            }
+          ],
+          "name": "Overflow",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "tokens",
+              "type": "address[]"
+            }
+          ],
+          "name": "WrongPool",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroValue",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "priceCumulative",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "timestamp",
+              "type": "uint256"
+            }
+          ],
+          "name": "ObservationUpdated",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "balancerPoolId",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "balancerVault",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "direction",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getPrice",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getTWAP",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "lastObservation",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "priceCumulative",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "timestamp",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxStaleness",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "minTwapWindow",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "minUpdateInterval",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "prevObservation",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "priceCumulative",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "timestamp",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "updatePrice",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>Andrey Lebedev - <andrey.lebedev@valory.xyz>Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>",
+        "details": "This contract acts as an oracle for a specific Balancer V2 pool. It allows:      1) Getting the spot price (balance ratio) in 1e18 format      2) Getting the TWAP price in 1e18 format      Fixes vs the original version:      - TWAP is computed from two independent observations (delta_cumulative / delta_t).      - No state mutation on rejected updates (commit-on-success).      - Avoids permanent freeze after large market moves by allowing baseline to adapt via rolling-window TWAP.      - updatePrice() is rate-limited to prevent griefing resets of the observation.      - Adds freshness constraints for TWAP retrieval.",
+        "errors": {
+          "Overflow(uint256,uint256)": [
+            {
+              "details": "Value overflow.",
+              "params": {
+                "max": "Maximum possible value.",
+                "provided": "Overflow value."
+              }
+            }
+          ],
+          "WrongPool(address[])": [
+            {
+              "details": "Provided wrong pool.",
+              "params": {
+                "tokens": "Token addresses."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroValue()": [
+            {
+              "details": "Provided zero value."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "constructor": {
+            "details": "BalancerPriceOracle constructor.",
+            "params": {
+              "_balancerPoolId": "Balancer pool Id.",
+              "_balancerVault": "Balancer vault address.",
+              "_maxStalenessSeconds": "Max staleness in seconds.",
+              "_minTwapWindowSeconds": "Min TWAP window in seconds.",
+              "_minUpdateIntervalSeconds": "Min price update interval in seconds.",
+              "_olas": "OLAS address."
+            }
+          },
+          "getPrice()": {
+            "details": "Gets the current OLAS token price in 1e18 format.",
+            "returns": {
+              "_0": "Current spot price in 1e18 format."
+            }
+          },
+          "getTWAP()": {
+            "details": "Gets the current TWAP price in 1e18 format.      Reverts if the oracle is not initialized, observations are stale, or the TWAP window is insufficient.",
+            "returns": {
+              "_0": "TWAP price in 1e18 format (OLAS per secondToken)."
+            }
+          },
+          "updatePrice()": {
+            "details": "Records a new rolling TWAP observation from the Balancer V2 pool.",
+            "returns": {
+              "_0": "True if price update is successful."
+            }
+          }
+        },
+        "title": "BalancerPriceOracle - a smart contract oracle for Balancer V2 pools (BPS version)",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "updatePrice()": {
+            "notice": "Permissionless but rate-limited to prevent griefing resets."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/oracles/BalancerPriceOracle.sol": "BalancerPriceOracle"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@gnosis.pm/=node_modules/@gnosis.pm/",
+        ":@handlers/=lib/fx-portal/test/handlers/",
+        ":@mock/=lib/fx-portal/test/mock/",
+        ":@openzeppelin/=lib/fx-portal/lib/openzeppelin-contracts/",
+        ":@prb/=node_modules/@prb/",
+        ":@uniswap/=node_modules/@uniswap/",
+        ":@utils/=lib/fx-portal/test/utils/",
+        ":canonical-weth/=node_modules/canonical-weth/",
+        ":ds-test/=lib/solmate/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":fx-portal/=lib/fx-portal/contracts/",
+        ":openzeppelin-contracts/=lib/fx-portal/lib/openzeppelin-contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":weird-erc20/=lib/zuniswapv2/lib/solmate/lib/weird-erc20/src/",
+        ":wormhole-solidity-sdk/=node_modules/wormhole-solidity-sdk/",
+        ":zuniswapv2/=lib/zuniswapv2/src/"
+      ],
+      "viaIR": true
+    },
+    "sources": {
+      "contracts/oracles/BalancerPriceOracle.sol": {
+        "keccak256": "0xcf0203dd78198258aa354e6e0c3982036a9b3f2cc46c9d87d207d919899ed88d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b2f9e636ba6e1a5e8ed145b7d89d03fa74c20da8902b8eac93c971b2d09343a7",
+          "dweb:/ipfs/QmRhKbL1GzXhXuuJ64v1EmV3FjdZjcksPBN8qbp8QeYTLA"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.30+commit.73712a01",
+    "compilerSettings": {
+      "viaIR": true,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "canonical-weth/=node_modules/canonical-weth/",
+        "@gnosis.pm/=node_modules/@gnosis.pm/",
+        "@prb/=node_modules/@prb/",
+        "@uniswap/=node_modules/@uniswap/",
+        "wormhole-solidity-sdk/=node_modules/wormhole-solidity-sdk/",
+        "@handlers/=lib/fx-portal/test/handlers/",
+        "@mock/=lib/fx-portal/test/mock/",
+        "@openzeppelin/=lib/fx-portal/lib/openzeppelin-contracts/",
+        "@utils/=lib/fx-portal/test/utils/",
+        "ds-test/=lib/solmate/lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "fx-portal/=lib/fx-portal/contracts/",
+        "openzeppelin-contracts/=lib/fx-portal/lib/openzeppelin-contracts/",
+        "solmate/=lib/solmate/src/",
+        "weird-erc20/=lib/zuniswapv2/lib/solmate/lib/weird-erc20/src/",
+        "zuniswapv2/=lib/zuniswapv2/src/"
+      ]
+    },
+    "name": "BalancerPriceOracle",
+    "fullyQualifiedName": "contracts/oracles/BalancerPriceOracle.sol:BalancerPriceOracle"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "29252631",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-05-18T11:30:54Z",
+  "match": "exact_match",
+  "chainId": "137",
+  "address": "0x43117542A48588be59018A16443Ae75942ffDe91"
+}

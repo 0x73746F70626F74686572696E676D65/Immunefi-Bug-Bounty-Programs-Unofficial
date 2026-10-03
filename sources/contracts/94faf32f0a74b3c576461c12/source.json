@@ -1,0 +1,413 @@
+{
+  "sources": {
+    "contracts/bridges/HomeMediator.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.19;\n\n/// @dev Interface to the AMB Contract Proxy.\ninterface IAMB {\n    function messageSender() external view returns (address);\n}\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Only self contract is allowed to call the function.\n/// @param sender Sender address.\n/// @param instance Required contract instance address.\nerror SelfCallOnly(address sender, address instance);\n\n/// @dev Only `AMBContractProxyHome` is allowed to call the function.\n/// @param sender Sender address.\n/// @param AMBContractProxyHome Required AMB Contract Proxy (Home) address.\nerror AMBContractProxyHomeOnly(address sender, address AMBContractProxyHome);\n\n/// @dev Only on behalf of `foreignGovernor` the function is allowed to process the data.\n/// @param sender Sender address.\n/// @param foreignGovernor Required Foreign Governor address.\nerror ForeignGovernorOnly(address sender, address foreignGovernor);\n\n/// @dev Provided incorrect data length.\n/// @param expected Expected minimum data length.\n/// @param provided Provided data length.\nerror IncorrectDataLength(uint256 expected, uint256 provided);\n\n/// @dev Provided value is bigger than the actual balance.\n/// @param value Provided value.\n/// @param balance Actual balance.\nerror InsufficientBalance(uint256 value, uint256 balance);\n\n/// @dev Target execution failed.\n/// @param target Target address.\n/// @param value Provided value.\n/// @param payload Provided payload.\nerror TargetExecFailed(address target, uint256 value, bytes payload);\n\n/// @title HomeMediator - Smart contract for the governor home (gnosis chain) bridge implementation\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author AL\ncontract HomeMediator {\n    event FundsReceived(address indexed sender, uint256 value);\n    event ForeignGovernorUpdated(address indexed foreignMessageSender);\n    event MessageReceived(address indexed foreignMessageSender, bytes data);\n\n    // Default payload data length includes the number of bytes of at least one address (20 bytes or 160 bits),\n    // value (12 bytes or 96 bits) and the payload size (4 bytes or 32 bits)\n    uint256 public constant DEFAULT_DATA_LENGTH = 36;\n    // AMB Contract Proxy (Home) address on L2 that receives the message across the bridge from the foreign L1 network\n    address public immutable AMBContractProxyHome;\n    // Foreign governor address on L1 that is authorized to propagate the transaction execution across the bridge\n    address public foreignGovernor;\n\n    /// @dev HomeMediator constructor.\n    /// @param _AMBContractProxyHome AMB Contract Proxy (Home) address (Gnosis).\n    /// @param _foreignGovernor Foreign Governor address (ETH).\n    constructor(address _AMBContractProxyHome, address _foreignGovernor) {\n        // Check fo zero addresses\n        if (_AMBContractProxyHome == address(0) || _foreignGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        AMBContractProxyHome = _AMBContractProxyHome;\n        foreignGovernor = _foreignGovernor;\n    }\n\n    /// @dev Receives native network token.\n    receive() external payable {\n        emit FundsReceived(msg.sender, msg.value);\n    }\n\n    /// @dev Changes the Foreign Governor address (original Timelock).\n    /// @notice The only way to change the Foreign Governor address is by the Timelock on L1 to request that change.\n    ///         This triggers a self-contract transaction of HomeMediator that changes the Foreign Governor address.\n    /// @param newForeignGovernor New Foreign Governor address.\n    function changeForeignGovernor(address newForeignGovernor) external {\n        // Check if the change is authorized by the previous governor itself\n        // This is possible only if all the checks in the message process function pass and the contract calls itself\n        if (msg.sender != address(this)) {\n            revert SelfCallOnly(msg.sender, address(this));\n        }\n\n        // Check for the zero address\n        if (newForeignGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        foreignGovernor = newForeignGovernor;\n        emit ForeignGovernorUpdated(newForeignGovernor);\n    }\n\n    /// @dev Processes a message received from the AMB Contract Proxy (Home) contract.\n    /// @notice The sender must be the Foreign Governor address (Timelock).\n    /// @param data Bytes message sent from the AMB Contract Proxy (Home) contract. The data must be encoded as a set of\n    ///        continuous transactions packed into a single buffer, where each transaction is composed as follows:\n    ///        - target address of 20 bytes (160 bits);\n    ///        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;\n    ///        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;\n    ///        - payload as bytes, with the length equal to the specified payload length.\n    function processMessageFromForeign(bytes memory data) external {\n        // Check for the AMB Contract Proxy (Home) address\n        if (msg.sender != AMBContractProxyHome) {\n            revert AMBContractProxyHomeOnly(msg.sender, AMBContractProxyHome);\n        }\n\n        // Check for the Foreign Governor address\n        address governor = foreignGovernor;\n        address bridgeGovernor = IAMB(AMBContractProxyHome).messageSender();\n        if (bridgeGovernor != governor) {\n            revert ForeignGovernorOnly(bridgeGovernor, governor);\n        }\n\n        // Check for the correct data length\n        uint256 dataLength = data.length;\n        if (dataLength < DEFAULT_DATA_LENGTH) {\n            revert IncorrectDataLength(DEFAULT_DATA_LENGTH, data.length);\n        }\n\n        // Unpack and process the data\n        for (uint256 i = 0; i < dataLength;) {\n            address target;\n            uint96 value;\n            uint32 payloadLength;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                // First 20 bytes is the address (160 bits)\n                i := add(i, 20)\n                target := mload(add(data, i))\n                // Offset the data by 12 bytes of value (96 bits)\n                i := add(i, 12)\n                value := mload(add(data, i))\n                // Offset the data by 4 bytes of payload length (32 bits)\n                i := add(i, 4)\n                payloadLength := mload(add(data, i))\n            }\n\n            // Check for the zero address\n            if (target == address(0)) {\n                revert ZeroAddress();\n            }\n            // Check for the value compared to the contract's balance\n            if (value > address(this).balance) {\n                revert InsufficientBalance(value, address(this).balance);\n            }\n\n            // Get the payload\n            bytes memory payload = new bytes(payloadLength);\n            for (uint256 j = 0; j < payloadLength; ++j) {\n                payload[j] = data[i + j];\n            }\n            // Offset the data by the payload number of bytes\n            i += payloadLength;\n\n            // Call the target with the provided payload\n            (bool success, ) = target.call{value: value}(payload);\n            if (!success) {\n                revert TargetExecFailed(target, value, payload);\n            }\n        }\n\n        // Emit received message\n        emit MessageReceived(governor, data);\n    }\n}"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.19+commit.7dd6d404"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_AMBContractProxyHome",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_foreignGovernor",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "AMBContractProxyHome",
+              "type": "address"
+            }
+          ],
+          "name": "AMBContractProxyHomeOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "foreignGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "ForeignGovernorOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncorrectDataLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "balance",
+              "type": "uint256"
+            }
+          ],
+          "name": "InsufficientBalance",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "instance",
+              "type": "address"
+            }
+          ],
+          "name": "SelfCallOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "payload",
+              "type": "bytes"
+            }
+          ],
+          "name": "TargetExecFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "foreignMessageSender",
+              "type": "address"
+            }
+          ],
+          "name": "ForeignGovernorUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            }
+          ],
+          "name": "FundsReceived",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "foreignMessageSender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "MessageReceived",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "AMBContractProxyHome",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DEFAULT_DATA_LENGTH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newForeignGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "changeForeignGovernor",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "foreignGovernor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "processMessageFromForeign",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>AL",
+        "errors": {
+          "AMBContractProxyHomeOnly(address,address)": [
+            {
+              "details": "Only `AMBContractProxyHome` is allowed to call the function.",
+              "params": {
+                "AMBContractProxyHome": "Required AMB Contract Proxy (Home) address.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "ForeignGovernorOnly(address,address)": [
+            {
+              "details": "Only on behalf of `foreignGovernor` the function is allowed to process the data.",
+              "params": {
+                "foreignGovernor": "Required Foreign Governor address.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "IncorrectDataLength(uint256,uint256)": [
+            {
+              "details": "Provided incorrect data length.",
+              "params": {
+                "expected": "Expected minimum data length.",
+                "provided": "Provided data length."
+              }
+            }
+          ],
+          "InsufficientBalance(uint256,uint256)": [
+            {
+              "details": "Provided value is bigger than the actual balance.",
+              "params": {
+                "balance": "Actual balance.",
+                "value": "Provided value."
+              }
+            }
+          ],
+          "SelfCallOnly(address,address)": [
+            {
+              "details": "Only self contract is allowed to call the function.",
+              "params": {
+                "instance": "Required contract instance address.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "TargetExecFailed(address,uint256,bytes)": [
+            {
+              "details": "Target execution failed.",
+              "params": {
+                "payload": "Provided payload.",
+                "target": "Target address.",
+                "value": "Provided value."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "changeForeignGovernor(address)": {
+            "details": "Changes the Foreign Governor address (original Timelock).",
+            "params": {
+              "newForeignGovernor": "New Foreign Governor address."
+            }
+          },
+          "constructor": {
+            "details": "HomeMediator constructor.",
+            "params": {
+              "_AMBContractProxyHome": "AMB Contract Proxy (Home) address (Gnosis).",
+              "_foreignGovernor": "Foreign Governor address (ETH)."
+            }
+          },
+          "processMessageFromForeign(bytes)": {
+            "details": "Processes a message received from the AMB Contract Proxy (Home) contract.",
+            "params": {
+              "data": "Bytes message sent from the AMB Contract Proxy (Home) contract. The data must be encoded as a set of        continuous transactions packed into a single buffer, where each transaction is composed as follows:        - target address of 20 bytes (160 bits);        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;        - payload as bytes, with the length equal to the specified payload length."
+            }
+          }
+        },
+        "title": "HomeMediator - Smart contract for the governor home (gnosis chain) bridge implementation",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "changeForeignGovernor(address)": {
+            "notice": "The only way to change the Foreign Governor address is by the Timelock on L1 to request that change.         This triggers a self-contract transaction of HomeMediator that changes the Foreign Governor address."
+          },
+          "processMessageFromForeign(bytes)": {
+            "notice": "The sender must be the Foreign Governor address (Timelock)."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/bridges/HomeMediator.sol": "HomeMediator"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 750
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/bridges/HomeMediator.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.19;\n\n/// @dev Interface to the AMB Contract Proxy.\ninterface IAMB {\n    function messageSender() external view returns (address);\n}\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Only self contract is allowed to call the function.\n/// @param sender Sender address.\n/// @param instance Required contract instance address.\nerror SelfCallOnly(address sender, address instance);\n\n/// @dev Only `AMBContractProxyHome` is allowed to call the function.\n/// @param sender Sender address.\n/// @param AMBContractProxyHome Required AMB Contract Proxy (Home) address.\nerror AMBContractProxyHomeOnly(address sender, address AMBContractProxyHome);\n\n/// @dev Only on behalf of `foreignGovernor` the function is allowed to process the data.\n/// @param sender Sender address.\n/// @param foreignGovernor Required Foreign Governor address.\nerror ForeignGovernorOnly(address sender, address foreignGovernor);\n\n/// @dev Provided incorrect data length.\n/// @param expected Expected minimum data length.\n/// @param provided Provided data length.\nerror IncorrectDataLength(uint256 expected, uint256 provided);\n\n/// @dev Provided value is bigger than the actual balance.\n/// @param value Provided value.\n/// @param balance Actual balance.\nerror InsufficientBalance(uint256 value, uint256 balance);\n\n/// @dev Target execution failed.\n/// @param target Target address.\n/// @param value Provided value.\n/// @param payload Provided payload.\nerror TargetExecFailed(address target, uint256 value, bytes payload);\n\n/// @title HomeMediator - Smart contract for the governor home (gnosis chain) bridge implementation\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author AL\ncontract HomeMediator {\n    event FundsReceived(address indexed sender, uint256 value);\n    event ForeignGovernorUpdated(address indexed foreignMessageSender);\n    event MessageReceived(address indexed foreignMessageSender, bytes data);\n\n    // Default payload data length includes the number of bytes of at least one address (20 bytes or 160 bits),\n    // value (12 bytes or 96 bits) and the payload size (4 bytes or 32 bits)\n    uint256 public constant DEFAULT_DATA_LENGTH = 36;\n    // AMB Contract Proxy (Home) address on L2 that receives the message across the bridge from the foreign L1 network\n    address public immutable AMBContractProxyHome;\n    // Foreign governor address on L1 that is authorized to propagate the transaction execution across the bridge\n    address public foreignGovernor;\n\n    /// @dev HomeMediator constructor.\n    /// @param _AMBContractProxyHome AMB Contract Proxy (Home) address (Gnosis).\n    /// @param _foreignGovernor Foreign Governor address (ETH).\n    constructor(address _AMBContractProxyHome, address _foreignGovernor) {\n        // Check fo zero addresses\n        if (_AMBContractProxyHome == address(0) || _foreignGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        AMBContractProxyHome = _AMBContractProxyHome;\n        foreignGovernor = _foreignGovernor;\n    }\n\n    /// @dev Receives native network token.\n    receive() external payable {\n        emit FundsReceived(msg.sender, msg.value);\n    }\n\n    /// @dev Changes the Foreign Governor address (original Timelock).\n    /// @notice The only way to change the Foreign Governor address is by the Timelock on L1 to request that change.\n    ///         This triggers a self-contract transaction of HomeMediator that changes the Foreign Governor address.\n    /// @param newForeignGovernor New Foreign Governor address.\n    function changeForeignGovernor(address newForeignGovernor) external {\n        // Check if the change is authorized by the previous governor itself\n        // This is possible only if all the checks in the message process function pass and the contract calls itself\n        if (msg.sender != address(this)) {\n            revert SelfCallOnly(msg.sender, address(this));\n        }\n\n        // Check for the zero address\n        if (newForeignGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        foreignGovernor = newForeignGovernor;\n        emit ForeignGovernorUpdated(newForeignGovernor);\n    }\n\n    /// @dev Processes a message received from the AMB Contract Proxy (Home) contract.\n    /// @notice The sender must be the Foreign Governor address (Timelock).\n    /// @param data Bytes message sent from the AMB Contract Proxy (Home) contract. The data must be encoded as a set of\n    ///        continuous transactions packed into a single buffer, where each transaction is composed as follows:\n    ///        - target address of 20 bytes (160 bits);\n    ///        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;\n    ///        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;\n    ///        - payload as bytes, with the length equal to the specified payload length.\n    function processMessageFromForeign(bytes memory data) external {\n        // Check for the AMB Contract Proxy (Home) address\n        if (msg.sender != AMBContractProxyHome) {\n            revert AMBContractProxyHomeOnly(msg.sender, AMBContractProxyHome);\n        }\n\n        // Check for the Foreign Governor address\n        address governor = foreignGovernor;\n        address bridgeGovernor = IAMB(AMBContractProxyHome).messageSender();\n        if (bridgeGovernor != governor) {\n            revert ForeignGovernorOnly(bridgeGovernor, governor);\n        }\n\n        // Check for the correct data length\n        uint256 dataLength = data.length;\n        if (dataLength < DEFAULT_DATA_LENGTH) {\n            revert IncorrectDataLength(DEFAULT_DATA_LENGTH, data.length);\n        }\n\n        // Unpack and process the data\n        for (uint256 i = 0; i < dataLength;) {\n            address target;\n            uint96 value;\n            uint32 payloadLength;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                // First 20 bytes is the address (160 bits)\n                i := add(i, 20)\n                target := mload(add(data, i))\n                // Offset the data by 12 bytes of value (96 bits)\n                i := add(i, 12)\n                value := mload(add(data, i))\n                // Offset the data by 4 bytes of payload length (32 bits)\n                i := add(i, 4)\n                payloadLength := mload(add(data, i))\n            }\n\n            // Check for the zero address\n            if (target == address(0)) {\n                revert ZeroAddress();\n            }\n            // Check for the value compared to the contract's balance\n            if (value > address(this).balance) {\n                revert InsufficientBalance(value, address(this).balance);\n            }\n\n            // Get the payload\n            bytes memory payload = new bytes(payloadLength);\n            for (uint256 j = 0; j < payloadLength; ++j) {\n                payload[j] = data[i + j];\n            }\n            // Offset the data by the payload number of bytes\n            i += payloadLength;\n\n            // Call the target with the provided payload\n            (bool success, ) = target.call{value: value}(payload);\n            if (!success) {\n                revert TargetExecFailed(target, value, payload);\n            }\n        }\n\n        // Emit received message\n        emit MessageReceived(governor, data);\n    }\n}",
+        "keccak256": "0x99b80d53f22faf2ea1ad5b6a36342b7693b47820dd8798b02134885bacba3d65",
+        "license": "MIT"
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.19+commit.7dd6d404",
+    "compilerSettings": {
+      "metadata": {
+        "useLiteralContent": true
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 750,
+        "enabled": true
+      }
+    },
+    "name": "HomeMediator",
+    "fullyQualifiedName": "contracts/bridges/HomeMediator.sol:HomeMediator"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "7610663",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2025-07-16T10:39:41Z",
+  "match": "exact_match",
+  "chainId": "100",
+  "address": "0x15bd56669F57192a97dF41A2aa8f4403e9491776"
+}

@@ -1,0 +1,431 @@
+{
+  "sources": {
+    "contracts/bridges/FxGovernorTunnel.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.19;\n\n/// @dev Interface to process message across the bridge.\ninterface IFxMessageProcessor {\n    function processMessageFromRoot(uint256 stateId, address rootMessageSender, bytes memory data) external;\n}\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Only self contract is allowed to call the function.\n/// @param sender Sender address.\n/// @param instance Required contract instance address.\nerror SelfCallOnly(address sender, address instance);\n\n/// @dev Only `fxChild` is allowed to call the function.\n/// @param sender Sender address.\n/// @param fxChild Required Fx Child address.\nerror FxChildOnly(address sender, address fxChild);\n\n/// @dev Only on behalf of `rootGovernor` the function is allowed to process the data.\n/// @param sender Sender address.\n/// @param rootGovernor Required Root Governor address.\nerror RootGovernorOnly(address sender, address rootGovernor);\n\n/// @dev Provided incorrect data length.\n/// @param expected Expected minimum data length.\n/// @param provided Provided data length.\nerror IncorrectDataLength(uint256 expected, uint256 provided);\n\n/// @dev Provided value is bigger than the actual balance.\n/// @param value Provided value.\n/// @param balance Actual balance.\nerror InsufficientBalance(uint256 value, uint256 balance);\n\n/// @dev Target execution failed.\n/// @param target Target address.\n/// @param value Provided value.\n/// @param payload Provided payload.\nerror TargetExecFailed(address target, uint256 value, bytes payload);\n\n/// @title FxGovernorTunnel - Smart contract for the governor child tunnel bridge implementation\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author AL\ncontract FxGovernorTunnel is IFxMessageProcessor {\n    event FundsReceived(address indexed sender, uint256 value);\n    event RootGovernorUpdated(address indexed rootMessageSender);\n    event MessageReceived(uint256 indexed stateId, address indexed rootMessageSender, bytes data);\n\n    // Default payload data length includes the number of bytes of at least one address (20 bytes or 160 bits),\n    // value (12 bytes or 96 bits) and the payload size (4 bytes or 32 bits)\n    uint256 public constant DEFAULT_DATA_LENGTH = 36;\n    // FX child address on L2 that receives the message across the bridge from the root L1 network\n    address public immutable fxChild;\n    // Root governor address on L1 that is authorized to propagate the transaction execution across the bridge\n    address public rootGovernor;\n\n    /// @dev FxGovernorTunnel constructor.\n    /// @param _fxChild Fx Child address.\n    /// @param _rootGovernor Root Governor address.\n    constructor(address _fxChild, address _rootGovernor) {\n        // Check fo zero addresses\n        if (_fxChild == address(0) || _rootGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        fxChild = _fxChild;\n        rootGovernor = _rootGovernor;\n    }\n\n    /// @dev Receives native network token.\n    receive() external payable {\n        emit FundsReceived(msg.sender, msg.value);\n    }\n\n    /// @dev Changes the Root Governor address (Timelock).\n    /// @notice The only way to change the Root Governor address is by the Timelock on L1 to request that change.\n    ///         This triggers a self-contract transaction of FxGovernorTunnel that changes the Root Governor address.\n    /// @param newRootGovernor New Root Governor address.\n    function changeRootGovernor(address newRootGovernor) external {\n        // Check if the change is authorized by the previous governor itself\n        // This is possible only if all the checks in the message process function pass and the contract calls itself\n        if (msg.sender != address(this)) {\n            revert SelfCallOnly(msg.sender, address(this));\n        }\n\n        // Check for the zero address\n        if (newRootGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        rootGovernor = newRootGovernor;\n        emit RootGovernorUpdated(newRootGovernor);\n    }\n\n    /// @dev Process message received from the Root Tunnel.\n    /// @notice This is called by onStateReceive function. The sender must be the Root Governor address (Timelock).\n    /// @param stateId Unique state id.\n    /// @param rootMessageSender Root message sender.\n    /// @param data Bytes message sent from the Root Tunnel. The data must be encoded as a set of continuous\n    ///        transactions packed into a single buffer, where each transaction is composed as follows:\n    ///        - target address of 20 bytes (160 bits);\n    ///        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;\n    ///        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;\n    ///        - payload as bytes, with the length equal to the specified payload length.\n    function processMessageFromRoot(uint256 stateId, address rootMessageSender, bytes memory data) external override {\n        // Check for the Fx Child address\n        if(msg.sender != fxChild) {\n            revert FxChildOnly(msg.sender, fxChild);\n        }\n\n        // Check for the Root Governor address\n        if(rootMessageSender != rootGovernor) {\n            revert RootGovernorOnly(rootMessageSender, rootGovernor);\n        }\n\n        // Check for the correct data length\n        uint256 dataLength = data.length;\n        if (dataLength < DEFAULT_DATA_LENGTH) {\n            revert IncorrectDataLength(DEFAULT_DATA_LENGTH, data.length);\n        }\n\n        // Unpack and process the data\n        for (uint256 i = 0; i < dataLength;) {\n            address target;\n            uint96 value;\n            uint32 payloadLength;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                // First 20 bytes is the address (160 bits)\n                i := add(i, 20)\n                target := mload(add(data, i))\n                // Offset the data by 12 bytes of value (96 bits)\n                i := add(i, 12)\n                value := mload(add(data, i))\n                // Offset the data by 4 bytes of payload length (32 bits)\n                i := add(i, 4)\n                payloadLength := mload(add(data, i))\n            }\n\n            // Check for the zero address\n            if (target == address(0)) {\n                revert ZeroAddress();\n            }\n            // Check for the value compared to the contract's balance\n            if (value > address(this).balance) {\n                revert InsufficientBalance(value, address(this).balance);\n            }\n\n            // Get the payload\n            bytes memory payload = new bytes(payloadLength);\n            for (uint256 j = 0; j < payloadLength; ++j) {\n                payload[j] = data[i + j];\n            }\n            // Offset the data by the payload number of bytes\n            i += payloadLength;\n\n            // Call the target with the provided payload\n            (bool success, ) = target.call{value: value}(payload);\n            if (!success) {\n                revert TargetExecFailed(target, value, payload);\n            }\n        }\n\n        // Emit received message\n        emit MessageReceived(stateId, rootMessageSender, data);\n    }\n}"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.19+commit.7dd6d404"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_fxChild",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_rootGovernor",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "fxChild",
+              "type": "address"
+            }
+          ],
+          "name": "FxChildOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncorrectDataLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "balance",
+              "type": "uint256"
+            }
+          ],
+          "name": "InsufficientBalance",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "rootGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "RootGovernorOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "instance",
+              "type": "address"
+            }
+          ],
+          "name": "SelfCallOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "payload",
+              "type": "bytes"
+            }
+          ],
+          "name": "TargetExecFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            }
+          ],
+          "name": "FundsReceived",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "stateId",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rootMessageSender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "MessageReceived",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rootMessageSender",
+              "type": "address"
+            }
+          ],
+          "name": "RootGovernorUpdated",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "DEFAULT_DATA_LENGTH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newRootGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "changeRootGovernor",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "fxChild",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "stateId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "rootMessageSender",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "processMessageFromRoot",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "rootGovernor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>AL",
+        "errors": {
+          "FxChildOnly(address,address)": [
+            {
+              "details": "Only `fxChild` is allowed to call the function.",
+              "params": {
+                "fxChild": "Required Fx Child address.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "IncorrectDataLength(uint256,uint256)": [
+            {
+              "details": "Provided incorrect data length.",
+              "params": {
+                "expected": "Expected minimum data length.",
+                "provided": "Provided data length."
+              }
+            }
+          ],
+          "InsufficientBalance(uint256,uint256)": [
+            {
+              "details": "Provided value is bigger than the actual balance.",
+              "params": {
+                "balance": "Actual balance.",
+                "value": "Provided value."
+              }
+            }
+          ],
+          "RootGovernorOnly(address,address)": [
+            {
+              "details": "Only on behalf of `rootGovernor` the function is allowed to process the data.",
+              "params": {
+                "rootGovernor": "Required Root Governor address.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "SelfCallOnly(address,address)": [
+            {
+              "details": "Only self contract is allowed to call the function.",
+              "params": {
+                "instance": "Required contract instance address.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "TargetExecFailed(address,uint256,bytes)": [
+            {
+              "details": "Target execution failed.",
+              "params": {
+                "payload": "Provided payload.",
+                "target": "Target address.",
+                "value": "Provided value."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "changeRootGovernor(address)": {
+            "details": "Changes the Root Governor address (Timelock).",
+            "params": {
+              "newRootGovernor": "New Root Governor address."
+            }
+          },
+          "constructor": {
+            "details": "FxGovernorTunnel constructor.",
+            "params": {
+              "_fxChild": "Fx Child address.",
+              "_rootGovernor": "Root Governor address."
+            }
+          },
+          "processMessageFromRoot(uint256,address,bytes)": {
+            "details": "Process message received from the Root Tunnel.",
+            "params": {
+              "data": "Bytes message sent from the Root Tunnel. The data must be encoded as a set of continuous        transactions packed into a single buffer, where each transaction is composed as follows:        - target address of 20 bytes (160 bits);        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;        - payload as bytes, with the length equal to the specified payload length.",
+              "rootMessageSender": "Root message sender.",
+              "stateId": "Unique state id."
+            }
+          }
+        },
+        "title": "FxGovernorTunnel - Smart contract for the governor child tunnel bridge implementation",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "changeRootGovernor(address)": {
+            "notice": "The only way to change the Root Governor address is by the Timelock on L1 to request that change.         This triggers a self-contract transaction of FxGovernorTunnel that changes the Root Governor address."
+          },
+          "processMessageFromRoot(uint256,address,bytes)": {
+            "notice": "This is called by onStateReceive function. The sender must be the Root Governor address (Timelock)."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/bridges/FxGovernorTunnel.sol": "FxGovernorTunnel"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 1000000
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/bridges/FxGovernorTunnel.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.19;\n\n/// @dev Interface to process message across the bridge.\ninterface IFxMessageProcessor {\n    function processMessageFromRoot(uint256 stateId, address rootMessageSender, bytes memory data) external;\n}\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Only self contract is allowed to call the function.\n/// @param sender Sender address.\n/// @param instance Required contract instance address.\nerror SelfCallOnly(address sender, address instance);\n\n/// @dev Only `fxChild` is allowed to call the function.\n/// @param sender Sender address.\n/// @param fxChild Required Fx Child address.\nerror FxChildOnly(address sender, address fxChild);\n\n/// @dev Only on behalf of `rootGovernor` the function is allowed to process the data.\n/// @param sender Sender address.\n/// @param rootGovernor Required Root Governor address.\nerror RootGovernorOnly(address sender, address rootGovernor);\n\n/// @dev Provided incorrect data length.\n/// @param expected Expected minimum data length.\n/// @param provided Provided data length.\nerror IncorrectDataLength(uint256 expected, uint256 provided);\n\n/// @dev Provided value is bigger than the actual balance.\n/// @param value Provided value.\n/// @param balance Actual balance.\nerror InsufficientBalance(uint256 value, uint256 balance);\n\n/// @dev Target execution failed.\n/// @param target Target address.\n/// @param value Provided value.\n/// @param payload Provided payload.\nerror TargetExecFailed(address target, uint256 value, bytes payload);\n\n/// @title FxGovernorTunnel - Smart contract for the governor child tunnel bridge implementation\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author AL\ncontract FxGovernorTunnel is IFxMessageProcessor {\n    event FundsReceived(address indexed sender, uint256 value);\n    event RootGovernorUpdated(address indexed rootMessageSender);\n    event MessageReceived(uint256 indexed stateId, address indexed rootMessageSender, bytes data);\n\n    // Default payload data length includes the number of bytes of at least one address (20 bytes or 160 bits),\n    // value (12 bytes or 96 bits) and the payload size (4 bytes or 32 bits)\n    uint256 public constant DEFAULT_DATA_LENGTH = 36;\n    // FX child address on L2 that receives the message across the bridge from the root L1 network\n    address public immutable fxChild;\n    // Root governor address on L1 that is authorized to propagate the transaction execution across the bridge\n    address public rootGovernor;\n\n    /// @dev FxGovernorTunnel constructor.\n    /// @param _fxChild Fx Child address.\n    /// @param _rootGovernor Root Governor address.\n    constructor(address _fxChild, address _rootGovernor) {\n        // Check fo zero addresses\n        if (_fxChild == address(0) || _rootGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        fxChild = _fxChild;\n        rootGovernor = _rootGovernor;\n    }\n\n    /// @dev Receives native network token.\n    receive() external payable {\n        emit FundsReceived(msg.sender, msg.value);\n    }\n\n    /// @dev Changes the Root Governor address (Timelock).\n    /// @notice The only way to change the Root Governor address is by the Timelock on L1 to request that change.\n    ///         This triggers a self-contract transaction of FxGovernorTunnel that changes the Root Governor address.\n    /// @param newRootGovernor New Root Governor address.\n    function changeRootGovernor(address newRootGovernor) external {\n        // Check if the change is authorized by the previous governor itself\n        // This is possible only if all the checks in the message process function pass and the contract calls itself\n        if (msg.sender != address(this)) {\n            revert SelfCallOnly(msg.sender, address(this));\n        }\n\n        // Check for the zero address\n        if (newRootGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        rootGovernor = newRootGovernor;\n        emit RootGovernorUpdated(newRootGovernor);\n    }\n\n    /// @dev Process message received from the Root Tunnel.\n    /// @notice This is called by onStateReceive function. The sender must be the Root Governor address (Timelock).\n    /// @param stateId Unique state id.\n    /// @param rootMessageSender Root message sender.\n    /// @param data Bytes message sent from the Root Tunnel. The data must be encoded as a set of continuous\n    ///        transactions packed into a single buffer, where each transaction is composed as follows:\n    ///        - target address of 20 bytes (160 bits);\n    ///        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;\n    ///        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;\n    ///        - payload as bytes, with the length equal to the specified payload length.\n    function processMessageFromRoot(uint256 stateId, address rootMessageSender, bytes memory data) external override {\n        // Check for the Fx Child address\n        if(msg.sender != fxChild) {\n            revert FxChildOnly(msg.sender, fxChild);\n        }\n\n        // Check for the Root Governor address\n        if(rootMessageSender != rootGovernor) {\n            revert RootGovernorOnly(rootMessageSender, rootGovernor);\n        }\n\n        // Check for the correct data length\n        uint256 dataLength = data.length;\n        if (dataLength < DEFAULT_DATA_LENGTH) {\n            revert IncorrectDataLength(DEFAULT_DATA_LENGTH, data.length);\n        }\n\n        // Unpack and process the data\n        for (uint256 i = 0; i < dataLength;) {\n            address target;\n            uint96 value;\n            uint32 payloadLength;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                // First 20 bytes is the address (160 bits)\n                i := add(i, 20)\n                target := mload(add(data, i))\n                // Offset the data by 12 bytes of value (96 bits)\n                i := add(i, 12)\n                value := mload(add(data, i))\n                // Offset the data by 4 bytes of payload length (32 bits)\n                i := add(i, 4)\n                payloadLength := mload(add(data, i))\n            }\n\n            // Check for the zero address\n            if (target == address(0)) {\n                revert ZeroAddress();\n            }\n            // Check for the value compared to the contract's balance\n            if (value > address(this).balance) {\n                revert InsufficientBalance(value, address(this).balance);\n            }\n\n            // Get the payload\n            bytes memory payload = new bytes(payloadLength);\n            for (uint256 j = 0; j < payloadLength; ++j) {\n                payload[j] = data[i + j];\n            }\n            // Offset the data by the payload number of bytes\n            i += payloadLength;\n\n            // Call the target with the provided payload\n            (bool success, ) = target.call{value: value}(payload);\n            if (!success) {\n                revert TargetExecFailed(target, value, payload);\n            }\n        }\n\n        // Emit received message\n        emit MessageReceived(stateId, rootMessageSender, data);\n    }\n}",
+        "keccak256": "0x45954f9d4eeffc1cc8e4efb9e61ffb48047653ae8d8f5eb02a93a788f4f70509",
+        "license": "MIT"
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.19+commit.7dd6d404",
+    "compilerSettings": {
+      "metadata": {
+        "useLiteralContent": true
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 1000000,
+        "enabled": true
+      }
+    },
+    "name": "FxGovernorTunnel",
+    "fullyQualifiedName": "contracts/bridges/FxGovernorTunnel.sol:FxGovernorTunnel"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "7481872",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2025-07-15T04:27:44Z",
+  "match": "exact_match",
+  "chainId": "137",
+  "address": "0x9338b5153AE39BB89f50468E608eD9d764B755fD"
+}

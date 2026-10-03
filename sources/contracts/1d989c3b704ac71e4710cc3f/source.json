@@ -1,0 +1,312 @@
+{
+  "sources": {
+    "contracts/utils/Bridge2Burner.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\n// ERC20 token interface\ninterface IToken {\n    /// @dev Gets the amount of tokens owned by a specified account.\n    /// @param account Account address.\n    /// @return Amount of tokens owned.\n    function balanceOf(address account) external view returns (uint256);\n}\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Underflow of values.\n/// @param provided Provided value.\n/// @param min Min required value.\nerror Underflow(uint256 provided, uint256 min);\n\n/// @title Bridge2Burner - Smart contract for collecting OLAS and relaying them back to L1 OLAS Burner contract.\nabstract contract Bridge2Burner {\n    // Version number\n    string public constant VERSION = \"0.1.0\";\n    // L1 OLAS Burner address\n    address public constant OLAS_BURNER = 0x51eb65012ca5cEB07320c497F4151aC207FEa4E0;\n    // Min OLAS balance to transfer\n    uint256 public constant MIN_OLAS_BALANCE = 100 ether;\n\n    // L2 OLAS address\n    address public immutable olas;\n    // L2 Token relayer address that sends tokens to the L1 source network\n    address public immutable l2TokenRelayer;\n\n    // Reentrancy lock\n    uint256 internal _locked;\n\n    /// @dev Bridge2Burner constructor.\n    /// @param _olas OLAS token address on L2.\n    /// @param _l2TokenRelayer L2 token relayer bridging contract address.\n    constructor(address _olas, address _l2TokenRelayer) {\n        // Check for zero addresses\n        if (_olas == address(0) || _l2TokenRelayer == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Immutable parameters assignment\n        olas = _olas;\n        l2TokenRelayer = _l2TokenRelayer;\n\n        _locked = 1;\n    }\n\n    /// @dev Gets OLAS balance.\n    /// @param olasBalance OLAS balance.\n    function _getBalance() internal virtual returns (uint256 olasBalance) {\n        // Get OLAS balance\n        olasBalance = IToken(olas).balanceOf(address(this));\n\n        // Check for underflow value\n        if (olasBalance < MIN_OLAS_BALANCE) {\n            revert Underflow(olasBalance, MIN_OLAS_BALANCE);\n        }\n    }\n\n    /// @dev Relays OLAS to the L1 OLAS Burner contract (chain-specific implementation).\n    /// @notice On chains whose bridge primitive accepts an explicit recipient (Optimism / Arbitrum / Gnosis),\n    ///         OLAS is routed directly to OLAS_BURNER on L1. On Polygon — whose PoS child token only exposes\n    ///         `withdraw(uint256)` with no recipient parameter — OLAS is forwarded to the bridge mediator\n    ///         (an L2 contract under L1 governance control) instead, and final disposition is governance's call.\n    function relayToL1Burner() external virtual;\n}\n"
+    },
+    "contracts/utils/Bridge2BurnerPolygon.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\nimport {Bridge2Burner} from \"./Bridge2Burner.sol\";\n\n// ERC20 token interface\ninterface IToken {\n    /// @dev Transfers `amount` tokens from the caller's account to `to`.\n    /// @param to Recipient address.\n    /// @param amount Token amount.\n    /// @return True if the function execution is successful.\n    function transfer(address to, uint256 amount) external returns (bool);\n}\n\n/// @dev Reentrancy guard.\nerror ReentrancyGuard();\n\n/// @dev Token transfer failed.\n/// @param token Token address.\n/// @param to Recipient.\n/// @param amount Amount.\nerror TransferFailed(address token, address to, uint256 amount);\n\n/// @title Bridge2BurnerPolygon - Smart contract for collecting OLAS on Polygon and routing it to the L1-governance\n///        bridge mediator on L2.\n/// @dev Polygon's PoS ERC20 child token only exposes `withdraw(uint256)` — no recipient parameter — so an L2 bridge-burn\n///      would release the L1 tokens to the L1-mirror of `msg.sender`, i.e. this contract's address on L1, which has no\n///      deployed code and would render the OLAS unrecoverable. Compare with the Optimism / Arbitrum / Gnosis variants\n///      whose bridge primitives accept an explicit recipient (`withdrawTo` / `outboundTransfer` / `relayTokens`) and\n///      route directly to OLAS_BURNER on L1.\n///\n///      The chosen workaround on Polygon: forward OLAS to the bridge mediator on L2 — the contract that L1 governance\n///      reaches over fx-portal — and let governance decide the final disposition (keep, transfer, or trigger a\n///      PoS-bridge burn from the mediator, whose L1-mirror at the same address is recoverable). The bridge mediator\n///      address is supplied at deployment as the second constructor argument (the base class's `l2TokenRelayer`\n///      immutable storage is reused to hold it; on this chain there is no separate L2 token relayer to talk to).\n///      This reuse keeps the base constructor signature symmetric across chains while letting the deployment script\n///      record the chain-specific destination on a per-chain basis.\ncontract Bridge2BurnerPolygon is Bridge2Burner {\n    /// @dev Bridge2BurnerPolygon constructor.\n    /// @param _olas OLAS token address on L2.\n    /// @param _bridgeMediator Polygon L2 bridge mediator address — the contract L1 governance reaches over fx-portal.\n    ///                        Stored in the inherited `l2TokenRelayer` immutable; no separate field is introduced.\n    constructor(address _olas, address _bridgeMediator) Bridge2Burner(_olas, _bridgeMediator) {}\n\n    /// @dev Forwards OLAS to the Polygon bridge mediator (L2 governance custody).\n    function relayToL1Burner() external virtual override {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Get OLAS amount to bridge\n        uint256 olasAmount = _getBalance();\n\n        // Forward OLAS to the bridge mediator (held in the inherited `l2TokenRelayer` immutable on this chain)\n        bool success = IToken(olas).transfer(l2TokenRelayer, olasAmount);\n        if (!success) {\n            revert TransferFailed(olas, l2TokenRelayer, olasAmount);\n        }\n\n        _locked = 1;\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.30+commit.73712a01"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_olas",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_bridgeMediator",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "ReentrancyGuard",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TransferFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "min",
+              "type": "uint256"
+            }
+          ],
+          "name": "Underflow",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "MIN_OLAS_BALANCE",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "OLAS_BURNER",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "VERSION",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "l2TokenRelayer",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "olas",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "relayToL1Burner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "details": "Polygon's PoS ERC20 child token only exposes `withdraw(uint256)` — no recipient parameter — so an L2 bridge-burn      would release the L1 tokens to the L1-mirror of `msg.sender`, i.e. this contract's address on L1, which has no      deployed code and would render the OLAS unrecoverable. Compare with the Optimism / Arbitrum / Gnosis variants      whose bridge primitives accept an explicit recipient (`withdrawTo` / `outboundTransfer` / `relayTokens`) and      route directly to OLAS_BURNER on L1.      The chosen workaround on Polygon: forward OLAS to the bridge mediator on L2 — the contract that L1 governance      reaches over fx-portal — and let governance decide the final disposition (keep, transfer, or trigger a      PoS-bridge burn from the mediator, whose L1-mirror at the same address is recoverable). The bridge mediator      address is supplied at deployment as the second constructor argument (the base class's `l2TokenRelayer`      immutable storage is reused to hold it; on this chain there is no separate L2 token relayer to talk to).      This reuse keeps the base constructor signature symmetric across chains while letting the deployment script      record the chain-specific destination on a per-chain basis.",
+        "errors": {
+          "ReentrancyGuard()": [
+            {
+              "details": "Reentrancy guard."
+            }
+          ],
+          "TransferFailed(address,address,uint256)": [
+            {
+              "details": "Token transfer failed.",
+              "params": {
+                "amount": "Amount.",
+                "to": "Recipient.",
+                "token": "Token address."
+              }
+            }
+          ],
+          "Underflow(uint256,uint256)": [
+            {
+              "details": "Underflow of values.",
+              "params": {
+                "min": "Min required value.",
+                "provided": "Provided value."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "constructor": {
+            "details": "Bridge2BurnerPolygon constructor.",
+            "params": {
+              "_bridgeMediator": "Polygon L2 bridge mediator address — the contract L1 governance reaches over fx-portal.                        Stored in the inherited `l2TokenRelayer` immutable; no separate field is introduced.",
+              "_olas": "OLAS token address on L2."
+            }
+          },
+          "relayToL1Burner()": {
+            "details": "Forwards OLAS to the Polygon bridge mediator (L2 governance custody)."
+          }
+        },
+        "title": "Bridge2BurnerPolygon - Smart contract for collecting OLAS on Polygon and routing it to the L1-governance        bridge mediator on L2.",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {},
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/utils/Bridge2BurnerPolygon.sol": "Bridge2BurnerPolygon"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@gnosis.pm/=node_modules/@gnosis.pm/",
+        ":@handlers/=lib/fx-portal/test/handlers/",
+        ":@mock/=lib/fx-portal/test/mock/",
+        ":@openzeppelin/=lib/fx-portal/lib/openzeppelin-contracts/",
+        ":@prb/=node_modules/@prb/",
+        ":@uniswap/=node_modules/@uniswap/",
+        ":@utils/=lib/fx-portal/test/utils/",
+        ":canonical-weth/=node_modules/canonical-weth/",
+        ":ds-test/=lib/solmate/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":fx-portal/=lib/fx-portal/contracts/",
+        ":openzeppelin-contracts/=lib/fx-portal/lib/openzeppelin-contracts/",
+        ":solmate/=lib/solmate/src/",
+        ":weird-erc20/=lib/zuniswapv2/lib/solmate/lib/weird-erc20/src/",
+        ":wormhole-solidity-sdk/=node_modules/wormhole-solidity-sdk/",
+        ":zuniswapv2/=lib/zuniswapv2/src/"
+      ],
+      "viaIR": true
+    },
+    "sources": {
+      "contracts/utils/Bridge2Burner.sol": {
+        "keccak256": "0xd32d18e3772a313e51ff205771177b4e91f851af7abc3507f1382bb3673e3031",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6e649d2a681e4db9bce0024c8ae81ef2343a866a12c2349ccc7fd50772cae75a",
+          "dweb:/ipfs/QmbbaBfnJymixaKb4qSiPSCExu6coAUAKiMq2sGVuDqzYc"
+        ]
+      },
+      "contracts/utils/Bridge2BurnerPolygon.sol": {
+        "keccak256": "0x64bc6a640bd9c33029e4549d085e5485d98c5a4d06eff71b9418f6e04e6544ad",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://144c9294f372f384f42de36602f8f79b1d4e6b3634764eec744e4e69ed382edd",
+          "dweb:/ipfs/Qmex8rc4awa2AvKQAaE78Prrd23MLY8cPE4qdZLZsidDCF"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.30+commit.73712a01",
+    "compilerSettings": {
+      "viaIR": true,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "canonical-weth/=node_modules/canonical-weth/",
+        "@gnosis.pm/=node_modules/@gnosis.pm/",
+        "@prb/=node_modules/@prb/",
+        "@uniswap/=node_modules/@uniswap/",
+        "wormhole-solidity-sdk/=node_modules/wormhole-solidity-sdk/",
+        "@handlers/=lib/fx-portal/test/handlers/",
+        "@mock/=lib/fx-portal/test/mock/",
+        "@openzeppelin/=lib/fx-portal/lib/openzeppelin-contracts/",
+        "@utils/=lib/fx-portal/test/utils/",
+        "ds-test/=lib/solmate/lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "fx-portal/=lib/fx-portal/contracts/",
+        "openzeppelin-contracts/=lib/fx-portal/lib/openzeppelin-contracts/",
+        "solmate/=lib/solmate/src/",
+        "weird-erc20/=lib/zuniswapv2/lib/solmate/lib/weird-erc20/src/",
+        "zuniswapv2/=lib/zuniswapv2/src/"
+      ]
+    },
+    "name": "Bridge2BurnerPolygon",
+    "fullyQualifiedName": "contracts/utils/Bridge2BurnerPolygon.sol:Bridge2BurnerPolygon"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "29252681",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-05-18T11:34:21Z",
+  "match": "exact_match",
+  "chainId": "137",
+  "address": "0xE6e03DD62D11f88A11D65663B398ED2B3Be2070c"
+}

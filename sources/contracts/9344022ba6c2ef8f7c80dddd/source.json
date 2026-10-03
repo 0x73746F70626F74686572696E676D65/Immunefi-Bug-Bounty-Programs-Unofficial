@@ -1,0 +1,1508 @@
+{
+  "sources": {
+    "contracts/interfaces/IToken.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.18;\n\n/// @dev Generic token interface for IERC20 and IERC721 tokens.\ninterface IToken {\n    /// @dev Gets the amount of tokens owned by a specified account.\n    /// @param account Account address.\n    /// @return Amount of tokens owned.\n    function balanceOf(address account) external view returns (uint256);\n\n    /// @dev Gets the owner of the token Id.\n    /// @param tokenId Token Id.\n    /// @return Token Id owner address.\n    function ownerOf(uint256 tokenId) external view returns (address);\n\n    /// @dev Gets the total amount of tokens stored by the contract.\n    /// @return Amount of tokens.\n    function totalSupply() external view returns (uint256);\n\n    /// @dev Transfers the token amount.\n    /// @param to Address to transfer to.\n    /// @param amount The amount to transfer.\n    /// @return True if the function execution is successful.\n    function transfer(address to, uint256 amount) external returns (bool);\n\n    /// @dev Gets remaining number of tokens that the `spender` can transfer on behalf of `owner`.\n    /// @param owner Token owner.\n    /// @param spender Account address that is able to transfer tokens on behalf of the owner.\n    /// @return Token amount allowed to be transferred.\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    /// @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n    /// @param spender Account address that will be able to transfer tokens on behalf of the caller.\n    /// @param amount Token amount.\n    /// @return True if the function execution is successful.\n    function approve(address spender, uint256 amount) external returns (bool);\n\n    /// @dev Transfers the token amount that was previously approved up until the maximum allowance.\n    /// @param from Account address to transfer from.\n    /// @param to Account address to transfer to.\n    /// @param amount Amount to transfer to.\n    /// @return True if the function execution is successful.\n    function transferFrom(address from, address to, uint256 amount) external returns (bool);\n}\n"
+    },
+    "contracts/interfaces/IServiceRegistry.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.18;\n\n/// @dev Required interface for the service registry.\ninterface IServiceRegistry {\n    enum UnitType {\n        Component,\n        Agent\n    }\n\n    /// @dev Checks if the service Id exists.\n    /// @param serviceId Service Id.\n    /// @return true if the service exists, false otherwise.\n    function exists(uint256 serviceId) external view returns (bool);\n\n    /// @dev Gets the full set of linearized components / canonical agent Ids for a specified service.\n    /// @notice The service must be / have been deployed in order to get the actual data.\n    /// @param serviceId Service Id.\n    /// @return numUnitIds Number of component / agent Ids.\n    /// @return unitIds Set of component / agent Ids.\n    function getUnitIdsOfService(UnitType unitType, uint256 serviceId) external view\n        returns (uint256 numUnitIds, uint32[] memory unitIds);\n\n    /// @dev Gets the value of slashed funds from the service registry.\n    /// @return amount Drained amount.\n    function slashedFunds() external view returns (uint256 amount);\n\n    /// @dev Drains slashed funds.\n    /// @return amount Drained amount.\n    function drain() external returns (uint256 amount);\n}\n"
+    },
+    "contracts/interfaces/ITokenomics.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.18;\n\n/// @dev Interface for tokenomics management.\ninterface ITokenomics {\n    /// @dev Gets effective bond (bond left).\n    /// @return Effective bond.\n    function effectiveBond() external pure returns (uint256);\n\n    /// @dev Record global data to the checkpoint\n    function checkpoint() external returns (bool);\n\n    /// @dev Tracks the deposited ETH service donations during the current epoch.\n    /// @notice This function is only called by the treasury where the validity of arrays and values has been performed.\n    /// @param donator Donator account address.\n    /// @param serviceIds Set of service Ids.\n    /// @param amounts Correspondent set of ETH amounts provided by services.\n    /// @param donationETH Overall service donation amount in ETH.\n    function trackServiceDonations(\n        address donator,\n        uint256[] memory serviceIds,\n        uint256[] memory amounts,\n        uint256 donationETH\n    ) external;\n\n    /// @dev Reserves OLAS amount from the effective bond to be minted during a bond program.\n    /// @notice Programs exceeding the limit in the epoch are not allowed.\n    /// @param amount Requested amount for the bond program.\n    /// @return True if effective bond threshold is not reached.\n    function reserveAmountForBondProgram(uint256 amount) external returns(bool);\n\n    /// @dev Refunds unused bond program amount.\n    /// @param amount Amount to be refunded from the bond program.\n    function refundFromBondProgram(uint256 amount) external;\n\n    /// @dev Gets component / agent owner incentives and clears the balances.\n    /// @param account Account address.\n    /// @param unitTypes Set of unit types (component / agent).\n    /// @param unitIds Set of corresponding unit Ids where account is the owner.\n    /// @return reward Reward amount.\n    /// @return topUp Top-up amount.\n    function accountOwnerIncentives(address account, uint256[] memory unitTypes, uint256[] memory unitIds) external\n        returns (uint256 reward, uint256 topUp);\n\n    /// @dev Gets inverse discount factor with the multiple of 1e18 of the last epoch.\n    /// @return idf Discount factor with the multiple of 1e18.\n    function getLastIDF() external view returns (uint256 idf);\n\n    /// @dev Gets the service registry contract address\n    /// @return Service registry contract address;\n    function serviceRegistry() external view returns (address);\n}\n"
+    },
+    "contracts/Treasury.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.18;\n\nimport \"./interfaces/IErrorsTokenomics.sol\";\nimport \"./interfaces/IOLAS.sol\";\nimport \"./interfaces/IToken.sol\";\nimport \"./interfaces/IServiceRegistry.sol\";\nimport \"./interfaces/ITokenomics.sol\";\n\n/*\n* In this contract we consider both ETH and OLAS tokens.\n* For ETH tokens, there are currently about 121 million tokens.\n* Even if the ETH inflation rate is 5% per year, it would take 130+ years to reach 2^96 - 1 of ETH total supply.\n* Lately the inflation rate was lower and could actually be deflationary.\n*\n* For OLAS tokens, the initial numbers will be as follows:\n*  - For the first 10 years there will be the cap of 1 billion (1e27) tokens;\n*  - After 10 years, the inflation rate is capped at 2% per year.\n* Starting from a year 11, the maximum number of tokens that can be reached per the year x is 1e27 * (1.02)^x.\n* To make sure that a unit(n) does not overflow the total supply during the year x, we have to check that\n* 2^n - 1 >= 1e27 * (1.02)^x. We limit n by 96, thus it would take 220+ years to reach that total supply.\n*\n* We then limit each time variable to last until the value of 2^32 - 1 in seconds.\n* 2^32 - 1 gives 136+ years counted in seconds starting from the year 1970.\n* Thus, this counter is safe until the year 2106.\n*\n* The number of blocks cannot be practically bigger than the number of seconds, since there is more than one second\n* in a block. Thus, it is safe to assume that uint32 for the number of blocks is also sufficient.\n*\n* In conclusion, this contract is only safe to use until 2106.\n*/\n\n/// @title Treasury - Smart contract for managing OLAS Treasury\n/// @author AL\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// Invariant does not support a failing call() function while transferring ETH when using the CEI pattern:\n/// revert TransferFailed(address(0), address(this), to, tokenAmount);\n/// invariant {:msg \"broken conservation law\"} address(this).balance == ETHFromServices + ETHOwned;\ncontract Treasury is IErrorsTokenomics {\n    event OwnerUpdated(address indexed owner);\n    event TokenomicsUpdated(address indexed tokenomics);\n    event DepositoryUpdated(address indexed depository);\n    event DispenserUpdated(address indexed dispenser);\n    event DepositTokenFromAccount(address indexed account, address indexed token, uint256 tokenAmount, uint256 olasAmount);\n    event DonateToServicesETH(address indexed sender, uint256[] serviceIds, uint256[] amounts, uint256 donation);\n    event Withdraw(address indexed token, address indexed to, uint256 tokenAmount);\n    event EnableToken(address indexed token);\n    event DisableToken(address indexed token);\n    event ReceiveETH(address indexed sender, uint256 amount);\n    event UpdateTreasuryBalances(uint256 ETHOwned, uint256 ETHFromServices);\n    event PauseTreasury();\n    event UnpauseTreasury();\n    event MinAcceptedETHUpdated(uint256 amount);\n\n    // A well-known representation of an ETH as address\n    address public constant ETH_TOKEN_ADDRESS = address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);\n\n    // Owner address\n    address public owner;\n    // ETH received from services\n    // Even if the ETH inflation rate is 5% per year, it would take 130+ years to reach 2^96 - 1 of ETH total supply\n    uint96 public ETHFromServices;\n\n    // OLAS token address\n    address public olas;\n    // ETH owned by treasury\n    // Even if the ETH inflation rate is 5% per year, it would take 130+ years to reach 2^96 - 1 of ETH total supply\n    uint96 public ETHOwned;\n\n    // Tkenomics contract address\n    address public tokenomics;\n    // Minimum accepted donation value\n    uint96 public minAcceptedETH = 0.065 ether;\n\n    // Depository contract address\n    address public depository;\n    // Contract pausing\n    uint8 public paused = 1;\n    // Reentrancy lock\n    uint8 internal _locked;\n    \n    // Dispenser contract address\n    address public dispenser;\n\n    // Token address => token reserves\n    mapping(address => uint256) public mapTokenReserves;\n    // Token address => enabled / disabled status\n    mapping(address => bool) public mapEnabledTokens;\n\n    /// @dev Treasury constructor.\n    /// @param _olas OLAS token address.\n    /// @param _tokenomics Tokenomics address.\n    /// @param _depository Depository address.\n    /// @param _dispenser Dispenser address.\n    constructor(address _olas, address _tokenomics, address _depository, address _dispenser) payable {\n        owner = msg.sender;\n        _locked = 1;\n\n        // Check for at least one zero contract address\n        if (_olas == address(0) || _tokenomics == address(0) || _depository == address(0) || _dispenser == address(0)) {\n            revert ZeroAddress();\n        }\n\n        olas = _olas;\n        tokenomics = _tokenomics;\n        depository = _depository;\n        dispenser = _dispenser;\n\n        // Assign an initial contract address ETH balance\n        // If msg.value is passed in the constructor, it is already accounted for in the address balance\n        // This way the balance also accounts for possible transfers before the contract was created\n        ETHOwned = uint96(address(this).balance);\n    }\n\n    /// @dev Receives ETH.\n    /// #if_succeeds {:msg \"we do not touch the balance of developers\" } old(ETHFromServices) == ETHFromServices;\n    /// #if_succeeds {:msg \"conservation law\"} old(ETHOwned) + msg.value + old(ETHFromServices) <= type(uint96).max && ETHOwned == old(ETHOwned) + msg.value\n    /// ==> address(this).balance == ETHFromServices + ETHOwned;\n    /// #if_succeeds {:msg \"any paused\"} paused == 1 || paused == 2;\n    receive() external payable {\n        if (msg.value < minAcceptedETH) {\n            revert LowerThan(msg.value, minAcceptedETH);\n        }\n\n        uint256 amount = ETHOwned;\n        amount += msg.value;\n        // Check for the overflow values, specifically when fuzzing, since practically these amounts are not realistic\n        if (amount + ETHFromServices > type(uint96).max) {\n            revert Overflow(amount, type(uint96).max);\n        }\n        ETHOwned = uint96(amount);\n        emit ReceiveETH(msg.sender, msg.value);\n    }\n\n    /// @dev Changes the owner address.\n    /// @param newOwner Address of a new owner.\n    function changeOwner(address newOwner) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero address\n        if (newOwner == address(0)) {\n            revert ZeroAddress();\n        }\n\n        owner = newOwner;\n        emit OwnerUpdated(newOwner);\n    }\n\n    /// @dev Changes various managing contract addresses.\n    /// @param _tokenomics Tokenomics address.\n    /// @param _depository Depository address.\n    /// @param _dispenser Dispenser address.\n    function changeManagers(address _tokenomics, address _depository, address _dispenser) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Change Tokenomics contract address\n        if (_tokenomics != address(0)) {\n            tokenomics = _tokenomics;\n            emit TokenomicsUpdated(_tokenomics);\n        }\n        // Change Depository contract address\n        if (_depository != address(0)) {\n            depository = _depository;\n            emit DepositoryUpdated(_depository);\n        }\n        // Change Dispenser contract address\n        if (_dispenser != address(0)) {\n            dispenser = _dispenser;\n            emit DispenserUpdated(_dispenser);\n        }\n    }\n\n    /// @dev Changes minimum accepted ETH amount by the Treasury.\n    /// @param _minAcceptedETH New minimum accepted ETH amount.\n    /// #if_succeeds {:msg \"Min accepted ETH\"} minAcceptedETH > 0 && minAcceptedETH <= type(uint96).max;\n    function changeMinAcceptedETH(uint256 _minAcceptedETH) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero value\n        if (_minAcceptedETH == 0) {\n            revert ZeroValue();\n        }\n\n        // Check for the overflow value\n        if (_minAcceptedETH > type(uint96).max) {\n            revert Overflow(_minAcceptedETH, type(uint96).max);\n        }\n\n        minAcceptedETH = uint96(_minAcceptedETH);\n        emit MinAcceptedETHUpdated(_minAcceptedETH);\n    }\n\n    /// @dev Allows the depository to deposit LP tokens for OLAS.\n    /// @notice Only depository contract can call this function.\n    /// @param account Account address making a deposit of LP tokens for OLAS.\n    /// @param tokenAmount Token amount to get OLAS for.\n    /// @param token Token address.\n    /// @param olasMintAmount Amount of OLAS token issued.\n    /// #if_succeeds {:msg \"we do not touch the total eth balance\"} old(address(this).balance) == address(this).balance;\n    /// #if_succeeds {:msg \"any paused\"} paused == 1 || paused == 2;\n    /// #if_succeeds {:msg \"OLAS balances\"} IToken(olas).balanceOf(msg.sender) == old(IToken(olas).balanceOf(msg.sender)) + olasMintAmount;\n    /// #if_succeeds {:msg \"OLAS supply\"} IToken(olas).totalSupply() == old(IToken(olas).totalSupply()) + olasMintAmount;\n    function depositTokenForOLAS(address account, uint256 tokenAmount, address token, uint256 olasMintAmount) external {\n        // Check for the depository access\n        if (depository != msg.sender) {\n            revert ManagerOnly(msg.sender, depository);\n        }\n\n        // Check if the token is authorized by the registry\n        if (!mapEnabledTokens[token]) {\n            revert UnauthorizedToken(token);\n        }\n\n        // Increase the amount of LP token reserves\n        uint256 reserves = mapTokenReserves[token] + tokenAmount;\n        mapTokenReserves[token] = reserves;\n\n        // Uniswap allowance implementation does not revert with the accurate message, need to check before the transfer is engaged\n        if (IToken(token).allowance(account, address(this)) < tokenAmount) {\n            revert InsufficientAllowance(IToken(token).allowance((account), address(this)), tokenAmount);\n        }\n\n        // Transfer tokens from account to treasury and add to the token treasury reserves\n        // We assume that authorized LP tokens in the protocol are safe as they are enabled via the governance\n        // UniswapV2ERC20 realization has a standard transferFrom() function that returns a boolean value\n        bool success = IToken(token).transferFrom(account, address(this), tokenAmount);\n        if (!success) {\n            revert TransferFailed(token, account, address(this), tokenAmount);\n        }\n\n        // Mint specified number of OLAS tokens corresponding to tokens bonding deposit\n        // The olasMintAmount is guaranteed by the product supply limit, which is limited by the effectiveBond\n        IOLAS(olas).mint(msg.sender, olasMintAmount);\n\n        emit DepositTokenFromAccount(account, token, tokenAmount, olasMintAmount);\n    }\n\n    /// @dev Deposits service donations in ETH.\n    /// @notice Each provided service Id must be deployed at least once, otherwise its components and agents are undefined.\n    /// @notice If a specific service is terminated with agent Ids being updated, incentives will be issued to its old\n    ///         configuration component / agent owners until the service is re-deployed when new agent Ids are accounted for.\n    /// @param serviceIds Set of service Ids.\n    /// @param amounts Set of corresponding amounts deposited on behalf of each service Id.\n    /// #if_succeeds {:msg \"we do not touch the owners balance\"} old(ETHOwned) == ETHOwned;\n    /// #if_succeeds {:msg \"updated ETHFromServices\"} old(ETHFromServices) + msg.value + old(ETHOwned) <= type(uint96).max && ETHFromServices == old(ETHFromServices) + msg.value\n    /// ==> address(this).balance == ETHFromServices + ETHOwned;\n    /// #if_succeeds {:msg \"any paused\"} paused == 1 || paused == 2;\n    function depositServiceDonationsETH(uint256[] memory serviceIds, uint256[] memory amounts) external payable {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Check that the amount donated has at least a practical minimal value\n        if (msg.value < minAcceptedETH) {\n            revert LowerThan(msg.value, minAcceptedETH);\n        }\n\n        // Check for the same length of arrays\n        uint256 numServices = serviceIds.length;\n        if (amounts.length != numServices) {\n            revert WrongArrayLength(numServices, amounts.length);\n        }\n\n        uint256 totalAmount;\n        for (uint256 i = 0; i < numServices; ++i) {\n            if (amounts[i] == 0) {\n                revert ZeroValue();\n            }\n            totalAmount += amounts[i];\n        }\n\n        // Check if the total transferred amount corresponds to the sum of amounts from services\n        if (msg.value != totalAmount) {\n            revert WrongAmount(msg.value, totalAmount);\n        }\n\n        // Accumulate received donation from services\n        uint256 donationETH = ETHFromServices + msg.value;\n        // Check for the overflow values, specifically when fuzzing, since realistically these amounts are assumed to be not possible\n        if (donationETH + ETHOwned > type(uint96).max) {\n            revert Overflow(donationETH, type(uint96).max);\n        }\n        ETHFromServices = uint96(donationETH);\n        emit DonateToServicesETH(msg.sender, serviceIds, amounts, msg.value);\n\n        // Track service donations on the Tokenomics side\n        ITokenomics(tokenomics).trackServiceDonations(msg.sender, serviceIds, amounts, msg.value);\n\n        _locked = 1;\n    }\n\n    /// @dev Allows owner to transfer tokens from treasury reserves to a specified address.\n    /// @param to Address to transfer funds to.\n    /// @param tokenAmount Token amount to get reserves from.\n    /// @param token Token or ETH address.\n    /// @return success True if the transfer is successful.\n    /// #if_succeeds {:msg \"we do not touch the balance of developers\"} old(ETHFromServices) == ETHFromServices;\n    /// #if_succeeds {:msg \"updated ETHOwned\"} token == ETH_TOKEN_ADDRESS ==> ETHOwned == old(ETHOwned) - tokenAmount;\n    /// #if_succeeds {:msg \"ETH balance\"} token == ETH_TOKEN_ADDRESS ==> address(this).balance == old(address(this).balance) - tokenAmount;\n    /// #if_succeeds {:msg \"updated token reserves\"} token != ETH_TOKEN_ADDRESS ==> mapTokenReserves[token] == old(mapTokenReserves[token]) - tokenAmount;\n    /// #if_succeeds {:msg \"any paused\"} paused == 1 || paused == 2;\n    function withdraw(address to, uint256 tokenAmount, address token) external returns (bool success) {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check that the withdraw address is not treasury itself\n        if (to == address(this)) {\n            revert TransferFailed(token, address(this), to, tokenAmount);\n        }\n\n        // Check for the zero withdraw amount\n        if (tokenAmount == 0) {\n            revert ZeroValue();\n        }\n\n        // ETH address is taken separately, and all the LP tokens must be validated with corresponding token reserves\n        if (token == ETH_TOKEN_ADDRESS) {\n            uint256 amountOwned = ETHOwned;\n            // Check if treasury has enough amount of owned ETH\n            if (amountOwned >= tokenAmount) {\n                // This branch is used to transfer ETH to a specified address\n                amountOwned -= tokenAmount;\n                ETHOwned = uint96(amountOwned);\n                emit Withdraw(ETH_TOKEN_ADDRESS, to, tokenAmount);\n                // Send ETH to the specified address\n                (success, ) = to.call{value: tokenAmount}(\"\");\n                if (!success) {\n                    revert TransferFailed(ETH_TOKEN_ADDRESS, address(this), to, tokenAmount);\n                }\n            } else {\n                // Insufficient amount of treasury owned ETH\n                revert LowerThan(tokenAmount, amountOwned);\n            }\n        } else {\n            // Only approved token reserves can be used for redemptions\n            if (!mapEnabledTokens[token]) {\n                revert UnauthorizedToken(token);\n            }\n            // Decrease the global LP token reserves record\n            uint256 reserves = mapTokenReserves[token];\n            if (reserves >= tokenAmount) {\n                reserves -= tokenAmount;\n                mapTokenReserves[token] = reserves;\n\n                emit Withdraw(token, to, tokenAmount);\n                // Transfer LP tokens\n                // We assume that LP tokens enabled in the protocol are safe by default\n                // UniswapV2ERC20 realization has a standard transfer() function\n                success = IToken(token).transfer(to, tokenAmount);\n                if (!success) {\n                    revert TransferFailed(token, address(this), to, tokenAmount);\n                }\n            }  else {\n                // Insufficient amount of LP tokens\n                revert LowerThan(tokenAmount, reserves);\n            }\n        }\n    }\n\n    /// @dev Withdraws ETH and / or OLAS amounts to the requested account address.\n    /// @notice Only dispenser contract can call this function.\n    /// @notice Reentrancy guard is on a dispenser side.\n    /// @notice Zero account address is not possible, since the dispenser contract interacts with msg.sender.\n    /// @param account Account address.\n    /// @param accountRewards Amount of account rewards.\n    /// @param accountTopUps Amount of account top-ups.\n    /// @return success True if the function execution is successful.\n    /// #if_succeeds {:msg \"we do not touch the owners balance\"} old(ETHOwned) == ETHOwned;\n    /// #if_succeeds {:msg \"updated ETHFromServices\"} accountRewards > 0 && ETHFromServices >= accountRewards ==> ETHFromServices == old(ETHFromServices) - accountRewards;\n    /// #if_succeeds {:msg \"ETH balance\"} accountRewards > 0 && ETHFromServices >= accountRewards ==> address(this).balance == old(address(this).balance) - accountRewards;\n    /// #if_succeeds {:msg \"updated OLAS balances\"} accountTopUps > 0 ==> IToken(olas).balanceOf(account) == old(IToken(olas).balanceOf(account)) + accountTopUps;\n    /// #if_succeeds {:msg \"OLAS supply\"} IToken(olas).totalSupply() == old(IToken(olas).totalSupply()) + accountTopUps;\n    /// #if_succeeds {:msg \"unpaused\"} paused == 1;\n    function withdrawToAccount(address account, uint256 accountRewards, uint256 accountTopUps) external\n        returns (bool success)\n    {\n        // Check if the contract is paused\n        if (paused == 2) {\n            revert Paused();\n        }\n\n        // Check for the dispenser access\n        if (dispenser != msg.sender) {\n            revert ManagerOnly(msg.sender, dispenser);\n        }\n\n        uint256 amountETHFromServices = ETHFromServices;\n        // Send ETH rewards, if any\n        if (accountRewards > 0 && amountETHFromServices >= accountRewards) {\n            amountETHFromServices -= accountRewards;\n            ETHFromServices = uint96(amountETHFromServices);\n            emit Withdraw(ETH_TOKEN_ADDRESS, account, accountRewards);\n            (success, ) = account.call{value: accountRewards}(\"\");\n            if (!success) {\n                revert TransferFailed(address(0), address(this), account, accountRewards);\n            }\n        }\n\n        // Send OLAS top-ups\n        if (accountTopUps > 0) {\n            // Tokenomics has already accounted for the account's top-up amount,\n            // thus the the mint does not break the inflation schedule\n            IOLAS(olas).mint(account, accountTopUps);\n            success = true;\n            emit Withdraw(olas, account, accountTopUps);\n        }\n    }\n\n    /// @dev Re-balances treasury funds to account for the treasury reward for a specific epoch.\n    /// @param treasuryRewards Treasury rewards.\n    /// @return success True, if the function execution is successful.\n    /// #if_succeeds {:msg \"we do not touch the total eth balance\"} old(address(this).balance) == address(this).balance;\n    /// #if_succeeds {:msg \"conservation law\"} old(ETHFromServices + ETHOwned) == ETHFromServices + ETHOwned;\n    /// #if_succeeds {:msg \"unpaused\"} paused == 1;\n    function rebalanceTreasury(uint256 treasuryRewards) external returns (bool success) {\n        // Check if the contract is paused\n        if (paused == 2) {\n            revert Paused();\n        }\n\n        // Check for the tokenomics contract access\n        if (msg.sender != tokenomics) {\n            revert ManagerOnly(msg.sender, tokenomics);\n        }\n\n        // Collect treasury's own reward share\n        success = true;\n        if (treasuryRewards > 0) {\n            uint256 amountETHFromServices = ETHFromServices;\n            if (amountETHFromServices >= treasuryRewards) {\n                // Update ETH from services value\n                amountETHFromServices -= treasuryRewards;\n                // Update treasury ETH owned values\n                uint256 amountETHOwned = ETHOwned;\n                amountETHOwned += treasuryRewards;\n                // Assign back to state variables\n                ETHOwned = uint96(amountETHOwned);\n                ETHFromServices = uint96(amountETHFromServices);\n                emit UpdateTreasuryBalances(amountETHOwned, amountETHFromServices);\n            } else {\n                // There is not enough amount from services to allocate to the treasury\n                success = false;\n            }\n        }\n    }\n\n    /// @dev Drains slashed funds from the service registry.\n    /// @return amount Drained amount.\n    /// #if_succeeds {:msg \"correct update total eth balance\"} address(this).balance == old(address(this).balance) + amount;\n    /// #if_succeeds {:msg \"conservation law\"} ETHFromServices + ETHOwned == old(ETHFromServices + ETHOwned) + amount;\n    ///if_succeeds {:msg \"slashed funds check\"} IServiceRegistry(ITokenomics(tokenomics).serviceRegistry()).slashedFunds() >= minAcceptedETH\n    /// ==> old(IServiceRegistry(ITokenomics(tokenomics).serviceRegistry()).slashedFunds()) == amount;\n    function drainServiceSlashedFunds() external returns (uint256 amount) {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Get the service registry contract address\n        address serviceRegistry = ITokenomics(tokenomics).serviceRegistry();\n\n        // Check if the amount of slashed funds are at least the minimum required amount to receive by the Treasury\n        uint256 slashedFunds = IServiceRegistry(serviceRegistry).slashedFunds();\n        if (slashedFunds < minAcceptedETH) {\n            revert LowerThan(slashedFunds, minAcceptedETH);\n        }\n\n        // Call the service registry drain function\n        amount = IServiceRegistry(serviceRegistry).drain();\n    }\n\n    /// @dev Enables an LP token to be bonded for OLAS.\n    /// @param token Token address.\n    function enableToken(address token) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero address token\n        if (token == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Authorize the token\n        if (!mapEnabledTokens[token]) {\n            mapEnabledTokens[token] = true;\n            emit EnableToken(token);\n        }\n    }\n\n    /// @dev Disables an LP token from the ability to bond for OLAS.\n    /// @param token Token address.\n    function disableToken(address token) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        if (mapEnabledTokens[token]) {\n            // The reserves of a token must be zero in order to disable it\n            if (mapTokenReserves[token] > 0) {\n                revert NonZeroValue();\n            }\n            mapEnabledTokens[token] = false;\n            emit DisableToken(token);\n        }\n    }\n\n    /// @dev Gets information about token being enabled for bonding.\n    /// @param token Token address.\n    /// @return enabled True if token is enabled.\n    function isEnabled(address token) external view returns (bool enabled) {\n        enabled = mapEnabledTokens[token];\n    }\n\n    /// @dev Pauses the contract.\n    function pause() external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        paused = 2;\n        emit PauseTreasury();\n    }\n\n    /// @dev Unpauses the contract.\n    function unpause() external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        paused = 1;\n        emit UnpauseTreasury();\n    }\n}\n"
+    },
+    "contracts/interfaces/IErrorsTokenomics.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.18;\n\n/// @dev Errors.\ninterface IErrorsTokenomics {\n    /// @dev Only `manager` has a privilege, but the `sender` was provided.\n    /// @param sender Sender address.\n    /// @param manager Required sender address as a manager.\n    error ManagerOnly(address sender, address manager);\n\n    /// @dev Only `owner` has a privilege, but the `sender` was provided.\n    /// @param sender Sender address.\n    /// @param owner Required sender address as an owner.\n    error OwnerOnly(address sender, address owner);\n\n    /// @dev Provided zero address.\n    error ZeroAddress();\n\n    /// @dev Wrong length of two arrays.\n    /// @param numValues1 Number of values in a first array.\n    /// @param numValues2 Number of values in a second array.\n    error WrongArrayLength(uint256 numValues1, uint256 numValues2);\n\n    /// @dev Service Id does not exist in registry records.\n    /// @param serviceId Service Id.\n    error ServiceDoesNotExist(uint256 serviceId);\n\n    /// @dev Zero value when it has to be different from zero.\n    error ZeroValue();\n\n    /// @dev Non-zero value when it has to be zero.\n    error NonZeroValue();\n\n    /// @dev Value overflow.\n    /// @param provided Overflow value.\n    /// @param max Maximum possible value.\n    error Overflow(uint256 provided, uint256 max);\n\n    /// @dev Service was never deployed.\n    /// @param serviceId Service Id.\n    error ServiceNeverDeployed(uint256 serviceId);\n\n    /// @dev Token is disabled or not whitelisted.\n    /// @param tokenAddress Address of a token.\n    error UnauthorizedToken(address tokenAddress);\n\n    /// @dev Provided token address is incorrect.\n    /// @param provided Provided token address.\n    /// @param expected Expected token address.\n    error WrongTokenAddress(address provided, address expected);\n\n    /// @dev Bond is not redeemable (does not exist or not matured).\n    /// @param bondId Bond Id.\n    error BondNotRedeemable(uint256 bondId);\n\n    /// @dev The product is expired.\n    /// @param tokenAddress Address of a token.\n    /// @param productId Product Id.\n    /// @param deadline The program expiry time.\n    /// @param curTime Current timestamp.\n    error ProductExpired(address tokenAddress, uint256 productId, uint256 deadline, uint256 curTime);\n\n    /// @dev The product is already closed.\n    /// @param productId Product Id.\n    error ProductClosed(uint256 productId);\n\n    /// @dev The product supply is low for the requested payout.\n    /// @param tokenAddress Address of a token.\n    /// @param productId Product Id.\n    /// @param requested Requested payout.\n    /// @param actual Actual supply left.\n    error ProductSupplyLow(address tokenAddress, uint256 productId, uint256 requested, uint256 actual);\n\n    /// @dev Received lower value than the expected one.\n    /// @param provided Provided value is lower.\n    /// @param expected Expected value.\n    error LowerThan(uint256 provided, uint256 expected);\n\n    /// @dev Wrong amount received / provided.\n    /// @param provided Provided amount.\n    /// @param expected Expected amount.\n    error WrongAmount(uint256 provided, uint256 expected);\n\n    /// @dev Insufficient token allowance.\n    /// @param provided Provided amount.\n    /// @param expected Minimum expected amount.\n    error InsufficientAllowance(uint256 provided, uint256 expected);\n\n    /// @dev Failure of a transfer.\n    /// @param token Address of a token.\n    /// @param from Address `from`.\n    /// @param to Address `to`.\n    /// @param amount Token amount.\n    error TransferFailed(address token, address from, address to, uint256 amount);\n\n    /// @dev Incentives claim has failed.\n    /// @param account Account address.\n    /// @param reward Reward amount.\n    /// @param topUp Top-up amount.\n    error ClaimIncentivesFailed(address account, uint256 reward, uint256 topUp);\n\n    /// @dev Caught reentrancy violation.\n    error ReentrancyGuard();\n\n    /// @dev Failure of treasury re-balance during the reward allocation.\n    /// @param epochNumber Epoch number.\n    error TreasuryRebalanceFailed(uint256 epochNumber);\n\n    /// @dev Operation with a wrong component / agent Id.\n    /// @param unitId Component / agent Id.\n    /// @param unitType Type of the unit (component / agent).\n    error WrongUnitId(uint256 unitId, uint256 unitType);\n\n    /// @dev The donator address is blacklisted.\n    /// @param account Donator account address.\n    error DonatorBlacklisted(address account);\n\n    /// @dev The contract is already initialized.\n    error AlreadyInitialized();\n\n    /// @dev The contract has to be delegate-called via proxy.\n    error DelegatecallOnly();\n\n    /// @dev The contract is paused.\n    error Paused();\n\n    /// @dev Caught an operation that is not supposed to happen in the same block.\n    error SameBlockNumberViolation();\n}\n"
+    },
+    "contracts/interfaces/IOLAS.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.18;\n\ninterface IOLAS {\n    /// @dev Mints OLA tokens.\n    /// @param account Account address.\n    /// @param amount OLA token amount.\n    function mint(address account, uint256 amount) external;\n\n    /// @dev Provides OLA token time launch.\n    /// @return Time launch.\n    function timeLaunch() external view returns (uint256);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.18+commit.87f61d96"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_olas",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_tokenomics",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_depository",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_dispenser",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "AlreadyInitialized",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "bondId",
+              "type": "uint256"
+            }
+          ],
+          "name": "BondNotRedeemable",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "reward",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "topUp",
+              "type": "uint256"
+            }
+          ],
+          "name": "ClaimIncentivesFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DelegatecallOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "DonatorBlacklisted",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            }
+          ],
+          "name": "InsufficientAllowance",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            }
+          ],
+          "name": "LowerThan",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            }
+          ],
+          "name": "ManagerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NonZeroValue",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "max",
+              "type": "uint256"
+            }
+          ],
+          "name": "Overflow",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Paused",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "productId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProductClosed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenAddress",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "productId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "curTime",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProductExpired",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenAddress",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "productId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "requested",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "actual",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProductSupplyLow",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ReentrancyGuard",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "SameBlockNumberViolation",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ServiceDoesNotExist",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ServiceNeverDeployed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "from",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TransferFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "epochNumber",
+              "type": "uint256"
+            }
+          ],
+          "name": "TreasuryRebalanceFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "tokenAddress",
+              "type": "address"
+            }
+          ],
+          "name": "UnauthorizedToken",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongAmount",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "numValues1",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "numValues2",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongArrayLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "provided",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "expected",
+              "type": "address"
+            }
+          ],
+          "name": "WrongTokenAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "unitId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "unitType",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongUnitId",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroValue",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "tokenAmount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "olasAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "DepositTokenFromAccount",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "depository",
+              "type": "address"
+            }
+          ],
+          "name": "DepositoryUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "DisableToken",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "dispenser",
+              "type": "address"
+            }
+          ],
+          "name": "DispenserUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "serviceIds",
+              "type": "uint256[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "donation",
+              "type": "uint256"
+            }
+          ],
+          "name": "DonateToServicesETH",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "EnableToken",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "MinAcceptedETHUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "PauseTreasury",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "ReceiveETH",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "tokenomics",
+              "type": "address"
+            }
+          ],
+          "name": "TokenomicsUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "UnpauseTreasury",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "ETHOwned",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "ETHFromServices",
+              "type": "uint256"
+            }
+          ],
+          "name": "UpdateTreasuryBalances",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "tokenAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Withdraw",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "ETHFromServices",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ETHOwned",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ETH_TOKEN_ADDRESS",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_tokenomics",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_depository",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_dispenser",
+              "type": "address"
+            }
+          ],
+          "name": "changeManagers",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_minAcceptedETH",
+              "type": "uint256"
+            }
+          ],
+          "name": "changeMinAcceptedETH",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "changeOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "serviceIds",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "amounts",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "depositServiceDonationsETH",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "tokenAmount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "olasMintAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "depositTokenForOLAS",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "depository",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "disableToken",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "dispenser",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "drainServiceSlashedFunds",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "enableToken",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "isEnabled",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "enabled",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "mapEnabledTokens",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "mapTokenReserves",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "minAcceptedETH",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "olas",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pause",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "paused",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "treasuryRewards",
+              "type": "uint256"
+            }
+          ],
+          "name": "rebalanceTreasury",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "tokenomics",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "unpause",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "tokenAmount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "withdraw",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "accountRewards",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "accountTopUps",
+              "type": "uint256"
+            }
+          ],
+          "name": "withdrawToAccount",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "author": "ALAleksandr Kuperman - <aleksandr.kuperman@valory.xyz> Invariant does not support a failing call() function while transferring ETH when using the CEI pattern: revert TransferFailed(address(0), address(this), to, tokenAmount); invariant {:msg \"broken conservation law\"} address(this).balance == ETHFromServices + ETHOwned;",
+        "errors": {
+          "AlreadyInitialized()": [
+            {
+              "details": "The contract is already initialized."
+            }
+          ],
+          "BondNotRedeemable(uint256)": [
+            {
+              "details": "Bond is not redeemable (does not exist or not matured).",
+              "params": {
+                "bondId": "Bond Id."
+              }
+            }
+          ],
+          "ClaimIncentivesFailed(address,uint256,uint256)": [
+            {
+              "details": "Incentives claim has failed.",
+              "params": {
+                "account": "Account address.",
+                "reward": "Reward amount.",
+                "topUp": "Top-up amount."
+              }
+            }
+          ],
+          "DelegatecallOnly()": [
+            {
+              "details": "The contract has to be delegate-called via proxy."
+            }
+          ],
+          "DonatorBlacklisted(address)": [
+            {
+              "details": "The donator address is blacklisted.",
+              "params": {
+                "account": "Donator account address."
+              }
+            }
+          ],
+          "InsufficientAllowance(uint256,uint256)": [
+            {
+              "details": "Insufficient token allowance.",
+              "params": {
+                "expected": "Minimum expected amount.",
+                "provided": "Provided amount."
+              }
+            }
+          ],
+          "LowerThan(uint256,uint256)": [
+            {
+              "details": "Received lower value than the expected one.",
+              "params": {
+                "expected": "Expected value.",
+                "provided": "Provided value is lower."
+              }
+            }
+          ],
+          "ManagerOnly(address,address)": [
+            {
+              "details": "Only `manager` has a privilege, but the `sender` was provided.",
+              "params": {
+                "manager": "Required sender address as a manager.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "NonZeroValue()": [
+            {
+              "details": "Non-zero value when it has to be zero."
+            }
+          ],
+          "Overflow(uint256,uint256)": [
+            {
+              "details": "Value overflow.",
+              "params": {
+                "max": "Maximum possible value.",
+                "provided": "Overflow value."
+              }
+            }
+          ],
+          "OwnerOnly(address,address)": [
+            {
+              "details": "Only `owner` has a privilege, but the `sender` was provided.",
+              "params": {
+                "owner": "Required sender address as an owner.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "Paused()": [
+            {
+              "details": "The contract is paused."
+            }
+          ],
+          "ProductClosed(uint256)": [
+            {
+              "details": "The product is already closed.",
+              "params": {
+                "productId": "Product Id."
+              }
+            }
+          ],
+          "ProductExpired(address,uint256,uint256,uint256)": [
+            {
+              "details": "The product is expired.",
+              "params": {
+                "curTime": "Current timestamp.",
+                "deadline": "The program expiry time.",
+                "productId": "Product Id.",
+                "tokenAddress": "Address of a token."
+              }
+            }
+          ],
+          "ProductSupplyLow(address,uint256,uint256,uint256)": [
+            {
+              "details": "The product supply is low for the requested payout.",
+              "params": {
+                "actual": "Actual supply left.",
+                "productId": "Product Id.",
+                "requested": "Requested payout.",
+                "tokenAddress": "Address of a token."
+              }
+            }
+          ],
+          "ReentrancyGuard()": [
+            {
+              "details": "Caught reentrancy violation."
+            }
+          ],
+          "SameBlockNumberViolation()": [
+            {
+              "details": "Caught an operation that is not supposed to happen in the same block."
+            }
+          ],
+          "ServiceDoesNotExist(uint256)": [
+            {
+              "details": "Service Id does not exist in registry records.",
+              "params": {
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "ServiceNeverDeployed(uint256)": [
+            {
+              "details": "Service was never deployed.",
+              "params": {
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "TransferFailed(address,address,address,uint256)": [
+            {
+              "details": "Failure of a transfer.",
+              "params": {
+                "amount": "Token amount.",
+                "from": "Address `from`.",
+                "to": "Address `to`.",
+                "token": "Address of a token."
+              }
+            }
+          ],
+          "TreasuryRebalanceFailed(uint256)": [
+            {
+              "details": "Failure of treasury re-balance during the reward allocation.",
+              "params": {
+                "epochNumber": "Epoch number."
+              }
+            }
+          ],
+          "UnauthorizedToken(address)": [
+            {
+              "details": "Token is disabled or not whitelisted.",
+              "params": {
+                "tokenAddress": "Address of a token."
+              }
+            }
+          ],
+          "WrongAmount(uint256,uint256)": [
+            {
+              "details": "Wrong amount received / provided.",
+              "params": {
+                "expected": "Expected amount.",
+                "provided": "Provided amount."
+              }
+            }
+          ],
+          "WrongArrayLength(uint256,uint256)": [
+            {
+              "details": "Wrong length of two arrays.",
+              "params": {
+                "numValues1": "Number of values in a first array.",
+                "numValues2": "Number of values in a second array."
+              }
+            }
+          ],
+          "WrongTokenAddress(address,address)": [
+            {
+              "details": "Provided token address is incorrect.",
+              "params": {
+                "expected": "Expected token address.",
+                "provided": "Provided token address."
+              }
+            }
+          ],
+          "WrongUnitId(uint256,uint256)": [
+            {
+              "details": "Operation with a wrong component / agent Id.",
+              "params": {
+                "unitId": "Component / agent Id.",
+                "unitType": "Type of the unit (component / agent)."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroValue()": [
+            {
+              "details": "Zero value when it has to be different from zero."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "changeManagers(address,address,address)": {
+            "details": "Changes various managing contract addresses.",
+            "params": {
+              "_depository": "Depository address.",
+              "_dispenser": "Dispenser address.",
+              "_tokenomics": "Tokenomics address."
+            }
+          },
+          "changeMinAcceptedETH(uint256)": {
+            "details": "Changes minimum accepted ETH amount by the Treasury.",
+            "params": {
+              "_minAcceptedETH": "New minimum accepted ETH amount. #if_succeeds {:msg \"Min accepted ETH\"} minAcceptedETH > 0 && minAcceptedETH <= type(uint96).max;"
+            }
+          },
+          "changeOwner(address)": {
+            "details": "Changes the owner address.",
+            "params": {
+              "newOwner": "Address of a new owner."
+            }
+          },
+          "constructor": {
+            "details": "Treasury constructor.",
+            "params": {
+              "_depository": "Depository address.",
+              "_dispenser": "Dispenser address.",
+              "_olas": "OLAS token address.",
+              "_tokenomics": "Tokenomics address."
+            }
+          },
+          "depositServiceDonationsETH(uint256[],uint256[])": {
+            "details": "Deposits service donations in ETH.",
+            "params": {
+              "amounts": "Set of corresponding amounts deposited on behalf of each service Id. #if_succeeds {:msg \"we do not touch the owners balance\"} old(ETHOwned) == ETHOwned; #if_succeeds {:msg \"updated ETHFromServices\"} old(ETHFromServices) + msg.value + old(ETHOwned) <= type(uint96).max && ETHFromServices == old(ETHFromServices) + msg.value ==> address(this).balance == ETHFromServices + ETHOwned; #if_succeeds {:msg \"any paused\"} paused == 1 || paused == 2;",
+              "serviceIds": "Set of service Ids."
+            }
+          },
+          "depositTokenForOLAS(address,uint256,address,uint256)": {
+            "details": "Allows the depository to deposit LP tokens for OLAS.",
+            "params": {
+              "account": "Account address making a deposit of LP tokens for OLAS.",
+              "olasMintAmount": "Amount of OLAS token issued. #if_succeeds {:msg \"we do not touch the total eth balance\"} old(address(this).balance) == address(this).balance; #if_succeeds {:msg \"any paused\"} paused == 1 || paused == 2; #if_succeeds {:msg \"OLAS balances\"} IToken(olas).balanceOf(msg.sender) == old(IToken(olas).balanceOf(msg.sender)) + olasMintAmount; #if_succeeds {:msg \"OLAS supply\"} IToken(olas).totalSupply() == old(IToken(olas).totalSupply()) + olasMintAmount;",
+              "token": "Token address.",
+              "tokenAmount": "Token amount to get OLAS for."
+            }
+          },
+          "disableToken(address)": {
+            "details": "Disables an LP token from the ability to bond for OLAS.",
+            "params": {
+              "token": "Token address."
+            }
+          },
+          "drainServiceSlashedFunds()": {
+            "details": "Drains slashed funds from the service registry.",
+            "returns": {
+              "amount": "Drained amount. #if_succeeds {:msg \"correct update total eth balance\"} address(this).balance == old(address(this).balance) + amount; #if_succeeds {:msg \"conservation law\"} ETHFromServices + ETHOwned == old(ETHFromServices + ETHOwned) + amount; if_succeeds {:msg \"slashed funds check\"} IServiceRegistry(ITokenomics(tokenomics).serviceRegistry()).slashedFunds() >= minAcceptedETH ==> old(IServiceRegistry(ITokenomics(tokenomics).serviceRegistry()).slashedFunds()) == amount;"
+            }
+          },
+          "enableToken(address)": {
+            "details": "Enables an LP token to be bonded for OLAS.",
+            "params": {
+              "token": "Token address."
+            }
+          },
+          "isEnabled(address)": {
+            "details": "Gets information about token being enabled for bonding.",
+            "params": {
+              "token": "Token address."
+            },
+            "returns": {
+              "enabled": "True if token is enabled."
+            }
+          },
+          "pause()": {
+            "details": "Pauses the contract."
+          },
+          "rebalanceTreasury(uint256)": {
+            "details": "Re-balances treasury funds to account for the treasury reward for a specific epoch.",
+            "params": {
+              "treasuryRewards": "Treasury rewards."
+            },
+            "returns": {
+              "success": "True, if the function execution is successful. #if_succeeds {:msg \"we do not touch the total eth balance\"} old(address(this).balance) == address(this).balance; #if_succeeds {:msg \"conservation law\"} old(ETHFromServices + ETHOwned) == ETHFromServices + ETHOwned; #if_succeeds {:msg \"unpaused\"} paused == 1;"
+            }
+          },
+          "unpause()": {
+            "details": "Unpauses the contract."
+          },
+          "withdraw(address,uint256,address)": {
+            "details": "Allows owner to transfer tokens from treasury reserves to a specified address.",
+            "params": {
+              "to": "Address to transfer funds to.",
+              "token": "Token or ETH address.",
+              "tokenAmount": "Token amount to get reserves from."
+            },
+            "returns": {
+              "success": "True if the transfer is successful. #if_succeeds {:msg \"we do not touch the balance of developers\"} old(ETHFromServices) == ETHFromServices; #if_succeeds {:msg \"updated ETHOwned\"} token == ETH_TOKEN_ADDRESS ==> ETHOwned == old(ETHOwned) - tokenAmount; #if_succeeds {:msg \"ETH balance\"} token == ETH_TOKEN_ADDRESS ==> address(this).balance == old(address(this).balance) - tokenAmount; #if_succeeds {:msg \"updated token reserves\"} token != ETH_TOKEN_ADDRESS ==> mapTokenReserves[token] == old(mapTokenReserves[token]) - tokenAmount; #if_succeeds {:msg \"any paused\"} paused == 1 || paused == 2;"
+            }
+          },
+          "withdrawToAccount(address,uint256,uint256)": {
+            "details": "Withdraws ETH and / or OLAS amounts to the requested account address.",
+            "params": {
+              "account": "Account address.",
+              "accountRewards": "Amount of account rewards.",
+              "accountTopUps": "Amount of account top-ups."
+            },
+            "returns": {
+              "success": "True if the function execution is successful. #if_succeeds {:msg \"we do not touch the owners balance\"} old(ETHOwned) == ETHOwned; #if_succeeds {:msg \"updated ETHFromServices\"} accountRewards > 0 && ETHFromServices >= accountRewards ==> ETHFromServices == old(ETHFromServices) - accountRewards; #if_succeeds {:msg \"ETH balance\"} accountRewards > 0 && ETHFromServices >= accountRewards ==> address(this).balance == old(address(this).balance) - accountRewards; #if_succeeds {:msg \"updated OLAS balances\"} accountTopUps > 0 ==> IToken(olas).balanceOf(account) == old(IToken(olas).balanceOf(account)) + accountTopUps; #if_succeeds {:msg \"OLAS supply\"} IToken(olas).totalSupply() == old(IToken(olas).totalSupply()) + accountTopUps; #if_succeeds {:msg \"unpaused\"} paused == 1;"
+            }
+          }
+        },
+        "title": "Treasury - Smart contract for managing OLAS Treasury",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "depositServiceDonationsETH(uint256[],uint256[])": {
+            "notice": "Each provided service Id must be deployed at least once, otherwise its components and agents are undefined.If a specific service is terminated with agent Ids being updated, incentives will be issued to its old         configuration component / agent owners until the service is re-deployed when new agent Ids are accounted for."
+          },
+          "depositTokenForOLAS(address,uint256,address,uint256)": {
+            "notice": "Only depository contract can call this function."
+          },
+          "withdrawToAccount(address,uint256,uint256)": {
+            "notice": "Only dispenser contract can call this function.Reentrancy guard is on a dispenser side.Zero account address is not possible, since the dispenser contract interacts with msg.sender."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/Treasury.sol": "Treasury"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 4000
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/Treasury.sol": {
+        "keccak256": "0xeaa7478c089695c5c392aeb89b6d673405ed5a375a8099961deee236de8c2ea7",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://b597cab468f96f49589dc295c14af572f6022865e1c5cd7fefadc74dcc1b001d",
+          "dweb:/ipfs/QmWaYSAi6vXdgqcChzyXxL8D23qGY9icK7iQXjp4ojYpfJ"
+        ]
+      },
+      "contracts/interfaces/IErrorsTokenomics.sol": {
+        "keccak256": "0xa6017f4964c98cf02cefd3f1c06d25e4943b2e79c93fdffb52f435e77fbf639a",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8f668c874ce0899c4b888243a6fb249bf2166d6dbcc603448d1803868f807e20",
+          "dweb:/ipfs/QmSfqDCMXJ99BfVMPr46pGbBWS3CaGP6L3yb3QZBtEwjHS"
+        ]
+      },
+      "contracts/interfaces/IOLAS.sol": {
+        "keccak256": "0x6dc9ac9a42fe8b49283360e4361dfa0134305bbaee8c16172a9cfe42e0e4547e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ac9dd9b3726e1268bca4549c05a6c2d7e0a0128599daa908ddd725fe88b2def5",
+          "dweb:/ipfs/QmWX8DSwAmFUcMBMV4e4WZADamwTXhar82QVpJ5v9ZkX8U"
+        ]
+      },
+      "contracts/interfaces/IServiceRegistry.sol": {
+        "keccak256": "0x8234787720405061bc781e7d4e63b5f2f9de7ce446212f8d427a1362f083c528",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d2d7e4415d9ff054d92e1b71e4054e650ef43509ddece1a0d185d4238a0b81a2",
+          "dweb:/ipfs/QmXuvHnMBPTsqo7Aow8mk7Hmoe3xECfkWUthcrGpUz2NyT"
+        ]
+      },
+      "contracts/interfaces/IToken.sol": {
+        "keccak256": "0x45f428413967ced12fee0cf45e922f993711fd823e8d0fc28a36a4706c1c6adb",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://d5fe763a0f7c1b35553060f254f71423b0d0816a1d75e87a6d3ac21dedad9cc6",
+          "dweb:/ipfs/QmSTLuTqgrnQrfF4kiLDd3n2nmJnCcdp9LLP4Pj1c1RCBZ"
+        ]
+      },
+      "contracts/interfaces/ITokenomics.sol": {
+        "keccak256": "0xcb4c444f33dcd1fe9fa77154a5784047d77e7b659d4f8f5f0785c6cef2181f76",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://89e2e6573f64ae82ad7335575562d70ecbaa25c47d4f1a32ebb2d0c60084eeb9",
+          "dweb:/ipfs/QmVeJAbhDxHFJJA4o2vN7N1MQ93HxzR336k1TUi6jyT1Fq"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.18+commit.87f61d96",
+    "compilerSettings": {
+      "libraries": {},
+      "optimizer": {
+        "runs": 4000,
+        "enabled": true
+      }
+    },
+    "name": "Treasury",
+    "fullyQualifiedName": "contracts/Treasury.sol:Treasury"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "6654242",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2025-06-23T11:52:09Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0xa0DA53447C0f6C4987964d8463da7e6628B30f82"
+}

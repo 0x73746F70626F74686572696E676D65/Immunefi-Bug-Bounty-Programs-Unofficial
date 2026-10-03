@@ -1,0 +1,983 @@
+{
+  "sources": {
+    "contracts/multisigs/VerifyData.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\n/// @dev The combination of target and selector is not authorized.\n/// @param target Target address.\n/// @param selector Function selector.\n/// @param chainId Chain Id.\nerror NotAuthorized(address target, bytes4 selector, uint256 chainId);\n\n/// @title VerifyData - Smart contract for verifying the Guard CM data\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\nabstract contract VerifyData {\n    // Mapping of (target address | bytes4 selector | uint64 chain Id) => enabled / disabled\n    mapping(uint256 => bool) public mapAllowedTargetSelectorChainIds;\n\n    /// @dev Verifies authorized combinations of target and selector.\n    /// @notice The bottom-most internal function is still not \"view\" since some reverts are not explicitly handled\n    /// @param target Target address.\n    /// @param data Payload bytes.\n    /// @param chainId Chain Id.\n    function _verifyData(address target, bytes memory data, uint256 chainId) internal {\n        // Push a pair of key defining variables into one key\n        // target occupies first 160 bits\n        uint256 targetSelectorChainId = uint256(uint160(target));\n        // selector occupies next 32 bits\n        bytes4 targetSelector = bytes4(data);\n        targetSelectorChainId |= uint256(uint32(targetSelector)) << 160;\n        // chainId occupies next 64 bits\n        targetSelectorChainId |= chainId << 192;\n\n        // Check the authorized combination of target and selector\n        if (!mapAllowedTargetSelectorChainIds[targetSelectorChainId]) {\n            revert NotAuthorized(target, targetSelector, chainId);\n        }\n    }\n}"
+    },
+    "contracts/multisigs/GuardCM.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\nimport {Enum} from \"@gnosis.pm/safe-contracts/contracts/common/Enum.sol\";\nimport {VerifyData} from \"./VerifyData.sol\";\n\ninterface IGovernor {\n    function state(uint256 proposalId) external returns (ProposalState);\n}\n\ninterface IBridgeVerifier {\n    /// @dev Processes bridged data: checks the header and verifies the payload.\n    /// @param data Full data bytes with the header.\n    /// @param bridgeMediatorL2 Address of a bridged mediator on L2.\n    /// @param chainId L2 chain Id.\n    function processBridgeData(\n        bytes memory data,\n        address bridgeMediatorL2,\n        uint256 chainId\n    ) external;\n}\n\n// Governor proposal state\nenum ProposalState {\n    Pending,\n    Active,\n    Canceled,\n    Defeated,\n    Succeeded,\n    Queued,\n    Expired,\n    Executed\n}\n\n// Struct for bridge parameters\nstruct BridgeParams {\n    // Data verifier contract for calls executed on L2\n    address verifierL2;\n    // Bridge mediator (data receiving) contract on L2\n    address bridgeMediatorL2;\n    // Chain Id: this value cannot practically be bigger than `floor(MAX_UINT64 / 2) - 36` as per EIP 2294\n    uint64 chainId;\n}\n\n/// @dev Only `owner` has a privilege, but the `sender` was provided.\n/// @param sender Sender address.\n/// @param owner Required sender address as an owner.\nerror OwnerOnly(address sender, address owner);\n\n/// @dev Only `manager` has a privilege, but the `sender` was provided.\n/// @param sender Sender address.\n/// @param manager Required sender address as an owner.\nerror ManagerOnly(address sender, address manager);\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Provided zero value.\nerror ZeroValue();\n\n/// @dev Wrong length of two arrays.\n/// @param numValues1 Number of values in a first array.\n/// @param numValues2 Number of of values in a second array.\n/// @param numValues3 Number of of values in a third array.\n/// @param numValues4 Number of of values in a fourth array.\nerror WrongArrayLength(uint256 numValues1, uint256 numValues2, uint256 numValues3, uint256 numValues4);\n\n/// @dev Provided incorrect data length.\n/// @param expected Expected minimum data length.\n/// @param provided Provided data length.\nerror IncorrectDataLength(uint256 expected, uint256 provided);\n\n/// @dev No delegatecall is allowed.\nerror NoDelegateCall();\n\n/// @dev No self multisig call is allowed.\nerror NoSelfCall();\n\n/// @dev The proposal is not defeated.\n/// @param proposalId Proposal Id.\n/// @param state Current proposal state.\nerror NotDefeated(uint256 proposalId, ProposalState state);\n\n/// @dev Delegatecall reverted.\nerror DelegateCallFailed();\n\n/// @dev Only the contract address is allowed, but the EOA account was provided.\n/// @param account Account address.\nerror ContractOnly(address account);\n\n/// @dev Passed L2 chain Id is not supported.\n/// @param chainId L2 chain Id.\nerror L2ChainIdNotSupported(uint256 chainId);\n\n/// @title GuardCM - Smart contract for Gnosis Safe community multisig (CM) guard\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\ncontract GuardCM is VerifyData {\n    event GovernorUpdated(address indexed governor);\n    event SetTargetSelectors(address[] indexed targets, bytes4[] indexed selectors, uint256[] chainIds, bool[] statuses);\n    event SetBridgeMediators(address[] indexed bridgeMediatorL1s, address[] indexed verifierL2s,\n        address[] indexed bridgeMediatorL2s, uint256[] chainIds);\n    event GovernorCheckProposalIdChanged(uint256 indexed proposalId);\n    event GuardPaused(address indexed account);\n    event GuardUnpaused();\n\n    // schedule selector\n    bytes4 public constant SCHEDULE = bytes4(keccak256(bytes(\"schedule(address,uint256,bytes,bytes32,bytes32,uint256)\")));\n    // scheduleBatch selector\n    bytes4 public constant SCHEDULE_BATCH = bytes4(keccak256(bytes(\"scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,uint256)\")));\n    // requireToPassMessage selector (Gnosis chain)\n    // Initial check governance proposal Id\n    // Calculated from the proposalHash function of the GovernorOLAS\n    uint256 public governorCheckProposalId = 88250008686885504216650933897987879122244685460173810624866685274624741477673;\n    // Minimum data length that is encoded for the schedule function,\n    // plus at least 4 bytes or 32 bits for the selector from the payload\n    uint256 public constant MIN_SCHEDULE_DATA_LENGTH = 260;\n    // Minimum data length that contains at least a selector (4 bytes or 32 bits)\n    uint256 public constant SELECTOR_DATA_LENGTH = 4;\n    // Maximum chain Id as per EVM specs\n    uint256 public constant MAX_CHAIN_ID = type(uint64).max / 2 - 36;\n\n    // Owner address\n    address public immutable owner;\n    // Multisig address\n    address public immutable multisig;\n\n    // Governor address\n    address public governor;\n    // Guard pausing possibility\n    uint8 public paused = 1;\n\n    // Mapping of L1 bridge mediator => (L2 verifier | uint64 supported L2 chain Id | L2 bridge mediator)\n    mapping(address => BridgeParams) public mapBridgeMediatorL1BridgeParams;\n\n    /// @dev GuardCM constructor.\n    /// @param _timelock Timelock address.\n    /// @param _multisig Community multisig address.\n    /// @param _governor Governor address.\n    constructor(\n        address _timelock,\n        address _multisig,\n        address _governor\n    ) {\n        // Check for zero addresses\n        if (_timelock == address(0) || _multisig == address(0) || _governor == address(0)) {\n            revert ZeroAddress();\n        }\n        owner = _timelock;\n        multisig = _multisig;\n        governor = _governor;\n    }\n\n    /// @dev Changes the governor.\n    /// @param newGovernor Address of a new governor.\n    function changeGovernor(address newGovernor) external {\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero address\n        if (newGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        governor = newGovernor;\n        emit GovernorUpdated(newGovernor);\n    }\n\n    /// @dev Changes the governor check proposal Id.\n    /// @param proposalId Governor check proposal Id.\n    function changeGovernorCheckProposalId(uint256 proposalId) external {\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero value\n        if (proposalId == 0) {\n            revert ZeroValue();\n        }\n\n        governorCheckProposalId = proposalId;\n        emit GovernorCheckProposalIdChanged(proposalId);\n    }\n\n    /// @dev Verifies authorized target and selector in the schedule or scheduleBatch function call.\n    /// @param data Data in bytes.\n    /// @param selector Schedule function selector.\n    function _verifySchedule(bytes memory data, bytes4 selector) internal {\n        // Copy the data without the selector\n        bytes memory payload = new bytes(data.length - SELECTOR_DATA_LENGTH);\n        for (uint256 i = 0; i < payload.length; ++i) {\n            payload[i] = data[i + 4];\n        }\n\n        // Prepare the decoding data sets\n        address[] memory targets;\n        bytes[] memory callDatas;\n        if (selector == SCHEDULE) {\n            targets = new address[](1);\n            callDatas = new bytes[](1);\n            // Decode the data in the schedule function\n            (targets[0], , callDatas[0], , , ) =\n                abi.decode(payload, (address, uint256, bytes, bytes32, bytes32, uint256));\n        } else {\n            // Decode the data in the scheduleBatch function\n            (targets, , callDatas, , , ) =\n            abi.decode(payload, (address[], uint256[], bytes[], bytes32, bytes32, uint256));\n        }\n\n        // Traverse all the schedule targets and selectors extracted from calldatas\n        for (uint i = 0; i < targets.length; ++i) {\n            // Get the verifierL2 and L2 chain Id, if any\n            BridgeParams memory bridgeParams = mapBridgeMediatorL1BridgeParams[targets[i]];\n\n            // Check if the data goes across the bridge\n            if (bridgeParams.verifierL2 != address(0)) {\n                // Process the bridge logic\n                bytes memory processData = abi.encodeCall(IBridgeVerifier.processBridgeData, (callDatas[i],\n                    bridgeParams.bridgeMediatorL2, bridgeParams.chainId));\n                (bool success, bytes memory returnData) = bridgeParams.verifierL2.delegatecall(processData);\n                // Process unsuccessful delegatecall\n                if (!success) {\n                    // Get the revert message bytes\n                    if (returnData.length > 0) {\n                        assembly {\n                            let returnDataSize := mload(returnData)\n                            revert(add(32, returnData), returnDataSize)\n                        }\n                    } else {\n                        revert DelegateCallFailed();\n                    }\n                }\n            } else {\n                // Verify the data right away as it is not the bridged one\n                _verifyData(targets[i], callDatas[i], block.chainid);\n            }\n        }\n    }\n\n    /// @dev Checks the transaction for authorized arguments.\n    /// @notice Scheduling in timelock is checked against authorized targets and signatures.\n    /// @notice No self-multisig function calls are allowed.\n    /// @param to Destination address of Safe transaction.\n    /// @param data Data payload of Safe transaction.\n    /// @param operation Operation type of Safe transaction.\n    function checkTransaction(\n        address to,\n        uint256,\n        bytes memory data,\n        Enum.Operation operation,\n        uint256,\n        uint256,\n        uint256,\n        address,\n        address payable,\n        bytes memory,\n        address\n    ) external {\n        // Just return if paused\n        if (paused == 1) {\n            // No delegatecall is allowed\n            if (operation == Enum.Operation.DelegateCall) {\n                revert NoDelegateCall();\n            }\n\n            // Call to the timelock\n            if (to == owner) {\n                // Data needs to have enough bytes at least to fit the selector\n                if (data.length < SELECTOR_DATA_LENGTH) {\n                    revert IncorrectDataLength(data.length, SELECTOR_DATA_LENGTH);\n                }\n\n                // Get the function signature\n                bytes4 functionSig = bytes4(data);\n                // Check the schedule or scheduleBatch function authorized parameters\n                // All other functions are not checked for\n                if (functionSig == SCHEDULE || functionSig == SCHEDULE_BATCH) {\n                    // Data length is too short: need to have enough bytes for the schedule() function\n                    // with one selector extracted from the payload\n                    if (data.length < MIN_SCHEDULE_DATA_LENGTH) {\n                        revert IncorrectDataLength(data.length, MIN_SCHEDULE_DATA_LENGTH);\n                    }\n\n                    _verifySchedule(data, functionSig);\n                }\n            } else if (to == multisig) {\n                // No self multisig call is allowed\n                revert NoSelfCall();\n            }\n        }\n    }\n\n    /// @dev Authorizes combinations of targets, selectors and chain Ids.\n    /// @notice It is the contract owner responsibility to set correct L1 chain Ids where the contract is deployed\n    ///         and corresponding supported L2-s, if the contract interacts with them.\n    /// @param targets Array of target addresses.\n    /// @param selectors Array of selectors for targets.\n    /// @param chainIds Chain Ids for authorized functions.\n    /// @param statuses Authorize if true, and restrict otherwise.\n    function setTargetSelectorChainIds(\n        address[] memory targets,\n        bytes4[] memory selectors,\n        uint256[] memory chainIds,\n        bool[] memory statuses\n    ) external {\n        // Check for the ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n        \n        // Check array length\n        if (targets.length != selectors.length || targets.length != statuses.length || targets.length != chainIds.length) {\n            revert WrongArrayLength(targets.length, selectors.length, statuses.length, chainIds.length);\n        }\n\n        // Traverse all the targets and selectors to build their paired values\n        for (uint256 i = 0; i < targets.length; ++i) {\n            // Check for zero address targets\n            if (targets[i] == address(0)) {\n                revert ZeroAddress();\n            }\n\n            // Check selector for zero selector value\n            if (selectors[i] == bytes4(0)) {\n                revert ZeroValue();\n            }\n\n            // Check chain Ids to be greater than zero\n            if (chainIds[i] == 0) {\n                revert ZeroValue();\n            }\n\n            // Push a pair of key defining variables into one key\n            // target occupies first 160 bits\n            uint256 targetSelectorChainId = uint256(uint160(targets[i]));\n            // selector occupies next 32 bits\n            targetSelectorChainId |= uint256(uint32(selectors[i])) << 160;\n            // chainId occupies next 64 bits\n            targetSelectorChainId |= chainIds[i] << 192;\n\n            // Set the status of the target and selector combination\n            mapAllowedTargetSelectorChainIds[targetSelectorChainId] = statuses[i];\n        }\n\n        emit SetTargetSelectors(targets, selectors, chainIds, statuses);\n    }\n\n    /// @dev Sets bridge mediator and L2 verifier contracts addresses on L1 and L2 chain Ids.\n    /// @notice It is the contract owner responsibility to set correct L1 bridge mediator contracts,\n    ///         corresponding L2 verifier contracts, and supported chain Ids.\n    ///         Note that it is out of scope of the verification procedure to check if any other chain Id formats,\n    ///         like Wormhole one, is correctly setup during the bridge call.\n    /// @param bridgeMediatorL1s Bridge mediator contract addresses on L1.\n    /// @param verifierL2s Corresponding L2 verifier contract addresses on L1.\n    /// @param chainIds Corresponding L2 chain Ids (original EVM numbers).\n    /// @param bridgeMediatorL2s Corresponding L2 bridge mediators.\n    function setBridgeMediatorL1BridgeParams(\n        address[] memory bridgeMediatorL1s,\n        address[] memory verifierL2s,\n        uint256[] memory chainIds,\n        address[] memory bridgeMediatorL2s\n    ) external {\n        // Check for the ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for array correctness\n        if (bridgeMediatorL1s.length != verifierL2s.length || bridgeMediatorL1s.length != chainIds.length ||\n            bridgeMediatorL1s.length != bridgeMediatorL2s.length) {\n            revert WrongArrayLength(bridgeMediatorL1s.length, verifierL2s.length, chainIds.length, bridgeMediatorL2s.length);\n        }\n\n        // Link L1 and L2 bridge mediators, set L2 chain Ids and L2 verifiers\n        for (uint256 i = 0; i < chainIds.length; ++i) {\n            // Check for zero addresses\n            if (bridgeMediatorL1s[i] == address(0) || verifierL2s[i] == address(0) || bridgeMediatorL2s[i] == address(0)) {\n                revert ZeroAddress();\n            }\n\n            // Check that the verifier is a contract\n            if (verifierL2s[i].code.length == 0) {\n                revert ContractOnly(verifierL2s[i]);\n            }\n\n            // Check chain Id\n            uint256 chainId = chainIds[i];\n            if (chainId == 0 || chainId > MAX_CHAIN_ID) {\n                revert L2ChainIdNotSupported(chainId);\n            }\n            \n            // Set bridge params\n            BridgeParams storage bridgeParams = mapBridgeMediatorL1BridgeParams[bridgeMediatorL1s[i]];\n            bridgeParams.verifierL2 = verifierL2s[i];\n            bridgeParams.bridgeMediatorL2 = bridgeMediatorL2s[i];\n            bridgeParams.chainId = uint64(chainIds[i]);\n        }\n        emit SetBridgeMediators(bridgeMediatorL1s, verifierL2s, bridgeMediatorL2s, chainIds);\n    }\n\n    /// @dev Pauses the guard restoring a full CM functionality.\n    /// @notice The timeline is able to pause the guard via the voting.\n    /// @notice The CM can request pausing the guard is there was a proposal to check if the governance is alive.\n    ///         If the proposal is defeated (not enough votes or never voted on),\n    ///         the governance is considered inactive for about a week.\n    function pause() external {\n        if (msg.sender == owner) {\n            // Timelock can release the community multisig right away\n            paused = 2;\n        } else if (msg.sender == multisig) {\n            // Multisig needs to check if the governor check proposal Id state is defeated\n            ProposalState state = IGovernor(governor).state(governorCheckProposalId);\n            if (state == ProposalState.Defeated) {\n                paused = 2;\n            } else {\n                revert NotDefeated(governorCheckProposalId, state);\n            }\n        } else {\n            // msg.sender is not a timelock, nor a multisig\n            revert ManagerOnly(msg.sender, multisig);\n        }\n\n        emit GuardPaused(msg.sender);\n    }\n\n    /// @dev Unpauses the guard restricting the CM functionality back.\n    function unpause() external {\n        // Check for the ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        paused = 1;\n\n        emit GuardUnpaused();\n    }\n\n    /// @dev Guards the multisig call after its execution.\n    function checkAfterExecution(bytes32, bool) external {}\n\n    /// @dev Gets the status of a target-selector-chainId combination.\n    /// @param target Target address.\n    /// @param selector Selector for a target.\n    /// @param chainId Corresponding chain Id.\n    /// @return status True, if the target-selector-chainId combination is authorized.\n    function getTargetSelectorChainId(address target, bytes4 selector, uint256 chainId) external view\n        returns (bool status)\n    {\n        // Push a pair of key defining variables into one key\n        // target occupies first 160 bits\n        uint256 targetSelectorChainId = uint256(uint160(target));\n        // selector occupies next 32 bits\n        targetSelectorChainId |= uint256(uint32(selector)) << 160;\n        // chainId occupies next 64 bits\n        targetSelectorChainId |= chainId << 192;\n\n        status = mapAllowedTargetSelectorChainIds[targetSelectorChainId];\n    }\n}"
+    },
+    "node_modules/@gnosis.pm/safe-contracts/contracts/common/Enum.sol": {
+      "content": "// SPDX-License-Identifier: LGPL-3.0-only\npragma solidity >=0.7.0 <0.9.0;\n\n/// @title Enum - Collection of enums\n/// @author Richard Meissner - <richard@gnosis.pm>\ncontract Enum {\n    enum Operation {Call, DelegateCall}\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.30+commit.73712a01"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_timelock",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_multisig",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_governor",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "ContractOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DelegateCallFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncorrectDataLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "L2ChainIdNotSupported",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            }
+          ],
+          "name": "ManagerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NoDelegateCall",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NoSelfCall",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes4",
+              "name": "selector",
+              "type": "bytes4"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "NotAuthorized",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "enum ProposalState",
+              "name": "state",
+              "type": "uint8"
+            }
+          ],
+          "name": "NotDefeated",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "numValues1",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "numValues2",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "numValues3",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "numValues4",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongArrayLength",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroValue",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "GovernorCheckProposalIdChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "governor",
+              "type": "address"
+            }
+          ],
+          "name": "GovernorUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "GuardPaused",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [],
+          "name": "GuardUnpaused",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address[]",
+              "name": "bridgeMediatorL1s",
+              "type": "address[]"
+            },
+            {
+              "indexed": true,
+              "internalType": "address[]",
+              "name": "verifierL2s",
+              "type": "address[]"
+            },
+            {
+              "indexed": true,
+              "internalType": "address[]",
+              "name": "bridgeMediatorL2s",
+              "type": "address[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "SetBridgeMediators",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address[]",
+              "name": "targets",
+              "type": "address[]"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes4[]",
+              "name": "selectors",
+              "type": "bytes4[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "bool[]",
+              "name": "statuses",
+              "type": "bool[]"
+            }
+          ],
+          "name": "SetTargetSelectors",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_CHAIN_ID",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MIN_SCHEDULE_DATA_LENGTH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "SCHEDULE",
+          "outputs": [
+            {
+              "internalType": "bytes4",
+              "name": "",
+              "type": "bytes4"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "SCHEDULE_BATCH",
+          "outputs": [
+            {
+              "internalType": "bytes4",
+              "name": "",
+              "type": "bytes4"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "SELECTOR_DATA_LENGTH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "changeGovernor",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "changeGovernorCheckProposalId",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "name": "checkAfterExecution",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            },
+            {
+              "internalType": "enum Enum.Operation",
+              "name": "operation",
+              "type": "uint8"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address payable",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "",
+              "type": "bytes"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "checkTransaction",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes4",
+              "name": "selector",
+              "type": "bytes4"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getTargetSelectorChainId",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "status",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "governor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "governorCheckProposalId",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "mapAllowedTargetSelectorChainIds",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "mapBridgeMediatorL1BridgeParams",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "verifierL2",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "bridgeMediatorL2",
+              "type": "address"
+            },
+            {
+              "internalType": "uint64",
+              "name": "chainId",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "multisig",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pause",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "paused",
+          "outputs": [
+            {
+              "internalType": "uint8",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "bridgeMediatorL1s",
+              "type": "address[]"
+            },
+            {
+              "internalType": "address[]",
+              "name": "verifierL2s",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "address[]",
+              "name": "bridgeMediatorL2s",
+              "type": "address[]"
+            }
+          ],
+          "name": "setBridgeMediatorL1BridgeParams",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "targets",
+              "type": "address[]"
+            },
+            {
+              "internalType": "bytes4[]",
+              "name": "selectors",
+              "type": "bytes4[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "bool[]",
+              "name": "statuses",
+              "type": "bool[]"
+            }
+          ],
+          "name": "setTargetSelectorChainIds",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "unpause",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>Andrey Lebedev - <andrey.lebedev@valory.xyz>",
+        "errors": {
+          "ContractOnly(address)": [
+            {
+              "details": "Only the contract address is allowed, but the EOA account was provided.",
+              "params": {
+                "account": "Account address."
+              }
+            }
+          ],
+          "DelegateCallFailed()": [
+            {
+              "details": "Delegatecall reverted."
+            }
+          ],
+          "IncorrectDataLength(uint256,uint256)": [
+            {
+              "details": "Provided incorrect data length.",
+              "params": {
+                "expected": "Expected minimum data length.",
+                "provided": "Provided data length."
+              }
+            }
+          ],
+          "L2ChainIdNotSupported(uint256)": [
+            {
+              "details": "Passed L2 chain Id is not supported.",
+              "params": {
+                "chainId": "L2 chain Id."
+              }
+            }
+          ],
+          "ManagerOnly(address,address)": [
+            {
+              "details": "Only `manager` has a privilege, but the `sender` was provided.",
+              "params": {
+                "manager": "Required sender address as an owner.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "NoDelegateCall()": [
+            {
+              "details": "No delegatecall is allowed."
+            }
+          ],
+          "NoSelfCall()": [
+            {
+              "details": "No self multisig call is allowed."
+            }
+          ],
+          "NotAuthorized(address,bytes4,uint256)": [
+            {
+              "details": "The combination of target and selector is not authorized.",
+              "params": {
+                "chainId": "Chain Id.",
+                "selector": "Function selector.",
+                "target": "Target address."
+              }
+            }
+          ],
+          "NotDefeated(uint256,uint8)": [
+            {
+              "details": "The proposal is not defeated.",
+              "params": {
+                "proposalId": "Proposal Id.",
+                "state": "Current proposal state."
+              }
+            }
+          ],
+          "OwnerOnly(address,address)": [
+            {
+              "details": "Only `owner` has a privilege, but the `sender` was provided.",
+              "params": {
+                "owner": "Required sender address as an owner.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "WrongArrayLength(uint256,uint256,uint256,uint256)": [
+            {
+              "details": "Wrong length of two arrays.",
+              "params": {
+                "numValues1": "Number of values in a first array.",
+                "numValues2": "Number of of values in a second array.",
+                "numValues3": "Number of of values in a third array.",
+                "numValues4": "Number of of values in a fourth array."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroValue()": [
+            {
+              "details": "Provided zero value."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "changeGovernor(address)": {
+            "details": "Changes the governor.",
+            "params": {
+              "newGovernor": "Address of a new governor."
+            }
+          },
+          "changeGovernorCheckProposalId(uint256)": {
+            "details": "Changes the governor check proposal Id.",
+            "params": {
+              "proposalId": "Governor check proposal Id."
+            }
+          },
+          "checkAfterExecution(bytes32,bool)": {
+            "details": "Guards the multisig call after its execution."
+          },
+          "checkTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes,address)": {
+            "details": "Checks the transaction for authorized arguments.",
+            "params": {
+              "data": "Data payload of Safe transaction.",
+              "operation": "Operation type of Safe transaction.",
+              "to": "Destination address of Safe transaction."
+            }
+          },
+          "constructor": {
+            "details": "GuardCM constructor.",
+            "params": {
+              "_governor": "Governor address.",
+              "_multisig": "Community multisig address.",
+              "_timelock": "Timelock address."
+            }
+          },
+          "getTargetSelectorChainId(address,bytes4,uint256)": {
+            "details": "Gets the status of a target-selector-chainId combination.",
+            "params": {
+              "chainId": "Corresponding chain Id.",
+              "selector": "Selector for a target.",
+              "target": "Target address."
+            },
+            "returns": {
+              "status": "True, if the target-selector-chainId combination is authorized."
+            }
+          },
+          "pause()": {
+            "details": "Pauses the guard restoring a full CM functionality."
+          },
+          "setBridgeMediatorL1BridgeParams(address[],address[],uint256[],address[])": {
+            "details": "Sets bridge mediator and L2 verifier contracts addresses on L1 and L2 chain Ids.",
+            "params": {
+              "bridgeMediatorL1s": "Bridge mediator contract addresses on L1.",
+              "bridgeMediatorL2s": "Corresponding L2 bridge mediators.",
+              "chainIds": "Corresponding L2 chain Ids (original EVM numbers).",
+              "verifierL2s": "Corresponding L2 verifier contract addresses on L1."
+            }
+          },
+          "setTargetSelectorChainIds(address[],bytes4[],uint256[],bool[])": {
+            "details": "Authorizes combinations of targets, selectors and chain Ids.",
+            "params": {
+              "chainIds": "Chain Ids for authorized functions.",
+              "selectors": "Array of selectors for targets.",
+              "statuses": "Authorize if true, and restrict otherwise.",
+              "targets": "Array of target addresses."
+            }
+          },
+          "unpause()": {
+            "details": "Unpauses the guard restricting the CM functionality back."
+          }
+        },
+        "title": "GuardCM - Smart contract for Gnosis Safe community multisig (CM) guard",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "checkTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes,address)": {
+            "notice": "Scheduling in timelock is checked against authorized targets and signatures.No self-multisig function calls are allowed."
+          },
+          "pause()": {
+            "notice": "The timeline is able to pause the guard via the voting.The CM can request pausing the guard is there was a proposal to check if the governance is alive.         If the proposal is defeated (not enough votes or never voted on),         the governance is considered inactive for about a week."
+          },
+          "setBridgeMediatorL1BridgeParams(address[],address[],uint256[],address[])": {
+            "notice": "It is the contract owner responsibility to set correct L1 bridge mediator contracts,         corresponding L2 verifier contracts, and supported chain Ids.         Note that it is out of scope of the verification procedure to check if any other chain Id formats,         like Wormhole one, is correctly setup during the bridge call."
+          },
+          "setTargetSelectorChainIds(address[],bytes4[],uint256[],bool[])": {
+            "notice": "It is the contract owner responsibility to set correct L1 chain Ids where the contract is deployed         and corresponding supported L2-s, if the contract interacts with them."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/multisigs/GuardCM.sol": "GuardCM"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@gnosis.pm/=node_modules/@gnosis.pm/",
+        ":@handlers/=lib/fx-portal/test/handlers/",
+        ":@mock/=lib/fx-portal/test/mock/",
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":@utils/=lib/fx-portal/test/utils/",
+        ":ds-test/=lib/solmate/lib/ds-test/src/",
+        ":forge-std/=lib/fx-portal/lib/forge-std/src/",
+        ":fx-portal/=node_modules/fx-portal/",
+        ":openzeppelin-contracts/=lib/fx-portal/lib/openzeppelin-contracts/",
+        ":solmate/=lib/solmate/src/"
+      ]
+    },
+    "sources": {
+      "contracts/multisigs/GuardCM.sol": {
+        "keccak256": "0x4111d5fd36d442fdb279d6a7a325ee0e49e9621f5594a3f9a7265058acf1cfa6",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c01d16a83fc790a8c64bc37f5b98f5d4ea4af476dc97b42e84e0c1e25e0b938a",
+          "dweb:/ipfs/QmW6fG3YSDRr1SPRJNqLteTD6dBuYMgqaHeicstFK2YPZy"
+        ]
+      },
+      "contracts/multisigs/VerifyData.sol": {
+        "keccak256": "0xa1011258ef374f174ed928b0c8199546410dd58f141c4d751bb59101c24b04d5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://9ea7db143f07099c1e716ff432c38eadcb1e28e49951d24bc3289178717091cf",
+          "dweb:/ipfs/QmRvsgrT8WStNkWrUSAJT4UQ9EVoP9MaV2eBz7u5XX4Y95"
+        ]
+      },
+      "node_modules/@gnosis.pm/safe-contracts/contracts/common/Enum.sol": {
+        "keccak256": "0x473e45b1a5cc47be494b0e123c9127f0c11c1e0992a321ae5a644c0bfdb2c14f",
+        "license": "LGPL-3.0-only",
+        "urls": [
+          "bzz-raw://948e6d5a8bd7377f7795b6e28584eab9be5c0a8db240bf5e606744a175238c3d",
+          "dweb:/ipfs/QmQQaUmQfpuejV41jbxKSTgEBYYCcVTjCsDMgf2htgz6ej"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.30+commit.73712a01",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "@gnosis.pm/=node_modules/@gnosis.pm/",
+        "@openzeppelin/=node_modules/@openzeppelin/",
+        "fx-portal/=node_modules/fx-portal/",
+        "@handlers/=lib/fx-portal/test/handlers/",
+        "@mock/=lib/fx-portal/test/mock/",
+        "@utils/=lib/fx-portal/test/utils/",
+        "ds-test/=lib/solmate/lib/ds-test/src/",
+        "forge-std/=lib/fx-portal/lib/forge-std/src/",
+        "openzeppelin-contracts/=lib/fx-portal/lib/openzeppelin-contracts/",
+        "solmate/=lib/solmate/src/"
+      ]
+    },
+    "name": "GuardCM",
+    "fullyQualifiedName": "contracts/multisigs/GuardCM.sol:GuardCM"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "30138313",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-05-29T11:25:25Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0xC0b146D61e2A2C17E024477E01978D1Fcf598c6B"
+}

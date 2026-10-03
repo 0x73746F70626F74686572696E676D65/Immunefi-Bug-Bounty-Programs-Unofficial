@@ -1,0 +1,511 @@
+{
+  "sources": {
+    "contracts/bridges/BridgeMessenger.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\nimport {IBridgeErrors} from \"../interfaces/IBridgeErrors.sol\";\n\n/// @title BridgeMessenger - Abstract smart contract for the bridge communication data processing\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\nabstract contract BridgeMessenger is IBridgeErrors {\n    event FundsReceived(address indexed sender, uint256 value);\n\n    // Default payload data length includes the number of bytes of at least one address (20 bytes or 160 bits),\n    // value (12 bytes or 96 bits) and the payload size (4 bytes or 32 bits)\n    uint256 public constant DEFAULT_DATA_LENGTH = 36;\n\n    /// @dev Receives native network token.\n    receive() external payable {\n        emit FundsReceived(msg.sender, msg.value);\n    }\n\n    /// @dev Processes received data.\n    /// @param data Bytes message sent from L2 Relayer contract. The data must be encoded as a set of\n    ///        continuous transactions packed into a single buffer, where each transaction is composed as follows:\n    ///        - target address of 20 bytes (160 bits);\n    ///        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;\n    ///        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;\n    ///        - payload as bytes, with the length equal to the specified payload length.\n    function _processData(bytes memory data) internal virtual {\n        // Check for the correct data length\n        uint256 dataLength = data.length;\n        if (dataLength < DEFAULT_DATA_LENGTH) {\n            revert IncorrectDataLength(DEFAULT_DATA_LENGTH, data.length);\n        }\n\n        // Unpack and process the data\n        for (uint256 i = 0; i < dataLength;) {\n            address target;\n            uint96 value;\n            uint32 payloadLength;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                // First 20 bytes is the address (160 bits)\n                i := add(i, 20)\n                target := mload(add(data, i))\n                // Offset the data by 12 bytes of value (96 bits)\n                i := add(i, 12)\n                value := mload(add(data, i))\n                // Offset the data by 4 bytes of payload length (32 bits)\n                i := add(i, 4)\n                payloadLength := mload(add(data, i))\n            }\n\n            // Check for the zero address\n            if (target == address(0)) {\n                revert ZeroAddress();\n            }\n\n            // Check for the value compared to the contract's balance\n            if (value > address(this).balance) {\n                revert InsufficientBalance(value, address(this).balance);\n            }\n\n            // Get the payload\n            bytes memory payload = new bytes(payloadLength);\n            for (uint256 j = 0; j < payloadLength; ++j) {\n                payload[j] = data[i + j];\n            }\n            // Offset the data by the payload number of bytes\n            i += payloadLength;\n\n            // Call the target with the provided payload\n            (bool success, ) = target.call{value: value}(payload);\n            if (!success) {\n                revert TargetExecFailed(target, value, payload);\n            }\n        }\n    }\n}"
+    },
+    "contracts/interfaces/IBridgeErrors.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\n/// @dev Bridge errors.\ninterface IBridgeErrors {\n    /// @dev Provided zero address.\n    error ZeroAddress();\n\n    /// @dev Provided zero value.\n    error ZeroValue();\n\n    /// @dev Only self contract is allowed to call the function.\n    /// @param sender Sender address.\n    /// @param instance Required contract instance address.\n    error SelfCallOnly(address sender, address instance);\n\n    /// @dev Only L2 relayer is allowed to call the function.\n    /// @param sender Sender address.\n    /// @param targetRelayer Required L2 relayer address.\n    error TargetRelayerOnly(address sender, address targetRelayer);\n\n    /// @dev Wrong source chain Id.\n    /// @param received Chain Id received.\n    /// @param required Required chain Id.\n    error WrongSourceChainId(uint256 received, uint256 required);\n\n    /// @dev Only on behalf of `sourceGovernor` the function is allowed to process the data.\n    /// @param sender Sender address.\n    /// @param sourceGovernor Required source governor address.\n    error SourceGovernorOnly(address sender, address sourceGovernor);\n\n    /// @dev Only on behalf of `sourceGovernor` the function is allowed to process the data.\n    /// @param sender Sender address.\n    /// @param sourceGovernor Required source governor address.\n    error SourceGovernorOnly32(bytes32 sender, bytes32 sourceGovernor);\n\n    /// @dev The message with a specified hash has already been delivered.\n    /// @param deliveryHash Delivery hash.\n    error AlreadyDelivered(bytes32 deliveryHash);\n\n    /// @dev Provided incorrect data length.\n    /// @param expected Expected minimum data length.\n    /// @param provided Provided data length.\n    error IncorrectDataLength(uint256 expected, uint256 provided);\n\n    /// @dev Provided value is bigger than the actual balance.\n    /// @param value Provided value.\n    /// @param balance Actual balance.\n    error InsufficientBalance(uint256 value, uint256 balance);\n\n    /// @dev Target execution failed.\n    /// @param target Target address.\n    /// @param value Provided value.\n    /// @param payload Provided payload.\n    error TargetExecFailed(address target, uint256 value, bytes payload);\n}\n"
+    },
+    "contracts/bridges/OptimismMessenger.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\nimport {BridgeMessenger} from \"./BridgeMessenger.sol\";\n\n/// @dev Interface to the CrossDomainMessenger (CDM) Contract Proxy.\ninterface ICrossDomainMessenger {\n    function xDomainMessageSender() external returns (address);\n}\n\n/// @title OptimismMessenger - Smart contract for the governor home (Optimism) bridge implementation\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\ncontract OptimismMessenger is BridgeMessenger {\n    event SourceGovernorUpdated(address indexed sourceGovernor);\n    event MessageReceived(address indexed sourceMessageSender, bytes data);\n\n    // CDM Contract Proxy (Home) address on L2 that receives the message across the bridge from the source L1 network\n    address public immutable CDMContractProxyHome;\n    // Source governor address on L1 that is authorized to propagate the transaction execution across the bridge\n    address public sourceGovernor;\n\n    /// @dev OptimismMessenger constructor.\n    /// @param _CDMContractProxyHome CDM Contract Proxy (Home) address (Optimism).\n    /// @param _sourceGovernor Source Governor address (ETH).\n    constructor(address _CDMContractProxyHome, address _sourceGovernor) {\n        // Check fo zero addresses\n        if (_CDMContractProxyHome == address(0) || _sourceGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        CDMContractProxyHome = _CDMContractProxyHome;\n        sourceGovernor = _sourceGovernor;\n    }\n\n    /// @dev Changes the source governor address (original Timelock).\n    /// @notice The only way to change the source governor address is by the Timelock on L1 to request that change.\n    ///         This triggers a self-contract transaction of BridgeMessenger that changes the source governor address.\n    /// @param newSourceGovernor New source governor address.\n    function changeSourceGovernor(address newSourceGovernor) external {\n        // Check if the change is authorized by the previous governor itself\n        // This is possible only if all the checks in the message process function pass and the contract calls itself\n        if (msg.sender != address(this)) {\n            revert SelfCallOnly(msg.sender, address(this));\n        }\n\n        // Check for the zero address\n        if (newSourceGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        sourceGovernor = newSourceGovernor;\n        emit SourceGovernorUpdated(newSourceGovernor);\n    }\n\n    /// @dev Processes a message received from the CDM Contract Proxy (Home) contract.\n    /// @notice The sender must be the Source Governor address (Timelock).\n    /// @param data Bytes message sent from the CDM Contract Proxy (Home) contract. The data must be encoded as a set of\n    ///        continuous transactions packed into a single buffer, where each transaction is composed as follows:\n    ///        - target address of 20 bytes (160 bits);\n    ///        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;\n    ///        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;\n    ///        - payload as bytes, with the length equal to the specified payload length.\n    function processMessageFromSource(bytes memory data) external payable {\n        // Check for the CDM Contract Proxy (Home) address\n        if (msg.sender != CDMContractProxyHome) {\n            revert TargetRelayerOnly(msg.sender, CDMContractProxyHome);\n        }\n\n        // Check for the Source Governor address\n        address governor = sourceGovernor;\n        address bridgeGovernor = ICrossDomainMessenger(CDMContractProxyHome).xDomainMessageSender();\n        if (bridgeGovernor != governor) {\n            revert SourceGovernorOnly(bridgeGovernor, governor);\n        }\n\n        // Process the data\n        _processData(data);\n\n        // Emit received message\n        emit MessageReceived(governor, data);\n    }\n}"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.23+commit.f704f362"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_CDMContractProxyHome",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_sourceGovernor",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "deliveryHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "AlreadyDelivered",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncorrectDataLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "balance",
+              "type": "uint256"
+            }
+          ],
+          "name": "InsufficientBalance",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "instance",
+              "type": "address"
+            }
+          ],
+          "name": "SelfCallOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "sourceGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "SourceGovernorOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "sender",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "sourceGovernor",
+              "type": "bytes32"
+            }
+          ],
+          "name": "SourceGovernorOnly32",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "target",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "payload",
+              "type": "bytes"
+            }
+          ],
+          "name": "TargetExecFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "targetRelayer",
+              "type": "address"
+            }
+          ],
+          "name": "TargetRelayerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "received",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "required",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongSourceChainId",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroValue",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            }
+          ],
+          "name": "FundsReceived",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sourceMessageSender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "MessageReceived",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sourceGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "SourceGovernorUpdated",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "CDMContractProxyHome",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DEFAULT_DATA_LENGTH",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newSourceGovernor",
+              "type": "address"
+            }
+          ],
+          "name": "changeSourceGovernor",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "processMessageFromSource",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "sourceGovernor",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>Andrey Lebedev - <andrey.lebedev@valory.xyz>Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>",
+        "errors": {
+          "AlreadyDelivered(bytes32)": [
+            {
+              "details": "The message with a specified hash has already been delivered.",
+              "params": {
+                "deliveryHash": "Delivery hash."
+              }
+            }
+          ],
+          "IncorrectDataLength(uint256,uint256)": [
+            {
+              "details": "Provided incorrect data length.",
+              "params": {
+                "expected": "Expected minimum data length.",
+                "provided": "Provided data length."
+              }
+            }
+          ],
+          "InsufficientBalance(uint256,uint256)": [
+            {
+              "details": "Provided value is bigger than the actual balance.",
+              "params": {
+                "balance": "Actual balance.",
+                "value": "Provided value."
+              }
+            }
+          ],
+          "SelfCallOnly(address,address)": [
+            {
+              "details": "Only self contract is allowed to call the function.",
+              "params": {
+                "instance": "Required contract instance address.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "SourceGovernorOnly(address,address)": [
+            {
+              "details": "Only on behalf of `sourceGovernor` the function is allowed to process the data.",
+              "params": {
+                "sender": "Sender address.",
+                "sourceGovernor": "Required source governor address."
+              }
+            }
+          ],
+          "SourceGovernorOnly32(bytes32,bytes32)": [
+            {
+              "details": "Only on behalf of `sourceGovernor` the function is allowed to process the data.",
+              "params": {
+                "sender": "Sender address.",
+                "sourceGovernor": "Required source governor address."
+              }
+            }
+          ],
+          "TargetExecFailed(address,uint256,bytes)": [
+            {
+              "details": "Target execution failed.",
+              "params": {
+                "payload": "Provided payload.",
+                "target": "Target address.",
+                "value": "Provided value."
+              }
+            }
+          ],
+          "TargetRelayerOnly(address,address)": [
+            {
+              "details": "Only L2 relayer is allowed to call the function.",
+              "params": {
+                "sender": "Sender address.",
+                "targetRelayer": "Required L2 relayer address."
+              }
+            }
+          ],
+          "WrongSourceChainId(uint256,uint256)": [
+            {
+              "details": "Wrong source chain Id.",
+              "params": {
+                "received": "Chain Id received.",
+                "required": "Required chain Id."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroValue()": [
+            {
+              "details": "Provided zero value."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "changeSourceGovernor(address)": {
+            "details": "Changes the source governor address (original Timelock).",
+            "params": {
+              "newSourceGovernor": "New source governor address."
+            }
+          },
+          "constructor": {
+            "details": "OptimismMessenger constructor.",
+            "params": {
+              "_CDMContractProxyHome": "CDM Contract Proxy (Home) address (Optimism).",
+              "_sourceGovernor": "Source Governor address (ETH)."
+            }
+          },
+          "processMessageFromSource(bytes)": {
+            "details": "Processes a message received from the CDM Contract Proxy (Home) contract.",
+            "params": {
+              "data": "Bytes message sent from the CDM Contract Proxy (Home) contract. The data must be encoded as a set of        continuous transactions packed into a single buffer, where each transaction is composed as follows:        - target address of 20 bytes (160 bits);        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;        - payload as bytes, with the length equal to the specified payload length."
+            }
+          }
+        },
+        "title": "OptimismMessenger - Smart contract for the governor home (Optimism) bridge implementation",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "changeSourceGovernor(address)": {
+            "notice": "The only way to change the source governor address is by the Timelock on L1 to request that change.         This triggers a self-contract transaction of BridgeMessenger that changes the source governor address."
+          },
+          "processMessageFromSource(bytes)": {
+            "notice": "The sender must be the Source Governor address (Timelock)."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/bridges/OptimismMessenger.sol": "OptimismMessenger"
+      },
+      "evmVersion": "paris",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 1000000
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/bridges/BridgeMessenger.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\nimport {IBridgeErrors} from \"../interfaces/IBridgeErrors.sol\";\n\n/// @title BridgeMessenger - Abstract smart contract for the bridge communication data processing\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\nabstract contract BridgeMessenger is IBridgeErrors {\n    event FundsReceived(address indexed sender, uint256 value);\n\n    // Default payload data length includes the number of bytes of at least one address (20 bytes or 160 bits),\n    // value (12 bytes or 96 bits) and the payload size (4 bytes or 32 bits)\n    uint256 public constant DEFAULT_DATA_LENGTH = 36;\n\n    /// @dev Receives native network token.\n    receive() external payable {\n        emit FundsReceived(msg.sender, msg.value);\n    }\n\n    /// @dev Processes received data.\n    /// @param data Bytes message sent from L2 Relayer contract. The data must be encoded as a set of\n    ///        continuous transactions packed into a single buffer, where each transaction is composed as follows:\n    ///        - target address of 20 bytes (160 bits);\n    ///        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;\n    ///        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;\n    ///        - payload as bytes, with the length equal to the specified payload length.\n    function _processData(bytes memory data) internal virtual {\n        // Check for the correct data length\n        uint256 dataLength = data.length;\n        if (dataLength < DEFAULT_DATA_LENGTH) {\n            revert IncorrectDataLength(DEFAULT_DATA_LENGTH, data.length);\n        }\n\n        // Unpack and process the data\n        for (uint256 i = 0; i < dataLength;) {\n            address target;\n            uint96 value;\n            uint32 payloadLength;\n            // solhint-disable-next-line no-inline-assembly\n            assembly {\n                // First 20 bytes is the address (160 bits)\n                i := add(i, 20)\n                target := mload(add(data, i))\n                // Offset the data by 12 bytes of value (96 bits)\n                i := add(i, 12)\n                value := mload(add(data, i))\n                // Offset the data by 4 bytes of payload length (32 bits)\n                i := add(i, 4)\n                payloadLength := mload(add(data, i))\n            }\n\n            // Check for the zero address\n            if (target == address(0)) {\n                revert ZeroAddress();\n            }\n\n            // Check for the value compared to the contract's balance\n            if (value > address(this).balance) {\n                revert InsufficientBalance(value, address(this).balance);\n            }\n\n            // Get the payload\n            bytes memory payload = new bytes(payloadLength);\n            for (uint256 j = 0; j < payloadLength; ++j) {\n                payload[j] = data[i + j];\n            }\n            // Offset the data by the payload number of bytes\n            i += payloadLength;\n\n            // Call the target with the provided payload\n            (bool success, ) = target.call{value: value}(payload);\n            if (!success) {\n                revert TargetExecFailed(target, value, payload);\n            }\n        }\n    }\n}",
+        "keccak256": "0x33a5521a7ae5fe601218bda237c165f66d73e81f71450b7029fa167fddb6c353",
+        "license": "MIT"
+      },
+      "contracts/bridges/OptimismMessenger.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\nimport {BridgeMessenger} from \"./BridgeMessenger.sol\";\n\n/// @dev Interface to the CrossDomainMessenger (CDM) Contract Proxy.\ninterface ICrossDomainMessenger {\n    function xDomainMessageSender() external returns (address);\n}\n\n/// @title OptimismMessenger - Smart contract for the governor home (Optimism) bridge implementation\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\ncontract OptimismMessenger is BridgeMessenger {\n    event SourceGovernorUpdated(address indexed sourceGovernor);\n    event MessageReceived(address indexed sourceMessageSender, bytes data);\n\n    // CDM Contract Proxy (Home) address on L2 that receives the message across the bridge from the source L1 network\n    address public immutable CDMContractProxyHome;\n    // Source governor address on L1 that is authorized to propagate the transaction execution across the bridge\n    address public sourceGovernor;\n\n    /// @dev OptimismMessenger constructor.\n    /// @param _CDMContractProxyHome CDM Contract Proxy (Home) address (Optimism).\n    /// @param _sourceGovernor Source Governor address (ETH).\n    constructor(address _CDMContractProxyHome, address _sourceGovernor) {\n        // Check fo zero addresses\n        if (_CDMContractProxyHome == address(0) || _sourceGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        CDMContractProxyHome = _CDMContractProxyHome;\n        sourceGovernor = _sourceGovernor;\n    }\n\n    /// @dev Changes the source governor address (original Timelock).\n    /// @notice The only way to change the source governor address is by the Timelock on L1 to request that change.\n    ///         This triggers a self-contract transaction of BridgeMessenger that changes the source governor address.\n    /// @param newSourceGovernor New source governor address.\n    function changeSourceGovernor(address newSourceGovernor) external {\n        // Check if the change is authorized by the previous governor itself\n        // This is possible only if all the checks in the message process function pass and the contract calls itself\n        if (msg.sender != address(this)) {\n            revert SelfCallOnly(msg.sender, address(this));\n        }\n\n        // Check for the zero address\n        if (newSourceGovernor == address(0)) {\n            revert ZeroAddress();\n        }\n\n        sourceGovernor = newSourceGovernor;\n        emit SourceGovernorUpdated(newSourceGovernor);\n    }\n\n    /// @dev Processes a message received from the CDM Contract Proxy (Home) contract.\n    /// @notice The sender must be the Source Governor address (Timelock).\n    /// @param data Bytes message sent from the CDM Contract Proxy (Home) contract. The data must be encoded as a set of\n    ///        continuous transactions packed into a single buffer, where each transaction is composed as follows:\n    ///        - target address of 20 bytes (160 bits);\n    ///        - value of 12 bytes (96 bits), as a limit for all of Autonolas ecosystem contracts;\n    ///        - payload length of 4 bytes (32 bits), as 2^32 - 1 characters is more than enough to fill a whole block;\n    ///        - payload as bytes, with the length equal to the specified payload length.\n    function processMessageFromSource(bytes memory data) external payable {\n        // Check for the CDM Contract Proxy (Home) address\n        if (msg.sender != CDMContractProxyHome) {\n            revert TargetRelayerOnly(msg.sender, CDMContractProxyHome);\n        }\n\n        // Check for the Source Governor address\n        address governor = sourceGovernor;\n        address bridgeGovernor = ICrossDomainMessenger(CDMContractProxyHome).xDomainMessageSender();\n        if (bridgeGovernor != governor) {\n            revert SourceGovernorOnly(bridgeGovernor, governor);\n        }\n\n        // Process the data\n        _processData(data);\n\n        // Emit received message\n        emit MessageReceived(governor, data);\n    }\n}",
+        "keccak256": "0x393a19f36cb3bb995268192732a1f3c41529110e14bccd1c6767826c6d2d51ec",
+        "license": "MIT"
+      },
+      "contracts/interfaces/IBridgeErrors.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\n/// @dev Bridge errors.\ninterface IBridgeErrors {\n    /// @dev Provided zero address.\n    error ZeroAddress();\n\n    /// @dev Provided zero value.\n    error ZeroValue();\n\n    /// @dev Only self contract is allowed to call the function.\n    /// @param sender Sender address.\n    /// @param instance Required contract instance address.\n    error SelfCallOnly(address sender, address instance);\n\n    /// @dev Only L2 relayer is allowed to call the function.\n    /// @param sender Sender address.\n    /// @param targetRelayer Required L2 relayer address.\n    error TargetRelayerOnly(address sender, address targetRelayer);\n\n    /// @dev Wrong source chain Id.\n    /// @param received Chain Id received.\n    /// @param required Required chain Id.\n    error WrongSourceChainId(uint256 received, uint256 required);\n\n    /// @dev Only on behalf of `sourceGovernor` the function is allowed to process the data.\n    /// @param sender Sender address.\n    /// @param sourceGovernor Required source governor address.\n    error SourceGovernorOnly(address sender, address sourceGovernor);\n\n    /// @dev Only on behalf of `sourceGovernor` the function is allowed to process the data.\n    /// @param sender Sender address.\n    /// @param sourceGovernor Required source governor address.\n    error SourceGovernorOnly32(bytes32 sender, bytes32 sourceGovernor);\n\n    /// @dev The message with a specified hash has already been delivered.\n    /// @param deliveryHash Delivery hash.\n    error AlreadyDelivered(bytes32 deliveryHash);\n\n    /// @dev Provided incorrect data length.\n    /// @param expected Expected minimum data length.\n    /// @param provided Provided data length.\n    error IncorrectDataLength(uint256 expected, uint256 provided);\n\n    /// @dev Provided value is bigger than the actual balance.\n    /// @param value Provided value.\n    /// @param balance Actual balance.\n    error InsufficientBalance(uint256 value, uint256 balance);\n\n    /// @dev Target execution failed.\n    /// @param target Target address.\n    /// @param value Provided value.\n    /// @param payload Provided payload.\n    error TargetExecFailed(address target, uint256 value, bytes payload);\n}\n",
+        "keccak256": "0x6ce046c3ec4aca3c837218d3f99ccbe8c20f370bc7cd7b022e812467262c6cb7",
+        "license": "MIT"
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.23+commit.f704f362",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 1000000,
+        "enabled": true
+      },
+      "evmVersion": "paris",
+      "remappings": []
+    },
+    "name": "OptimismMessenger",
+    "fullyQualifiedName": "contracts/bridges/OptimismMessenger.sol:OptimismMessenger"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "128113",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T10:49:39Z",
+  "match": "exact_match",
+  "chainId": "10",
+  "address": "0x87c511c8aE3fAF0063b3F3CF9C6ab96c4AA5C60c"
+}

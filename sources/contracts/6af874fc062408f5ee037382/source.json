@@ -1,0 +1,2066 @@
+{
+  "sources": {
+    "contracts/GenericManager.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\nimport \"./interfaces/IErrorsRegistries.sol\";\n\n/// @title Generic Manager - Smart contract for generic registry manager template\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\nabstract contract GenericManager is IErrorsRegistries {\n    event OwnerUpdated(address indexed owner);\n    event Pause(address indexed owner);\n    event Unpause(address indexed owner);\n\n    // Owner address\n    address public owner;\n    // Pause switch\n    bool public paused;\n\n    /// @dev Changes the owner address.\n    /// @param newOwner Address of a new owner.\n    function changeOwner(address newOwner) external virtual {\n        // Check for the ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero address\n        if (newOwner == address(0)) {\n            revert ZeroAddress();\n        }\n\n        owner = newOwner;\n        emit OwnerUpdated(newOwner);\n    }\n\n    /// @dev Pauses the contract.\n    function pause() external virtual {\n        // Check for the ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        paused = true;\n        emit Pause(msg.sender);\n    }\n\n    /// @dev Unpauses the contract.\n    function unpause() external virtual {\n        // Check for the ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        paused = false;\n        emit Unpause(msg.sender);\n    }\n}\n"
+    },
+    "contracts/ServiceManager.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\nimport {GenericManager} from \"./GenericManager.sol\";\nimport {OperatorSignedHashes} from \"./utils/OperatorSignedHashes.sol\";\nimport \"./interfaces/IService.sol\";\nimport \"./interfaces/IServiceTokenUtility.sol\";\n\n// Operator whitelist interface\ninterface IOperatorWhitelist {\n    /// @dev Gets operator whitelisting status.\n    /// @param serviceId Service Id.\n    /// @param operator Operator address.\n    /// @return status Whitelisting status.\n    function isOperatorWhitelisted(uint256 serviceId, address operator) external view returns (bool status);\n}\n\ninterface IIdentityRegistryBridger {\n    /// @dev Registers 8004 agent Id corresponding to service Id.\n    /// @param serviceId Service Id.\n    /// @return agentId Corresponding 8004 agent Id.\n    function register(uint256 serviceId) external returns (uint256 agentId);\n\n    /// @dev Updates 8004 agent Id wallet corresponding to service Id multisig.\n    /// @param serviceId Service Id.\n    /// @param oldMultisig Old multisig address.\n    /// @param newMultisig New multisig address.\n    function updateAgentWallet(uint256 serviceId, address oldMultisig, address newMultisig) external;\n}\n\ninterface IServiceRegistry {\n    enum ServiceState {\n        NonExistent,\n        PreRegistration,\n        ActiveRegistration,\n        FinishedRegistration,\n        Deployed,\n        TerminatedBonded\n    }\n\n    /// @dev Gets service instance params.\n    /// @param serviceId Service Id.\n    /// @return securityDeposit Registration activation deposit.\n    /// @return multisig Service multisig address.\n    /// @return configHash IPFS hashes pointing to the config metadata.\n    /// @return threshold Agent instance signers threshold.\n    /// @return maxNumAgentInstances Total number of agent instances.\n    /// @return numAgentInstances Actual number of agent instances.\n    /// @return state Service state.\n    function mapServices(uint256 serviceId)\n        external\n        view\n        returns (\n            uint96 securityDeposit,\n            address multisig,\n            bytes32 configHash,\n            uint32 threshold,\n            uint32 maxNumAgentInstances,\n            uint32 numAgentInstances,\n            ServiceState state\n        );\n\n    /// @dev Gets service total supply.\n    function totalSupply() external view returns (uint256);\n}\n\n// ERC721 interface\ninterface IERC721 {\n    /// @dev Gets the owner of the token Id.\n    /// @param tokenId Token Id.\n    /// @return Token Id owner address.\n    function ownerOf(uint256 tokenId) external view returns (address);\n}\n\n/// @dev Storage is already initialized.\nerror AlreadyInitialized();\n\n/// @title Service Manager - Periphery smart contract for managing services with custom ERC20 tokens or ETH\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\ncontract ServiceManager is GenericManager, OperatorSignedHashes {\n    event OperatorWhitelistUpdated(address indexed operatorWhitelist);\n    event IdentityRegistryBridgerUpdated(address indexed identityRegistryBridger);\n    event ImplementationUpdated(address indexed implementation);\n    event CreateMultisig(address indexed multisig);\n    event UnbondWithSignatureExecuted(address indexed operator, uint256 indexed serviceId, uint256 refund);\n    event RegisterAgentsWithSignatureExecuted(\n        address indexed operator, uint256 indexed serviceId, address[] agentInstances, uint32[] agentIds\n    );\n\n    // Name of a signing domain\n    string public constant NAME = \"OLAS Service Manager\";\n    // Version number\n    string public constant VERSION = \"1.2.0\";\n    // Service Manager proxy address slot\n    // keccak256(\"PROXY_SERVICE_MANAGER\") = \"0xe39e69948a448ce9239ad71b908b6c5b46225f86ffa735b25a8cd64080315855\"\n    bytes32 public constant PROXY_SERVICE_MANAGER = 0xe39e69948a448ce9239ad71b908b6c5b46225f86ffa735b25a8cd64080315855;\n    // A well-known representation of ETH as address\n    address public constant ETH_TOKEN_ADDRESS = address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);\n    // Bond wrapping constant\n    uint96 public constant BOND_WRAPPER = 1;\n\n    // Service Registry address\n    address public immutable serviceRegistry;\n    // Service Registry Token Utility address\n    address public immutable serviceRegistryTokenUtility;\n\n    // Operator whitelist address\n    address public operatorWhitelist;\n\n    // 8004 Identity Registry Bridger address\n    address public identityRegistryBridger;\n\n    // Reentrancy lock\n    uint256 internal _locked = 1;\n\n    /// @dev ServiceManager constructor.\n    /// @param _serviceRegistry Service Registry address.\n    /// @param _serviceRegistryTokenUtility Service Registry Token Utility address.\n    constructor(address _serviceRegistry, address _serviceRegistryTokenUtility) OperatorSignedHashes(NAME, VERSION) {\n        // Check for the Service Registry related contract zero addresses\n        if (_serviceRegistry == address(0) || _serviceRegistryTokenUtility == address(0)) {\n            revert ZeroAddress();\n        }\n\n        serviceRegistry = _serviceRegistry;\n        serviceRegistryTokenUtility = _serviceRegistryTokenUtility;\n    }\n\n    /// @dev Initializes proxy contract storage.\n    function initialize() external {\n        // Check if contract is already initialized\n        if (owner != address(0)) {\n            revert AlreadyInitialized();\n        }\n\n        owner = msg.sender;\n    }\n\n    /// @dev Sets the operator whitelist contract address.\n    /// @param newOperatorWhitelist New operator whitelist contract address.\n    function setOperatorWhitelist(address newOperatorWhitelist) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        operatorWhitelist = newOperatorWhitelist;\n        emit OperatorWhitelistUpdated(newOperatorWhitelist);\n    }\n\n    /// @dev Sets identity registry bridger contract address.\n    /// @param newIdentityRegistryBridger New identity registry bridger contract address.\n    function setIdentityRegistryBridger(address newIdentityRegistryBridger) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        identityRegistryBridger = newIdentityRegistryBridger;\n        emit IdentityRegistryBridgerUpdated(newIdentityRegistryBridger);\n    }\n\n    /// @dev Changes implementation contract address.\n    /// @notice Make sure implementation contract has function to change its implementation.\n    /// @param implementation Implementation contract address.\n    function changeImplementation(address implementation) external {\n        // Check for contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for zero address\n        if (implementation == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Store implementation address under designated storage slot\n        assembly {\n            sstore(PROXY_SERVICE_MANAGER, implementation)\n        }\n        emit ImplementationUpdated(implementation);\n    }\n\n    /// @dev Creates a new service.\n    /// @param serviceOwner Individual that creates and controls a service.\n    /// @param token ERC20 token address for the security deposit, or ETH.\n    /// @param configHash IPFS hash pointing to the config metadata.\n    /// @param agentIds Canonical agent Ids.\n    /// @param agentParams Number of agent instances and required bond to register an instance in the service.\n    /// @param threshold Threshold for a multisig composed by agents.\n    /// @return serviceId Created service Id.\n    function create(\n        address serviceOwner,\n        address token,\n        bytes32 configHash,\n        uint32[] memory agentIds,\n        IService.AgentParams[] memory agentParams,\n        uint32 threshold\n    ) external returns (uint256 serviceId) {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Check if the minting is paused\n        if (paused) {\n            revert Paused();\n        }\n\n        // Check for the zero address\n        if (token == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Check for the custom ERC20 token or ETH based bond\n        if (token == ETH_TOKEN_ADDRESS) {\n            // Call the original ServiceRegistry contract function\n            serviceId = IService(serviceRegistry).create(serviceOwner, configHash, agentIds, agentParams, threshold);\n        } else {\n            // Wrap agent params with just 1 WEI bond going to the original ServiceRegistry contract,\n            // and actual token bonds being recorded with the ServiceRegistryTokenUtility contract\n            uint256 numAgents = agentParams.length;\n            uint256[] memory bonds = new uint256[](numAgents);\n            for (uint256 i = 0; i < numAgents; ++i) {\n                // Check for the zero bond value\n                if (agentParams[i].bond == 0) {\n                    revert ZeroValue();\n                }\n\n                // Copy actual bond values for each agent Id\n                bonds[i] = agentParams[i].bond;\n                // Wrap bonds with the BOND_WRAPPER value for the original ServiceRegistry contract\n                agentParams[i].bond = BOND_WRAPPER;\n            }\n\n            // Get created service Id\n            serviceId = IServiceRegistry(serviceRegistry).totalSupply() + 1;\n\n            // Create a token-related record for the service\n            IServiceTokenUtility(serviceRegistryTokenUtility).createWithToken(serviceId, token, agentIds, bonds);\n\n            // Call the original ServiceRegistry contract function\n            IService(serviceRegistry).create(serviceOwner, configHash, agentIds, agentParams, threshold);\n        }\n\n        // 8004 Identity Registry workflow\n        if (identityRegistryBridger != address(0)) {\n            // Register corresponding 8004 agent Id\n            IIdentityRegistryBridger(identityRegistryBridger).register(serviceId);\n        }\n\n        _locked = 1;\n    }\n\n    /// @dev Updates a service in a CRUD way.\n    /// @param token ERC20 token address for the security deposit, or ETH.\n    /// @param configHash IPFS hash pointing to the config metadata.\n    /// @param agentIds Canonical agent Ids.\n    /// @param agentParams Number of agent instances and required bond to register an instance in the service.\n    /// @param threshold Threshold for a multisig composed by agents.\n    /// @param serviceId Service Id to be updated.\n    /// @return success True, if function executed successfully.\n    function update(\n        address token,\n        bytes32 configHash,\n        uint32[] memory agentIds,\n        IService.AgentParams[] memory agentParams,\n        uint32 threshold,\n        uint256 serviceId\n    ) external returns (bool success) {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Check for the zero address\n        if (token == address(0)) {\n            revert ZeroAddress();\n        }\n\n        uint256 numAgents = agentParams.length;\n        if (token == ETH_TOKEN_ADDRESS) {\n            // If any of the slots is a non-zero, the correspondent bond cannot be zero\n            for (uint256 i = 0; i < numAgents; ++i) {\n                // Check for the zero bond value\n                if (agentParams[i].slots > 0 && agentParams[i].bond == 0) {\n                    revert ZeroValue();\n                }\n            }\n\n            // Call the original ServiceRegistry contract function\n            success =\n                IService(serviceRegistry).update(msg.sender, configHash, agentIds, agentParams, threshold, serviceId);\n\n            // Reset the service token-based data\n            // This function still needs to be called as the previous token could be a custom ERC20 token\n            IServiceTokenUtility(serviceRegistryTokenUtility).resetServiceToken(serviceId);\n        } else {\n            // Wrap agent params with just 1 WEI bond going to the original ServiceRegistry contract,\n            // and actual token bonds being recorded with the ServiceRegistryTokenUtility contract\n            uint256[] memory bonds = new uint256[](numAgents);\n            for (uint256 i = 0; i < numAgents; ++i) {\n                // Copy actual bond values for each agent Id that has at least one slot in the updated service\n                if (agentParams[i].slots > 0) {\n                    // Check for the zero bond value\n                    if (agentParams[i].bond == 0) {\n                        revert ZeroValue();\n                    }\n                    bonds[i] = agentParams[i].bond;\n                    // Wrap bonds with the BOND_WRAPPER value for the original ServiceRegistry contract\n                    agentParams[i].bond = BOND_WRAPPER;\n                }\n            }\n\n            // Update relevant data in the ServiceRegistryTokenUtility contract\n            // We follow the optimistic design where existing bonds are just overwritten without a clearing\n            // bond values of agent Ids that are not going to be used in the service. This is coming from the fact\n            // that all the checks are done on the original ServiceRegistry side\n            IServiceTokenUtility(serviceRegistryTokenUtility).createWithToken(serviceId, token, agentIds, bonds);\n\n            // Call the original ServiceRegistry contract function\n            success =\n                IService(serviceRegistry).update(msg.sender, configHash, agentIds, agentParams, threshold, serviceId);\n        }\n\n        _locked = 1;\n    }\n\n    /// @dev Activates the service and its sensitive components.\n    /// @param serviceId Correspondent service Id.\n    /// @return success True, if function executed successfully.\n    function activateRegistration(uint256 serviceId) external payable returns (bool success) {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Record the actual ERC20 security deposit\n        bool isTokenSecured =\n            IServiceTokenUtility(serviceRegistryTokenUtility).activateRegistrationTokenDeposit(serviceId);\n\n        // Activate registration in the original ServiceRegistry contract\n        if (isTokenSecured) {\n            // Check for msg.value\n            if (msg.value != BOND_WRAPPER) {\n                revert IncorrectRegistrationDepositValue(msg.value, BOND_WRAPPER, serviceId);\n            }\n\n            // If the service Id is based on the ERC20 token, the provided value to the standard registration is 1\n            success = IService(serviceRegistry).activateRegistration{value: BOND_WRAPPER}(msg.sender, serviceId);\n        } else {\n            // Otherwise follow the standard msg.value path\n            success = IService(serviceRegistry).activateRegistration{value: msg.value}(msg.sender, serviceId);\n        }\n\n        _locked = 1;\n    }\n\n    /// @dev Registers agent instances.\n    /// @param serviceId Service Id to be updated.\n    /// @param agentInstances Agent instance addresses.\n    /// @param agentIds Canonical Ids of the agent correspondent to the agent instance.\n    /// @return success True, if function executed successfully.\n    function registerAgents(uint256 serviceId, address[] memory agentInstances, uint32[] memory agentIds)\n        external\n        payable\n        returns (bool success)\n    {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        if (operatorWhitelist != address(0)) {\n            // Check if the operator is whitelisted\n            if (!IOperatorWhitelist(operatorWhitelist).isOperatorWhitelisted(serviceId, msg.sender)) {\n                revert WrongOperator(serviceId);\n            }\n        }\n\n        // Record the actual ERC20 bond\n        bool isTokenSecured = IServiceTokenUtility(serviceRegistryTokenUtility)\n            .registerAgentsTokenDeposit(msg.sender, serviceId, agentIds);\n\n        // Register agent instances in a main ServiceRegistry contract\n        if (isTokenSecured) {\n            // Get total bond wrapper value\n            uint256 totalBond = agentInstances.length * BOND_WRAPPER;\n            // Check for msg.value\n            if (msg.value != totalBond) {\n                revert IncorrectAgentBondingValue(msg.value, totalBond, serviceId);\n            }\n\n            // If the service Id is based on the ERC20 token, the provided value to the standard registration is 1\n            // multiplied by the number of agent instances\n            success = IService(serviceRegistry).registerAgents{value: totalBond}(\n                msg.sender, serviceId, agentInstances, agentIds\n            );\n        } else {\n            // Otherwise follow the standard msg.value path\n            success = IService(serviceRegistry).registerAgents{value: msg.value}(\n                msg.sender, serviceId, agentInstances, agentIds\n            );\n        }\n\n        _locked = 1;\n    }\n\n    /// @dev Creates multisig instance controlled by the set of service agent instances and deploys the service.\n    /// @param serviceId Correspondent service Id.\n    /// @param multisigImplementation Multisig implementation address.\n    /// @param data Data payload for the multisig creation.\n    /// @return multisig Address of the created multisig.\n    function deploy(uint256 serviceId, address multisigImplementation, bytes memory data)\n        external\n        returns (address multisig)\n    {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Get current service multisig\n        (, address lastMultisig,,,,,) = IServiceRegistry(serviceRegistry).mapServices(serviceId);\n\n        // Create or update multisig instance\n        multisig = IService(serviceRegistry).deploy(msg.sender, serviceId, multisigImplementation, data);\n\n        // Check for zero address\n        if (multisig == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // 8004 Identity Registry workflow: check if current and last multisigs are different\n        if ((identityRegistryBridger != address(0)) && (multisig != lastMultisig)) {\n            // Update corresponding multisig records and unset wallet in 8004 agent Id, if required\n            IIdentityRegistryBridger(identityRegistryBridger).updateAgentWallet(serviceId, lastMultisig, multisig);\n        }\n\n        emit CreateMultisig(multisig);\n\n        _locked = 1;\n    }\n\n    /// @dev Terminates the service.\n    /// @param serviceId Service Id.\n    /// @return success True, if function executed successfully.\n    /// @return refund Refund for the service owner.\n    function terminate(uint256 serviceId) external returns (bool success, uint256 refund) {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Withdraw the ERC20 token if the service is token-based\n        uint256 tokenRefund = IServiceTokenUtility(serviceRegistryTokenUtility).terminateTokenRefund(serviceId);\n\n        // Terminate the service with the regular service registry routine\n        (success, refund) = IService(serviceRegistry).terminate(msg.sender, serviceId);\n\n        // If the service is token-based, the actual refund is provided via the serviceRegistryTokenUtility contract\n        if (tokenRefund > 0) {\n            refund = tokenRefund;\n        }\n\n        _locked = 1;\n    }\n\n    /// @dev Unbonds agent instances of the operator from the service.\n    /// @param serviceId Service Id.\n    /// @return success True, if function executed successfully.\n    /// @return refund The amount of refund returned to the operator.\n    function unbond(uint256 serviceId) external returns (bool success, uint256 refund) {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Withdraw the ERC20 token if the service is token-based\n        uint256 tokenRefund = IServiceTokenUtility(serviceRegistryTokenUtility).unbondTokenRefund(msg.sender, serviceId);\n\n        // Unbond with the regular service registry routine\n        (success, refund) = IService(serviceRegistry).unbond(msg.sender, serviceId);\n\n        // If the service is token-based, the actual refund is provided via the serviceRegistryTokenUtility contract\n        if (tokenRefund > 0) {\n            refund = tokenRefund;\n        }\n\n        _locked = 1;\n    }\n\n    /// @dev Unbonds agent instances of the operator by the service owner via the operator's pre-signed message hash.\n    /// @notice Note that this function accounts for the operator being the EOA, or the contract that has an\n    ///         isValidSignature() function that would confirm the message hash was signed by the operator contract.\n    ///         Otherwise, if the message hash has been pre-approved, the corresponding map of hashes is going to\n    ///         to verify the signed hash, similar to the Safe contract implementation in v1.3.0:\n    ///         https://github.com/safe-global/safe-contracts/blob/186a21a74b327f17fc41217a927dea7064f74604/contracts/GnosisSafe.sol#L240-L304\n    ///         Also note that only the service owner is able to call this function on behalf of the operator.\n    /// @param operator Operator address that signed the unbond message hash.\n    /// @param serviceId Service Id.\n    /// @param signature Signature byte array associated with operator message hash signature.\n    /// @return success True, if the function executed successfully.\n    /// @return refund The amount of refund returned to the operator.\n    function unbondWithSignature(address operator, uint256 serviceId, bytes memory signature)\n        external\n        returns (bool success, uint256 refund)\n    {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Check the service owner\n        address serviceOwner = IERC721(serviceRegistry).ownerOf(serviceId);\n        if (msg.sender != serviceOwner) {\n            revert OwnerOnly(msg.sender, serviceOwner);\n        }\n\n        // Get the (operator | serviceId) nonce for the unbond message\n        // Push a pair of key defining variables into one key. Service Id or operator are not enough by themselves\n        // as another service might use the operator address at the same time frame\n        // operator occupies first 160 bits\n        uint256 operatorService = uint256(uint160(operator));\n        // serviceId occupies next 32 bits\n        operatorService |= serviceId << 160;\n        uint256 nonce = mapOperatorUnbondNonces[operatorService];\n        // Get the unbond message hash\n        bytes32 msgHash = getUnbondHash(operator, serviceOwner, serviceId, nonce);\n\n        // Verify the signed hash against the operator address\n        _verifySignedHash(operator, msgHash, signature);\n\n        // Update corresponding nonce value\n        nonce++;\n        mapOperatorUnbondNonces[operatorService] = nonce;\n\n        // Withdraw the ERC20 token if the service is token-based\n        uint256 tokenRefund = IServiceTokenUtility(serviceRegistryTokenUtility).unbondTokenRefund(operator, serviceId);\n\n        // Unbond with the regular service registry routine\n        (success, refund) = IService(serviceRegistry).unbond(operator, serviceId);\n\n        // If the service is token-based, the actual refund is provided via the serviceRegistryTokenUtility contract\n        if (tokenRefund > 0) {\n            refund = tokenRefund;\n        }\n\n        emit UnbondWithSignatureExecuted(operator, serviceId, refund);\n\n        _locked = 1;\n    }\n\n    /// @dev Registers agent instances of the operator by the service owner via the operator's pre-signed message hash.\n    /// @notice Note that this function accounts for the operator being the EOA, or the contract that has an\n    ///         isValidSignature() function that would confirm the message hash was signed by the operator contract.\n    ///         Otherwise, if the message hash has been pre-approved, the corresponding map of hashes is going to\n    ///         to verify the signed hash, similar to the Safe contract implementation in v1.3.0:\n    ///         https://github.com/safe-global/safe-contracts/blob/186a21a74b327f17fc41217a927dea7064f74604/contracts/GnosisSafe.sol#L240-L304\n    ///         Also note that only the service owner is able to call this function on behalf of the operator.\n    /// @param operator Operator address that signed the register agents message hash.\n    /// @param serviceId Service Id.\n    /// @param agentInstances Agent instance addresses.\n    /// @param agentIds Canonical Ids of the agent correspondent to the agent instance.\n    /// @param signature Signature byte array associated with operator message hash signature.\n    /// @return success True, if the the function executed successfully.\n    function registerAgentsWithSignature(\n        address operator,\n        uint256 serviceId,\n        address[] memory agentInstances,\n        uint32[] memory agentIds,\n        bytes memory signature\n    ) external payable returns (bool success) {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Check the service owner\n        address serviceOwner = IERC721(serviceRegistry).ownerOf(serviceId);\n        if (msg.sender != serviceOwner) {\n            revert OwnerOnly(msg.sender, serviceOwner);\n        }\n\n        // Get the (operator | serviceId) nonce for the registerAgents message\n        // Push a pair of key defining variables into one key. Service Id or operator are not enough by themselves\n        // as another service might use the operator address at the same time frame\n        // operator occupies first 160 bits\n        uint256 operatorService = uint256(uint160(operator));\n        // serviceId occupies next 32 bits as serviceId is limited by the 2^32 - 1 value\n        operatorService |= serviceId << 160;\n        uint256 nonce = mapOperatorRegisterAgentsNonces[operatorService];\n        // Get register agents message hash\n        bytes32 msgHash = getRegisterAgentsHash(operator, serviceOwner, serviceId, agentInstances, agentIds, nonce);\n\n        // Verify the signed hash against the operator address\n        _verifySignedHash(operator, msgHash, signature);\n\n        // Update corresponding nonce value\n        nonce++;\n        mapOperatorRegisterAgentsNonces[operatorService] = nonce;\n\n        // Record the actual ERC20 bond\n        bool isTokenSecured =\n            IServiceTokenUtility(serviceRegistryTokenUtility).registerAgentsTokenDeposit(operator, serviceId, agentIds);\n\n        // Register agent instances in a main ServiceRegistry contract\n        if (isTokenSecured) {\n            // If the service Id is based on the ERC20 token, the provided value to the standard registration is 1\n            // multiplied by the number of agent instances\n            success = IService(serviceRegistry).registerAgents{value: agentInstances.length * BOND_WRAPPER}(\n                operator, serviceId, agentInstances, agentIds\n            );\n        } else {\n            // Otherwise follow the standard msg.value path\n            success = IService(serviceRegistry).registerAgents{value: msg.value}(\n                operator, serviceId, agentInstances, agentIds\n            );\n        }\n\n        emit RegisterAgentsWithSignatureExecuted(operator, serviceId, agentInstances, agentIds);\n\n        _locked = 1;\n    }\n}\n"
+    },
+    "contracts/interfaces/IErrorsRegistries.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\n/// @dev Errors.\ninterface IErrorsRegistries {\n    /// @dev Only `manager` has a privilege, but the `sender` was provided.\n    /// @param sender Sender address.\n    /// @param manager Required sender address as a manager.\n    error ManagerOnly(address sender, address manager);\n\n    /// @dev Only `owner` has a privilege, but the `sender` was provided.\n    /// @param sender Sender address.\n    /// @param owner Required sender address as an owner.\n    error OwnerOnly(address sender, address owner);\n\n    /// @dev Hash already exists in the records.\n    error HashExists();\n\n    /// @dev Provided zero address.\n    error ZeroAddress();\n\n    /// @dev Agent Id is not correctly provided for the current routine.\n    /// @param agentId Component Id.\n    error WrongAgentId(uint256 agentId);\n\n    /// @dev Wrong length of two arrays.\n    /// @param numValues1 Number of values in a first array.\n    /// @param numValues2 Numberf of values in a second array.\n    error WrongArrayLength(uint256 numValues1, uint256 numValues2);\n\n    /// @dev Canonical agent Id is not found.\n    /// @param agentId Canonical agent Id.\n    error AgentNotFound(uint256 agentId);\n\n    /// @dev Component Id is not found.\n    /// @param componentId Component Id.\n    error ComponentNotFound(uint256 componentId);\n\n    /// @dev Multisig threshold is out of bounds.\n    /// @param currentThreshold Current threshold value.\n    /// @param minThreshold Minimum possible threshold value.\n    /// @param maxThreshold Maximum possible threshold value.\n    error WrongThreshold(uint256 currentThreshold, uint256 minThreshold, uint256 maxThreshold);\n\n    /// @dev Agent instance is already registered with a specified `operator`.\n    /// @param operator Operator that registered an instance.\n    error AgentInstanceRegistered(address operator);\n\n    /// @dev Wrong operator is specified when interacting with a specified `serviceId`.\n    /// @param serviceId Service Id.\n    error WrongOperator(uint256 serviceId);\n\n    /// @dev Operator has no registered instances in the service.\n    /// @param operator Operator address.\n    /// @param serviceId Service Id.\n    error OperatorHasNoInstances(address operator, uint256 serviceId);\n\n    /// @dev Canonical `agentId` is not found as a part of `serviceId`.\n    /// @param agentId Canonical agent Id.\n    /// @param serviceId Service Id.\n    error AgentNotInService(uint256 agentId, uint256 serviceId);\n\n    /// @dev The contract is paused.\n    error Paused();\n\n    /// @dev Zero value when it has to be different from zero.\n    error ZeroValue();\n\n    /// @dev Value overflow.\n    /// @param provided Overflow value.\n    /// @param max Maximum possible value.\n    error Overflow(uint256 provided, uint256 max);\n\n    /// @dev Service must be inactive.\n    /// @param serviceId Service Id.\n    error ServiceMustBeInactive(uint256 serviceId);\n\n    /// @dev All the agent instance slots for a specific `serviceId` are filled.\n    /// @param serviceId Service Id.\n    error AgentInstancesSlotsFilled(uint256 serviceId);\n\n    /// @dev Wrong state of a service.\n    /// @param state Service state.\n    /// @param serviceId Service Id.\n    error WrongServiceState(uint256 state, uint256 serviceId);\n\n    /// @dev Only own service multisig is allowed.\n    /// @param provided Provided address.\n    /// @param expected Expected multisig address.\n    /// @param serviceId Service Id.\n    error OnlyOwnServiceMultisig(address provided, address expected, uint256 serviceId);\n\n    /// @dev Multisig is not whitelisted.\n    /// @param multisig Address of a multisig implementation.\n    error UnauthorizedMultisig(address multisig);\n\n    /// @dev Incorrect deposit provided for the registration activation.\n    /// @param sent Sent amount.\n    /// @param expected Expected amount.\n    /// @param serviceId Service Id.\n    error IncorrectRegistrationDepositValue(uint256 sent, uint256 expected, uint256 serviceId);\n\n    /// @dev Insufficient value provided for the agent instance bonding.\n    /// @param sent Sent amount.\n    /// @param expected Expected amount.\n    /// @param serviceId Service Id.\n    error IncorrectAgentBondingValue(uint256 sent, uint256 expected, uint256 serviceId);\n\n    /// @dev Failure of a transfer.\n    /// @param token Address of a token.\n    /// @param from Address `from`.\n    /// @param to Address `to`.\n    /// @param value Value.\n    error TransferFailed(address token, address from, address to, uint256 value);\n\n    /// @dev Caught reentrancy violation.\n    error ReentrancyGuard();\n}\n"
+    },
+    "contracts/interfaces/IService.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.15;\n\n/// @dev Required interface for the service manipulation.\ninterface IService{\n    struct AgentParams {\n        // Number of agent instances\n        uint32 slots;\n        // Bond per agent instance\n        uint96 bond;\n    }\n\n    /// @dev Creates a new service.\n    /// @param serviceOwner Individual that creates and controls a service.\n    /// @param configHash IPFS hash pointing to the config metadata.\n    /// @param agentIds Canonical agent Ids in a sorted ascending order.\n    /// @param agentParams Number of agent instances and required bond to register an instance in the service.\n    /// @param threshold Signers threshold for a multisig composed by agent instances.\n    /// @return serviceId Created service Id.\n    function create(\n        address serviceOwner,\n        bytes32 configHash,\n        uint32[] memory agentIds,\n        AgentParams[] memory agentParams,\n        uint32 threshold\n    ) external returns (uint256 serviceId);\n\n    /// @dev Updates a service in a CRUD way.\n    /// @param serviceOwner Individual that creates and controls a service.\n    /// @param configHash IPFS hash pointing to the config metadata.\n    /// @param agentIds Canonical agent Ids in a sorted ascending order.\n    /// @param agentParams Number of agent instances and required bond to register an instance in the service.\n    /// @param threshold Signers threshold for a multisig composed by agent instances.\n    /// @param serviceId Service Id to be updated.\n    /// @return success True, if function executed successfully.\n    function update(\n        address serviceOwner,\n        bytes32 configHash,\n        uint32[] memory agentIds,\n        AgentParams[] memory agentParams,\n        uint32 threshold,\n        uint256 serviceId\n    ) external returns (bool success);\n\n    /// @dev Activates the service.\n    /// @param serviceOwner Individual that creates and controls a service.\n    /// @param serviceId Correspondent service Id.\n    /// @return success True, if function executed successfully.\n    function activateRegistration(address serviceOwner, uint256 serviceId) external payable returns (bool success);\n\n    /// @dev Registers agent instances.\n    /// @param operator Address of the operator.\n    /// @param serviceId Service Id to be updated.\n    /// @param agentInstances Agent instance addresses.\n    /// @param agentIds Canonical Ids of the agent correspondent to the agent instance.\n    /// @return success True, if function executed successfully.\n    function registerAgents(\n        address operator,\n        uint256 serviceId,\n        address[] memory agentInstances,\n        uint32[] memory agentIds\n    ) external payable returns (bool success);\n\n    /// @dev Creates multisig instance controlled by the set of service agent instances and deploys the service.\n    /// @param serviceOwner Individual that creates and controls a service.\n    /// @param serviceId Correspondent service Id.\n    /// @param multisigImplementation Multisig implementation address.\n    /// @param data Data payload for the multisig creation.\n    /// @return multisig Address of the created multisig.\n    function deploy(\n        address serviceOwner,\n        uint256 serviceId,\n        address multisigImplementation,\n        bytes memory data\n    ) external returns (address multisig);\n\n    /// @dev Terminates the service.\n    /// @param serviceOwner Owner of the service.\n    /// @param serviceId Service Id to be updated.\n    /// @return success True, if function executed successfully.\n    /// @return refund Refund to return to the serviceOwner.\n    function terminate(address serviceOwner, uint256 serviceId) external returns (bool success, uint256 refund);\n\n    /// @dev Unbonds agent instances of the operator from the service.\n    /// @param operator Operator of agent instances.\n    /// @param serviceId Service Id.\n    /// @return success True, if function executed successfully.\n    /// @return refund The amount of refund returned to the operator.\n    function unbond(address operator, uint256 serviceId) external returns (bool success, uint256 refund);\n}\n"
+    },
+    "contracts/interfaces/IServiceTokenUtility.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.19;\n\n/// @dev Interface for the service registration token utility manipulation.\ninterface IServiceTokenUtility {\n    /// @dev Creates a record with the token-related information for the specified service.\n    /// @param serviceId Service Id.\n    /// @param token Token address.\n    /// @param agentIds Set of agent Ids.\n    /// @param bonds Set of correspondent bonds.\n    function createWithToken(\n        uint256 serviceId,\n        address token,\n        uint32[] memory agentIds,\n        uint256[] memory bonds\n    ) external;\n\n    /// @dev Resets a record with token and security deposit data.\n    /// @param serviceId Service Id.\n    function resetServiceToken(uint256 serviceId) external;\n\n    /// @dev Deposit a token security deposit for the service registration after its activation.\n    /// @param serviceId Service Id.\n    /// @return isTokenSecured True if the service Id is token secured, false if ETH secured otherwise.\n    function activateRegistrationTokenDeposit(uint256 serviceId) external returns (bool isTokenSecured);\n\n    /// @dev Deposits bonded tokens from the operator during the agent instance registration.\n    /// @param operator Operator address.\n    /// @param serviceId Service Id.\n    /// @param agentIds Set of agent Ids for corresponding agent instances opertor is registering.\n    /// @return isTokenSecured True if the service Id is token secured, false if ETH secured otherwise.\n    function registerAgentsTokenDeposit(\n        address operator,\n        uint256 serviceId,\n        uint32[] memory agentIds\n    ) external returns (bool isTokenSecured);\n\n    /// @dev Withdraws a token security deposit to the service owner after the service termination.\n    /// @param serviceId Service Id.\n    /// @return securityRefund Returned token security deposit, or zero if the service is ETH-secured.\n    function terminateTokenRefund(uint256 serviceId) external returns (uint256 securityRefund);\n\n    /// @dev Withdraws bonded tokens to the operator during the unbond phase.\n    /// @param operator Operator address.\n    /// @param serviceId Service Id.\n    /// @return refund Returned bonded token amount, or zero if the service is ETH-secured.\n    function unbondTokenRefund(address operator, uint256 serviceId) external returns (uint256 refund);\n\n    /// @dev Gets service token secured status.\n    /// @param serviceId Service Id.\n    /// @return True if the service Id is token secured.\n    function isTokenSecuredService(uint256 serviceId) external view returns (bool);\n}\n"
+    },
+    "contracts/utils/OperatorSignedHashes.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\ninterface ISignatureValidator {\n    /// @dev Should return whether the signature provided is valid for the provided hash.\n    /// @notice MUST return the bytes4 magic value 0x1626ba7e when function passes.\n    ///         MUST NOT modify state (using STATICCALL for solc < 0.5, view modifier for solc > 0.5).\n    ///         MUST allow external calls.\n    /// @param hash Hash of the data to be signed.\n    /// @param signature Signature byte array associated with hash.\n    /// @return magicValue bytes4 magic value.\n    function isValidSignature(bytes32 hash, bytes memory signature) external view returns (bytes4 magicValue);\n}\n\n/// @dev Provided zero address.\nerror ZeroOperatorAddress();\n\n/// @dev Incorrect signature length provided.\n/// @param signature Signature bytes.\n/// @param provided Provided signature length.\n/// @param expected Expected signature length.\nerror IncorrectSignatureLength(bytes signature, uint256 provided, uint256 expected);\n\n/// @dev Hash is not validated.\n/// @param operator Operator contract address.\n/// @param msgHash Message hash.\n/// @param signature Signature bytes associated with the message hash.\nerror HashNotValidated(address operator, bytes32 msgHash, bytes signature);\n\n/// @dev Hash is not approved.\n/// @param operator Operator address.\n/// @param msgHash Message hash.\n/// @param signature Signature bytes associated with the message hash.\nerror HashNotApproved(address operator, bytes32 msgHash, bytes signature);\n\n/// @dev Obtained wrong operator address.\n/// @param provided Provided address.\n/// @param expected Expected address.\nerror WrongOperatorAddress(address provided, address expected);\n\n/// @title OperatorSignedHashes - Smart contract for managing operator signed hashes\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\nabstract contract OperatorSignedHashes {\n    event OperatorHashApproved(address indexed operator, bytes32 hash);\n\n    // Value for the contract signature validation: bytes4(keccak256(\"isValidSignature(bytes32,bytes)\")\n    bytes4 constant internal MAGIC_VALUE = 0x1626ba7e;\n    // Domain separator type hash\n    bytes32 public constant DOMAIN_SEPARATOR_TYPE_HASH =\n        keccak256(\"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\");\n    // Unbond type hash\n    bytes32 public constant UNBOND_TYPE_HASH =\n        keccak256(\"Unbond(address operator,address serviceOwner,uint256 serviceId,uint256 nonce)\");\n    // Register agents type hash\n    bytes32 public constant REGISTER_AGENTS_TYPE_HASH =\n        keccak256(\"RegisterAgents(address operator,address serviceOwner,uint256 serviceId,bytes32 agentsData,uint256 nonce)\");\n\n    // Name hash\n    bytes32 public immutable nameHash;\n    // Version hash\n    bytes32 public immutable versionHash;\n\n    // Map of operator address and serviceId => unbond nonce\n    mapping(uint256 => uint256) public mapOperatorUnbondNonces;\n    // Map of operator address and serviceId => register agents nonce\n    mapping(uint256 => uint256) public mapOperatorRegisterAgentsNonces;\n    // Mapping operator address => approved hashes status\n    mapping(address => mapping(bytes32 => bool)) public mapOperatorApprovedHashes;\n\n    /// @dev OperatorSignedHashes constructor.\n    /// @param _name Name of a signing domain.\n    /// @param _version Version of a signing domain.\n    constructor(string memory _name, string memory _version) {\n        nameHash = keccak256(bytes(_name));\n        versionHash = keccak256(bytes(_version));\n    }\n\n    /// @dev Verifies provided message hash against its signature.\n    /// @param operator Operator address.\n    /// @param msgHash Message hash.\n    /// @param signature Signature bytes associated with the signed message hash.\n    function _verifySignedHash(address operator, bytes32 msgHash, bytes memory signature) internal view {\n        // Check for the operator zero address\n        if (operator == address(0)) {\n            revert ZeroOperatorAddress();\n        }\n\n        // Check for the signature length\n        if (signature.length != 65) {\n            revert IncorrectSignatureLength(signature, signature.length, 65);\n        }\n\n        // Decode the signature\n        uint8 v = uint8(signature[64]);\n        // For the correct ecrecover() function execution, the v value must be set to {0,1} + 27\n        // Although v in a very rare case can be equal to {2,3} (with a probability of 3.73e-37%)\n        // If v is set to just 0 or 1 when signing  by the EOA, it is most likely signed by the ledger and must be adjusted\n        if (v < 4 && operator.code.length == 0) {\n            // In case of a non-contract, adjust v to follow the standard ecrecover case\n            v += 27;\n        }\n        bytes32 r;\n        bytes32 s;\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            r := mload(add(signature, 32))\n            s := mload(add(signature, 64))\n        }\n\n        address recOperator;\n        // Go through signature cases based on the value of v\n        if (v == 4) {\n            // Contract signature case, where the address of the contract is encoded into r\n            recOperator = address(uint160(uint256(r)));\n\n            // Check for the signature validity in the contract\n            if (ISignatureValidator(recOperator).isValidSignature(msgHash, signature) != MAGIC_VALUE) {\n                revert HashNotValidated(recOperator, msgHash, signature);\n            }\n        } else if (v == 5) {\n            // Case of an approved hash, where the address of the operator is encoded into r\n            recOperator = address(uint160(uint256(r)));\n\n            // Hashes have been pre-approved by the operator via a separate message, see operatorApproveHash() function\n            if (!mapOperatorApprovedHashes[recOperator][msgHash]) {\n                revert HashNotApproved(recOperator, msgHash, signature);\n            }\n        } else {\n            // Case of ecrecover with the message hash for EOA signatures\n            recOperator = ecrecover(msgHash, v, r, s);\n        }\n\n        // Final check is for the operator address itself\n        if (recOperator != operator) {\n            revert WrongOperatorAddress(recOperator, operator);\n        }\n    }\n\n    /// @dev Approves message hash for the operator address.\n    /// @param hash Provided message hash to approve.\n    function operatorApproveHash(bytes32 hash) external {\n        mapOperatorApprovedHashes[msg.sender][hash] = true;\n        emit OperatorHashApproved(msg.sender, hash);\n    }\n\n    /// @dev Computes domain separator hash.\n    /// @return Hash of the domain separator based on its name, version, chain Id and contract address.\n    function _computeDomainSeparator() internal view returns (bytes32) {\n        return keccak256(\n            abi.encode(\n                DOMAIN_SEPARATOR_TYPE_HASH,\n                nameHash,\n                versionHash,\n                block.chainid,\n                address(this)\n            )\n        );\n    }\n\n    /// @dev Gets domain separator hash.\n    /// @return Original or recomputed domain separator.\n    function getDomainSeparator() external view returns (bytes32) {\n        return _computeDomainSeparator();\n    }\n\n    /// @dev Gets the unbond message hash for the operator.\n    /// @param operator Operator address.\n    /// @param serviceOwner Service owner address.\n    /// @param serviceId Service Id.\n    /// @param nonce Nonce for the unbond message from the pair of (operator | service Id).\n    /// @return Computed message hash.\n    function getUnbondHash(\n        address operator,\n        address serviceOwner,\n        uint256 serviceId,\n        uint256 nonce\n    ) public view returns (bytes32)\n    {\n        return keccak256(\n            abi.encodePacked(\n                \"\\x19\\x01\",\n                _computeDomainSeparator(),\n                keccak256(\n                    abi.encode(\n                        UNBOND_TYPE_HASH,\n                        operator,\n                        serviceOwner,\n                        serviceId,\n                        nonce\n                    )\n                )\n            )\n        );\n    }\n\n    /// @dev Gets the register agents message hash for the operator.\n    /// @param operator Operator address.\n    /// @param serviceOwner Service owner address.\n    /// @param serviceId Service Id.\n    /// @param agentInstances Agent instance addresses operator is going to register.\n    /// @param agentIds Agent Ids corresponding to each agent instance address.\n    /// @param nonce Nonce for the register agents message from the pair of (operator | service Id).\n    /// @return Computed message hash.\n    function getRegisterAgentsHash(\n        address operator,\n        address serviceOwner,\n        uint256 serviceId,\n        address[] memory agentInstances,\n        uint32[] memory agentIds,\n        uint256 nonce\n    ) public view returns (bytes32)\n    {\n        return keccak256(\n            abi.encodePacked(\n                \"\\x19\\x01\",\n                _computeDomainSeparator(),\n                keccak256(\n                    abi.encode(\n                        REGISTER_AGENTS_TYPE_HASH,\n                        operator,\n                        serviceOwner,\n                        serviceId,\n                        keccak256(abi.encode(agentInstances, agentIds)),\n                        nonce\n                    )\n                )\n            )\n        );\n    }\n\n    /// @dev Checks if the hash provided by the operator is approved.\n    /// @param operator Operator address.\n    /// @param hash Message hash.\n    /// @return True, if the hash provided by the operator is approved.\n    function isOperatorHashApproved(address operator, bytes32 hash) external view returns (bool) {\n        return mapOperatorApprovedHashes[operator][hash];\n    }\n\n    /// @dev Gets the (operator | service Id) nonce for the unbond message data.\n    /// @param operator Operator address.\n    /// @param serviceId Service Id.\n    /// @return nonce Obtained nonce.\n    function getOperatorUnbondNonce(address operator, uint256 serviceId) external view returns (uint256 nonce) {\n        // operator occupies first 160 bits\n        uint256 operatorService = uint256(uint160(operator));\n        // serviceId occupies next 32 bits as serviceId is limited by the 2^32 - 1 value\n        operatorService |= serviceId << 160;\n        nonce = mapOperatorUnbondNonces[operatorService];\n    }\n\n    /// @dev Gets the (operator | service Id) nonce for the register agents message data.\n    /// @param operator Operator address.\n    /// @param serviceId Service Id.\n    /// @return nonce Obtained nonce.\n    function getOperatorRegisterAgentsNonce(address operator, uint256 serviceId) external view returns (uint256 nonce) {\n        // operator occupies first 160 bits\n        uint256 operatorService = uint256(uint160(operator));\n        // serviceId occupies next 32 bits as serviceId is limited by the 2^32 - 1 value\n        operatorService |= serviceId << 160;\n        nonce = mapOperatorRegisterAgentsNonces[operatorService];\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.30+commit.73712a01"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_serviceRegistry",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_serviceRegistryTokenUtility",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            }
+          ],
+          "name": "AgentInstanceRegistered",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "AgentInstancesSlotsFilled",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "agentId",
+              "type": "uint256"
+            }
+          ],
+          "name": "AgentNotFound",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "agentId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "AgentNotInService",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "AlreadyInitialized",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "componentId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ComponentNotFound",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "HashExists",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "msgHash",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes",
+              "name": "signature",
+              "type": "bytes"
+            }
+          ],
+          "name": "HashNotApproved",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "msgHash",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes",
+              "name": "signature",
+              "type": "bytes"
+            }
+          ],
+          "name": "HashNotValidated",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "sent",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncorrectAgentBondingValue",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "sent",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncorrectRegistrationDepositValue",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes",
+              "name": "signature",
+              "type": "bytes"
+            },
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            }
+          ],
+          "name": "IncorrectSignatureLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            }
+          ],
+          "name": "ManagerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "provided",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "expected",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "OnlyOwnServiceMultisig",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "OperatorHasNoInstances",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "max",
+              "type": "uint256"
+            }
+          ],
+          "name": "Overflow",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Paused",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ReentrancyGuard",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "ServiceMustBeInactive",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "from",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "value",
+              "type": "uint256"
+            }
+          ],
+          "name": "TransferFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "multisig",
+              "type": "address"
+            }
+          ],
+          "name": "UnauthorizedMultisig",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "agentId",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongAgentId",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "numValues1",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "numValues2",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongArrayLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongOperator",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "provided",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "expected",
+              "type": "address"
+            }
+          ],
+          "name": "WrongOperatorAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "state",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongServiceState",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "currentThreshold",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "minThreshold",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongThreshold",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroOperatorAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroValue",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "multisig",
+              "type": "address"
+            }
+          ],
+          "name": "CreateMultisig",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "identityRegistryBridger",
+              "type": "address"
+            }
+          ],
+          "name": "IdentityRegistryBridgerUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "implementation",
+              "type": "address"
+            }
+          ],
+          "name": "ImplementationUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "hash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "OperatorHashApproved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "operatorWhitelist",
+              "type": "address"
+            }
+          ],
+          "name": "OperatorWhitelistUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "Pause",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "address[]",
+              "name": "agentInstances",
+              "type": "address[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint32[]",
+              "name": "agentIds",
+              "type": "uint32[]"
+            }
+          ],
+          "name": "RegisterAgentsWithSignatureExecuted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "refund",
+              "type": "uint256"
+            }
+          ],
+          "name": "UnbondWithSignatureExecuted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "Unpause",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "BOND_WRAPPER",
+          "outputs": [
+            {
+              "internalType": "uint96",
+              "name": "",
+              "type": "uint96"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DOMAIN_SEPARATOR_TYPE_HASH",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ETH_TOKEN_ADDRESS",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "NAME",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "PROXY_SERVICE_MANAGER",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "REGISTER_AGENTS_TYPE_HASH",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "UNBOND_TYPE_HASH",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "VERSION",
+          "outputs": [
+            {
+              "internalType": "string",
+              "name": "",
+              "type": "string"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "activateRegistration",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "implementation",
+              "type": "address"
+            }
+          ],
+          "name": "changeImplementation",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "changeOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "serviceOwner",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "configHash",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint32[]",
+              "name": "agentIds",
+              "type": "uint32[]"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "uint32",
+                  "name": "slots",
+                  "type": "uint32"
+                },
+                {
+                  "internalType": "uint96",
+                  "name": "bond",
+                  "type": "uint96"
+                }
+              ],
+              "internalType": "struct IService.AgentParams[]",
+              "name": "agentParams",
+              "type": "tuple[]"
+            },
+            {
+              "internalType": "uint32",
+              "name": "threshold",
+              "type": "uint32"
+            }
+          ],
+          "name": "create",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "multisigImplementation",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "deploy",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "multisig",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getDomainSeparator",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getOperatorRegisterAgentsNonce",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "nonce",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getOperatorUnbondNonce",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "nonce",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "serviceOwner",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "agentInstances",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint32[]",
+              "name": "agentIds",
+              "type": "uint32[]"
+            },
+            {
+              "internalType": "uint256",
+              "name": "nonce",
+              "type": "uint256"
+            }
+          ],
+          "name": "getRegisterAgentsHash",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "serviceOwner",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "nonce",
+              "type": "uint256"
+            }
+          ],
+          "name": "getUnbondHash",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "identityRegistryBridger",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "initialize",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "hash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "isOperatorHashApproved",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "mapOperatorApprovedHashes",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "mapOperatorRegisterAgentsNonces",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "mapOperatorUnbondNonces",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "nameHash",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "hash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "operatorApproveHash",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "operatorWhitelist",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pause",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "paused",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "agentInstances",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint32[]",
+              "name": "agentIds",
+              "type": "uint32[]"
+            }
+          ],
+          "name": "registerAgents",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address[]",
+              "name": "agentInstances",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint32[]",
+              "name": "agentIds",
+              "type": "uint32[]"
+            },
+            {
+              "internalType": "bytes",
+              "name": "signature",
+              "type": "bytes"
+            }
+          ],
+          "name": "registerAgentsWithSignature",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "serviceRegistry",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "serviceRegistryTokenUtility",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newIdentityRegistryBridger",
+              "type": "address"
+            }
+          ],
+          "name": "setIdentityRegistryBridger",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOperatorWhitelist",
+              "type": "address"
+            }
+          ],
+          "name": "setOperatorWhitelist",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "terminate",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint256",
+              "name": "refund",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "unbond",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint256",
+              "name": "refund",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "operator",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "signature",
+              "type": "bytes"
+            }
+          ],
+          "name": "unbondWithSignature",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint256",
+              "name": "refund",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "unpause",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "configHash",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint32[]",
+              "name": "agentIds",
+              "type": "uint32[]"
+            },
+            {
+              "components": [
+                {
+                  "internalType": "uint32",
+                  "name": "slots",
+                  "type": "uint32"
+                },
+                {
+                  "internalType": "uint96",
+                  "name": "bond",
+                  "type": "uint96"
+                }
+              ],
+              "internalType": "struct IService.AgentParams[]",
+              "name": "agentParams",
+              "type": "tuple[]"
+            },
+            {
+              "internalType": "uint32",
+              "name": "threshold",
+              "type": "uint32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "serviceId",
+              "type": "uint256"
+            }
+          ],
+          "name": "update",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "success",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "versionHash",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>Andrey Lebedev - <andrey.lebedev@valory.xyz>Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>",
+        "errors": {
+          "AgentInstanceRegistered(address)": [
+            {
+              "details": "Agent instance is already registered with a specified `operator`.",
+              "params": {
+                "operator": "Operator that registered an instance."
+              }
+            }
+          ],
+          "AgentInstancesSlotsFilled(uint256)": [
+            {
+              "details": "All the agent instance slots for a specific `serviceId` are filled.",
+              "params": {
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "AgentNotFound(uint256)": [
+            {
+              "details": "Canonical agent Id is not found.",
+              "params": {
+                "agentId": "Canonical agent Id."
+              }
+            }
+          ],
+          "AgentNotInService(uint256,uint256)": [
+            {
+              "details": "Canonical `agentId` is not found as a part of `serviceId`.",
+              "params": {
+                "agentId": "Canonical agent Id.",
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "AlreadyInitialized()": [
+            {
+              "details": "Storage is already initialized."
+            }
+          ],
+          "ComponentNotFound(uint256)": [
+            {
+              "details": "Component Id is not found.",
+              "params": {
+                "componentId": "Component Id."
+              }
+            }
+          ],
+          "HashExists()": [
+            {
+              "details": "Hash already exists in the records."
+            }
+          ],
+          "HashNotApproved(address,bytes32,bytes)": [
+            {
+              "details": "Hash is not approved.",
+              "params": {
+                "msgHash": "Message hash.",
+                "operator": "Operator address.",
+                "signature": "Signature bytes associated with the message hash."
+              }
+            }
+          ],
+          "HashNotValidated(address,bytes32,bytes)": [
+            {
+              "details": "Hash is not validated.",
+              "params": {
+                "msgHash": "Message hash.",
+                "operator": "Operator contract address.",
+                "signature": "Signature bytes associated with the message hash."
+              }
+            }
+          ],
+          "IncorrectAgentBondingValue(uint256,uint256,uint256)": [
+            {
+              "details": "Insufficient value provided for the agent instance bonding.",
+              "params": {
+                "expected": "Expected amount.",
+                "sent": "Sent amount.",
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "IncorrectRegistrationDepositValue(uint256,uint256,uint256)": [
+            {
+              "details": "Incorrect deposit provided for the registration activation.",
+              "params": {
+                "expected": "Expected amount.",
+                "sent": "Sent amount.",
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "IncorrectSignatureLength(bytes,uint256,uint256)": [
+            {
+              "details": "Incorrect signature length provided.",
+              "params": {
+                "expected": "Expected signature length.",
+                "provided": "Provided signature length.",
+                "signature": "Signature bytes."
+              }
+            }
+          ],
+          "ManagerOnly(address,address)": [
+            {
+              "details": "Only `manager` has a privilege, but the `sender` was provided.",
+              "params": {
+                "manager": "Required sender address as a manager.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "OnlyOwnServiceMultisig(address,address,uint256)": [
+            {
+              "details": "Only own service multisig is allowed.",
+              "params": {
+                "expected": "Expected multisig address.",
+                "provided": "Provided address.",
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "OperatorHasNoInstances(address,uint256)": [
+            {
+              "details": "Operator has no registered instances in the service.",
+              "params": {
+                "operator": "Operator address.",
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "Overflow(uint256,uint256)": [
+            {
+              "details": "Value overflow.",
+              "params": {
+                "max": "Maximum possible value.",
+                "provided": "Overflow value."
+              }
+            }
+          ],
+          "OwnerOnly(address,address)": [
+            {
+              "details": "Only `owner` has a privilege, but the `sender` was provided.",
+              "params": {
+                "owner": "Required sender address as an owner.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "Paused()": [
+            {
+              "details": "The contract is paused."
+            }
+          ],
+          "ReentrancyGuard()": [
+            {
+              "details": "Caught reentrancy violation."
+            }
+          ],
+          "ServiceMustBeInactive(uint256)": [
+            {
+              "details": "Service must be inactive.",
+              "params": {
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "TransferFailed(address,address,address,uint256)": [
+            {
+              "details": "Failure of a transfer.",
+              "params": {
+                "from": "Address `from`.",
+                "to": "Address `to`.",
+                "token": "Address of a token.",
+                "value": "Value."
+              }
+            }
+          ],
+          "UnauthorizedMultisig(address)": [
+            {
+              "details": "Multisig is not whitelisted.",
+              "params": {
+                "multisig": "Address of a multisig implementation."
+              }
+            }
+          ],
+          "WrongAgentId(uint256)": [
+            {
+              "details": "Agent Id is not correctly provided for the current routine.",
+              "params": {
+                "agentId": "Component Id."
+              }
+            }
+          ],
+          "WrongArrayLength(uint256,uint256)": [
+            {
+              "details": "Wrong length of two arrays.",
+              "params": {
+                "numValues1": "Number of values in a first array.",
+                "numValues2": "Numberf of values in a second array."
+              }
+            }
+          ],
+          "WrongOperator(uint256)": [
+            {
+              "details": "Wrong operator is specified when interacting with a specified `serviceId`.",
+              "params": {
+                "serviceId": "Service Id."
+              }
+            }
+          ],
+          "WrongOperatorAddress(address,address)": [
+            {
+              "details": "Obtained wrong operator address.",
+              "params": {
+                "expected": "Expected address.",
+                "provided": "Provided address."
+              }
+            }
+          ],
+          "WrongServiceState(uint256,uint256)": [
+            {
+              "details": "Wrong state of a service.",
+              "params": {
+                "serviceId": "Service Id.",
+                "state": "Service state."
+              }
+            }
+          ],
+          "WrongThreshold(uint256,uint256,uint256)": [
+            {
+              "details": "Multisig threshold is out of bounds.",
+              "params": {
+                "currentThreshold": "Current threshold value.",
+                "maxThreshold": "Maximum possible threshold value.",
+                "minThreshold": "Minimum possible threshold value."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroOperatorAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroValue()": [
+            {
+              "details": "Zero value when it has to be different from zero."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "activateRegistration(uint256)": {
+            "details": "Activates the service and its sensitive components.",
+            "params": {
+              "serviceId": "Correspondent service Id."
+            },
+            "returns": {
+              "success": "True, if function executed successfully."
+            }
+          },
+          "changeImplementation(address)": {
+            "details": "Changes implementation contract address.",
+            "params": {
+              "implementation": "Implementation contract address."
+            }
+          },
+          "changeOwner(address)": {
+            "details": "Changes the owner address.",
+            "params": {
+              "newOwner": "Address of a new owner."
+            }
+          },
+          "constructor": {
+            "details": "ServiceManager constructor.",
+            "params": {
+              "_serviceRegistry": "Service Registry address.",
+              "_serviceRegistryTokenUtility": "Service Registry Token Utility address."
+            }
+          },
+          "create(address,address,bytes32,uint32[],(uint32,uint96)[],uint32)": {
+            "details": "Creates a new service.",
+            "params": {
+              "agentIds": "Canonical agent Ids.",
+              "agentParams": "Number of agent instances and required bond to register an instance in the service.",
+              "configHash": "IPFS hash pointing to the config metadata.",
+              "serviceOwner": "Individual that creates and controls a service.",
+              "threshold": "Threshold for a multisig composed by agents.",
+              "token": "ERC20 token address for the security deposit, or ETH."
+            },
+            "returns": {
+              "serviceId": "Created service Id."
+            }
+          },
+          "deploy(uint256,address,bytes)": {
+            "details": "Creates multisig instance controlled by the set of service agent instances and deploys the service.",
+            "params": {
+              "data": "Data payload for the multisig creation.",
+              "multisigImplementation": "Multisig implementation address.",
+              "serviceId": "Correspondent service Id."
+            },
+            "returns": {
+              "multisig": "Address of the created multisig."
+            }
+          },
+          "getDomainSeparator()": {
+            "details": "Gets domain separator hash.",
+            "returns": {
+              "_0": "Original or recomputed domain separator."
+            }
+          },
+          "getOperatorRegisterAgentsNonce(address,uint256)": {
+            "details": "Gets the (operator | service Id) nonce for the register agents message data.",
+            "params": {
+              "operator": "Operator address.",
+              "serviceId": "Service Id."
+            },
+            "returns": {
+              "nonce": "Obtained nonce."
+            }
+          },
+          "getOperatorUnbondNonce(address,uint256)": {
+            "details": "Gets the (operator | service Id) nonce for the unbond message data.",
+            "params": {
+              "operator": "Operator address.",
+              "serviceId": "Service Id."
+            },
+            "returns": {
+              "nonce": "Obtained nonce."
+            }
+          },
+          "getRegisterAgentsHash(address,address,uint256,address[],uint32[],uint256)": {
+            "details": "Gets the register agents message hash for the operator.",
+            "params": {
+              "agentIds": "Agent Ids corresponding to each agent instance address.",
+              "agentInstances": "Agent instance addresses operator is going to register.",
+              "nonce": "Nonce for the register agents message from the pair of (operator | service Id).",
+              "operator": "Operator address.",
+              "serviceId": "Service Id.",
+              "serviceOwner": "Service owner address."
+            },
+            "returns": {
+              "_0": "Computed message hash."
+            }
+          },
+          "getUnbondHash(address,address,uint256,uint256)": {
+            "details": "Gets the unbond message hash for the operator.",
+            "params": {
+              "nonce": "Nonce for the unbond message from the pair of (operator | service Id).",
+              "operator": "Operator address.",
+              "serviceId": "Service Id.",
+              "serviceOwner": "Service owner address."
+            },
+            "returns": {
+              "_0": "Computed message hash."
+            }
+          },
+          "initialize()": {
+            "details": "Initializes proxy contract storage."
+          },
+          "isOperatorHashApproved(address,bytes32)": {
+            "details": "Checks if the hash provided by the operator is approved.",
+            "params": {
+              "hash": "Message hash.",
+              "operator": "Operator address."
+            },
+            "returns": {
+              "_0": "True, if the hash provided by the operator is approved."
+            }
+          },
+          "operatorApproveHash(bytes32)": {
+            "details": "Approves message hash for the operator address.",
+            "params": {
+              "hash": "Provided message hash to approve."
+            }
+          },
+          "pause()": {
+            "details": "Pauses the contract."
+          },
+          "registerAgents(uint256,address[],uint32[])": {
+            "details": "Registers agent instances.",
+            "params": {
+              "agentIds": "Canonical Ids of the agent correspondent to the agent instance.",
+              "agentInstances": "Agent instance addresses.",
+              "serviceId": "Service Id to be updated."
+            },
+            "returns": {
+              "success": "True, if function executed successfully."
+            }
+          },
+          "registerAgentsWithSignature(address,uint256,address[],uint32[],bytes)": {
+            "details": "Registers agent instances of the operator by the service owner via the operator's pre-signed message hash.",
+            "params": {
+              "agentIds": "Canonical Ids of the agent correspondent to the agent instance.",
+              "agentInstances": "Agent instance addresses.",
+              "operator": "Operator address that signed the register agents message hash.",
+              "serviceId": "Service Id.",
+              "signature": "Signature byte array associated with operator message hash signature."
+            },
+            "returns": {
+              "success": "True, if the the function executed successfully."
+            }
+          },
+          "setIdentityRegistryBridger(address)": {
+            "details": "Sets identity registry bridger contract address.",
+            "params": {
+              "newIdentityRegistryBridger": "New identity registry bridger contract address."
+            }
+          },
+          "setOperatorWhitelist(address)": {
+            "details": "Sets the operator whitelist contract address.",
+            "params": {
+              "newOperatorWhitelist": "New operator whitelist contract address."
+            }
+          },
+          "terminate(uint256)": {
+            "details": "Terminates the service.",
+            "params": {
+              "serviceId": "Service Id."
+            },
+            "returns": {
+              "refund": "Refund for the service owner.",
+              "success": "True, if function executed successfully."
+            }
+          },
+          "unbond(uint256)": {
+            "details": "Unbonds agent instances of the operator from the service.",
+            "params": {
+              "serviceId": "Service Id."
+            },
+            "returns": {
+              "refund": "The amount of refund returned to the operator.",
+              "success": "True, if function executed successfully."
+            }
+          },
+          "unbondWithSignature(address,uint256,bytes)": {
+            "details": "Unbonds agent instances of the operator by the service owner via the operator's pre-signed message hash.",
+            "params": {
+              "operator": "Operator address that signed the unbond message hash.",
+              "serviceId": "Service Id.",
+              "signature": "Signature byte array associated with operator message hash signature."
+            },
+            "returns": {
+              "refund": "The amount of refund returned to the operator.",
+              "success": "True, if the function executed successfully."
+            }
+          },
+          "unpause()": {
+            "details": "Unpauses the contract."
+          },
+          "update(address,bytes32,uint32[],(uint32,uint96)[],uint32,uint256)": {
+            "details": "Updates a service in a CRUD way.",
+            "params": {
+              "agentIds": "Canonical agent Ids.",
+              "agentParams": "Number of agent instances and required bond to register an instance in the service.",
+              "configHash": "IPFS hash pointing to the config metadata.",
+              "serviceId": "Service Id to be updated.",
+              "threshold": "Threshold for a multisig composed by agents.",
+              "token": "ERC20 token address for the security deposit, or ETH."
+            },
+            "returns": {
+              "success": "True, if function executed successfully."
+            }
+          }
+        },
+        "title": "Service Manager - Periphery smart contract for managing services with custom ERC20 tokens or ETH",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "changeImplementation(address)": {
+            "notice": "Make sure implementation contract has function to change its implementation."
+          },
+          "registerAgentsWithSignature(address,uint256,address[],uint32[],bytes)": {
+            "notice": "Note that this function accounts for the operator being the EOA, or the contract that has an         isValidSignature() function that would confirm the message hash was signed by the operator contract.         Otherwise, if the message hash has been pre-approved, the corresponding map of hashes is going to         to verify the signed hash, similar to the Safe contract implementation in v1.3.0:         https://github.com/safe-global/safe-contracts/blob/186a21a74b327f17fc41217a927dea7064f74604/contracts/GnosisSafe.sol#L240-L304         Also note that only the service owner is able to call this function on behalf of the operator."
+          },
+          "unbondWithSignature(address,uint256,bytes)": {
+            "notice": "Note that this function accounts for the operator being the EOA, or the contract that has an         isValidSignature() function that would confirm the message hash was signed by the operator contract.         Otherwise, if the message hash has been pre-approved, the corresponding map of hashes is going to         to verify the signed hash, similar to the Safe contract implementation in v1.3.0:         https://github.com/safe-global/safe-contracts/blob/186a21a74b327f17fc41217a927dea7064f74604/contracts/GnosisSafe.sol#L240-L304         Also note that only the service owner is able to call this function on behalf of the operator."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/ServiceManager.sol": "ServiceManager"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 750
+      },
+      "remappings": [
+        ":@gnosis.pm/=node_modules/@gnosis.pm/",
+        ":ds-test/=lib/solmate/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":solmate/=lib/solmate/src/"
+      ]
+    },
+    "sources": {
+      "contracts/GenericManager.sol": {
+        "keccak256": "0x933cd8ce77c12c5a99fa930efaea5f2737dd334bc5fb3c7a404a2a964ce57622",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://5c5dd04c7e90965f37b44e71d1235ddd1f0f55cc499425f2f9fb452303015534",
+          "dweb:/ipfs/QmVj4f6D52EuvrnEyHbf7gXpLZWwnwJvNgt2DZWo47PuNK"
+        ]
+      },
+      "contracts/ServiceManager.sol": {
+        "keccak256": "0xe383e0a092ef68a1e230d268b4d6ba1595360142531a05a6efe1e68eab2cb151",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7db5b727401731ff4902c54e4eca6839e63b65b75c22d842d3f66083f9347700",
+          "dweb:/ipfs/QmeGqSRrWtg24bB3bisf3Q1WLrMxabMqw9rk7ZKaCoG5vy"
+        ]
+      },
+      "contracts/interfaces/IErrorsRegistries.sol": {
+        "keccak256": "0x559f068acda73f2f64d89a808cd42f13f278fb1de1ef18e8262a4e248c17a206",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://4e6ffe0210fda1efafc2fba8c48ff03816d5be805954f065baa3d8ecc1b40575",
+          "dweb:/ipfs/QmUz4QpT956ufPcJCy2ZofGiDrLUKmkEQP4nMsWQQWWN2L"
+        ]
+      },
+      "contracts/interfaces/IService.sol": {
+        "keccak256": "0xf781ce9f0f716b5fd8506c9d1cf856ab9cf902944a93c5ead2d3abb7f4353c23",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0596738760cd3c89db3b6ac9671023f99ff1c3907fd040391433e0bf0c191659",
+          "dweb:/ipfs/QmZy4dDdTFrpQfguaVZRutm7kHjxSj9gCgs1fza2kyJaGD"
+        ]
+      },
+      "contracts/interfaces/IServiceTokenUtility.sol": {
+        "keccak256": "0x1a2b7b1173eec1f8c37bd2d1f248f452b1cb9d3343a7c75de3e9bee69383f75e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://566164365db5c33b38ec2c72adbfed31e3ac0262bb60ca08b4d2f60c3f9410cc",
+          "dweb:/ipfs/QmctRoP5NgdrKYxU5XQCqw1VfvXEBK4SxAYWgwsLBi8an6"
+        ]
+      },
+      "contracts/utils/OperatorSignedHashes.sol": {
+        "keccak256": "0x2ddf6802971f536d091a69a485a8c9af66b33004176c4de9cdaf4f12dee202ac",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://bed620a6f8107373aff5f14b39b89a764bd627707fdb9369ee7fd8f09340692a",
+          "dweb:/ipfs/QmPdMcY6s1phAoLQZkAbYjANVAMhdZb7DjpZjC3FjjsBkf"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.30+commit.73712a01",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 750,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "@gnosis.pm/=node_modules/@gnosis.pm/",
+        "ds-test/=lib/solmate/lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "solmate/=lib/solmate/src/"
+      ]
+    },
+    "name": "ServiceManager",
+    "fullyQualifiedName": "contracts/ServiceManager.sol:ServiceManager"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "16593791",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-02-03T16:44:21Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0x4443ddD8EC67CbCf7E291ee3198f81dD0326b3A1"
+}

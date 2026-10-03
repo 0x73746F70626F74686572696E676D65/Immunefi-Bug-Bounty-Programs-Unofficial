@@ -1,0 +1,1415 @@
+{
+  "sources": {
+    "contracts/Dispenser.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.25;\n\n// Deposit Processor interface\ninterface IDepositProcessor {\n    /// @dev Sends a single message to the L2 side via a corresponding bridge.\n    /// @param target Staking target addresses.\n    /// @param stakingIncentive Corresponding staking incentive.\n    /// @param bridgePayload Bridge payload necessary (if required) for a specific bridge relayer.\n    /// @param transferAmount Actual OLAS amount to be transferred.\n    function sendMessage(address target, uint256 stakingIncentive, bytes memory bridgePayload,\n        uint256 transferAmount) external payable;\n\n    /// @dev Sends a batch message to the L2 side via a corresponding bridge.\n    /// @param targets Set of staking target addresses.\n    /// @param stakingIncentives Corresponding set of staking incentives.\n    /// @param bridgePayload Bridge payload necessary (if required) for a specific bridge relayer.\n    /// @param transferAmount Actual total OLAS amount across all the targets to be transferred.\n    function sendMessageBatch(address[] memory targets, uint256[] memory stakingIncentives, bytes memory bridgePayload,\n        uint256 transferAmount) external payable;\n\n    /// @dev Sends a single message to the non-EVM chain.\n    /// @param target Staking target addresses.\n    /// @param stakingIncentive Corresponding staking incentive.\n    /// @param bridgePayload Bridge payload necessary (if required) for a specific bridge relayer.\n    /// @param transferAmount Actual OLAS amount to be transferred.\n    function sendMessageNonEVM(bytes32 target, uint256 stakingIncentive, bytes memory bridgePayload,\n        uint256 transferAmount) external payable;\n\n    /// @dev Sends a batch message to the non-EVM chain.\n    /// @param targets Set of staking target addresses.\n    /// @param stakingIncentives Corresponding set of staking incentives.\n    /// @param bridgePayload Bridge payload necessary (if required) for a specific bridge relayer.\n    /// @param transferAmount Actual total OLAS amount across all the targets to be transferred.\n    function sendMessageBatchNonEVM(bytes32[] memory targets, uint256[] memory stakingIncentives,\n        bytes memory bridgePayload, uint256 transferAmount) external payable;\n\n    /// @dev Gets the maximum number of token decimals able to be transferred across the bridge.\n    /// @return Number of supported decimals.\n    function getBridgingDecimals() external pure returns (uint256);\n\n    /// @dev Updated the batch hash of a failed message, if applicable.\n    /// @param batchHash Unique batch hash for each message transfer.\n    function updateHashMaintenance(bytes32 batchHash) external;\n}\n\n// ERC20 token interface\ninterface IToken {\n    /// @dev Gets the amount of tokens owned by a specified account.\n    /// @param account Account address.\n    /// @return Amount of tokens owned.\n    function balanceOf(address account) external view returns (uint256);\n\n    /// @dev Transfers the token amount.\n    /// @param to Address to transfer to.\n    /// @param amount The amount to transfer.\n    /// @return True if the function execution is successful.\n    function transfer(address to, uint256 amount) external returns (bool);\n}\n\n// Tokenomics interface\ninterface ITokenomics {\n    // Structure for epoch point with tokenomics-related statistics during each epoch\n    // The size of the struct is 96 * 2 + 64 + 32 * 2 + 8 * 2 = 256 + 80 (2 slots)\n    struct EpochPoint {\n        // Total amount of ETH donations accrued by the protocol during one epoch\n        // Even if the ETH inflation rate is 5% per year, it would take 130+ years to reach 2^96 - 1 of ETH total supply\n        uint96 totalDonationsETH;\n        // Amount of OLAS intended to fund top-ups for the epoch based on the inflation schedule\n        // After 10 years, the OLAS inflation rate is 2% per year. It would take 220+ years to reach 2^96 - 1\n        uint96 totalTopUpsOLAS;\n        // Inverse of the discount factor\n        // IDF is bound by a factor of 18, since (2^64 - 1) / 10^18 > 18\n        // IDF uses a multiplier of 10^18 by default, since it is a rational number and must be accounted for divisions\n        // The IDF depends on the epsilonRate value, idf = 1 + epsilonRate, and epsilonRate is bound by 17 with 18 decimals\n        uint64 idf;\n        // Number of new owners\n        // Each unit has at most one owner, so this number cannot be practically bigger than numNewUnits\n        uint32 numNewOwners;\n        // Epoch end timestamp\n        // 2^32 - 1 gives 136+ years counted in seconds starting from the year 1970, which is safe until the year of 2106\n        uint32 endTime;\n        // Parameters for rewards and top-ups (in percentage)\n        // Each of these numbers cannot be practically bigger than 100 as they sum up to 100%\n        // treasuryFraction + rewardComponentFraction + rewardAgentFraction = 100%\n        // Treasury fraction\n        uint8 rewardTreasuryFraction;\n        // maxBondFraction + topUpComponentFraction + topUpAgentFraction <= 100%\n        // Amount of OLAS (in percentage of inflation) intended to fund bonding incentives during the epoch\n        uint8 maxBondFraction;\n    }\n\n    // Struct for service staking epoch info\n    struct StakingPoint {\n        // Amount of OLAS that funds service staking incentives for the epoch based on the inflation schedule\n        // After 10 years, the OLAS inflation rate is 2% per year. It would take 220+ years to reach 2^96 - 1\n        uint96 stakingIncentive;\n        // Max allowed service staking incentive threshold\n        // This value is never bigger than the stakingIncentive\n        uint96 maxStakingIncentive;\n        // Service staking vote weighting threshold\n        // This number is bound by 10_000, ranging from 0 to 100% with the step of 0.01%\n        uint16 minStakingWeight;\n        // Service staking fraction\n        // This number cannot be practically bigger than 100 as it sums up to 100% with others\n        // maxBondFraction + topUpComponentFraction + topUpAgentFraction + stakingFraction <= 100%\n        uint8 stakingFraction;\n    }\n\n    /// @dev Gets component / agent owner incentives and clears the balances.\n    /// @notice `account` must be the owner of components / agents Ids, otherwise the function will revert.\n    /// @notice If not all `unitIds` belonging to `account` were provided, they will be untouched and keep accumulating.\n    /// @notice Component and agent Ids must be provided in the ascending order and must not repeat.\n    /// @param account Account address.\n    /// @param unitTypes Set of unit types (component / agent).\n    /// @param unitIds Set of corresponding unit Ids where account is the owner.\n    /// @return reward Reward amount.\n    /// @return topUp Top-up amount.\n    function accountOwnerIncentives(address account, uint256[] memory unitTypes, uint256[] memory unitIds) external\n        returns (uint256 reward, uint256 topUp);\n\n    /// @dev Gets tokenomics epoch counter.\n    /// @return Epoch counter.\n    function epochCounter() external view returns (uint32);\n\n    /// @dev Gets tokenomics epoch length.\n    /// @return Epoch length.\n    function epochLen() external view returns (uint32);\n\n    /// @dev Gets epoch end time.\n    /// @param epoch Epoch number.\n    /// @return endTime Epoch end time.\n    function getEpochEndTime(uint256 epoch) external view returns (uint256 endTime);\n\n    /// @dev Gets tokenomics epoch service staking point.\n    /// @param eCounter Epoch number.\n    /// @return Staking point.\n    function mapEpochStakingPoints(uint256 eCounter) external view returns (StakingPoint memory);\n\n    /// @dev Records amount returned back from staking to the inflation.\n    /// @param amount OLAS amount returned from staking.\n    function refundFromStaking(uint256 amount) external;\n}\n\n// Treasury interface\ninterface ITreasury {\n    /// @dev Withdraws ETH and / or OLAS amounts to the requested account address.\n    /// @notice Only dispenser contract can call this function.\n    /// @notice Reentrancy guard is on a dispenser side.\n    /// @notice Zero account address is not possible, since the dispenser contract interacts with msg.sender.\n    /// @param account Account address.\n    /// @param accountRewards Amount of account rewards.\n    /// @param accountTopUps Amount of account top-ups.\n    /// @return success True if the function execution is successful.\n    function withdrawToAccount(address account, uint256 accountRewards, uint256 accountTopUps) external\n        returns (bool success);\n\n    /// @dev Returns the paused state.\n    /// @return Paused state.\n    function paused() external returns (uint8);\n}\n\n// Vote Weighting nterface\ninterface IVoteWeighting {\n    // Nominee struct\n    struct Nominee {\n        bytes32 account;\n        uint256 chainId;\n    }\n\n    /// @dev Gets the nominee Id by its hash.\n    /// @param nomineeHash Nominee hash derived from its account address and chainId.\n    /// @return Nominee Id.\n    function mapNomineeIds(bytes32 nomineeHash) external returns (uint256);\n\n    /// @dev Checkpoint to fill data for both a specific nominee and common for all nominees.\n    /// @param account Address of the nominee.\n    /// @param chainId Chain Id.\n    function checkpointNominee(bytes32 account, uint256 chainId) external;\n\n    /// @dev Get Nominee relative weight (not more than 1.0) normalized to 1e18 and the sum of weights.\n    ///         (e.g. 1.0 == 1e18). Inflation which will be received by it is\n    ///         inflation_rate * relativeWeight / 1e18.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @param time Relative weight at the specified timestamp in the past or present.\n    /// @return Value of relative weight normalized to 1e18.\n    /// @return Sum of nominee weights.\n    function nomineeRelativeWeight(bytes32 account, uint256 chainId, uint256 time) external view returns (uint256, uint256);\n}\n\n/// @dev Only `manager` has a privilege, but the `sender` was provided.\n/// @param sender Sender address.\n/// @param manager Required sender address as a manager.\nerror ManagerOnly(address sender, address manager);\n\n/// @dev Only `owner` has a privilege, but the `sender` was provided.\n/// @param sender Sender address.\n/// @param owner Required sender address as an owner.\nerror OwnerOnly(address sender, address owner);\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Wrong length of two arrays.\n/// @param numValues1 Number of values in a first array.\n/// @param numValues2 Number of values in a second array.\nerror WrongArrayLength(uint256 numValues1, uint256 numValues2);\n\n/// @dev Zero value when it has to be different from zero.\nerror ZeroValue();\n\n/// @dev Value overflow.\n/// @param provided Overflow value.\n/// @param max Maximum possible value.\nerror Overflow(uint256 provided, uint256 max);\n\n/// @dev Received lower value than the expected one.\n/// @param provided Provided value is lower.\n/// @param expected Expected value.\nerror LowerThan(uint256 provided, uint256 expected);\n\n/// @dev Wrong amount received / provided.\n/// @param provided Provided amount.\n/// @param expected Expected amount.\nerror WrongAmount(uint256 provided, uint256 expected);\n\n/// @dev Caught reentrancy violation.\nerror ReentrancyGuard();\n\n/// @dev The contract is paused.\nerror Paused();\n\n/// @dev Incentives claim has failed.\n/// @param account Account address.\n/// @param reward Reward amount.\n/// @param topUp Top-up amount.\nerror ClaimIncentivesFailed(address account, uint256 reward, uint256 topUp);\n\n/// @dev Only the deposit processor is able to call the function.\n/// @param sender Actual sender address.\n/// @param depositProcessor Required deposit processor.\nerror DepositProcessorOnly(address sender, address depositProcessor);\n\n/// @dev Chain Id is incorrect.\n/// @param chainId Chain Id.\nerror WrongChainId(uint256 chainId);\n\n/// @dev Account address is incorrect.\n/// @param account Account address.\nerror WrongAccount(bytes32 account);\n\n/// @title Dispenser - Smart contract for distributing incentives\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\ncontract Dispenser {\n    enum Pause {\n        Unpaused,\n        DevIncentivesPaused,\n        StakingIncentivesPaused,\n        AllPaused\n    }\n\n    event OwnerUpdated(address indexed owner);\n    event TokenomicsUpdated(address indexed tokenomics);\n    event TreasuryUpdated(address indexed treasury);\n    event VoteWeightingUpdated(address indexed voteWeighting);\n    event StakingParamsUpdated(uint256 maxNumClaimingEpochs, uint256 maxNumStakingTargets);\n    event IncentivesClaimed(address indexed owner, uint256 reward, uint256 topUp, uint256[] unitTypes, uint256[] unitIds);\n    event StakingIncentivesClaimed(address indexed account, uint256 chainId, bytes32 stakingTarget,\n        uint256 stakingIncentive, uint256 transferAmount, uint256 returnAmount);\n    event StakingIncentivesBatchClaimed(address indexed account, uint256[] chainIds, bytes32[][] stakingTargets,\n        uint256[][] stakingIncentives, uint256 totalStakingIncentive, uint256 totalTransferAmount,\n        uint256 totalReturnAmount);\n    event Retained(address indexed account, uint256 returnAmount);\n    event SetDepositProcessorChainIds(address[] depositProcessors, uint256[] chainIds);\n    event WithheldAmountSynced(uint256 chainId, uint256 amount, uint256 updatedWithheldAmount, bytes32 indexed batchHash);\n    event PauseDispenser(Pause pauseState);\n    event AddNomineeHash(bytes32 indexed nomineeHash);\n    event RemoveNomineeHash(bytes32 indexed nomineeHash);\n\n    // Maximum chain Id as per EVM specs\n    uint256 public constant MAX_EVM_CHAIN_ID = type(uint64).max / 2 - 36;\n    uint256 public immutable defaultMinStakingWeight;\n    uint256 public immutable defaultMaxStakingIncentive;\n    // OLAS token address\n    address public immutable olas;\n    // Retainer address in bytes32 form\n    bytes32 public immutable retainer;\n    // Retainer hash of a Nominee struct composed of retainer address with block.chainid\n    bytes32 public immutable retainerHash;\n\n    // Max number of epochs to claim staking incentives for\n    uint256 public maxNumClaimingEpochs;\n    // Max number of targets for a specific chain to claim staking incentives for\n    uint256 public maxNumStakingTargets;\n    // Owner address\n    address public owner;\n    // Reentrancy lock\n    uint8 internal _locked;\n    // Pause state\n    Pause public paused;\n\n    // Tokenomics contract address\n    address public tokenomics;\n    // Treasury contract address\n    address public treasury;\n    // Vote Weighting contract address\n    address public voteWeighting;\n\n    // Mapping for hash(Nominee struct) service staking pair => last claimed epochs\n    mapping(bytes32 => uint256) public mapLastClaimedStakingEpochs;\n    // Mapping for hash(Nominee struct) service staking pair => epoch number when the staking contract is removed\n    mapping(bytes32 => uint256) public mapRemovedNomineeEpochs;\n    // Mapping for L2 chain Id => dedicated deposit processors\n    mapping(uint256 => address) public mapChainIdDepositProcessors;\n    // Mapping for L2 chain Id => withheld OLAS amounts\n    mapping(uint256 => uint256) public mapChainIdWithheldAmounts;\n    // Mapping for epoch number => refunded all the staking inflation due to zero total voting power\n    mapping(uint256 => bool) public mapZeroWeightEpochRefunded;\n\n    /// @dev Dispenser constructor.\n    /// @param _olas OLAS token address.\n    /// @param _tokenomics Tokenomics address.\n    /// @param _treasury Treasury address.\n    /// @param _voteWeighting Vote Weighting address.\n    constructor(\n        address _olas,\n        address _tokenomics,\n        address _treasury,\n        address _voteWeighting,\n        bytes32 _retainer,\n        uint256 _maxNumClaimingEpochs,\n        uint256 _maxNumStakingTargets,\n        uint256 _defaultMinStakingWeight,\n        uint256 _defaultMaxStakingIncentive\n    ) {\n        owner = msg.sender;\n        _locked = 1;\n        // Staking incentives must be paused at the time of deployment because staking parameters are not live yet\n        paused = Pause.StakingIncentivesPaused;\n\n        // Check for at least one zero contract address\n        if (_olas == address(0) || _tokenomics == address(0) || _treasury == address(0) ||\n            _voteWeighting == address(0) || _retainer == 0) {\n            revert ZeroAddress();\n        }\n\n        // Check for zero value staking parameters\n        if (_maxNumClaimingEpochs == 0 || _maxNumStakingTargets == 0 || _defaultMinStakingWeight == 0 ||\n            _defaultMaxStakingIncentive == 0) {\n            revert ZeroValue();\n        }\n\n        // Check for maximum values\n        if (_defaultMinStakingWeight > type(uint16).max) {\n            revert Overflow(_defaultMinStakingWeight, type(uint16).max);\n        }\n        if (_defaultMaxStakingIncentive > type(uint96).max) {\n            revert Overflow(_defaultMaxStakingIncentive, type(uint96).max);\n        }\n\n        olas = _olas;\n        tokenomics = _tokenomics;\n        treasury = _treasury;\n        voteWeighting = _voteWeighting;\n\n        retainer = _retainer;\n        retainerHash = keccak256(abi.encode(IVoteWeighting.Nominee(retainer, block.chainid)));\n        maxNumClaimingEpochs = _maxNumClaimingEpochs;\n        maxNumStakingTargets = _maxNumStakingTargets;\n        defaultMinStakingWeight = _defaultMinStakingWeight;\n        defaultMaxStakingIncentive = _defaultMaxStakingIncentive;\n    }\n\n    /// @dev Checkpoints specified staking target (nominee in Vote Weighting) and gets claimed epoch counters.\n    /// @param nomineeHash Hash of a Nominee(stakingTarget, chainId).\n    /// @param numClaimedEpochs Specified number of claimed epochs.\n    /// @return firstClaimedEpoch First claimed epoch number.\n    /// @return lastClaimedEpoch Last claimed epoch number (not included in claiming).\n    function _checkpointNomineeAndGetClaimedEpochCounters(\n        bytes32 nomineeHash,\n        uint256 numClaimedEpochs\n    ) internal view returns (uint256 firstClaimedEpoch, uint256 lastClaimedEpoch) {\n        // Get the current epoch number\n        uint256 eCounter = ITokenomics(tokenomics).epochCounter();\n\n        // Get the first claimed epoch, which is equal to the last claiming one\n        firstClaimedEpoch = mapLastClaimedStakingEpochs[nomineeHash];\n\n        // This must never happen as the nominee gets enabled when added to Vote Weighting\n        // This is only possible if the dispenser has been unset in Vote Weighting for some time\n        // In that case the check is correct and those nominees must not be considered\n        if (firstClaimedEpoch == 0) {\n            revert ZeroValue();\n        }\n\n        // Must not claim in the ongoing epoch\n        if (firstClaimedEpoch == eCounter) {\n            // Epoch counter is never equal to zero\n            revert Overflow(firstClaimedEpoch, eCounter - 1);\n        }\n\n        // Get epoch number when the nominee was removed\n        uint256 epochRemoved = mapRemovedNomineeEpochs[nomineeHash];\n        // If the nominee is not removed, its value in the map is always zero\n        // The staking contract nominee cannot be removed in the zero-th epoch by default\n        if (epochRemoved > 0 && firstClaimedEpoch >= epochRemoved) {\n            revert Overflow(firstClaimedEpoch, epochRemoved - 1);\n        }\n\n        // Get a number of epochs to claim for based on the maximum number of epochs claimed\n        lastClaimedEpoch = firstClaimedEpoch + numClaimedEpochs;\n\n        // Limit last claimed epoch by the number following the nominee removal epoch\n        // The condition for is lastClaimedEpoch strictly > because the lastClaimedEpoch is not included in claiming\n        if (epochRemoved > 0 && lastClaimedEpoch > epochRemoved) {\n            lastClaimedEpoch = epochRemoved;\n        }\n\n        // Also limit by the current counter, if the nominee was removed in the current epoch\n        if (lastClaimedEpoch > eCounter) {\n            lastClaimedEpoch = eCounter;\n        }\n    }\n\n    /// @dev Distributes staking incentives to a corresponding staking target.\n    /// @param chainId Chain Id.\n    /// @param stakingTarget Staking target corresponding to the chain Id.\n    /// @param stakingIncentive Corresponding staking incentive.\n    /// @param bridgePayload Bridge payload necessary (if required) for a specific bridge relayer.\n    /// @param transferAmount Actual OLAS amount to be transferred.\n    function _distributeStakingIncentives(\n        uint256 chainId,\n        bytes32 stakingTarget,\n        uint256 stakingIncentive,\n        bytes memory bridgePayload,\n        uint256 transferAmount\n    ) internal {\n        // Get the deposit processor contract address\n        address depositProcessor = mapChainIdDepositProcessors[chainId];\n\n        // Transfer corresponding OLAS amounts to the deposit processor\n        if (transferAmount > 0) {\n            IToken(olas).transfer(depositProcessor, transferAmount);\n        }\n\n        if (chainId <= MAX_EVM_CHAIN_ID) {\n            address stakingTargetEVM = address(uint160(uint256(stakingTarget)));\n            IDepositProcessor(depositProcessor).sendMessage{value:msg.value}(stakingTargetEVM, stakingIncentive,\n                bridgePayload, transferAmount);\n        } else {\n            // Send to non-EVM\n            IDepositProcessor(depositProcessor).sendMessageNonEVM{value:msg.value}(stakingTarget,\n                stakingIncentive, bridgePayload, transferAmount);\n        }\n    }\n\n    /// @dev Distributes staking incentives to corresponding staking targets.\n    /// @param chainIds Set of chain Ids.\n    /// @param stakingTargets Set of staking target addresses corresponding to each chain Id.\n    /// @param stakingIncentives Corresponding set of staking incentives.\n    /// @param bridgePayloads Bridge payloads (if) necessary for a specific bridge relayer depending on chain Id.\n    /// @param transferAmounts Set of actual total OLAS amounts across all the targets to be transferred.\n    /// @param valueAmounts Set of value amounts required to provide to some of the bridges.\n    function _distributeStakingIncentivesBatch(\n        uint256[] memory chainIds,\n        bytes32[][] memory stakingTargets,\n        uint256[][] memory stakingIncentives,\n        bytes[] memory bridgePayloads,\n        uint256[] memory transferAmounts,\n        uint256[] memory valueAmounts\n    ) internal {\n        // Traverse all staking targets\n        for (uint256 i = 0; i < chainIds.length; ++i) {\n            // Get the deposit processor contract address\n            address depositProcessor = mapChainIdDepositProcessors[chainIds[i]];\n\n            // Transfer corresponding OLAS amounts to deposit processors\n            if (transferAmounts[i] > 0) {\n                IToken(olas).transfer(depositProcessor, transferAmounts[i]);\n            }\n\n            // Find zero staking incentives\n            uint256 numActualTargets;\n            bool[] memory positions = new bool[](stakingTargets[i].length);\n            for (uint256 j = 0; j < stakingTargets[i].length; ++j) {\n                if (stakingIncentives[i][j] > 0) {\n                    positions[j] = true;\n                    ++numActualTargets;\n                }\n            }\n\n            // Skip if there are no actual staking targets\n            if (numActualTargets == 0) {\n                continue;\n            }\n\n            // Allocate updated arrays accounting only for nonzero staking incentives\n            bytes32[] memory updatedStakingTargets = new bytes32[](numActualTargets);\n            uint256[] memory updatedStakingAmounts = new uint256[](numActualTargets);\n            uint256 numPos;\n            for (uint256 j = 0; j < stakingTargets[i].length; ++j) {\n                if (positions[j]) {\n                    updatedStakingTargets[numPos] = stakingTargets[i][j];\n                    updatedStakingAmounts[numPos] = stakingIncentives[i][j];\n                    ++numPos;\n                }\n            }\n\n            // Address conversion depending on chain Ids\n            if (chainIds[i] <= MAX_EVM_CHAIN_ID) {\n                // Convert to EVM addresses\n                address[] memory stakingTargetsEVM = new address[](updatedStakingTargets.length);\n                for (uint256 j = 0; j < updatedStakingTargets.length; ++j) {\n                    stakingTargetsEVM[j] = address(uint160(uint256(updatedStakingTargets[j])));\n                }\n\n                // Send to EVM chains\n                IDepositProcessor(depositProcessor).sendMessageBatch{value:valueAmounts[i]}(stakingTargetsEVM,\n                    updatedStakingAmounts, bridgePayloads[i], transferAmounts[i]);\n            } else {\n                // Send to non-EVM chains\n                IDepositProcessor(depositProcessor).sendMessageBatchNonEVM{value:valueAmounts[i]}(updatedStakingTargets,\n                    updatedStakingAmounts, bridgePayloads[i], transferAmounts[i]);\n            }\n        }\n    }\n\n    /// @dev Checks strict ascending order of chain Ids and staking targets to ensure the absence of duplicates.\n    /// @param chainIds Set of chain Ids.\n    /// @notice The function is not view deliberately such that all the reverts are executed correctly.\n    /// @param stakingTargets Set of staking target addresses corresponding to each chain Id.\n    /// @param bridgePayloads Set of bridge payloads (if) necessary for a specific bridge relayer depending on chain Id.\n    /// @param valueAmounts Set of value amounts required to provide to some of the bridges.\n    function _checkOrderAndValues(\n        uint256[] memory chainIds,\n        bytes32[][] memory stakingTargets,\n        bytes[] memory bridgePayloads,\n        uint256[] memory valueAmounts\n    ) internal {\n        // Check array sizes\n        if (chainIds.length != stakingTargets.length) {\n            revert WrongArrayLength(chainIds.length, stakingTargets.length);\n        }\n        if (chainIds.length != bridgePayloads.length) {\n            revert WrongArrayLength(chainIds.length, bridgePayloads.length);\n        }\n        if (chainIds.length != valueAmounts.length) {\n            revert WrongArrayLength(chainIds.length, valueAmounts.length);\n        }\n\n        uint256 lastChainId;\n        uint256 totalValueAmount;\n        // Traverse all chains\n        for (uint256 i = 0; i < chainIds.length; ++i) {\n            // Check that chain Ids are strictly in ascending non-repeatable order\n            // Also protects from the initial chainId == 0\n            if (lastChainId >= chainIds[i]) {\n                revert WrongChainId(chainIds[i]);\n            }\n            lastChainId = chainIds[i];\n\n            // Staking targets must not be an empty array\n            if (stakingTargets[i].length == 0) {\n                revert ZeroValue();\n            }\n\n            // Add to the total value amount\n            totalValueAmount += valueAmounts[i];\n\n            // Check for the maximum number of staking targets\n            uint256 localMaxNumStakingTargets = maxNumStakingTargets;\n            if (stakingTargets[i].length > localMaxNumStakingTargets) {\n                revert Overflow(stakingTargets[i].length, localMaxNumStakingTargets);\n            }\n\n            bytes32 lastTarget;\n            // Traverse all staking targets\n            for (uint256 j = 0; j < stakingTargets[i].length; ++j) {\n                // Enforce ascending non-repeatable order of targets\n                // Also protects from the initial stakingTargets[i][j] == 0\n                if (uint256(lastTarget) >= uint256(stakingTargets[i][j])) {\n                    revert WrongAccount(stakingTargets[i][j]);\n                }\n                lastTarget = stakingTargets[i][j];\n            }\n        }\n\n        // Check if the total transferred amount corresponds to the sum of value amounts\n        if (msg.value != totalValueAmount) {\n            revert WrongAmount(msg.value, totalValueAmount);\n        }\n    }\n\n    /// @dev Calculates staking incentives for sets of staking targets corresponding to a set of chain Ids.\n    /// @param numClaimedEpochs Specified number of claimed epochs.\n    /// @param chainIds Set of chain Ids.\n    /// @param stakingTargets Set of staking target addresses corresponding to each chain Id.\n    /// @return totalAmounts Total calculated amounts: staking, transfer, return.\n    /// @return stakingIncentives Sets of staking incentives.\n    /// @return transferAmounts Set of transfer amounts.\n    function _calculateStakingIncentivesBatch(\n        uint256 numClaimedEpochs,\n        uint256[] memory chainIds,\n        bytes32[][] memory stakingTargets\n    ) internal returns (\n        uint256[] memory totalAmounts,\n        uint256[][] memory stakingIncentives,\n        uint256[] memory transferAmounts\n    ) {\n        // Total staking incentives\n        // 0: Staking incentive across all the targets to send as a deposit\n        // 1: Actual OLAS transfer amount across all the targets\n        // 2: Staking incentive to return back to staking inflation\n        totalAmounts = new uint256[](3);\n\n        // Allocate the array of staking and transfer amounts\n        stakingIncentives = new uint256[][](chainIds.length);\n        transferAmounts = new uint256[](chainIds.length);\n\n        // Traverse all chains\n        for (uint256 i = 0; i < chainIds.length; ++i) {\n            // Get deposit processor bridging decimals corresponding to a chain Id\n            address depositProcessor = mapChainIdDepositProcessors[chainIds[i]];\n            uint256 bridgingDecimals = IDepositProcessor(depositProcessor).getBridgingDecimals();\n\n            stakingIncentives[i] = new uint256[](stakingTargets[i].length);\n            // Traverse all staking targets\n            for (uint256 j = 0; j < stakingTargets[i].length; ++j) {\n                // Check that staking target is not a retainer address\n                if (stakingTargets[i][j] == retainer) {\n                    revert WrongAccount(retainer);\n                }\n\n                // Get the staking incentive to send as a deposit with, and the amount to return back to staking inflation\n                (uint256 stakingIncentive, uint256 returnAmount, uint256 lastClaimedEpoch, bytes32 nomineeHash) =\n                    calculateStakingIncentives(numClaimedEpochs, chainIds[i], stakingTargets[i][j], bridgingDecimals);\n\n                // Write last claimed epoch counter to start claiming from the next time\n                mapLastClaimedStakingEpochs[nomineeHash] = lastClaimedEpoch;\n\n                stakingIncentives[i][j] = stakingIncentive;\n                transferAmounts[i] += stakingIncentive;\n                totalAmounts[0] += stakingIncentive;\n                totalAmounts[2] += returnAmount;\n            }\n\n            // Account for possible withheld OLAS amounts\n            if (transferAmounts[i] > 0) {\n                uint256 withheldAmount = mapChainIdWithheldAmounts[chainIds[i]];\n                if (withheldAmount > 0) {\n                    if (withheldAmount >= transferAmounts[i]) {\n                        withheldAmount -= transferAmounts[i];\n                        transferAmounts[i] = 0;\n                    } else {\n                        transferAmounts[i] -= withheldAmount;\n                        withheldAmount = 0;\n                    }\n                    mapChainIdWithheldAmounts[chainIds[i]] = withheldAmount;\n                }\n            }\n\n            // Add to the total transfer amount\n            totalAmounts[1] += transferAmounts[i];\n        }\n    }\n\n    /// @dev Changes the owner address.\n    /// @param newOwner Address of a new owner.\n    function changeOwner(address newOwner) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero address\n        if (newOwner == address(0)) {\n            revert ZeroAddress();\n        }\n\n        owner = newOwner;\n        emit OwnerUpdated(newOwner);\n    }\n\n    /// @dev Changes various managing contract addresses.\n    /// @param _tokenomics Tokenomics address.\n    /// @param _treasury Treasury address.\n    /// @param _voteWeighting Vote Weighting address.\n    function changeManagers(address _tokenomics, address _treasury, address _voteWeighting) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Change Tokenomics contract address\n        if (_tokenomics != address(0)) {\n            tokenomics = _tokenomics;\n            emit TokenomicsUpdated(_tokenomics);\n        }\n\n        // Change Treasury contract address\n        if (_treasury != address(0)) {\n            treasury = _treasury;\n            emit TreasuryUpdated(_treasury);\n        }\n\n        // Change Vote Weighting contract address\n        if (_voteWeighting != address(0)) {\n            voteWeighting = _voteWeighting;\n            emit VoteWeightingUpdated(_voteWeighting);\n        }\n    }\n\n    /// @dev Changes staking params by the DAO.\n    /// @param _maxNumClaimingEpochs Maximum number of epochs to claim staking incentives for.\n    /// @param _maxNumStakingTargets Maximum number of staking targets available to claim for on a single chain Id.\n    function changeStakingParams(uint256 _maxNumClaimingEpochs, uint256 _maxNumStakingTargets) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check if values are zero\n        if (_maxNumClaimingEpochs == 0 || _maxNumStakingTargets == 0) {\n            revert ZeroValue();\n        }\n\n        maxNumClaimingEpochs = _maxNumClaimingEpochs;\n        maxNumStakingTargets = _maxNumStakingTargets;\n\n        emit StakingParamsUpdated(_maxNumClaimingEpochs, _maxNumStakingTargets);\n    }\n\n    /// @dev Sets deposit processor contracts addresses and L2 chain Ids.\n    /// @notice It is the contract owner responsibility to set correct L1 deposit processor contracts\n    ///         and corresponding supported L2 chain Ids.\n    /// @param depositProcessors Set of deposit processor contract addresses on L1.\n    /// @param chainIds Set of corresponding L2 chain Ids.\n    function setDepositProcessorChainIds(address[] memory depositProcessors, uint256[] memory chainIds) external {\n        // Check for the ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for array length correctness\n        if (depositProcessors.length == 0 || depositProcessors.length != chainIds.length) {\n            revert WrongArrayLength(depositProcessors.length, chainIds.length);\n        }\n\n        // Link L1 and L2 bridge mediators, set L2 chain Ids\n        for (uint256 i = 0; i < chainIds.length; ++i) {\n            // Check supported chain Ids on L2\n            if (chainIds[i] == 0) {\n                revert ZeroValue();\n            }\n\n            // Note: depositProcessors[i] might be zero if there is a need to stop processing a specific L2 chain Id\n            mapChainIdDepositProcessors[chainIds[i]] = depositProcessors[i];\n        }\n\n        emit SetDepositProcessorChainIds(depositProcessors, chainIds);\n    }\n\n    /// @dev Records nominee starting epoch number.\n    /// @param nomineeHash Nominee hash.\n    function addNominee(bytes32 nomineeHash) external {\n        // Check for the contract ownership\n        if (msg.sender != voteWeighting) {\n            revert ManagerOnly(msg.sender, voteWeighting);\n        }\n\n        // Check for the paused state\n        Pause currentPause = paused;\n        if (currentPause == Pause.StakingIncentivesPaused || currentPause == Pause.AllPaused ||\n            ITreasury(treasury).paused() == 2) {\n            revert Paused();\n        }\n\n        mapLastClaimedStakingEpochs[nomineeHash] = ITokenomics(tokenomics).epochCounter();\n\n        emit AddNomineeHash(nomineeHash);\n    }\n\n    /// @dev Records nominee removal epoch number.\n    /// @notice The staking contract nominee cannot be removed starting from one week before the end of epoch.\n    ///         Since the epoch end time is unknown and the nominee removal is applied in the following week,\n    ///         it is prohibited to remove nominee one week before the foreseen epoch end to correctly reflect\n    ///         the removal epoch number.\n    ///         If the staking contract nominee must not get incentives in the ongoing ending epoch as well,\n    ///         the DAO is advised to use the removeInstance() function in the corresponding StakingFactory contract.\n    /// @param nomineeHash Nominee hash.\n    function removeNominee(bytes32 nomineeHash) external {\n        // Check for the contract ownership\n        if (msg.sender != voteWeighting) {\n            revert ManagerOnly(msg.sender, voteWeighting);\n        }\n\n        // Check for the retainer hash\n        if (retainerHash == nomineeHash) {\n            revert WrongAccount(retainer);\n        }\n\n        // Get the epoch counter\n        uint256 eCounter = ITokenomics(tokenomics).epochCounter();\n\n        // Get the previous epoch end time\n        // Epoch counter is never equal to zero\n        uint256 endTime = ITokenomics(tokenomics).getEpochEndTime(eCounter - 1);\n\n        // Get the epoch length\n        uint256 epochLen = ITokenomics(tokenomics).epochLen();\n\n        // Check that there is more than one week before the end of the ongoing epoch\n        // Note that epochLen cannot be smaller than one week as per specified limits\n        uint256 maxAllowedTime = endTime + epochLen - 1 weeks;\n        if (block.timestamp >= maxAllowedTime) {\n            revert Overflow(block.timestamp, maxAllowedTime);\n        }\n\n        // Set the removed nominee epoch number\n        mapRemovedNomineeEpochs[nomineeHash] = eCounter;\n\n        emit RemoveNomineeHash(nomineeHash);\n    }\n\n    /// @dev Claims incentives for the owner of components / agents.\n    /// @notice `msg.sender` must be the owner of components / agents they are passing, otherwise the function will revert.\n    /// @notice If not all `unitIds` belonging to `msg.sender` were provided, they will be untouched and keep accumulating.\n    /// @param unitTypes Set of unit types (component / agent).\n    /// @param unitIds Set of corresponding unit Ids where account is the owner.\n    /// @return reward Reward amount in ETH.\n    /// @return topUp Top-up amount in OLAS.\n    function claimOwnerIncentives(\n        uint256[] memory unitTypes,\n        uint256[] memory unitIds\n    ) external returns (uint256 reward, uint256 topUp) {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Check for the paused state\n        Pause currentPause = paused;\n        if (currentPause == Pause.DevIncentivesPaused || currentPause == Pause.AllPaused ||\n            ITreasury(treasury).paused() == 2) {\n            revert Paused();\n        }\n\n        // Calculate incentives\n        (reward, topUp) = ITokenomics(tokenomics).accountOwnerIncentives(msg.sender, unitTypes, unitIds);\n\n        bool success;\n        // Request treasury to transfer funds to msg.sender if reward > 0 or topUp > 0\n        if ((reward + topUp) > 0) {\n            // Get the current OLAS balance\n            uint256 olasBalance;\n            if (topUp > 0) {\n                olasBalance = IToken(olas).balanceOf(msg.sender);\n            }\n\n            success = ITreasury(treasury).withdrawToAccount(msg.sender, reward, topUp);\n\n            // Check the balance after the OLAS mint, if applicable\n            if (topUp > 0){\n                olasBalance = IToken(olas).balanceOf(msg.sender) - olasBalance;\n                if (olasBalance != topUp) {\n                    revert WrongAmount(olasBalance, topUp);\n                }\n            }\n        }\n\n        // Check if the claim is successful and has at least one non-zero incentive.\n        if (!success) {\n            revert ClaimIncentivesFailed(msg.sender, reward, topUp);\n        }\n\n        emit IncentivesClaimed(msg.sender, reward, topUp, unitTypes, unitIds);\n\n        _locked = 1;\n    }\n\n    /// @dev Calculates staking incentives for a specific staking target.\n    /// @notice Call this function via staticcall in order not to write in the nominee checkpoint map.\n    /// @param numClaimedEpochs Specified number of claimed epochs.\n    /// @param chainId Chain Id.\n    /// @param stakingTarget Staking target corresponding to the chain Id.\n    /// @param bridgingDecimals Number of supported token decimals able to be transferred across the bridge.\n    /// @return totalStakingIncentive Total staking incentive across all the claimed epochs.\n    /// @return totalReturnAmount Total return amount across all the claimed epochs.\n    /// @return lastClaimedEpoch Last claimed epoch number (not included in claiming).\n    /// @return nomineeHash Hash of a Nominee(stakingTarget, chainId).\n    function calculateStakingIncentives(\n        uint256 numClaimedEpochs,\n        uint256 chainId,\n        bytes32 stakingTarget,\n        uint256 bridgingDecimals\n    ) public returns (\n        uint256 totalStakingIncentive,\n        uint256 totalReturnAmount,\n        uint256 lastClaimedEpoch,\n        bytes32 nomineeHash\n    ) {\n        // Check for the correct chain Id\n        if (chainId == 0) {\n            revert ZeroValue();\n        }\n\n        // Check for the zero address\n        if (stakingTarget == 0) {\n            revert ZeroAddress();\n        }\n\n        // Check that staking target is not a retainer address\n        if (stakingTarget == retainer) {\n            revert WrongAccount(retainer);\n        }\n\n        // Get the staking target nominee hash\n        nomineeHash = keccak256(abi.encode(IVoteWeighting.Nominee(stakingTarget, chainId)));\n\n        uint256 firstClaimedEpoch;\n        (firstClaimedEpoch, lastClaimedEpoch) =\n            _checkpointNomineeAndGetClaimedEpochCounters(nomineeHash, numClaimedEpochs);\n\n        // Checkpoint staking target nominee in the Vote Weighting contract\n        IVoteWeighting(voteWeighting).checkpointNominee(stakingTarget, chainId);\n\n        // Traverse all the claimed epochs\n        for (uint256 j = firstClaimedEpoch; j < lastClaimedEpoch; ++j) {\n            // Check if epoch had zero total vote weights and all its staking incentives have been already refunded\n            // back to tokenomics inflation\n            if (mapZeroWeightEpochRefunded[j]) {\n                continue;\n            }\n\n            // Get service staking info\n            ITokenomics.StakingPoint memory stakingPoint =\n                ITokenomics(tokenomics).mapEpochStakingPoints(j);\n\n            // Check for staking parameters to all make sense\n            if (stakingPoint.stakingFraction > 0) {\n                // Check for unset values\n                if (stakingPoint.minStakingWeight == 0 && stakingPoint.maxStakingIncentive == 0) {\n                    stakingPoint.minStakingWeight = uint16(defaultMinStakingWeight);\n                    stakingPoint.maxStakingIncentive = uint96(defaultMaxStakingIncentive);\n                }\n            } else {\n                // No staking incentives in this epoch\n                continue;\n            }\n\n            uint256 endTime = ITokenomics(tokenomics).getEpochEndTime(j);\n\n            // Get the staking weight for each epoch and the total weight\n            // Epoch endTime is used to get the weights info, since otherwise there is a risk of having votes\n            // accounted for from the next epoch\n            // totalWeightSum is the overall veOLAS power (bias) across all the voting nominees\n            (uint256 stakingWeight, uint256 totalWeightSum) =\n                IVoteWeighting(voteWeighting).nomineeRelativeWeight(stakingTarget, chainId, endTime);\n\n            // Check if the totalWeightSum is zero, then all staking incentives must be returned back to tokenomics\n            if (totalWeightSum == 0) {\n                mapZeroWeightEpochRefunded[j] = true;\n                totalReturnAmount += stakingPoint.stakingIncentive;\n                continue;\n            }\n\n            uint256 stakingIncentive;\n            uint256 returnAmount;\n\n            // Adjust the inflation by the maximum amount of veOLAS voted for service staking contracts\n            // If veOLAS power is lower, it reflects the maximum amount of OLAS allocated for staking\n            // such that all the inflation is not distributed for a minimal veOLAS power\n            uint256 availableStakingAmount = stakingPoint.stakingIncentive;\n\n            uint256 stakingDiff;\n            if (availableStakingAmount > totalWeightSum) {\n                stakingDiff = availableStakingAmount - totalWeightSum;\n                availableStakingAmount = totalWeightSum;\n            }\n\n            // Compare the staking weight\n            // 100% = 1e18, in order to compare with minStakingWeight we need to bring it from the range of 0 .. 10_000\n            if (stakingWeight < uint256(stakingPoint.minStakingWeight) * 1e14) {\n                // If vote weighting staking weight is lower than the defined threshold - return the staking incentive\n                returnAmount = ((stakingDiff + availableStakingAmount) * stakingWeight) / 1e18;\n            } else {\n                // Otherwise, allocate staking incentive to corresponding contracts\n                stakingIncentive = (availableStakingAmount * stakingWeight) / 1e18;\n                // Calculate initial return amount, if stakingDiff > 0\n                returnAmount = (stakingDiff * stakingWeight) / 1e18;\n\n                // availableStakingAmount is not used anymore and can serve as a local maxStakingIncentive\n                availableStakingAmount = stakingPoint.maxStakingIncentive;\n                if (stakingIncentive > availableStakingAmount) {\n                    // Adjust the return amount\n                    returnAmount += stakingIncentive - availableStakingAmount;\n                    // Adjust the staking incentive\n                    stakingIncentive = availableStakingAmount;\n                }\n\n                // Normalize staking incentive if there is a bridge decimals limiting condition\n                // Note: only OLAS decimals must be considered\n                if (bridgingDecimals < 18) {\n                    uint256 normalizedStakingAmount = stakingIncentive / (10 ** (18 - bridgingDecimals));\n                    normalizedStakingAmount *= 10 ** (18 - bridgingDecimals);\n                    // Update return amounts\n                    // stakingIncentive is always bigger or equal than normalizedStakingAmount\n                    returnAmount += stakingIncentive - normalizedStakingAmount;\n                    // Downsize staking incentive to a specified number of bridging decimals\n                    stakingIncentive = normalizedStakingAmount;\n                }\n                // Adjust total staking incentive amount\n                totalStakingIncentive += stakingIncentive;\n            }\n            // Adjust total return amount\n            totalReturnAmount += returnAmount;\n        }\n    }\n\n    /// @dev Claims staking incentives for a specific staking target.\n    /// @param numClaimedEpochs Specified number of claimed epochs.\n    /// @param chainId Chain Id.\n    /// @param stakingTarget Staking target corresponding to the chain Id.\n    /// @param bridgePayload Bridge payload necessary (if required) for a specific bridge relayer.\n    function claimStakingIncentives(\n        uint256 numClaimedEpochs,\n        uint256 chainId,\n        bytes32 stakingTarget,\n        bytes memory bridgePayload\n    ) external payable {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Check for zero chain Id\n        if (chainId == 0) {\n            revert ZeroValue();\n        }\n\n        // Check for zero target address\n        if (stakingTarget == 0) {\n            revert ZeroAddress();\n        }\n\n        // Check the number of claimed epochs\n        uint256 localMaxNumClaimingEpochs = maxNumClaimingEpochs;\n        if (numClaimedEpochs > localMaxNumClaimingEpochs) {\n            revert Overflow(numClaimedEpochs, localMaxNumClaimingEpochs);\n        }\n\n        // Check for the paused state\n        Pause currentPause = paused;\n        if (currentPause == Pause.StakingIncentivesPaused || currentPause == Pause.AllPaused ||\n            ITreasury(treasury).paused() == 2) {\n            revert Paused();\n        }\n\n        // Get deposit processor bridging decimals corresponding to a chain Id\n        address depositProcessor = mapChainIdDepositProcessors[chainId];\n        uint256 bridgingDecimals = IDepositProcessor(depositProcessor).getBridgingDecimals();\n\n        // Get the staking incentive to send as a deposit with, and the amount to return back to staking inflation\n        (uint256 stakingIncentive, uint256 returnAmount, uint256 lastClaimedEpoch, bytes32 nomineeHash) =\n            calculateStakingIncentives(numClaimedEpochs, chainId, stakingTarget, bridgingDecimals);\n\n        // Write last claimed epoch counter to start claiming from the next time\n        mapLastClaimedStakingEpochs[nomineeHash] = lastClaimedEpoch;\n\n        // Refund returned amount back to tokenomics inflation\n        if (returnAmount > 0) {\n            ITokenomics(tokenomics).refundFromStaking(returnAmount);\n        }\n\n        uint256 transferAmount;\n\n        // Check if staking incentive is deposited\n        if (stakingIncentive > 0) {\n            transferAmount = stakingIncentive;\n            // Account for possible withheld OLAS amounts\n            // Note: in case of normalized staking incentives with bridging decimals, this is correctly managed\n            // as normalized amounts are returned from another side\n            uint256 withheldAmount = mapChainIdWithheldAmounts[chainId];\n            if (withheldAmount > 0) {\n                // If withheld amount is enough to cover all the staking incentives, the transfer of OLAS is not needed\n                if (withheldAmount >= transferAmount) {\n                    withheldAmount -= transferAmount;\n                    transferAmount = 0;\n                } else {\n                    // Otherwise, reduce the transfer of tokens for the OLAS withheld amount\n                    transferAmount -= withheldAmount;\n                    withheldAmount = 0;\n                }\n                mapChainIdWithheldAmounts[chainId] = withheldAmount;\n            }\n\n            // Check if minting is needed as the actual OLAS transfer is required\n            if (transferAmount > 0) {\n                uint256 olasBalance = IToken(olas).balanceOf(address(this));\n\n                // Mint tokens to self in order to distribute to the staking deposit processor\n                ITreasury(treasury).withdrawToAccount(address(this), 0, transferAmount);\n\n                // Check the balance after the mint\n                olasBalance = IToken(olas).balanceOf(address(this)) - olasBalance;\n                if (olasBalance != transferAmount) {\n                    revert WrongAmount(olasBalance, transferAmount);\n                }\n            }\n\n            // Dispense to a service staking target\n            _distributeStakingIncentives(chainId, stakingTarget, stakingIncentive, bridgePayload, transferAmount);\n        }\n\n        emit StakingIncentivesClaimed(msg.sender, chainId, stakingTarget, stakingIncentive, transferAmount, returnAmount);\n\n        _locked = 1;\n    }\n\n    /// @dev Claims staking incentives for sets staking targets corresponding to a set of chain Ids.\n    /// @notice Mind the gas spending depending on the max number of numChains * numTargetsPerChain * numEpochs to claim.\n    ///         Also note that in order to avoid duplicates, there is a requirement for a strict ascending order\n    ///         of chain Ids and stakingTargets.\n    /// @param numClaimedEpochs Specified number of claimed epochs.\n    /// @param chainIds Set of chain Ids.\n    /// @param stakingTargets Set of staking target addresses corresponding to each chain Id.\n    /// @param bridgePayloads Set of bridge payloads (if) necessary for a specific bridge relayer depending on chain Id.\n    /// @param valueAmounts Set of value amounts required to provide to some of the bridges.\n    function claimStakingIncentivesBatch(\n        uint256 numClaimedEpochs,\n        uint256[] memory chainIds,\n        bytes32[][] memory stakingTargets,\n        bytes[] memory bridgePayloads,\n        uint256[] memory valueAmounts\n    ) external payable {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        _checkOrderAndValues(chainIds, stakingTargets, bridgePayloads, valueAmounts);\n\n        // Check the number of claimed epochs\n        uint256 localMaxNumClaimingEpochs = maxNumClaimingEpochs;\n        if (numClaimedEpochs > localMaxNumClaimingEpochs) {\n            revert Overflow(numClaimedEpochs, localMaxNumClaimingEpochs);\n        }\n\n        Pause currentPause = paused;\n        if (currentPause == Pause.StakingIncentivesPaused || currentPause == Pause.AllPaused ||\n            ITreasury(treasury).paused() == 2) {\n            revert Paused();\n        }\n\n        // Total staking incentives\n        // 0: Staking incentive across all the targets to send as a deposit\n        // 1: Actual OLAS transfer amount across all the targets\n        // 2: Staking incentive to return back to staking inflation\n        uint256[] memory totalAmounts;\n        // Arrays of staking and transfer amounts\n        uint256[][] memory stakingIncentives;\n        uint256[] memory transferAmounts;\n\n        (totalAmounts, stakingIncentives, transferAmounts) = _calculateStakingIncentivesBatch(numClaimedEpochs, chainIds,\n            stakingTargets);\n\n        // Refund returned amount back to tokenomics inflation\n        if (totalAmounts[2] > 0) {\n            ITokenomics(tokenomics).refundFromStaking(totalAmounts[2]);\n        }\n\n        // Check if staking incentive is deposited\n        if (totalAmounts[0] > 0) {\n            // Check if minting is needed as the actual OLAS transfer is required\n            if (totalAmounts[1] > 0) {\n                uint256 olasBalance = IToken(olas).balanceOf(address(this));\n\n                // Mint tokens to self in order to distribute to staking deposit processors\n                ITreasury(treasury).withdrawToAccount(address(this), 0, totalAmounts[1]);\n\n                // Check the balance after the mint\n                olasBalance = IToken(olas).balanceOf(address(this)) - olasBalance;\n                if (olasBalance != totalAmounts[1]) {\n                    revert WrongAmount(olasBalance, totalAmounts[1]);\n                }\n            }\n\n            // Dispense all the service staking targets, if the total staking incentive is not equal to zero\n            _distributeStakingIncentivesBatch(chainIds, stakingTargets, stakingIncentives, bridgePayloads, transferAmounts,\n                valueAmounts);\n        }\n\n        emit StakingIncentivesBatchClaimed(msg.sender, chainIds, stakingTargets, stakingIncentives, totalAmounts[0],\n            totalAmounts[1], totalAmounts[2]);\n\n        _locked = 1;\n    }\n\n    /// @dev Retains staking incentives according to the retainer address to return it back to the staking inflation.\n    function retain() external {\n        // Reentrancy guard\n        if (_locked > 1) {\n            revert ReentrancyGuard();\n        }\n        _locked = 2;\n\n        // Get first and last claimed epochs\n        (uint256 firstClaimedEpoch, uint256 lastClaimedEpoch) =\n            _checkpointNomineeAndGetClaimedEpochCounters(retainerHash, maxNumClaimingEpochs);\n\n        // Checkpoint staking target nominee in the Vote Weighting contract\n        IVoteWeighting(voteWeighting).checkpointNominee(retainer, block.chainid);\n\n        // Write last claimed epoch counter to start retaining from the next time\n        mapLastClaimedStakingEpochs[retainerHash] = lastClaimedEpoch;\n\n        uint256 totalReturnAmount;\n\n        // Go over epochs and retain funds to return back to the tokenomics\n        for (uint256 j = firstClaimedEpoch; j < lastClaimedEpoch; ++j) {\n            // Get service staking info\n            ITokenomics.StakingPoint memory stakingPoint = ITokenomics(tokenomics).mapEpochStakingPoints(j);\n\n            // Get epoch end time\n            uint256 endTime = ITokenomics(tokenomics).getEpochEndTime(j);\n\n            // Get the staking weight for each epoch\n            (uint256 stakingWeight, ) = IVoteWeighting(voteWeighting).nomineeRelativeWeight(retainer,\n                block.chainid, endTime);\n\n            totalReturnAmount += stakingPoint.stakingIncentive * stakingWeight;\n        }\n        totalReturnAmount /= 1e18;\n\n        if (totalReturnAmount > 0) {\n            ITokenomics(tokenomics).refundFromStaking(totalReturnAmount);\n        }\n\n        emit Retained(msg.sender, totalReturnAmount);\n\n        _locked = 1;\n    }\n\n    /// @dev Syncs the withheld token amount according to the data received from L2.\n    /// @notice Only a corresponding chain Id deposit processor is able to communicate the withheld amount data.\n    ///         Note that by design only a normalized withheld amount is delivered from L2.\n    /// @param chainId L2 chain Id the withheld amount data is communicated from.\n    /// @param amount Withheld OLAS token amount.\n    /// @param batchHash Unique batch hash for each message transfer.\n    function syncWithheldAmount(uint256 chainId, uint256 amount, bytes32 batchHash) external {\n        address depositProcessor = mapChainIdDepositProcessors[chainId];\n\n        // Check L1 deposit processor address\n        if (msg.sender != depositProcessor) {\n            revert DepositProcessorOnly(msg.sender, depositProcessor);\n        }\n\n        // The overall amount is bound by the OLAS projected maximum amount for years to come\n        uint256 withheldAmount = mapChainIdWithheldAmounts[chainId] + amount;\n        if (withheldAmount > type(uint96).max) {\n            revert Overflow(withheldAmount, type(uint96).max);\n        }\n\n        // Update the withheld amount\n        mapChainIdWithheldAmounts[chainId] = withheldAmount;\n\n        emit WithheldAmountSynced(chainId, amount, withheldAmount, batchHash);\n    }\n\n    /// @dev Syncs the withheld amount manually by the DAO in order to restore the data that was not delivered from L2.\n    /// @notice The parameters here must correspond to the exact data failed to be delivered (amount, batch).\n    ///         The possible bridge failure scenario that requires to act via the DAO vote includes:\n    ///         - Message from L2 to L1 fails: need to call this function.\n    /// @param chainId L2 chain Id.\n    /// @param amount Withheld amount that was not delivered from L2.\n    /// @param batchHash Unique batch hash for each message transfer.\n    function syncWithheldAmountMaintenance(uint256 chainId, uint256 amount, bytes32 batchHash) external {\n        // Check the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check zero value chain Id and amount\n        if (chainId == 0 || amount == 0 || batchHash == 0) {\n            revert ZeroValue();\n        }\n\n        // The sync must never happen for the L1 chain Id itself, as dispenser exists strictly on L1-s\n        if (chainId == block.chainid) {\n            revert WrongChainId(chainId);\n        }\n\n        // Note: all the amounts coming from events of undelivered messages are already normalized\n        uint256 withheldAmount = mapChainIdWithheldAmounts[chainId] + amount;\n        // The overall amount is bound by the OLAS projected maximum amount for years to come\n        if (withheldAmount > type(uint96).max) {\n            revert Overflow(withheldAmount, type(uint96).max);\n        }\n\n        // Add to the withheld amount\n        mapChainIdWithheldAmounts[chainId] = withheldAmount;\n\n        // Get deposit processor address corresponding to the specified chain Id\n        address depositProcessor = mapChainIdDepositProcessors[chainId];\n\n        // Update the batch hash on deposit processor side\n        IDepositProcessor(depositProcessor).updateHashMaintenance(batchHash);\n\n        emit WithheldAmountSynced(chainId, amount, withheldAmount, batchHash);\n    }\n\n    /// @dev Sets the pause state.\n    /// @param pauseState Pause state.\n    function setPauseState(Pause pauseState) external {\n        // Check the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        paused = pauseState;\n\n        emit PauseDispenser(pauseState);\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.25+commit.b61c2a91"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_olas",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_tokenomics",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_treasury",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_voteWeighting",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "_retainer",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxNumClaimingEpochs",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxNumStakingTargets",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_defaultMinStakingWeight",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_defaultMaxStakingIncentive",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "reward",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "topUp",
+              "type": "uint256"
+            }
+          ],
+          "name": "ClaimIncentivesFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "depositProcessor",
+              "type": "address"
+            }
+          ],
+          "name": "DepositProcessorOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "manager",
+              "type": "address"
+            }
+          ],
+          "name": "ManagerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "max",
+              "type": "uint256"
+            }
+          ],
+          "name": "Overflow",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Paused",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ReentrancyGuard",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            }
+          ],
+          "name": "WrongAccount",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongAmount",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "numValues1",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "numValues2",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongArrayLength",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongChainId",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroValue",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "nomineeHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "AddNomineeHash",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "reward",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "topUp",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "unitTypes",
+              "type": "uint256[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "unitIds",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "IncentivesClaimed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "enum Dispenser.Pause",
+              "name": "pauseState",
+              "type": "uint8"
+            }
+          ],
+          "name": "PauseDispenser",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "nomineeHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "RemoveNomineeHash",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "returnAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Retained",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address[]",
+              "name": "depositProcessors",
+              "type": "address[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "SetDepositProcessorChainIds",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes32[][]",
+              "name": "stakingTargets",
+              "type": "bytes32[][]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[][]",
+              "name": "stakingIncentives",
+              "type": "uint256[][]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "totalStakingIncentive",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "totalTransferAmount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "totalReturnAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "StakingIncentivesBatchClaimed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes32",
+              "name": "stakingTarget",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "stakingIncentive",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "transferAmount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "returnAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "StakingIncentivesClaimed",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "maxNumClaimingEpochs",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "maxNumStakingTargets",
+              "type": "uint256"
+            }
+          ],
+          "name": "StakingParamsUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "tokenomics",
+              "type": "address"
+            }
+          ],
+          "name": "TokenomicsUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "treasury",
+              "type": "address"
+            }
+          ],
+          "name": "TreasuryUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "voteWeighting",
+              "type": "address"
+            }
+          ],
+          "name": "VoteWeightingUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "updatedWithheldAmount",
+              "type": "uint256"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "batchHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "WithheldAmountSynced",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_EVM_CHAIN_ID",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "nomineeHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "addNominee",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "numClaimedEpochs",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "stakingTarget",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "bridgingDecimals",
+              "type": "uint256"
+            }
+          ],
+          "name": "calculateStakingIncentives",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "totalStakingIncentive",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "totalReturnAmount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "lastClaimedEpoch",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "nomineeHash",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_tokenomics",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_treasury",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_voteWeighting",
+              "type": "address"
+            }
+          ],
+          "name": "changeManagers",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "changeOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "_maxNumClaimingEpochs",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_maxNumStakingTargets",
+              "type": "uint256"
+            }
+          ],
+          "name": "changeStakingParams",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "unitTypes",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "unitIds",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "claimOwnerIncentives",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "reward",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "topUp",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "numClaimedEpochs",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "stakingTarget",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bytes",
+              "name": "bridgePayload",
+              "type": "bytes"
+            }
+          ],
+          "name": "claimStakingIncentives",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "numClaimedEpochs",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "bytes32[][]",
+              "name": "stakingTargets",
+              "type": "bytes32[][]"
+            },
+            {
+              "internalType": "bytes[]",
+              "name": "bridgePayloads",
+              "type": "bytes[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "valueAmounts",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "claimStakingIncentivesBatch",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "defaultMaxStakingIncentive",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "defaultMinStakingWeight",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "mapChainIdDepositProcessors",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "mapChainIdWithheldAmounts",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "mapLastClaimedStakingEpochs",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "mapRemovedNomineeEpochs",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "mapZeroWeightEpochRefunded",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxNumClaimingEpochs",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxNumStakingTargets",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "olas",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "paused",
+          "outputs": [
+            {
+              "internalType": "enum Dispenser.Pause",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "nomineeHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "removeNominee",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "retain",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "retainer",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "retainerHash",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "depositProcessors",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "setDepositProcessorChainIds",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "enum Dispenser.Pause",
+              "name": "pauseState",
+              "type": "uint8"
+            }
+          ],
+          "name": "setPauseState",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "batchHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "syncWithheldAmount",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "batchHash",
+              "type": "bytes32"
+            }
+          ],
+          "name": "syncWithheldAmountMaintenance",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "tokenomics",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "treasury",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "voteWeighting",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>Andrey Lebedev - <andrey.lebedev@valory.xyz>Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>",
+        "errors": {
+          "ClaimIncentivesFailed(address,uint256,uint256)": [
+            {
+              "details": "Incentives claim has failed.",
+              "params": {
+                "account": "Account address.",
+                "reward": "Reward amount.",
+                "topUp": "Top-up amount."
+              }
+            }
+          ],
+          "DepositProcessorOnly(address,address)": [
+            {
+              "details": "Only the deposit processor is able to call the function.",
+              "params": {
+                "depositProcessor": "Required deposit processor.",
+                "sender": "Actual sender address."
+              }
+            }
+          ],
+          "ManagerOnly(address,address)": [
+            {
+              "details": "Only `manager` has a privilege, but the `sender` was provided.",
+              "params": {
+                "manager": "Required sender address as a manager.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "Overflow(uint256,uint256)": [
+            {
+              "details": "Value overflow.",
+              "params": {
+                "max": "Maximum possible value.",
+                "provided": "Overflow value."
+              }
+            }
+          ],
+          "OwnerOnly(address,address)": [
+            {
+              "details": "Only `owner` has a privilege, but the `sender` was provided.",
+              "params": {
+                "owner": "Required sender address as an owner.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "Paused()": [
+            {
+              "details": "The contract is paused."
+            }
+          ],
+          "ReentrancyGuard()": [
+            {
+              "details": "Caught reentrancy violation."
+            }
+          ],
+          "WrongAccount(bytes32)": [
+            {
+              "details": "Account address is incorrect.",
+              "params": {
+                "account": "Account address."
+              }
+            }
+          ],
+          "WrongAmount(uint256,uint256)": [
+            {
+              "details": "Wrong amount received / provided.",
+              "params": {
+                "expected": "Expected amount.",
+                "provided": "Provided amount."
+              }
+            }
+          ],
+          "WrongArrayLength(uint256,uint256)": [
+            {
+              "details": "Wrong length of two arrays.",
+              "params": {
+                "numValues1": "Number of values in a first array.",
+                "numValues2": "Number of values in a second array."
+              }
+            }
+          ],
+          "WrongChainId(uint256)": [
+            {
+              "details": "Chain Id is incorrect.",
+              "params": {
+                "chainId": "Chain Id."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroValue()": [
+            {
+              "details": "Zero value when it has to be different from zero."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "addNominee(bytes32)": {
+            "details": "Records nominee starting epoch number.",
+            "params": {
+              "nomineeHash": "Nominee hash."
+            }
+          },
+          "calculateStakingIncentives(uint256,uint256,bytes32,uint256)": {
+            "details": "Calculates staking incentives for a specific staking target.",
+            "params": {
+              "bridgingDecimals": "Number of supported token decimals able to be transferred across the bridge.",
+              "chainId": "Chain Id.",
+              "numClaimedEpochs": "Specified number of claimed epochs.",
+              "stakingTarget": "Staking target corresponding to the chain Id."
+            },
+            "returns": {
+              "lastClaimedEpoch": "Last claimed epoch number (not included in claiming).",
+              "nomineeHash": "Hash of a Nominee(stakingTarget, chainId).",
+              "totalReturnAmount": "Total return amount across all the claimed epochs.",
+              "totalStakingIncentive": "Total staking incentive across all the claimed epochs."
+            }
+          },
+          "changeManagers(address,address,address)": {
+            "details": "Changes various managing contract addresses.",
+            "params": {
+              "_tokenomics": "Tokenomics address.",
+              "_treasury": "Treasury address.",
+              "_voteWeighting": "Vote Weighting address."
+            }
+          },
+          "changeOwner(address)": {
+            "details": "Changes the owner address.",
+            "params": {
+              "newOwner": "Address of a new owner."
+            }
+          },
+          "changeStakingParams(uint256,uint256)": {
+            "details": "Changes staking params by the DAO.",
+            "params": {
+              "_maxNumClaimingEpochs": "Maximum number of epochs to claim staking incentives for.",
+              "_maxNumStakingTargets": "Maximum number of staking targets available to claim for on a single chain Id."
+            }
+          },
+          "claimOwnerIncentives(uint256[],uint256[])": {
+            "details": "Claims incentives for the owner of components / agents.",
+            "params": {
+              "unitIds": "Set of corresponding unit Ids where account is the owner.",
+              "unitTypes": "Set of unit types (component / agent)."
+            },
+            "returns": {
+              "reward": "Reward amount in ETH.",
+              "topUp": "Top-up amount in OLAS."
+            }
+          },
+          "claimStakingIncentives(uint256,uint256,bytes32,bytes)": {
+            "details": "Claims staking incentives for a specific staking target.",
+            "params": {
+              "bridgePayload": "Bridge payload necessary (if required) for a specific bridge relayer.",
+              "chainId": "Chain Id.",
+              "numClaimedEpochs": "Specified number of claimed epochs.",
+              "stakingTarget": "Staking target corresponding to the chain Id."
+            }
+          },
+          "claimStakingIncentivesBatch(uint256,uint256[],bytes32[][],bytes[],uint256[])": {
+            "details": "Claims staking incentives for sets staking targets corresponding to a set of chain Ids.",
+            "params": {
+              "bridgePayloads": "Set of bridge payloads (if) necessary for a specific bridge relayer depending on chain Id.",
+              "chainIds": "Set of chain Ids.",
+              "numClaimedEpochs": "Specified number of claimed epochs.",
+              "stakingTargets": "Set of staking target addresses corresponding to each chain Id.",
+              "valueAmounts": "Set of value amounts required to provide to some of the bridges."
+            }
+          },
+          "constructor": {
+            "details": "Dispenser constructor.",
+            "params": {
+              "_olas": "OLAS token address.",
+              "_tokenomics": "Tokenomics address.",
+              "_treasury": "Treasury address.",
+              "_voteWeighting": "Vote Weighting address."
+            }
+          },
+          "removeNominee(bytes32)": {
+            "details": "Records nominee removal epoch number.",
+            "params": {
+              "nomineeHash": "Nominee hash."
+            }
+          },
+          "retain()": {
+            "details": "Retains staking incentives according to the retainer address to return it back to the staking inflation."
+          },
+          "setDepositProcessorChainIds(address[],uint256[])": {
+            "details": "Sets deposit processor contracts addresses and L2 chain Ids.",
+            "params": {
+              "chainIds": "Set of corresponding L2 chain Ids.",
+              "depositProcessors": "Set of deposit processor contract addresses on L1."
+            }
+          },
+          "setPauseState(uint8)": {
+            "details": "Sets the pause state.",
+            "params": {
+              "pauseState": "Pause state."
+            }
+          },
+          "syncWithheldAmount(uint256,uint256,bytes32)": {
+            "details": "Syncs the withheld token amount according to the data received from L2.",
+            "params": {
+              "amount": "Withheld OLAS token amount.",
+              "batchHash": "Unique batch hash for each message transfer.",
+              "chainId": "L2 chain Id the withheld amount data is communicated from."
+            }
+          },
+          "syncWithheldAmountMaintenance(uint256,uint256,bytes32)": {
+            "details": "Syncs the withheld amount manually by the DAO in order to restore the data that was not delivered from L2.",
+            "params": {
+              "amount": "Withheld amount that was not delivered from L2.",
+              "batchHash": "Unique batch hash for each message transfer.",
+              "chainId": "L2 chain Id."
+            }
+          }
+        },
+        "title": "Dispenser - Smart contract for distributing incentives",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "calculateStakingIncentives(uint256,uint256,bytes32,uint256)": {
+            "notice": "Call this function via staticcall in order not to write in the nominee checkpoint map."
+          },
+          "claimOwnerIncentives(uint256[],uint256[])": {
+            "notice": "`msg.sender` must be the owner of components / agents they are passing, otherwise the function will revert.If not all `unitIds` belonging to `msg.sender` were provided, they will be untouched and keep accumulating."
+          },
+          "claimStakingIncentivesBatch(uint256,uint256[],bytes32[][],bytes[],uint256[])": {
+            "notice": "Mind the gas spending depending on the max number of numChains * numTargetsPerChain * numEpochs to claim.         Also note that in order to avoid duplicates, there is a requirement for a strict ascending order         of chain Ids and stakingTargets."
+          },
+          "removeNominee(bytes32)": {
+            "notice": "The staking contract nominee cannot be removed starting from one week before the end of epoch.         Since the epoch end time is unknown and the nominee removal is applied in the following week,         it is prohibited to remove nominee one week before the foreseen epoch end to correctly reflect         the removal epoch number.         If the staking contract nominee must not get incentives in the ongoing ending epoch as well,         the DAO is advised to use the removeInstance() function in the corresponding StakingFactory contract."
+          },
+          "setDepositProcessorChainIds(address[],uint256[])": {
+            "notice": "It is the contract owner responsibility to set correct L1 deposit processor contracts         and corresponding supported L2 chain Ids."
+          },
+          "syncWithheldAmount(uint256,uint256,bytes32)": {
+            "notice": "Only a corresponding chain Id deposit processor is able to communicate the withheld amount data.         Note that by design only a normalized withheld amount is delivered from L2."
+          },
+          "syncWithheldAmountMaintenance(uint256,uint256,bytes32)": {
+            "notice": "The parameters here must correspond to the exact data failed to be delivered (amount, batch).         The possible bridge failure scenario that requires to act via the DAO vote includes:         - Message from L2 to L1 fails: need to call this function."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/Dispenser.sol": "Dispenser"
+      },
+      "evmVersion": "cancun",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 1500
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/Dispenser.sol": {
+        "keccak256": "0x307b54cde6978843581f16e8120b697479410dfb5fe0632cf4ffdd43b9319cae",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://c4fc0789a19b6f63459cac7678cd3184279dcd5adc4b51a7bb75dcdc32427fca",
+          "dweb:/ipfs/QmYtPUUEQ6R7BtRjMCqDSJWXwVC9CPwSLRxYEgsjgumafv"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.25+commit.b61c2a91",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 1500,
+        "enabled": true
+      },
+      "evmVersion": "cancun",
+      "remappings": []
+    },
+    "name": "Dispenser",
+    "fullyQualifiedName": "contracts/Dispenser.sol:Dispenser"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "2816302",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T16:36:46Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0x5650300fCBab43A0D7D02F8Cb5d0f039402593f0"
+}

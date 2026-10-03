@@ -1,0 +1,454 @@
+{
+  "sources": {
+    "contracts/multisigs/PolySafeCreatorWithRecoveryModule.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.30;\n\n// Poly Safe Proxy Factory: https://polygonscan.com/address/0xaacfeea03eb1561c4e67d661e40682bd20e3541b#code\ninterface IPolySafeProxyFactory {\n    // Signature struct\n    struct Sig {\n        uint8 v;\n        bytes32 r;\n        bytes32 s;\n    }\n\n    /// @dev Creates Poly Safe proxy contract.\n    function createProxy(address paymentToken, uint256 payment, address payable paymentReceiver, Sig memory createSig)\n        external;\n\n    /// @dev Computes Poly Safe proxy address based on owner account.\n    function computeProxyAddress(address owner) external view returns (address);\n\n    /// @dev Gets domain separator\n    function domainSeparator() external view returns (bytes32);\n}\n\n// Generic Safe multisig interface\ninterface ISafe {\n    enum Operation {\n        Call,\n        DelegateCall\n    }\n\n    /// @dev Allows to execute a Safe transaction confirmed by required number of owners and then pays the account that submitted the transaction.\n    ///      Note: The fees are always transferred, even if the user transaction fails.\n    /// @param to Destination address of Safe transaction.\n    /// @param value Ether value of Safe transaction.\n    /// @param data Data payload of Safe transaction.\n    /// @param operation Operation type of Safe transaction.\n    /// @param safeTxGas Gas that should be used for the Safe transaction.\n    /// @param baseGas Gas costs that are independent of the transaction execution(e.g. base transaction fee, signature check, payment of the refund)\n    /// @param gasPrice Gas price that should be used for the payment calculation.\n    /// @param gasToken Token address (or 0 if ETH) that is used for the payment.\n    /// @param refundReceiver Address of receiver of gas payment (or 0 if tx.origin).\n    /// @param signatures Packed signature data ({bytes32 r}{bytes32 s}{uint8 v})\n    function execTransaction(\n        address to,\n        uint256 value,\n        bytes calldata data,\n        Operation operation,\n        uint256 safeTxGas,\n        uint256 baseGas,\n        uint256 gasPrice,\n        address gasToken,\n        address payable refundReceiver,\n        bytes memory signatures\n    ) external payable returns (bool success);\n\n    /// @dev Allows to add a module to the whitelist.\n    /// @param module Module to be whitelisted.\n    function enableModule(address module) external;\n\n    /// @dev Gets Safe's set of owners.\n    function getOwners() external view returns (address[] memory);\n\n    /// @dev Gets Safe threshold.\n    function getThreshold() external view returns (uint256);\n}\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Provided zero value.\nerror ZeroValue();\n\n/// @dev Multisig proxy bytecode hash is incorrect.\n/// @param multisig Address of a multisig proxy.\nerror UnauthorizedMultisig(address multisig);\n\n/// @dev Multisig already exists.\n/// @param multisig Multisig address.\nerror MultisigAlreadyExists(address multisig);\n\n/// @dev Provided incorrect multisig threshold.\n/// @param expected Expected threshold.\n/// @param provided Provided threshold.\nerror WrongThreshold(uint256 expected, uint256 provided);\n\n/// @dev Provided incorrect number of owners.\n/// @param expected Expected number of owners.\n/// @param provided Provided number of owners.\nerror WrongNumOwners(uint256 expected, uint256 provided);\n\n/// @dev Provided incorrect multisig owner.\n/// @param provided Provided owner address.\nerror WrongOwner(address provided);\n\n/// @title PolySafeCreatorWithRecoveryModule - Smart contract for Poly Safe multisig implementation with Recovery Module\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\ncontract PolySafeCreatorWithRecoveryModule {\n    event MultisigCreated(address indexed multisig, address indexed owner);\n\n    // keccak256(\n    //     \"EIP712Domain(uint256 chainId,address verifyingContract)\"\n    // );\n    bytes32 public constant DOMAIN_SEPARATOR_TYPEHASH =\n        0x47e79534a245952e8b16893a336b85a3d9ea9fa8c573f3d803afb92a79469218;\n\n    // keccak256(\n    //     \"SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)\"\n    // );\n    bytes32 public constant SAFE_TX_TYPEHASH = 0xbb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8;\n\n    // keccak256(\n    //     \"CreateProxy(address paymentToken,uint256 payment,address paymentReceiver)\"\n    // );\n    bytes32 public constant CREATE_PROXY_TYPEHASH = 0xdee5f5588156b735c3bff14a54c9acefc845807cec91b7fd0809fa3deccab363;\n\n    // Poly Safe Proxy Factory domain separator value\n    bytes32 public immutable polySafeProxyFactoryDomainSeparator;\n    // Poly Safe proxy bytecode hash\n    bytes32 public immutable polySafeProxyBytecodeHash;\n    // Poly Safe Factory address\n    address public immutable polySafeProxyFactory;\n    // Recovery Module address\n    address public immutable recoveryModule;\n\n    /// @dev PolySafeCreator constructor.\n    /// @param _polySafeProxyFactory Poly Safe proxy factory address.\n    /// @param _recoveryModule Recovery Module address.\n    constructor(address _polySafeProxyFactory, address _recoveryModule, bytes32 _polySafeProxyBytecodeHash) {\n        // Check for zero addresses\n        if (_polySafeProxyFactory == address(0) || _recoveryModule == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Check for zero value\n        if (_polySafeProxyBytecodeHash == 0) {\n            revert ZeroValue();\n        }\n\n        polySafeProxyFactoryDomainSeparator = IPolySafeProxyFactory(_polySafeProxyFactory).domainSeparator();\n        polySafeProxyFactory = _polySafeProxyFactory;\n        recoveryModule = _recoveryModule;\n        polySafeProxyBytecodeHash = _polySafeProxyBytecodeHash;\n    }\n\n    /// @dev Creates Poly Safe multisig.\n    /// @notice Number of owners and threshold is required to be 1.\n    /// @param owners Set of multisig owners.\n    /// @param threshold Number of required confirmations for a multisig transaction.\n    /// @param data Packed data related to the creation of a chosen multisig.\n    /// @return multisig Address of a created multisig.\n    function create(address[] memory owners, uint256 threshold, bytes memory data) external returns (address multisig) {\n        // PolySafe is created based on one owner only\n        if (owners.length != 1) {\n            revert WrongNumOwners(1, owners.length);\n        }\n\n        // Decode provided data\n        (IPolySafeProxyFactory.Sig memory safeCreateSig, bytes memory enableModuleSig) =\n            abi.decode(data, (IPolySafeProxyFactory.Sig, bytes));\n\n        // Calculate multisig address\n        multisig = IPolySafeProxyFactory(polySafeProxyFactory).computeProxyAddress(owners[0]);\n\n        // Check that multisig is not yet deployed\n        if (multisig.code.length > 0) {\n            revert MultisigAlreadyExists(multisig);\n        }\n\n        // Create a poly safe multisig via its proxy factory with all payment related values being equal to zero\n        IPolySafeProxyFactory(polySafeProxyFactory).createProxy(address(0), 0, payable(address(0)), safeCreateSig);\n\n        // Check for code hash\n        if (multisig.codehash != polySafeProxyBytecodeHash) {\n            revert UnauthorizedMultisig(multisig);\n        }\n\n        // Get provided proxy multisig owners and threshold\n        address[] memory checkOwners = ISafe(multisig).getOwners();\n        uint256 checkThreshold = ISafe(multisig).getThreshold();\n\n        // Verify multisig proxy for provided owners and threshold\n        if (threshold != checkThreshold) {\n            revert WrongThreshold(checkThreshold, threshold);\n        }\n        if (owners.length != checkOwners.length) {\n            revert WrongNumOwners(owners.length, checkOwners.length);\n        }\n\n        // Check for owner address match\n        if (owners[0] != checkOwners[0]) {\n            revert WrongOwner(owners[0]);\n        }\n\n        // Enable module payload\n        bytes memory execData = abi.encodeCall(ISafe.enableModule, (recoveryModule));\n\n        // Enable Recovery Module\n        // to = multisig, value = 0, operation = Call, all payment related = 0\n        ISafe(multisig)\n            .execTransaction(\n                multisig, 0, execData, ISafe.Operation.Call, 0, 0, 0, address(0), payable(address(0)), enableModuleSig\n            );\n\n        emit MultisigCreated(multisig, owners[0]);\n    }\n\n    /// @dev Gets hash that is required to be signed by multisig owner in order to create Poly Safe multisig proxy.\n    function getPolySafeCreateTransactionHash() external view returns (bytes32) {\n        // All payment related values are equal to zero\n        bytes32 structHash = keccak256(abi.encode(CREATE_PROXY_TYPEHASH, address(0), 0, payable(address(0))));\n\n        return keccak256(abi.encodePacked(\"\\x19\\x01\", polySafeProxyFactoryDomainSeparator, structHash));\n    }\n\n    /// @dev Gets hash that is required to be signed by multisig owner in order to enable Recovery Module.\n    /// @param owner Multisig owner.\n    /// @return Transaction hash bytes.\n    function getEnableModuleTransactionHash(address owner) external view returns (bytes32) {\n        // Enable module payload\n        bytes memory data = abi.encodeCall(ISafe.enableModule, (recoveryModule));\n\n        // Calculate multisig address\n        address multisig = IPolySafeProxyFactory(polySafeProxyFactory).computeProxyAddress(owner);\n\n        // Get domain separator value using calculated multisig address\n        bytes32 domainSeparator = keccak256(abi.encode(DOMAIN_SEPARATOR_TYPEHASH, block.chainid, multisig));\n\n        // Get SafeTx hash\n        // to = multisig, value = 0, operation = Call, all payment related = 0, nonce = 0\n        bytes32 safeTxHash = keccak256(\n            abi.encode(\n                SAFE_TX_TYPEHASH, multisig, 0, keccak256(data), ISafe.Operation.Call, 0, 0, 0, address(0), address(0), 0\n            )\n        );\n\n        return keccak256(abi.encodePacked(bytes1(0x19), bytes1(0x01), domainSeparator, safeTxHash));\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.30+commit.73712a01"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_polySafeProxyFactory",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_recoveryModule",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "_polySafeProxyBytecodeHash",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "multisig",
+              "type": "address"
+            }
+          ],
+          "name": "MultisigAlreadyExists",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "multisig",
+              "type": "address"
+            }
+          ],
+          "name": "UnauthorizedMultisig",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongNumOwners",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "provided",
+              "type": "address"
+            }
+          ],
+          "name": "WrongOwner",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongThreshold",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroValue",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "multisig",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "MultisigCreated",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "CREATE_PROXY_TYPEHASH",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "DOMAIN_SEPARATOR_TYPEHASH",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "SAFE_TX_TYPEHASH",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address[]",
+              "name": "owners",
+              "type": "address[]"
+            },
+            {
+              "internalType": "uint256",
+              "name": "threshold",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bytes",
+              "name": "data",
+              "type": "bytes"
+            }
+          ],
+          "name": "create",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "multisig",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "getEnableModuleTransactionHash",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getPolySafeCreateTransactionHash",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "polySafeProxyBytecodeHash",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "polySafeProxyFactory",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "polySafeProxyFactoryDomainSeparator",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "recoveryModule",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>Andrey Lebedev - <andrey.lebedev@valory.xyz>Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>",
+        "errors": {
+          "MultisigAlreadyExists(address)": [
+            {
+              "details": "Multisig already exists.",
+              "params": {
+                "multisig": "Multisig address."
+              }
+            }
+          ],
+          "UnauthorizedMultisig(address)": [
+            {
+              "details": "Multisig proxy bytecode hash is incorrect.",
+              "params": {
+                "multisig": "Address of a multisig proxy."
+              }
+            }
+          ],
+          "WrongNumOwners(uint256,uint256)": [
+            {
+              "details": "Provided incorrect number of owners.",
+              "params": {
+                "expected": "Expected number of owners.",
+                "provided": "Provided number of owners."
+              }
+            }
+          ],
+          "WrongOwner(address)": [
+            {
+              "details": "Provided incorrect multisig owner.",
+              "params": {
+                "provided": "Provided owner address."
+              }
+            }
+          ],
+          "WrongThreshold(uint256,uint256)": [
+            {
+              "details": "Provided incorrect multisig threshold.",
+              "params": {
+                "expected": "Expected threshold.",
+                "provided": "Provided threshold."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroValue()": [
+            {
+              "details": "Provided zero value."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "constructor": {
+            "details": "PolySafeCreator constructor.",
+            "params": {
+              "_polySafeProxyFactory": "Poly Safe proxy factory address.",
+              "_recoveryModule": "Recovery Module address."
+            }
+          },
+          "create(address[],uint256,bytes)": {
+            "details": "Creates Poly Safe multisig.",
+            "params": {
+              "data": "Packed data related to the creation of a chosen multisig.",
+              "owners": "Set of multisig owners.",
+              "threshold": "Number of required confirmations for a multisig transaction."
+            },
+            "returns": {
+              "multisig": "Address of a created multisig."
+            }
+          },
+          "getEnableModuleTransactionHash(address)": {
+            "details": "Gets hash that is required to be signed by multisig owner in order to enable Recovery Module.",
+            "params": {
+              "owner": "Multisig owner."
+            },
+            "returns": {
+              "_0": "Transaction hash bytes."
+            }
+          },
+          "getPolySafeCreateTransactionHash()": {
+            "details": "Gets hash that is required to be signed by multisig owner in order to create Poly Safe multisig proxy."
+          }
+        },
+        "title": "PolySafeCreatorWithRecoveryModule - Smart contract for Poly Safe multisig implementation with Recovery Module",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "create(address[],uint256,bytes)": {
+            "notice": "Number of owners and threshold is required to be 1."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/multisigs/PolySafeCreatorWithRecoveryModule.sol": "PolySafeCreatorWithRecoveryModule"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 750
+      },
+      "remappings": [
+        ":@gnosis.pm/=node_modules/@gnosis.pm/",
+        ":ds-test/=lib/solmate/lib/ds-test/src/",
+        ":forge-std/=lib/forge-std/src/",
+        ":solmate/=lib/solmate/src/"
+      ]
+    },
+    "sources": {
+      "contracts/multisigs/PolySafeCreatorWithRecoveryModule.sol": {
+        "keccak256": "0x214501a0e21eca0ea0334efbed1cbaab79c3a5b8193195f45e58fb4ad29db555",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://915131f87215f1f37d461f8e8813f330097e371a649faa2aa84ae365612542ad",
+          "dweb:/ipfs/QmZR6kNmgab2wX57Umo4XmZiAoRsw3M84PJkhYKZBcbeNJ"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.30+commit.73712a01",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 750,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "@gnosis.pm/=node_modules/@gnosis.pm/",
+        "ds-test/=lib/solmate/lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "solmate/=lib/solmate/src/"
+      ]
+    },
+    "name": "PolySafeCreatorWithRecoveryModule",
+    "fullyQualifiedName": "contracts/multisigs/PolySafeCreatorWithRecoveryModule.sol:PolySafeCreatorWithRecoveryModule"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "22448695",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-03-12T10:19:34Z",
+  "match": "exact_match",
+  "chainId": "137",
+  "address": "0xA749f605D93B3efcc207C54270d83C6E8fa70fF8"
+}

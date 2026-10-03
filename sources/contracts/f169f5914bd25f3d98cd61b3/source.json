@@ -1,0 +1,1747 @@
+{
+  "sources": {
+    "contracts/VoteWeighting.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.25;\n\n// Dispenser interface\ninterface IDispenser {\n    /// @dev Records nominee addition in dispenser.\n    /// @param nomineeHash Nominee hash.\n    function addNominee(bytes32 nomineeHash) external;\n\n    /// @dev Records nominee removal.\n    /// @param nomineeHash Nominee hash.\n    function removeNominee(bytes32 nomineeHash) external;\n}\n\n// veOLAS interface\ninterface IVEOLAS {\n    // Structure for voting escrow points\n    // The struct size is two storage slots of 2 * uint256 (128 + 128 + 64 + 64 + 128)\n    struct PointVoting {\n        // w(i) = at + b (bias)\n        int128 bias;\n        // dw / dt = a (slope)\n        int128 slope;\n        // Timestamp. It will never practically be bigger than 2^64 - 1\n        uint64 ts;\n        // Block number. It will not be bigger than the timestamp\n        uint64 blockNumber;\n        // Token amount. It will never practically be bigger. Initial OLAS cap is 1 bn tokens, or 1e27.\n        // After 10 years, the inflation rate is 2% per year. It would take 1340+ years to reach 2^128 - 1\n        uint128 balance;\n    }\n\n    /// @dev Gets the `account`'s lock end time.\n    /// @param account Account address.\n    /// @return unlockTime Lock end time.\n    function lockedEnd(address account) external view returns (uint256 unlockTime);\n\n    /// @dev Gets the most recently recorded user point for `account`.\n    /// @param account Account address.\n    /// @return pv Last checkpoint.\n    function getLastUserPoint(address account) external view returns (PointVoting memory pv);\n}\n\n/// @dev Only `owner` has a privilege, but the `sender` was provided.\n/// @param sender Sender address.\n/// @param owner Required sender address as an owner.\nerror OwnerOnly(address sender, address owner);\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Zero value when it has to be different from zero.\nerror ZeroValue();\n\n/// @dev Wrong length of two arrays.\n/// @param numValues1 Number of values in a first array.\n/// @param numValues2 Number of values in a second array.\nerror WrongArrayLength(uint256 numValues1, uint256 numValues2);\n\n/// @dev Value overflow.\n/// @param provided Overflow value.\n/// @param max Maximum possible value.\nerror Overflow(uint256 provided, uint256 max);\n\n/// @dev Underflow value.\n/// @param provided Provided value.\n/// @param expected Minimum expected value.\nerror Underflow(uint256 provided, uint256 expected);\n\n/// @dev Nominee does not exist.\n/// @param account Nominee account address.\n/// @param chainId Nominee chain Id.\nerror NomineeDoesNotExist(bytes32 account, uint256 chainId);\n\n/// @dev Nominee already exists.\n/// @param account Nominee account address.\n/// @param chainId Nominee chain Id.\nerror NomineeAlreadyExists(bytes32 account, uint256 chainId);\n\n/// @dev Value lock is expired.\n/// @param account Address that is checked for the locked value.\n/// @param deadline The lock expiration deadline.\n/// @param curTime Current timestamp.\nerror LockExpired(address account, uint256 deadline, uint256 curTime);\n\n/// @dev Violated a negative slope value.\n/// @param account Account address.\n/// @param slope Negative slope.\nerror NegativeSlope(address account, int128 slope);\n\n/// @dev The vote has been performed already.\n/// @param voter Voter address.\n/// @param curTime Current time.\n/// @param nextAllowedVotingTime Next allowed voting time.\nerror VoteTooOften(address voter, uint256 curTime, uint256 nextAllowedVotingTime);\n\n/// @dev Nominee is not in the removed nominee map.\n/// @param account Nominee account address.\n/// @param chainId Nominee chain Id.\nerror NomineeNotRemoved(bytes32 account, uint256 chainId);\n\n/// @dev Nominee is in the removed nominee map.\n/// @param account Nominee account address.\n/// @param chainId Nominee chain Id.\nerror NomineeRemoved(bytes32 account, uint256 chainId);\n\n// Point struct\nstruct Point {\n    uint256 bias;\n    uint256 slope;\n}\n\n// Voted slope struct\nstruct VotedSlope {\n    uint256 slope;\n    uint256 power;\n    uint256 end;\n}\n\n// Nominee struct\nstruct Nominee {\n    bytes32 account;\n    uint256 chainId;\n}\n\n\n/// @title VoteWeighting - Smart contract for Vote Weighting with specific nominees composed of address and chain Id\n/// @notice Inspired by https://github.com/curvefi/curve-dao-contracts/blob/master/contracts/GaugeController.vy\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\ncontract VoteWeighting {\n    event OwnerUpdated(address indexed owner);\n    event DispenserUpdated(address indexed dispenser);\n    event Checkpoint(address indexed sender, uint256 sumBias);\n    event CheckpointNominee(address indexed sender, bytes32 indexed nomineeAccount, uint256 chainId,\n        uint256 nomineeWeight, uint256 totalSum);\n    event NomineeRelativeWeightWrite(address indexed sender, bytes32 indexed nomineeAccount, uint256 chainId,\n        uint256 nomineeWeight, uint256 totalSum, uint256 relativeWeight);\n    event VoteForNominee(address indexed user, bytes32 indexed nominee, uint256 chainId, uint256 weight,\n        uint256 powerUsed);\n    event AddNominee(bytes32 indexed account, uint256 chainId, uint256 id);\n    event RemoveNominee(bytes32 indexed account, uint256 chainId, uint256 newSum);\n    event VotingPowerRevoked(address indexed user, bytes32 indexed nominee, uint256 chainId, uint256 powerUsed);\n\n    // 7 * 86400 seconds - all future times are rounded by week\n    uint256 public constant WEEK = 604_800;\n    // Cannot change weight votes more often than once in 10 days\n    // For explanation about the delay consult the official audit report: https://github.com/trailofbits/publications/blob/master/reviews/CurveDAO.pdf\n    uint256 public constant WEIGHT_VOTE_DELAY = 864_000;\n    // Max number of weeks for checkpoints\n    // The number corresponds to more than four years timeframe\n    // It is enough to have at least one vote while veOLAS value is greater than zero\n    // In practice it is unlikely that there is no single checkpoint for the maximum amount of weeks\n    // For gas concerns regarding checkpoint calculations, see the internal audit and the official audit report: https://github.com/trailofbits/publications/blob/master/reviews/CurveDAO.pdf\n    uint256 public constant MAX_NUM_WEEKS = 250;\n    // Max weight amount\n    uint256 public constant MAX_WEIGHT = 10_000;\n    // Maximum chain Id as per EVM specs\n    uint256 public constant MAX_EVM_CHAIN_ID = type(uint64).max / 2 - 36;\n    // veOLAS contract address\n    address public immutable ve;\n    // Contract owner address\n    address public owner;\n    // Dispenser contract\n    address public dispenser;\n\n    // Set of Nominee structs\n    Nominee[] public setNominees;\n    // Set of removed Nominee structs\n    Nominee[] public setRemovedNominees;\n    // Mapping of hash(Nominee struct) => nominee Id\n    mapping(bytes32 => uint256) public mapNomineeIds;\n    // Mapping of hash(Nominee struct) => removed nominee Id\n    mapping(bytes32 => uint256) public mapRemovedNominees;\n\n    // Mapping for user => hash(Nominee struct) => VotedSlope\n    mapping(address => mapping(bytes32 => VotedSlope)) public voteUserSlopes;\n    // Mapping for user address => total vote power used\n    mapping(address => uint256) public voteUserPower;\n    // Mapping for user address => hash(Nominee struct) => last vote timestamp\n    mapping(address => mapping(bytes32 => uint256)) public lastUserVote;\n\n    // Past and scheduled points for nominee weight, sum of weights\n    // Point is for bias + slope\n    // changes* are for changes in slope\n    // time* are for the last change timestamp\n    // timestamps are rounded to whole weeks\n\n    // Mapping for hash(Nominee struct) => time => Point\n    mapping(bytes32 => mapping(uint256 => Point)) public pointsWeight;\n    // Mapping for hash(Nominee struct) => time => slope\n    mapping(bytes32 => mapping(uint256 => uint256)) public changesWeight;\n    // Mapping for hash(Nominee struct) => last scheduled time (next week)\n    mapping(bytes32 => uint256) public timeWeight;\n\n    // Mapping for time => Point\n    mapping(uint256 => Point) public pointsSum;\n    // Mapping for time => slope\n    mapping(uint256 => uint256) public changesSum;\n    // Last scheduled time (next week)\n    uint256 public timeSum;\n\n    /// @dev Contract constructor.\n    /// @param _ve Voting Escrow contract address.\n    constructor(address _ve) {\n        // Check for the zero address\n        if (_ve == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Set initial parameters\n        owner = msg.sender;\n        ve = _ve;\n        timeSum = block.timestamp / WEEK * WEEK;\n        // Push empty element to the zero-th index\n        setNominees.push(Nominee(0, 0));\n        // For symmetry, push empty element to the zero-th index in the removed Nominee set as well\n        setRemovedNominees.push(Nominee(0, 0));\n    }\n\n    /// @dev Fill sum of nominee weights week-over-week for missed checkins and return the sum for the future week.\n    /// @return Sum of nominee weights.\n    function _getSum() internal returns (uint256) {\n        // t is always > 0 as it is set in the constructor\n        uint256 t = timeSum;\n        Point memory pt = pointsSum[t];\n        for (uint256 i = 0; i < MAX_NUM_WEEKS; i++) {\n            if (t > block.timestamp) {\n                break;\n            }\n            t += WEEK;\n            uint256 dBias = pt.slope * WEEK;\n            if (pt.bias > dBias) {\n                pt.bias -= dBias;\n                uint256 dSlope = changesSum[t];\n                pt.slope -= dSlope;\n            } else {\n                pt.bias = 0;\n                pt.slope = 0;\n            }\n\n            pointsSum[t] = pt;\n            if (t > block.timestamp) {\n                timeSum = t;\n            }\n        }\n        return pt.bias;\n    }\n\n    /// @dev Fill historic nominee weights week-over-week for missed checkins and return the total for the future week.\n    /// @param account Nominee account address in bytes32 form.\n    /// @param chainId Nominee chain Id.\n    /// @return Nominee weight.\n    function _getWeight(bytes32 account, uint256 chainId) internal returns (uint256) {\n        // Construct the nominee struct\n        Nominee memory nominee = Nominee(account, chainId);\n\n        // Check that the nominee exists or has been removed\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n        if (mapRemovedNominees[nomineeHash] == 0 && mapNomineeIds[nomineeHash] == 0) {\n            revert NomineeDoesNotExist(account, chainId);\n        }\n\n        // t is always > 0 as it is set during the addNominee() call\n        uint256 t = timeWeight[nomineeHash];\n        Point memory pt = pointsWeight[nomineeHash][t];\n        for (uint256 i = 0; i < MAX_NUM_WEEKS; i++) {\n            if (t > block.timestamp) {\n                break;\n            }\n            t += WEEK;\n            uint256 dBias = pt.slope * WEEK;\n            if (pt.bias > dBias) {\n                pt.bias -= dBias;\n                uint256 dSlope = changesWeight[nomineeHash][t];\n                pt.slope -= dSlope;\n            } else {\n                pt.bias = 0;\n                pt.slope = 0;\n            }\n\n            pointsWeight[nomineeHash][t] = pt;\n            if (t > block.timestamp) {\n                timeWeight[nomineeHash] = t;\n            }\n        }\n        return pt.bias;\n    }\n\n    /// @dev Add nominee address along with the chain Id.\n    /// @param nominee Nominee account address and chainId.\n    function _addNominee(Nominee memory nominee) internal {\n        // Check for the nominee existence\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n        if (mapNomineeIds[nomineeHash] > 0) {\n            revert NomineeAlreadyExists(nominee.account, nominee.chainId);\n        }\n\n        // Check for the previously removed nominee\n        if (mapRemovedNominees[nomineeHash] > 0) {\n            revert NomineeRemoved(nominee.account, nominee.chainId);\n        }\n\n        uint256 id = setNominees.length;\n        mapNomineeIds[nomineeHash] = id;\n        // Push the nominee into the list\n        setNominees.push(nominee);\n\n        uint256 nextTime = (block.timestamp + WEEK) / WEEK * WEEK;\n        timeWeight[nomineeHash] = nextTime;\n\n        // Enable nominee in dispenser, if applicable\n        address localDispenser = dispenser;\n        if (localDispenser != address(0)) {\n            IDispenser(localDispenser).addNominee(nomineeHash);\n        }\n\n        emit AddNominee(nominee.account, nominee.chainId, id);\n    }\n\n    /// @dev Add EVM nominee address along with the chain Id.\n    /// @param account Address of the nominee.\n    /// @param chainId Chain Id.\n    function addNomineeEVM(address account, uint256 chainId) external {\n        // Check for the zero address\n        if (account == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Check for zero chain Id\n        if (chainId == 0) {\n            revert ZeroValue();\n        }\n\n        // Check for the chain Id overflow\n        if (chainId > MAX_EVM_CHAIN_ID) {\n            revert Overflow(chainId, MAX_EVM_CHAIN_ID);\n        }\n\n        Nominee memory nominee = Nominee(bytes32(uint256(uint160(account))), chainId);\n\n        // Record nominee instance\n        _addNominee(nominee);\n    }\n\n    /// @dev Add Non-EVM nominee address along with the chain Id.\n    /// @param account Address of the nominee in byte32 standard.\n    /// @param chainId Chain Id.\n    function addNomineeNonEVM(bytes32 account, uint256 chainId) external {\n        // Check for the zero address\n        if (account == bytes32(0)) {\n            revert ZeroAddress();\n        }\n\n        // Check for the chain Id underflow\n        if (MAX_EVM_CHAIN_ID >= chainId) {\n            revert Underflow(chainId, MAX_EVM_CHAIN_ID + 1);\n        }\n\n        Nominee memory nominee = Nominee(account, chainId);\n\n        // Record nominee instance\n        _addNominee(nominee);\n    }\n\n    /// @dev Changes the owner address.\n    /// @param newOwner Address of a new owner.\n    function changeOwner(address newOwner) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero address\n        if (newOwner == address(0)) {\n            revert ZeroAddress();\n        }\n\n        owner = newOwner;\n        emit OwnerUpdated(newOwner);\n    }\n\n    /// @dev Changes the dispenser contract address.\n    /// @notice Dispenser can be set to a zero address if the contract needs to serve a general purpose.\n    /// @param newDispenser New dispenser contract address.\n    function changeDispenser(address newDispenser) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        dispenser = newDispenser;\n        emit DispenserUpdated(newDispenser);\n    }\n\n    /// @dev Checkpoints to fill data common for all nominees.\n    function checkpoint() external {\n        uint256 totalSum = _getSum();\n\n        emit Checkpoint(msg.sender, totalSum);\n    }\n\n    /// @dev Checkpoints to fill data for both a specific nominee and common for all nominees.\n    /// @param account Address of the nominee.\n    /// @param chainId Chain Id.\n    function checkpointNominee(bytes32 account, uint256 chainId) external {\n        uint256 nomineeWeight = _getWeight(account, chainId);\n        uint256 totalSum = _getSum();\n\n        emit CheckpointNominee(msg.sender, account, chainId, nomineeWeight, totalSum);\n    }\n\n    /// @dev Gets Nominee relative weight (not more than 1.0) normalized to 1e18 (e.g. 1.0 == 1e18) and a sum of weights.\n    /// @param account Address of the nominee in byte32 standard.\n    /// @param chainId Chain Id.\n    /// @param time Timestamp in the past or present.\n    /// @return weight Value of relative weight normalized to 1e18.\n    /// @return totalSum Sum of nominee weights.\n    function _nomineeRelativeWeight(\n        bytes32 account,\n        uint256 chainId,\n        uint256 time\n    ) internal view returns (uint256 weight, uint256 totalSum) {\n        uint256 t = time / WEEK * WEEK;\n        totalSum = pointsSum[t].bias;\n\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        if (totalSum > 0) {\n            uint256 nomineeWeight = pointsWeight[nomineeHash][t].bias;\n            weight = 1e18 * nomineeWeight / totalSum;\n        }\n    }\n\n    /// @dev Gets Nominee relative weight (not more than 1.0) normalized to 1e18 (e.g. 1.0 == 1e18) and a sum of weights.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @param time Relative weight at the specified timestamp in the past or present.\n    /// @return relativeWeight Value of nominee relative weight normalized to 1e18.\n    /// @return totalSum Sum of nominee weights.\n    function nomineeRelativeWeight(\n        bytes32 account,\n        uint256 chainId,\n        uint256 time\n    ) external view returns (uint256 relativeWeight, uint256 totalSum) {\n        (relativeWeight, totalSum) = _nomineeRelativeWeight(account, chainId, time);\n    }\n\n    /// @dev Checkpoints and gets nominee weight normalized to 1e18, and the total sum of all the nominee weights.\n    /// @notice Nothing is recorded if the values are already filled.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @param time Relative weight at the specified timestamp in the past or present.\n    /// @return relativeWeight Value of nominee relative weight normalized to 1e18.\n    /// @return totalSum Sum of nominee weights.\n    function nomineeRelativeWeightWrite(\n        bytes32 account,\n        uint256 chainId,\n        uint256 time\n    ) external returns (uint256 relativeWeight, uint256 totalSum) {\n        uint256 nomineeWeight = _getWeight(account, chainId);\n        _getSum();\n        (relativeWeight, totalSum) =  _nomineeRelativeWeight(account, chainId, time);\n\n        emit NomineeRelativeWeightWrite(msg.sender, account, chainId, nomineeWeight, totalSum, relativeWeight);\n    }\n\n    /// @dev Allocates voting power for changing pool weights.\n    /// @param account Address of the nominee the `msg.sender` votes for in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @param weight Weight for a nominee in bps (units of 0.01%). Minimal step is is 0.01% (1 out of 10_000).\n    function voteForNomineeWeights(bytes32 account, uint256 chainId, uint256 weight) public {\n        // Get the nominee hash\n        bytes32 nomineeHash = keccak256(abi.encode(Nominee(account, chainId)));\n\n        // Check for the previously removed nominee\n        if (mapRemovedNominees[nomineeHash] > 0) {\n            revert NomineeRemoved(account, chainId);\n        }\n\n        // Get user veOLAS slope and check its value\n        int128 userSlope = IVEOLAS(ve).getLastUserPoint(msg.sender).slope;\n        if (userSlope < 0) {\n            revert NegativeSlope(msg.sender, userSlope);\n        }\n\n        uint256 lockEnd = IVEOLAS(ve).lockedEnd(msg.sender);\n        uint256 nextTime = (block.timestamp + WEEK) / WEEK * WEEK;\n\n        // Check for the lock end expiration\n        if (nextTime >= lockEnd) {\n            revert LockExpired(msg.sender, lockEnd, nextTime);\n        }\n\n        // Check for the weight value\n        if (weight > MAX_WEIGHT) {\n            revert Overflow(weight, MAX_WEIGHT);\n        }\n\n        // Check for the last voting time\n        uint256 nextAllowedVotingTime = lastUserVote[msg.sender][nomineeHash] + WEIGHT_VOTE_DELAY;\n        if (nextAllowedVotingTime > block.timestamp) {\n            revert VoteTooOften(msg.sender, block.timestamp, nextAllowedVotingTime);\n        }\n\n        // Prepare old and new slopes and biases\n        VotedSlope memory oldSlope = voteUserSlopes[msg.sender][nomineeHash];\n        uint256 oldBias;\n        if (oldSlope.end > nextTime) {\n            oldBias = oldSlope.slope * (oldSlope.end - nextTime);\n        }\n\n        VotedSlope memory newSlope = VotedSlope({\n            slope: uint256(uint128(userSlope)) * weight / MAX_WEIGHT,\n            end: lockEnd,\n            power: weight\n        });\n\n        uint256 newBias = newSlope.slope * (lockEnd - nextTime);\n\n        uint256 powerUsed = voteUserPower[msg.sender];\n        powerUsed = powerUsed + newSlope.power - oldSlope.power;\n        voteUserPower[msg.sender] = powerUsed;\n        if (powerUsed > MAX_WEIGHT) {\n            revert Overflow(powerUsed, MAX_WEIGHT);\n        }\n\n        // Remove old and schedule new slope changes\n        // Remove slope changes for old slopes\n        // Schedule recording of initial slope for nextTime\n        pointsWeight[nomineeHash][nextTime].bias = _maxAndSub(_getWeight(account, chainId) + newBias, oldBias);\n        pointsSum[nextTime].bias = _maxAndSub(_getSum() + newBias, oldBias);\n        if (oldSlope.end > nextTime) {\n            pointsWeight[nomineeHash][nextTime].slope =\n                _maxAndSub(pointsWeight[nomineeHash][nextTime].slope + newSlope.slope, oldSlope.slope);\n            pointsSum[nextTime].slope = _maxAndSub(pointsSum[nextTime].slope + newSlope.slope, oldSlope.slope);\n        } else {\n            pointsWeight[nomineeHash][nextTime].slope += newSlope.slope;\n            pointsSum[nextTime].slope += newSlope.slope;\n        }\n        if (oldSlope.end > block.timestamp) {\n            // Cancel old slope changes if they still didn't happen\n            changesWeight[nomineeHash][oldSlope.end] -= oldSlope.slope;\n            changesSum[oldSlope.end] -= oldSlope.slope;\n        }\n        // Add slope changes for new slopes\n        changesWeight[nomineeHash][newSlope.end] += newSlope.slope;\n        changesSum[newSlope.end] += newSlope.slope;\n\n        voteUserSlopes[msg.sender][nomineeHash] = newSlope;\n\n        // Record last action time\n        lastUserVote[msg.sender][nomineeHash] = block.timestamp;\n\n        emit VoteForNominee(msg.sender, account, chainId, weight, powerUsed);\n    }\n\n    /// @dev Allocates voting power for changing pool weights in a batch set.\n    /// @param accounts Set of nominee addresses in bytes32 form the `msg.sender` votes for.\n    /// @param chainIds Set of corresponding chain Ids.\n    /// @param weights Weights for a nominees in bps (units of 0.01%). Minimal is 0.01%. Ignored if 0.\n    function voteForNomineeWeightsBatch(\n        bytes32[] memory accounts,\n        uint256[] memory chainIds,\n        uint256[] memory weights\n    ) external {\n        if (accounts.length != chainIds.length || accounts.length != weights.length) {\n            revert WrongArrayLength(accounts.length, weights.length);\n        }\n\n        // Traverse all accounts and weights\n        for (uint256 i = 0; i < accounts.length; ++i) {\n            voteForNomineeWeights(accounts[i], chainIds[i], weights[i]);\n        }\n    }\n\n    function _maxAndSub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a > b ? a - b : 0;\n    }\n\n    /// @dev Removes nominee from the contract and zeros its weight.\n    /// @notice The last nominee in the set of nominees is going to change its Id at the end of this function call.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    function removeNominee(bytes32 account, uint256 chainId) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(owner, msg.sender);\n        }\n\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        // Get the nominee id in the nominee set\n        uint256 id = mapNomineeIds[nomineeHash];\n        if (id == 0) {\n            revert NomineeDoesNotExist(account, chainId);\n        }\n\n        // Set nominee weight to zero\n        uint256 oldWeight = _getWeight(account, chainId);\n        uint256 oldSum = _getSum();\n        uint256 nextTime = (block.timestamp + WEEK) / WEEK * WEEK;\n        pointsWeight[nomineeHash][nextTime].bias = 0;\n        timeWeight[nomineeHash] = nextTime;\n\n        // Account for the the sum weight change\n        uint256 newSum = oldSum - oldWeight;\n        pointsSum[nextTime].bias = newSum;\n        timeSum = nextTime;\n\n        // Add to the removed nominee map and set\n        mapRemovedNominees[nomineeHash] = setRemovedNominees.length;\n        setRemovedNominees.push(nominee);\n\n        // Remove nominee from the map\n        mapNomineeIds[nomineeHash] = 0;\n\n        uint256 numNominees = setNominees.length - 1;\n        // Shuffle the current last nominee id in the set to be placed to the removed one, if it's not the last nominee\n        // Note that the zero-th element of setNominees is always zero and the final length is never below 1\n        if (numNominees > 1) {\n            // Shuffle the current last nominee id in the set to be placed to the removed one\n            nominee = setNominees[numNominees];\n            bytes32 replacedNomineeHash = keccak256(abi.encode(nominee));\n            mapNomineeIds[replacedNomineeHash] = id;\n            setNominees[id] = nominee;\n        }\n        // Pop the last element from the set\n        setNominees.pop();\n\n        // Remove nominee in dispenser, if applicable\n        address localDispenser = dispenser;\n        if (localDispenser != address(0)) {\n            IDispenser(localDispenser).removeNominee(nomineeHash);\n        }\n\n        emit RemoveNominee(account, chainId, newSum);\n    }\n\n    /// @dev Revokes user voting power from a removed nominee.\n    /// @param account Address of the removed nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    function revokeRemovedNomineeVotingPower(bytes32 account, uint256 chainId) external {\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        // Check that the nominee is removed\n        if (mapRemovedNominees[nomineeHash] == 0) {\n            revert NomineeNotRemoved(account, chainId);\n        }\n\n        // Get the user old slope\n        VotedSlope memory oldSlope = voteUserSlopes[msg.sender][nomineeHash];\n        if (oldSlope.power == 0) {\n            revert ZeroValue();\n        }\n\n        uint256 nextTime = (block.timestamp + WEEK) / WEEK * WEEK;\n        // Adjust weight and sum slope changes\n        if (oldSlope.end > nextTime) {\n            pointsWeight[nomineeHash][nextTime].slope =\n                _maxAndSub(pointsWeight[nomineeHash][nextTime].slope, oldSlope.slope);\n            pointsSum[nextTime].slope = _maxAndSub(pointsSum[nextTime].slope, oldSlope.slope);\n        }\n\n        // Cancel old slope changes if they still didn't happen\n        if (oldSlope.end > block.timestamp) {\n            changesWeight[nomineeHash][oldSlope.end] -= oldSlope.slope;\n            changesSum[oldSlope.end] -= oldSlope.slope;\n        }\n\n        // Update the voting power\n        uint256 powerUsed = voteUserPower[msg.sender];\n        powerUsed = powerUsed - oldSlope.power;\n        voteUserPower[msg.sender] = powerUsed;\n        delete voteUserSlopes[msg.sender][nomineeHash];\n\n        emit VotingPowerRevoked(msg.sender, account, chainId, powerUsed);\n    }\n\n    /// @dev Get current nominee weight.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @return Nominee weight.\n    function getNomineeWeight(bytes32 account, uint256 chainId) external view returns (uint256) {\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        return pointsWeight[nomineeHash][timeWeight[nomineeHash]].bias;\n    }\n    \n    /// @dev Get sum of nominee weights.\n    /// @return Sum of nominee weights.\n    function getWeightsSum() external view returns (uint256) {\n        return pointsSum[timeSum].bias;\n    }\n\n    /// @dev Get the total number of nominees.\n    /// @notice The zero-th default nominee Id with id == 0 does not count.\n    /// @return Total number of nominees.\n    function getNumNominees() external view returns (uint256) {\n        return setNominees.length - 1;\n    }\n\n    /// @dev Get the total number of removed nominees.\n    /// @notice The zero-th default nominee Id with id == 0 does not count.\n    /// @return Total number of removed nominees.\n    function getNumRemovedNominees() external view returns (uint256) {\n        return setRemovedNominees.length - 1;\n    }\n\n    /// @dev Gets a full set of nominees.\n    /// @notice The returned set includes the zero-th empty nominee instance.\n    /// @return Set of all the nominees in the contract.\n    function getAllNominees() external view returns (Nominee[] memory) {\n        return setNominees;\n    }\n\n    /// @dev Gets a full set of removed nominees.\n    /// @notice The returned set includes the zero-th empty nominee instance.\n    /// @return Set of all the removed nominees in the contract.\n    function getAllRemovedNominees() external view returns (Nominee[] memory) {\n        return setRemovedNominees;\n    }\n\n    /// @dev Gets the nominee Id in the global nominees set.\n    /// @param account Nominee address in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @return Nominee Id in the global set of Nominee struct values.\n    function getNomineeId(bytes32 account, uint256 chainId) external view returns (uint256) {\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        return mapNomineeIds[nomineeHash];\n    }\n\n    /// @dev Gets the removed nominee Id in the global removed nominees set.\n    /// @param account Nominee address in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @return Removed nominee Id in the global set of Nominee struct values.\n    function getRemovedNomineeId(bytes32 account, uint256 chainId) external view returns (uint256) {\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        return mapRemovedNominees[nomineeHash];\n    }\n\n    /// @dev Gets the nominee address and its corresponding chain Id.\n    /// @notice The zero-th default nominee Id with id == 0 does not count.\n    /// @param id Nominee Id in the global set of Nominee struct values.\n    /// @return Nominee address in bytes32 form and chain Id.\n    function getNominee(uint256 id) external view returns (Nominee memory) {\n        // Get the total number of nominees in the contract\n        uint256 totalNumNominees = setNominees.length - 1;\n        // Check for the zero id or the overflow\n        if (id == 0) {\n            revert ZeroValue();\n        } else if (id > totalNumNominees) {\n            revert Overflow(id, totalNumNominees);\n        }\n\n        return setNominees[id];\n    }\n\n    /// @dev Gets the removed nominee address and its corresponding chain Id.\n    /// @notice The zero-th default removed nominee Id with id == 0 does not count.\n    /// @param id Removed nominee Id in the global set of Nominee struct values.\n    /// @return Removed nominee address in bytes32 form and chain Id.\n    function getRemovedNominee(uint256 id) external view returns (Nominee memory) {\n        // Get the total number of nominees in the contract\n        uint256 totalNumRemovedNominees = setRemovedNominees.length - 1;\n        // Check for the zero id or the overflow\n        if (id == 0) {\n            revert ZeroValue();\n        } else if (id > totalNumRemovedNominees) {\n            revert Overflow(id, totalNumRemovedNominees);\n        }\n\n        return setRemovedNominees[id];\n    }\n\n    /// @dev Gets next allowed voting time for selected nominees and voters.\n    /// @notice The function does not check for repeated nominees and voters.\n    /// @param accounts Set of nominee account addresses.\n    /// @param chainIds Corresponding set of chain Ids.\n    /// @param voters Corresponding set of voters for specified nominees.\n    function getNextAllowedVotingTimes(\n        bytes32[] memory accounts,\n        uint256[] memory chainIds,\n        address[] memory voters\n    ) external view returns (uint256[] memory nextAllowedVotingTimes) {\n        // Check array lengths\n        if (accounts.length != chainIds.length || accounts.length != voters.length) {\n            revert WrongArrayLength(accounts.length, chainIds.length);\n        }\n\n        // Allocate the times array\n        nextAllowedVotingTimes = new uint256[](accounts.length);\n\n        // Traverse nominees and get next available voting times\n        for (uint256 i = 0; i < accounts.length; ++i) {\n            // Get the nominee struct and hash\n            Nominee memory nominee = Nominee(accounts[i], chainIds[i]);\n            bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n            // Check for nominee existence\n            if (mapNomineeIds[nomineeHash] == 0) {\n                revert NomineeDoesNotExist(accounts[i], chainIds[i]);\n            }\n\n            // Calculate next allowed voting times\n            nextAllowedVotingTimes[i] = lastUserVote[voters[i]][nomineeHash] + WEIGHT_VOTE_DELAY;\n        }\n    }\n}"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.25+commit.b61c2a91"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_ve",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deadline",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "curTime",
+              "type": "uint256"
+            }
+          ],
+          "name": "LockExpired",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "int128",
+              "name": "slope",
+              "type": "int128"
+            }
+          ],
+          "name": "NegativeSlope",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "NomineeAlreadyExists",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "NomineeDoesNotExist",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "NomineeNotRemoved",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "NomineeRemoved",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "max",
+              "type": "uint256"
+            }
+          ],
+          "name": "Overflow",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerOnly",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "provided",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "expected",
+              "type": "uint256"
+            }
+          ],
+          "name": "Underflow",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "voter",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "curTime",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "nextAllowedVotingTime",
+              "type": "uint256"
+            }
+          ],
+          "name": "VoteTooOften",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "numValues1",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "numValues2",
+              "type": "uint256"
+            }
+          ],
+          "name": "WrongArrayLength",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroValue",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "AddNominee",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "sumBias",
+              "type": "uint256"
+            }
+          ],
+          "name": "Checkpoint",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "nomineeAccount",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "nomineeWeight",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "totalSum",
+              "type": "uint256"
+            }
+          ],
+          "name": "CheckpointNominee",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "dispenser",
+              "type": "address"
+            }
+          ],
+          "name": "DispenserUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "nomineeAccount",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "nomineeWeight",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "totalSum",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "relativeWeight",
+              "type": "uint256"
+            }
+          ],
+          "name": "NomineeRelativeWeightWrite",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnerUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newSum",
+              "type": "uint256"
+            }
+          ],
+          "name": "RemoveNominee",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "nominee",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "weight",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "powerUsed",
+              "type": "uint256"
+            }
+          ],
+          "name": "VoteForNominee",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "user",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "nominee",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "powerUsed",
+              "type": "uint256"
+            }
+          ],
+          "name": "VotingPowerRevoked",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_EVM_CHAIN_ID",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_NUM_WEEKS",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "MAX_WEIGHT",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "WEEK",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "WEIGHT_VOTE_DELAY",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "addNomineeEVM",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "addNomineeNonEVM",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newDispenser",
+              "type": "address"
+            }
+          ],
+          "name": "changeDispenser",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "changeOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "changesSum",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "changesWeight",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "checkpoint",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "checkpointNominee",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "dispenser",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getAllNominees",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes32",
+                  "name": "account",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "chainId",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct Nominee[]",
+              "name": "",
+              "type": "tuple[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getAllRemovedNominees",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes32",
+                  "name": "account",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "chainId",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct Nominee[]",
+              "name": "",
+              "type": "tuple[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32[]",
+              "name": "accounts",
+              "type": "bytes32[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "address[]",
+              "name": "voters",
+              "type": "address[]"
+            }
+          ],
+          "name": "getNextAllowedVotingTimes",
+          "outputs": [
+            {
+              "internalType": "uint256[]",
+              "name": "nextAllowedVotingTimes",
+              "type": "uint256[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "getNominee",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes32",
+                  "name": "account",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "chainId",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct Nominee",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getNomineeId",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getNomineeWeight",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getNumNominees",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getNumRemovedNominees",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "getRemovedNominee",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "bytes32",
+                  "name": "account",
+                  "type": "bytes32"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "chainId",
+                  "type": "uint256"
+                }
+              ],
+              "internalType": "struct Nominee",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "getRemovedNomineeId",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getWeightsSum",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "lastUserVote",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "mapNomineeIds",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "mapRemovedNominees",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "time",
+              "type": "uint256"
+            }
+          ],
+          "name": "nomineeRelativeWeight",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "relativeWeight",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "totalSum",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "time",
+              "type": "uint256"
+            }
+          ],
+          "name": "nomineeRelativeWeightWrite",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "relativeWeight",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "totalSum",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "pointsSum",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "bias",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "slope",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "pointsWeight",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "bias",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "slope",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "removeNominee",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "name": "revokeRemovedNomineeVotingPower",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "setNominees",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "setRemovedNominees",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "timeSum",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "timeWeight",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ve",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "account",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "chainId",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "weight",
+              "type": "uint256"
+            }
+          ],
+          "name": "voteForNomineeWeights",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32[]",
+              "name": "accounts",
+              "type": "bytes32[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "chainIds",
+              "type": "uint256[]"
+            },
+            {
+              "internalType": "uint256[]",
+              "name": "weights",
+              "type": "uint256[]"
+            }
+          ],
+          "name": "voteForNomineeWeightsBatch",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "voteUserPower",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "voteUserSlopes",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "slope",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "power",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "end",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>Andrey Lebedev - <andrey.lebedev@valory.xyz>Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>",
+        "errors": {
+          "LockExpired(address,uint256,uint256)": [
+            {
+              "details": "Value lock is expired.",
+              "params": {
+                "account": "Address that is checked for the locked value.",
+                "curTime": "Current timestamp.",
+                "deadline": "The lock expiration deadline."
+              }
+            }
+          ],
+          "NegativeSlope(address,int128)": [
+            {
+              "details": "Violated a negative slope value.",
+              "params": {
+                "account": "Account address.",
+                "slope": "Negative slope."
+              }
+            }
+          ],
+          "NomineeAlreadyExists(bytes32,uint256)": [
+            {
+              "details": "Nominee already exists.",
+              "params": {
+                "account": "Nominee account address.",
+                "chainId": "Nominee chain Id."
+              }
+            }
+          ],
+          "NomineeDoesNotExist(bytes32,uint256)": [
+            {
+              "details": "Nominee does not exist.",
+              "params": {
+                "account": "Nominee account address.",
+                "chainId": "Nominee chain Id."
+              }
+            }
+          ],
+          "NomineeNotRemoved(bytes32,uint256)": [
+            {
+              "details": "Nominee is not in the removed nominee map.",
+              "params": {
+                "account": "Nominee account address.",
+                "chainId": "Nominee chain Id."
+              }
+            }
+          ],
+          "NomineeRemoved(bytes32,uint256)": [
+            {
+              "details": "Nominee is in the removed nominee map.",
+              "params": {
+                "account": "Nominee account address.",
+                "chainId": "Nominee chain Id."
+              }
+            }
+          ],
+          "Overflow(uint256,uint256)": [
+            {
+              "details": "Value overflow.",
+              "params": {
+                "max": "Maximum possible value.",
+                "provided": "Overflow value."
+              }
+            }
+          ],
+          "OwnerOnly(address,address)": [
+            {
+              "details": "Only `owner` has a privilege, but the `sender` was provided.",
+              "params": {
+                "owner": "Required sender address as an owner.",
+                "sender": "Sender address."
+              }
+            }
+          ],
+          "Underflow(uint256,uint256)": [
+            {
+              "details": "Underflow value.",
+              "params": {
+                "expected": "Minimum expected value.",
+                "provided": "Provided value."
+              }
+            }
+          ],
+          "VoteTooOften(address,uint256,uint256)": [
+            {
+              "details": "The vote has been performed already.",
+              "params": {
+                "curTime": "Current time.",
+                "nextAllowedVotingTime": "Next allowed voting time.",
+                "voter": "Voter address."
+              }
+            }
+          ],
+          "WrongArrayLength(uint256,uint256)": [
+            {
+              "details": "Wrong length of two arrays.",
+              "params": {
+                "numValues1": "Number of values in a first array.",
+                "numValues2": "Number of values in a second array."
+              }
+            }
+          ],
+          "ZeroAddress()": [
+            {
+              "details": "Provided zero address."
+            }
+          ],
+          "ZeroValue()": [
+            {
+              "details": "Zero value when it has to be different from zero."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "addNomineeEVM(address,uint256)": {
+            "details": "Add EVM nominee address along with the chain Id.",
+            "params": {
+              "account": "Address of the nominee.",
+              "chainId": "Chain Id."
+            }
+          },
+          "addNomineeNonEVM(bytes32,uint256)": {
+            "details": "Add Non-EVM nominee address along with the chain Id.",
+            "params": {
+              "account": "Address of the nominee in byte32 standard.",
+              "chainId": "Chain Id."
+            }
+          },
+          "changeDispenser(address)": {
+            "details": "Changes the dispenser contract address.",
+            "params": {
+              "newDispenser": "New dispenser contract address."
+            }
+          },
+          "changeOwner(address)": {
+            "details": "Changes the owner address.",
+            "params": {
+              "newOwner": "Address of a new owner."
+            }
+          },
+          "checkpoint()": {
+            "details": "Checkpoints to fill data common for all nominees."
+          },
+          "checkpointNominee(bytes32,uint256)": {
+            "details": "Checkpoints to fill data for both a specific nominee and common for all nominees.",
+            "params": {
+              "account": "Address of the nominee.",
+              "chainId": "Chain Id."
+            }
+          },
+          "constructor": {
+            "details": "Contract constructor.",
+            "params": {
+              "_ve": "Voting Escrow contract address."
+            }
+          },
+          "getAllNominees()": {
+            "details": "Gets a full set of nominees.",
+            "returns": {
+              "_0": "Set of all the nominees in the contract."
+            }
+          },
+          "getAllRemovedNominees()": {
+            "details": "Gets a full set of removed nominees.",
+            "returns": {
+              "_0": "Set of all the removed nominees in the contract."
+            }
+          },
+          "getNextAllowedVotingTimes(bytes32[],uint256[],address[])": {
+            "details": "Gets next allowed voting time for selected nominees and voters.",
+            "params": {
+              "accounts": "Set of nominee account addresses.",
+              "chainIds": "Corresponding set of chain Ids.",
+              "voters": "Corresponding set of voters for specified nominees."
+            }
+          },
+          "getNominee(uint256)": {
+            "details": "Gets the nominee address and its corresponding chain Id.",
+            "params": {
+              "id": "Nominee Id in the global set of Nominee struct values."
+            },
+            "returns": {
+              "_0": "Nominee address in bytes32 form and chain Id."
+            }
+          },
+          "getNomineeId(bytes32,uint256)": {
+            "details": "Gets the nominee Id in the global nominees set.",
+            "params": {
+              "account": "Nominee address in bytes32 form.",
+              "chainId": "Chain Id."
+            },
+            "returns": {
+              "_0": "Nominee Id in the global set of Nominee struct values."
+            }
+          },
+          "getNomineeWeight(bytes32,uint256)": {
+            "details": "Get current nominee weight.",
+            "params": {
+              "account": "Address of the nominee in bytes32 form.",
+              "chainId": "Chain Id."
+            },
+            "returns": {
+              "_0": "Nominee weight."
+            }
+          },
+          "getNumNominees()": {
+            "details": "Get the total number of nominees.",
+            "returns": {
+              "_0": "Total number of nominees."
+            }
+          },
+          "getNumRemovedNominees()": {
+            "details": "Get the total number of removed nominees.",
+            "returns": {
+              "_0": "Total number of removed nominees."
+            }
+          },
+          "getRemovedNominee(uint256)": {
+            "details": "Gets the removed nominee address and its corresponding chain Id.",
+            "params": {
+              "id": "Removed nominee Id in the global set of Nominee struct values."
+            },
+            "returns": {
+              "_0": "Removed nominee address in bytes32 form and chain Id."
+            }
+          },
+          "getRemovedNomineeId(bytes32,uint256)": {
+            "details": "Gets the removed nominee Id in the global removed nominees set.",
+            "params": {
+              "account": "Nominee address in bytes32 form.",
+              "chainId": "Chain Id."
+            },
+            "returns": {
+              "_0": "Removed nominee Id in the global set of Nominee struct values."
+            }
+          },
+          "getWeightsSum()": {
+            "details": "Get sum of nominee weights.",
+            "returns": {
+              "_0": "Sum of nominee weights."
+            }
+          },
+          "nomineeRelativeWeight(bytes32,uint256,uint256)": {
+            "details": "Gets Nominee relative weight (not more than 1.0) normalized to 1e18 (e.g. 1.0 == 1e18) and a sum of weights.",
+            "params": {
+              "account": "Address of the nominee in bytes32 form.",
+              "chainId": "Chain Id.",
+              "time": "Relative weight at the specified timestamp in the past or present."
+            },
+            "returns": {
+              "relativeWeight": "Value of nominee relative weight normalized to 1e18.",
+              "totalSum": "Sum of nominee weights."
+            }
+          },
+          "nomineeRelativeWeightWrite(bytes32,uint256,uint256)": {
+            "details": "Checkpoints and gets nominee weight normalized to 1e18, and the total sum of all the nominee weights.",
+            "params": {
+              "account": "Address of the nominee in bytes32 form.",
+              "chainId": "Chain Id.",
+              "time": "Relative weight at the specified timestamp in the past or present."
+            },
+            "returns": {
+              "relativeWeight": "Value of nominee relative weight normalized to 1e18.",
+              "totalSum": "Sum of nominee weights."
+            }
+          },
+          "removeNominee(bytes32,uint256)": {
+            "details": "Removes nominee from the contract and zeros its weight.",
+            "params": {
+              "account": "Address of the nominee in bytes32 form.",
+              "chainId": "Chain Id."
+            }
+          },
+          "revokeRemovedNomineeVotingPower(bytes32,uint256)": {
+            "details": "Revokes user voting power from a removed nominee.",
+            "params": {
+              "account": "Address of the removed nominee in bytes32 form.",
+              "chainId": "Chain Id."
+            }
+          },
+          "voteForNomineeWeights(bytes32,uint256,uint256)": {
+            "details": "Allocates voting power for changing pool weights.",
+            "params": {
+              "account": "Address of the nominee the `msg.sender` votes for in bytes32 form.",
+              "chainId": "Chain Id.",
+              "weight": "Weight for a nominee in bps (units of 0.01%). Minimal step is is 0.01% (1 out of 10_000)."
+            }
+          },
+          "voteForNomineeWeightsBatch(bytes32[],uint256[],uint256[])": {
+            "details": "Allocates voting power for changing pool weights in a batch set.",
+            "params": {
+              "accounts": "Set of nominee addresses in bytes32 form the `msg.sender` votes for.",
+              "chainIds": "Set of corresponding chain Ids.",
+              "weights": "Weights for a nominees in bps (units of 0.01%). Minimal is 0.01%. Ignored if 0."
+            }
+          }
+        },
+        "title": "VoteWeighting - Smart contract for Vote Weighting with specific nominees composed of address and chain Id",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "changeDispenser(address)": {
+            "notice": "Dispenser can be set to a zero address if the contract needs to serve a general purpose."
+          },
+          "getAllNominees()": {
+            "notice": "The returned set includes the zero-th empty nominee instance."
+          },
+          "getAllRemovedNominees()": {
+            "notice": "The returned set includes the zero-th empty nominee instance."
+          },
+          "getNextAllowedVotingTimes(bytes32[],uint256[],address[])": {
+            "notice": "The function does not check for repeated nominees and voters."
+          },
+          "getNominee(uint256)": {
+            "notice": "The zero-th default nominee Id with id == 0 does not count."
+          },
+          "getNumNominees()": {
+            "notice": "The zero-th default nominee Id with id == 0 does not count."
+          },
+          "getNumRemovedNominees()": {
+            "notice": "The zero-th default nominee Id with id == 0 does not count."
+          },
+          "getRemovedNominee(uint256)": {
+            "notice": "The zero-th default removed nominee Id with id == 0 does not count."
+          },
+          "nomineeRelativeWeightWrite(bytes32,uint256,uint256)": {
+            "notice": "Nothing is recorded if the values are already filled."
+          },
+          "removeNominee(bytes32,uint256)": {
+            "notice": "The last nominee in the set of nominees is going to change its Id at the end of this function call."
+          }
+        },
+        "notice": "Inspired by https://github.com/curvefi/curve-dao-contracts/blob/master/contracts/GaugeController.vy",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/VoteWeighting.sol": "VoteWeighting"
+      },
+      "evmVersion": "cancun",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 1000000
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/VoteWeighting.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.25;\n\n// Dispenser interface\ninterface IDispenser {\n    /// @dev Records nominee addition in dispenser.\n    /// @param nomineeHash Nominee hash.\n    function addNominee(bytes32 nomineeHash) external;\n\n    /// @dev Records nominee removal.\n    /// @param nomineeHash Nominee hash.\n    function removeNominee(bytes32 nomineeHash) external;\n}\n\n// veOLAS interface\ninterface IVEOLAS {\n    // Structure for voting escrow points\n    // The struct size is two storage slots of 2 * uint256 (128 + 128 + 64 + 64 + 128)\n    struct PointVoting {\n        // w(i) = at + b (bias)\n        int128 bias;\n        // dw / dt = a (slope)\n        int128 slope;\n        // Timestamp. It will never practically be bigger than 2^64 - 1\n        uint64 ts;\n        // Block number. It will not be bigger than the timestamp\n        uint64 blockNumber;\n        // Token amount. It will never practically be bigger. Initial OLAS cap is 1 bn tokens, or 1e27.\n        // After 10 years, the inflation rate is 2% per year. It would take 1340+ years to reach 2^128 - 1\n        uint128 balance;\n    }\n\n    /// @dev Gets the `account`'s lock end time.\n    /// @param account Account address.\n    /// @return unlockTime Lock end time.\n    function lockedEnd(address account) external view returns (uint256 unlockTime);\n\n    /// @dev Gets the most recently recorded user point for `account`.\n    /// @param account Account address.\n    /// @return pv Last checkpoint.\n    function getLastUserPoint(address account) external view returns (PointVoting memory pv);\n}\n\n/// @dev Only `owner` has a privilege, but the `sender` was provided.\n/// @param sender Sender address.\n/// @param owner Required sender address as an owner.\nerror OwnerOnly(address sender, address owner);\n\n/// @dev Provided zero address.\nerror ZeroAddress();\n\n/// @dev Zero value when it has to be different from zero.\nerror ZeroValue();\n\n/// @dev Wrong length of two arrays.\n/// @param numValues1 Number of values in a first array.\n/// @param numValues2 Number of values in a second array.\nerror WrongArrayLength(uint256 numValues1, uint256 numValues2);\n\n/// @dev Value overflow.\n/// @param provided Overflow value.\n/// @param max Maximum possible value.\nerror Overflow(uint256 provided, uint256 max);\n\n/// @dev Underflow value.\n/// @param provided Provided value.\n/// @param expected Minimum expected value.\nerror Underflow(uint256 provided, uint256 expected);\n\n/// @dev Nominee does not exist.\n/// @param account Nominee account address.\n/// @param chainId Nominee chain Id.\nerror NomineeDoesNotExist(bytes32 account, uint256 chainId);\n\n/// @dev Nominee already exists.\n/// @param account Nominee account address.\n/// @param chainId Nominee chain Id.\nerror NomineeAlreadyExists(bytes32 account, uint256 chainId);\n\n/// @dev Value lock is expired.\n/// @param account Address that is checked for the locked value.\n/// @param deadline The lock expiration deadline.\n/// @param curTime Current timestamp.\nerror LockExpired(address account, uint256 deadline, uint256 curTime);\n\n/// @dev Violated a negative slope value.\n/// @param account Account address.\n/// @param slope Negative slope.\nerror NegativeSlope(address account, int128 slope);\n\n/// @dev The vote has been performed already.\n/// @param voter Voter address.\n/// @param curTime Current time.\n/// @param nextAllowedVotingTime Next allowed voting time.\nerror VoteTooOften(address voter, uint256 curTime, uint256 nextAllowedVotingTime);\n\n/// @dev Nominee is not in the removed nominee map.\n/// @param account Nominee account address.\n/// @param chainId Nominee chain Id.\nerror NomineeNotRemoved(bytes32 account, uint256 chainId);\n\n/// @dev Nominee is in the removed nominee map.\n/// @param account Nominee account address.\n/// @param chainId Nominee chain Id.\nerror NomineeRemoved(bytes32 account, uint256 chainId);\n\n// Point struct\nstruct Point {\n    uint256 bias;\n    uint256 slope;\n}\n\n// Voted slope struct\nstruct VotedSlope {\n    uint256 slope;\n    uint256 power;\n    uint256 end;\n}\n\n// Nominee struct\nstruct Nominee {\n    bytes32 account;\n    uint256 chainId;\n}\n\n\n/// @title VoteWeighting - Smart contract for Vote Weighting with specific nominees composed of address and chain Id\n/// @notice Inspired by https://github.com/curvefi/curve-dao-contracts/blob/master/contracts/GaugeController.vy\n/// @author Aleksandr Kuperman - <aleksandr.kuperman@valory.xyz>\n/// @author Andrey Lebedev - <andrey.lebedev@valory.xyz>\n/// @author Mariapia Moscatiello - <mariapia.moscatiello@valory.xyz>\ncontract VoteWeighting {\n    event OwnerUpdated(address indexed owner);\n    event DispenserUpdated(address indexed dispenser);\n    event Checkpoint(address indexed sender, uint256 sumBias);\n    event CheckpointNominee(address indexed sender, bytes32 indexed nomineeAccount, uint256 chainId,\n        uint256 nomineeWeight, uint256 totalSum);\n    event NomineeRelativeWeightWrite(address indexed sender, bytes32 indexed nomineeAccount, uint256 chainId,\n        uint256 nomineeWeight, uint256 totalSum, uint256 relativeWeight);\n    event VoteForNominee(address indexed user, bytes32 indexed nominee, uint256 chainId, uint256 weight,\n        uint256 powerUsed);\n    event AddNominee(bytes32 indexed account, uint256 chainId, uint256 id);\n    event RemoveNominee(bytes32 indexed account, uint256 chainId, uint256 newSum);\n    event VotingPowerRevoked(address indexed user, bytes32 indexed nominee, uint256 chainId, uint256 powerUsed);\n\n    // 7 * 86400 seconds - all future times are rounded by week\n    uint256 public constant WEEK = 604_800;\n    // Cannot change weight votes more often than once in 10 days\n    // For explanation about the delay consult the official audit report: https://github.com/trailofbits/publications/blob/master/reviews/CurveDAO.pdf\n    uint256 public constant WEIGHT_VOTE_DELAY = 864_000;\n    // Max number of weeks for checkpoints\n    // The number corresponds to more than four years timeframe\n    // It is enough to have at least one vote while veOLAS value is greater than zero\n    // In practice it is unlikely that there is no single checkpoint for the maximum amount of weeks\n    // For gas concerns regarding checkpoint calculations, see the internal audit and the official audit report: https://github.com/trailofbits/publications/blob/master/reviews/CurveDAO.pdf\n    uint256 public constant MAX_NUM_WEEKS = 250;\n    // Max weight amount\n    uint256 public constant MAX_WEIGHT = 10_000;\n    // Maximum chain Id as per EVM specs\n    uint256 public constant MAX_EVM_CHAIN_ID = type(uint64).max / 2 - 36;\n    // veOLAS contract address\n    address public immutable ve;\n    // Contract owner address\n    address public owner;\n    // Dispenser contract\n    address public dispenser;\n\n    // Set of Nominee structs\n    Nominee[] public setNominees;\n    // Set of removed Nominee structs\n    Nominee[] public setRemovedNominees;\n    // Mapping of hash(Nominee struct) => nominee Id\n    mapping(bytes32 => uint256) public mapNomineeIds;\n    // Mapping of hash(Nominee struct) => removed nominee Id\n    mapping(bytes32 => uint256) public mapRemovedNominees;\n\n    // Mapping for user => hash(Nominee struct) => VotedSlope\n    mapping(address => mapping(bytes32 => VotedSlope)) public voteUserSlopes;\n    // Mapping for user address => total vote power used\n    mapping(address => uint256) public voteUserPower;\n    // Mapping for user address => hash(Nominee struct) => last vote timestamp\n    mapping(address => mapping(bytes32 => uint256)) public lastUserVote;\n\n    // Past and scheduled points for nominee weight, sum of weights\n    // Point is for bias + slope\n    // changes* are for changes in slope\n    // time* are for the last change timestamp\n    // timestamps are rounded to whole weeks\n\n    // Mapping for hash(Nominee struct) => time => Point\n    mapping(bytes32 => mapping(uint256 => Point)) public pointsWeight;\n    // Mapping for hash(Nominee struct) => time => slope\n    mapping(bytes32 => mapping(uint256 => uint256)) public changesWeight;\n    // Mapping for hash(Nominee struct) => last scheduled time (next week)\n    mapping(bytes32 => uint256) public timeWeight;\n\n    // Mapping for time => Point\n    mapping(uint256 => Point) public pointsSum;\n    // Mapping for time => slope\n    mapping(uint256 => uint256) public changesSum;\n    // Last scheduled time (next week)\n    uint256 public timeSum;\n\n    /// @dev Contract constructor.\n    /// @param _ve Voting Escrow contract address.\n    constructor(address _ve) {\n        // Check for the zero address\n        if (_ve == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Set initial parameters\n        owner = msg.sender;\n        ve = _ve;\n        timeSum = block.timestamp / WEEK * WEEK;\n        // Push empty element to the zero-th index\n        setNominees.push(Nominee(0, 0));\n        // For symmetry, push empty element to the zero-th index in the removed Nominee set as well\n        setRemovedNominees.push(Nominee(0, 0));\n    }\n\n    /// @dev Fill sum of nominee weights week-over-week for missed checkins and return the sum for the future week.\n    /// @return Sum of nominee weights.\n    function _getSum() internal returns (uint256) {\n        // t is always > 0 as it is set in the constructor\n        uint256 t = timeSum;\n        Point memory pt = pointsSum[t];\n        for (uint256 i = 0; i < MAX_NUM_WEEKS; i++) {\n            if (t > block.timestamp) {\n                break;\n            }\n            t += WEEK;\n            uint256 dBias = pt.slope * WEEK;\n            if (pt.bias > dBias) {\n                pt.bias -= dBias;\n                uint256 dSlope = changesSum[t];\n                pt.slope -= dSlope;\n            } else {\n                pt.bias = 0;\n                pt.slope = 0;\n            }\n\n            pointsSum[t] = pt;\n            if (t > block.timestamp) {\n                timeSum = t;\n            }\n        }\n        return pt.bias;\n    }\n\n    /// @dev Fill historic nominee weights week-over-week for missed checkins and return the total for the future week.\n    /// @param account Nominee account address in bytes32 form.\n    /// @param chainId Nominee chain Id.\n    /// @return Nominee weight.\n    function _getWeight(bytes32 account, uint256 chainId) internal returns (uint256) {\n        // Construct the nominee struct\n        Nominee memory nominee = Nominee(account, chainId);\n\n        // Check that the nominee exists or has been removed\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n        if (mapRemovedNominees[nomineeHash] == 0 && mapNomineeIds[nomineeHash] == 0) {\n            revert NomineeDoesNotExist(account, chainId);\n        }\n\n        // t is always > 0 as it is set during the addNominee() call\n        uint256 t = timeWeight[nomineeHash];\n        Point memory pt = pointsWeight[nomineeHash][t];\n        for (uint256 i = 0; i < MAX_NUM_WEEKS; i++) {\n            if (t > block.timestamp) {\n                break;\n            }\n            t += WEEK;\n            uint256 dBias = pt.slope * WEEK;\n            if (pt.bias > dBias) {\n                pt.bias -= dBias;\n                uint256 dSlope = changesWeight[nomineeHash][t];\n                pt.slope -= dSlope;\n            } else {\n                pt.bias = 0;\n                pt.slope = 0;\n            }\n\n            pointsWeight[nomineeHash][t] = pt;\n            if (t > block.timestamp) {\n                timeWeight[nomineeHash] = t;\n            }\n        }\n        return pt.bias;\n    }\n\n    /// @dev Add nominee address along with the chain Id.\n    /// @param nominee Nominee account address and chainId.\n    function _addNominee(Nominee memory nominee) internal {\n        // Check for the nominee existence\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n        if (mapNomineeIds[nomineeHash] > 0) {\n            revert NomineeAlreadyExists(nominee.account, nominee.chainId);\n        }\n\n        // Check for the previously removed nominee\n        if (mapRemovedNominees[nomineeHash] > 0) {\n            revert NomineeRemoved(nominee.account, nominee.chainId);\n        }\n\n        uint256 id = setNominees.length;\n        mapNomineeIds[nomineeHash] = id;\n        // Push the nominee into the list\n        setNominees.push(nominee);\n\n        uint256 nextTime = (block.timestamp + WEEK) / WEEK * WEEK;\n        timeWeight[nomineeHash] = nextTime;\n\n        // Enable nominee in dispenser, if applicable\n        address localDispenser = dispenser;\n        if (localDispenser != address(0)) {\n            IDispenser(localDispenser).addNominee(nomineeHash);\n        }\n\n        emit AddNominee(nominee.account, nominee.chainId, id);\n    }\n\n    /// @dev Add EVM nominee address along with the chain Id.\n    /// @param account Address of the nominee.\n    /// @param chainId Chain Id.\n    function addNomineeEVM(address account, uint256 chainId) external {\n        // Check for the zero address\n        if (account == address(0)) {\n            revert ZeroAddress();\n        }\n\n        // Check for zero chain Id\n        if (chainId == 0) {\n            revert ZeroValue();\n        }\n\n        // Check for the chain Id overflow\n        if (chainId > MAX_EVM_CHAIN_ID) {\n            revert Overflow(chainId, MAX_EVM_CHAIN_ID);\n        }\n\n        Nominee memory nominee = Nominee(bytes32(uint256(uint160(account))), chainId);\n\n        // Record nominee instance\n        _addNominee(nominee);\n    }\n\n    /// @dev Add Non-EVM nominee address along with the chain Id.\n    /// @param account Address of the nominee in byte32 standard.\n    /// @param chainId Chain Id.\n    function addNomineeNonEVM(bytes32 account, uint256 chainId) external {\n        // Check for the zero address\n        if (account == bytes32(0)) {\n            revert ZeroAddress();\n        }\n\n        // Check for the chain Id underflow\n        if (MAX_EVM_CHAIN_ID >= chainId) {\n            revert Underflow(chainId, MAX_EVM_CHAIN_ID + 1);\n        }\n\n        Nominee memory nominee = Nominee(account, chainId);\n\n        // Record nominee instance\n        _addNominee(nominee);\n    }\n\n    /// @dev Changes the owner address.\n    /// @param newOwner Address of a new owner.\n    function changeOwner(address newOwner) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        // Check for the zero address\n        if (newOwner == address(0)) {\n            revert ZeroAddress();\n        }\n\n        owner = newOwner;\n        emit OwnerUpdated(newOwner);\n    }\n\n    /// @dev Changes the dispenser contract address.\n    /// @notice Dispenser can be set to a zero address if the contract needs to serve a general purpose.\n    /// @param newDispenser New dispenser contract address.\n    function changeDispenser(address newDispenser) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(msg.sender, owner);\n        }\n\n        dispenser = newDispenser;\n        emit DispenserUpdated(newDispenser);\n    }\n\n    /// @dev Checkpoints to fill data common for all nominees.\n    function checkpoint() external {\n        uint256 totalSum = _getSum();\n\n        emit Checkpoint(msg.sender, totalSum);\n    }\n\n    /// @dev Checkpoints to fill data for both a specific nominee and common for all nominees.\n    /// @param account Address of the nominee.\n    /// @param chainId Chain Id.\n    function checkpointNominee(bytes32 account, uint256 chainId) external {\n        uint256 nomineeWeight = _getWeight(account, chainId);\n        uint256 totalSum = _getSum();\n\n        emit CheckpointNominee(msg.sender, account, chainId, nomineeWeight, totalSum);\n    }\n\n    /// @dev Gets Nominee relative weight (not more than 1.0) normalized to 1e18 (e.g. 1.0 == 1e18) and a sum of weights.\n    /// @param account Address of the nominee in byte32 standard.\n    /// @param chainId Chain Id.\n    /// @param time Timestamp in the past or present.\n    /// @return weight Value of relative weight normalized to 1e18.\n    /// @return totalSum Sum of nominee weights.\n    function _nomineeRelativeWeight(\n        bytes32 account,\n        uint256 chainId,\n        uint256 time\n    ) internal view returns (uint256 weight, uint256 totalSum) {\n        uint256 t = time / WEEK * WEEK;\n        totalSum = pointsSum[t].bias;\n\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        if (totalSum > 0) {\n            uint256 nomineeWeight = pointsWeight[nomineeHash][t].bias;\n            weight = 1e18 * nomineeWeight / totalSum;\n        }\n    }\n\n    /// @dev Gets Nominee relative weight (not more than 1.0) normalized to 1e18 (e.g. 1.0 == 1e18) and a sum of weights.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @param time Relative weight at the specified timestamp in the past or present.\n    /// @return relativeWeight Value of nominee relative weight normalized to 1e18.\n    /// @return totalSum Sum of nominee weights.\n    function nomineeRelativeWeight(\n        bytes32 account,\n        uint256 chainId,\n        uint256 time\n    ) external view returns (uint256 relativeWeight, uint256 totalSum) {\n        (relativeWeight, totalSum) = _nomineeRelativeWeight(account, chainId, time);\n    }\n\n    /// @dev Checkpoints and gets nominee weight normalized to 1e18, and the total sum of all the nominee weights.\n    /// @notice Nothing is recorded if the values are already filled.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @param time Relative weight at the specified timestamp in the past or present.\n    /// @return relativeWeight Value of nominee relative weight normalized to 1e18.\n    /// @return totalSum Sum of nominee weights.\n    function nomineeRelativeWeightWrite(\n        bytes32 account,\n        uint256 chainId,\n        uint256 time\n    ) external returns (uint256 relativeWeight, uint256 totalSum) {\n        uint256 nomineeWeight = _getWeight(account, chainId);\n        _getSum();\n        (relativeWeight, totalSum) =  _nomineeRelativeWeight(account, chainId, time);\n\n        emit NomineeRelativeWeightWrite(msg.sender, account, chainId, nomineeWeight, totalSum, relativeWeight);\n    }\n\n    /// @dev Allocates voting power for changing pool weights.\n    /// @param account Address of the nominee the `msg.sender` votes for in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @param weight Weight for a nominee in bps (units of 0.01%). Minimal step is is 0.01% (1 out of 10_000).\n    function voteForNomineeWeights(bytes32 account, uint256 chainId, uint256 weight) public {\n        // Get the nominee hash\n        bytes32 nomineeHash = keccak256(abi.encode(Nominee(account, chainId)));\n\n        // Check for the previously removed nominee\n        if (mapRemovedNominees[nomineeHash] > 0) {\n            revert NomineeRemoved(account, chainId);\n        }\n\n        // Get user veOLAS slope and check its value\n        int128 userSlope = IVEOLAS(ve).getLastUserPoint(msg.sender).slope;\n        if (userSlope < 0) {\n            revert NegativeSlope(msg.sender, userSlope);\n        }\n\n        uint256 lockEnd = IVEOLAS(ve).lockedEnd(msg.sender);\n        uint256 nextTime = (block.timestamp + WEEK) / WEEK * WEEK;\n\n        // Check for the lock end expiration\n        if (nextTime >= lockEnd) {\n            revert LockExpired(msg.sender, lockEnd, nextTime);\n        }\n\n        // Check for the weight value\n        if (weight > MAX_WEIGHT) {\n            revert Overflow(weight, MAX_WEIGHT);\n        }\n\n        // Check for the last voting time\n        uint256 nextAllowedVotingTime = lastUserVote[msg.sender][nomineeHash] + WEIGHT_VOTE_DELAY;\n        if (nextAllowedVotingTime > block.timestamp) {\n            revert VoteTooOften(msg.sender, block.timestamp, nextAllowedVotingTime);\n        }\n\n        // Prepare old and new slopes and biases\n        VotedSlope memory oldSlope = voteUserSlopes[msg.sender][nomineeHash];\n        uint256 oldBias;\n        if (oldSlope.end > nextTime) {\n            oldBias = oldSlope.slope * (oldSlope.end - nextTime);\n        }\n\n        VotedSlope memory newSlope = VotedSlope({\n            slope: uint256(uint128(userSlope)) * weight / MAX_WEIGHT,\n            end: lockEnd,\n            power: weight\n        });\n\n        uint256 newBias = newSlope.slope * (lockEnd - nextTime);\n\n        uint256 powerUsed = voteUserPower[msg.sender];\n        powerUsed = powerUsed + newSlope.power - oldSlope.power;\n        voteUserPower[msg.sender] = powerUsed;\n        if (powerUsed > MAX_WEIGHT) {\n            revert Overflow(powerUsed, MAX_WEIGHT);\n        }\n\n        // Remove old and schedule new slope changes\n        // Remove slope changes for old slopes\n        // Schedule recording of initial slope for nextTime\n        pointsWeight[nomineeHash][nextTime].bias = _maxAndSub(_getWeight(account, chainId) + newBias, oldBias);\n        pointsSum[nextTime].bias = _maxAndSub(_getSum() + newBias, oldBias);\n        if (oldSlope.end > nextTime) {\n            pointsWeight[nomineeHash][nextTime].slope =\n                _maxAndSub(pointsWeight[nomineeHash][nextTime].slope + newSlope.slope, oldSlope.slope);\n            pointsSum[nextTime].slope = _maxAndSub(pointsSum[nextTime].slope + newSlope.slope, oldSlope.slope);\n        } else {\n            pointsWeight[nomineeHash][nextTime].slope += newSlope.slope;\n            pointsSum[nextTime].slope += newSlope.slope;\n        }\n        if (oldSlope.end > block.timestamp) {\n            // Cancel old slope changes if they still didn't happen\n            changesWeight[nomineeHash][oldSlope.end] -= oldSlope.slope;\n            changesSum[oldSlope.end] -= oldSlope.slope;\n        }\n        // Add slope changes for new slopes\n        changesWeight[nomineeHash][newSlope.end] += newSlope.slope;\n        changesSum[newSlope.end] += newSlope.slope;\n\n        voteUserSlopes[msg.sender][nomineeHash] = newSlope;\n\n        // Record last action time\n        lastUserVote[msg.sender][nomineeHash] = block.timestamp;\n\n        emit VoteForNominee(msg.sender, account, chainId, weight, powerUsed);\n    }\n\n    /// @dev Allocates voting power for changing pool weights in a batch set.\n    /// @param accounts Set of nominee addresses in bytes32 form the `msg.sender` votes for.\n    /// @param chainIds Set of corresponding chain Ids.\n    /// @param weights Weights for a nominees in bps (units of 0.01%). Minimal is 0.01%. Ignored if 0.\n    function voteForNomineeWeightsBatch(\n        bytes32[] memory accounts,\n        uint256[] memory chainIds,\n        uint256[] memory weights\n    ) external {\n        if (accounts.length != chainIds.length || accounts.length != weights.length) {\n            revert WrongArrayLength(accounts.length, weights.length);\n        }\n\n        // Traverse all accounts and weights\n        for (uint256 i = 0; i < accounts.length; ++i) {\n            voteForNomineeWeights(accounts[i], chainIds[i], weights[i]);\n        }\n    }\n\n    function _maxAndSub(uint256 a, uint256 b) internal pure returns (uint256) {\n        return a > b ? a - b : 0;\n    }\n\n    /// @dev Removes nominee from the contract and zeros its weight.\n    /// @notice The last nominee in the set of nominees is going to change its Id at the end of this function call.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    function removeNominee(bytes32 account, uint256 chainId) external {\n        // Check for the contract ownership\n        if (msg.sender != owner) {\n            revert OwnerOnly(owner, msg.sender);\n        }\n\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        // Get the nominee id in the nominee set\n        uint256 id = mapNomineeIds[nomineeHash];\n        if (id == 0) {\n            revert NomineeDoesNotExist(account, chainId);\n        }\n\n        // Set nominee weight to zero\n        uint256 oldWeight = _getWeight(account, chainId);\n        uint256 oldSum = _getSum();\n        uint256 nextTime = (block.timestamp + WEEK) / WEEK * WEEK;\n        pointsWeight[nomineeHash][nextTime].bias = 0;\n        timeWeight[nomineeHash] = nextTime;\n\n        // Account for the the sum weight change\n        uint256 newSum = oldSum - oldWeight;\n        pointsSum[nextTime].bias = newSum;\n        timeSum = nextTime;\n\n        // Add to the removed nominee map and set\n        mapRemovedNominees[nomineeHash] = setRemovedNominees.length;\n        setRemovedNominees.push(nominee);\n\n        // Remove nominee from the map\n        mapNomineeIds[nomineeHash] = 0;\n\n        uint256 numNominees = setNominees.length - 1;\n        // Shuffle the current last nominee id in the set to be placed to the removed one, if it's not the last nominee\n        // Note that the zero-th element of setNominees is always zero and the final length is never below 1\n        if (numNominees > 1) {\n            // Shuffle the current last nominee id in the set to be placed to the removed one\n            nominee = setNominees[numNominees];\n            bytes32 replacedNomineeHash = keccak256(abi.encode(nominee));\n            mapNomineeIds[replacedNomineeHash] = id;\n            setNominees[id] = nominee;\n        }\n        // Pop the last element from the set\n        setNominees.pop();\n\n        // Remove nominee in dispenser, if applicable\n        address localDispenser = dispenser;\n        if (localDispenser != address(0)) {\n            IDispenser(localDispenser).removeNominee(nomineeHash);\n        }\n\n        emit RemoveNominee(account, chainId, newSum);\n    }\n\n    /// @dev Revokes user voting power from a removed nominee.\n    /// @param account Address of the removed nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    function revokeRemovedNomineeVotingPower(bytes32 account, uint256 chainId) external {\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        // Check that the nominee is removed\n        if (mapRemovedNominees[nomineeHash] == 0) {\n            revert NomineeNotRemoved(account, chainId);\n        }\n\n        // Get the user old slope\n        VotedSlope memory oldSlope = voteUserSlopes[msg.sender][nomineeHash];\n        if (oldSlope.power == 0) {\n            revert ZeroValue();\n        }\n\n        uint256 nextTime = (block.timestamp + WEEK) / WEEK * WEEK;\n        // Adjust weight and sum slope changes\n        if (oldSlope.end > nextTime) {\n            pointsWeight[nomineeHash][nextTime].slope =\n                _maxAndSub(pointsWeight[nomineeHash][nextTime].slope, oldSlope.slope);\n            pointsSum[nextTime].slope = _maxAndSub(pointsSum[nextTime].slope, oldSlope.slope);\n        }\n\n        // Cancel old slope changes if they still didn't happen\n        if (oldSlope.end > block.timestamp) {\n            changesWeight[nomineeHash][oldSlope.end] -= oldSlope.slope;\n            changesSum[oldSlope.end] -= oldSlope.slope;\n        }\n\n        // Update the voting power\n        uint256 powerUsed = voteUserPower[msg.sender];\n        powerUsed = powerUsed - oldSlope.power;\n        voteUserPower[msg.sender] = powerUsed;\n        delete voteUserSlopes[msg.sender][nomineeHash];\n\n        emit VotingPowerRevoked(msg.sender, account, chainId, powerUsed);\n    }\n\n    /// @dev Get current nominee weight.\n    /// @param account Address of the nominee in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @return Nominee weight.\n    function getNomineeWeight(bytes32 account, uint256 chainId) external view returns (uint256) {\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        return pointsWeight[nomineeHash][timeWeight[nomineeHash]].bias;\n    }\n    \n    /// @dev Get sum of nominee weights.\n    /// @return Sum of nominee weights.\n    function getWeightsSum() external view returns (uint256) {\n        return pointsSum[timeSum].bias;\n    }\n\n    /// @dev Get the total number of nominees.\n    /// @notice The zero-th default nominee Id with id == 0 does not count.\n    /// @return Total number of nominees.\n    function getNumNominees() external view returns (uint256) {\n        return setNominees.length - 1;\n    }\n\n    /// @dev Get the total number of removed nominees.\n    /// @notice The zero-th default nominee Id with id == 0 does not count.\n    /// @return Total number of removed nominees.\n    function getNumRemovedNominees() external view returns (uint256) {\n        return setRemovedNominees.length - 1;\n    }\n\n    /// @dev Gets a full set of nominees.\n    /// @notice The returned set includes the zero-th empty nominee instance.\n    /// @return Set of all the nominees in the contract.\n    function getAllNominees() external view returns (Nominee[] memory) {\n        return setNominees;\n    }\n\n    /// @dev Gets a full set of removed nominees.\n    /// @notice The returned set includes the zero-th empty nominee instance.\n    /// @return Set of all the removed nominees in the contract.\n    function getAllRemovedNominees() external view returns (Nominee[] memory) {\n        return setRemovedNominees;\n    }\n\n    /// @dev Gets the nominee Id in the global nominees set.\n    /// @param account Nominee address in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @return Nominee Id in the global set of Nominee struct values.\n    function getNomineeId(bytes32 account, uint256 chainId) external view returns (uint256) {\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        return mapNomineeIds[nomineeHash];\n    }\n\n    /// @dev Gets the removed nominee Id in the global removed nominees set.\n    /// @param account Nominee address in bytes32 form.\n    /// @param chainId Chain Id.\n    /// @return Removed nominee Id in the global set of Nominee struct values.\n    function getRemovedNomineeId(bytes32 account, uint256 chainId) external view returns (uint256) {\n        // Get the nominee struct and hash\n        Nominee memory nominee = Nominee(account, chainId);\n        bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n        return mapRemovedNominees[nomineeHash];\n    }\n\n    /// @dev Gets the nominee address and its corresponding chain Id.\n    /// @notice The zero-th default nominee Id with id == 0 does not count.\n    /// @param id Nominee Id in the global set of Nominee struct values.\n    /// @return Nominee address in bytes32 form and chain Id.\n    function getNominee(uint256 id) external view returns (Nominee memory) {\n        // Get the total number of nominees in the contract\n        uint256 totalNumNominees = setNominees.length - 1;\n        // Check for the zero id or the overflow\n        if (id == 0) {\n            revert ZeroValue();\n        } else if (id > totalNumNominees) {\n            revert Overflow(id, totalNumNominees);\n        }\n\n        return setNominees[id];\n    }\n\n    /// @dev Gets the removed nominee address and its corresponding chain Id.\n    /// @notice The zero-th default removed nominee Id with id == 0 does not count.\n    /// @param id Removed nominee Id in the global set of Nominee struct values.\n    /// @return Removed nominee address in bytes32 form and chain Id.\n    function getRemovedNominee(uint256 id) external view returns (Nominee memory) {\n        // Get the total number of nominees in the contract\n        uint256 totalNumRemovedNominees = setRemovedNominees.length - 1;\n        // Check for the zero id or the overflow\n        if (id == 0) {\n            revert ZeroValue();\n        } else if (id > totalNumRemovedNominees) {\n            revert Overflow(id, totalNumRemovedNominees);\n        }\n\n        return setRemovedNominees[id];\n    }\n\n    /// @dev Gets next allowed voting time for selected nominees and voters.\n    /// @notice The function does not check for repeated nominees and voters.\n    /// @param accounts Set of nominee account addresses.\n    /// @param chainIds Corresponding set of chain Ids.\n    /// @param voters Corresponding set of voters for specified nominees.\n    function getNextAllowedVotingTimes(\n        bytes32[] memory accounts,\n        uint256[] memory chainIds,\n        address[] memory voters\n    ) external view returns (uint256[] memory nextAllowedVotingTimes) {\n        // Check array lengths\n        if (accounts.length != chainIds.length || accounts.length != voters.length) {\n            revert WrongArrayLength(accounts.length, chainIds.length);\n        }\n\n        // Allocate the times array\n        nextAllowedVotingTimes = new uint256[](accounts.length);\n\n        // Traverse nominees and get next available voting times\n        for (uint256 i = 0; i < accounts.length; ++i) {\n            // Get the nominee struct and hash\n            Nominee memory nominee = Nominee(accounts[i], chainIds[i]);\n            bytes32 nomineeHash = keccak256(abi.encode(nominee));\n\n            // Check for nominee existence\n            if (mapNomineeIds[nomineeHash] == 0) {\n                revert NomineeDoesNotExist(accounts[i], chainIds[i]);\n            }\n\n            // Calculate next allowed voting times\n            nextAllowedVotingTimes[i] = lastUserVote[voters[i]][nomineeHash] + WEIGHT_VOTE_DELAY;\n        }\n    }\n}",
+        "keccak256": "0xd58f67364602f5658cc58e2fd92e4d5174e0846b3c2abf6e9adb1c4d75ee7ee6",
+        "license": "MIT"
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.25+commit.b61c2a91",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 1000000,
+        "enabled": true
+      },
+      "evmVersion": "cancun",
+      "remappings": []
+    },
+    "name": "VoteWeighting",
+    "fullyQualifiedName": "contracts/VoteWeighting.sol:VoteWeighting"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "2812567",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T16:36:02Z",
+  "match": "exact_match",
+  "chainId": "1",
+  "address": "0x95418b46d5566D3d1ea62C12Aea91227E566c5c1"
+}
