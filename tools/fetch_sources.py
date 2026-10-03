@@ -380,15 +380,15 @@ def solana(entry):
     if not m:raise RuntimeError('No Solana program address')
     program=m.group(1);endpoint='https://verify.osec.io/status/'+program
     obj=get_json(endpoint)
-    if not obj.get('is_verified'):raise RuntimeError('No verified source repository for this Solana account')
     url=obj.get('repo_url') or obj.get('git_url') or obj.get('repository_url')
     parsed=urllib.parse.urlsplit(url or '')
     if parsed.netloc!='github.com':raise RuntimeError('Verification registry does not expose a supported GitHub source repository')
     parts=parsed.path.strip('/').split('/');owner,repo=parts[:2];repo=repo.removesuffix('.git')
     commit=obj.get('commit') or obj.get('commit_hash') or obj.get('commitHash') or repo_info(owner,repo)['default_branch']
+    if str(commit).lower() in ('none','null',''):commit=repo_info(owner,repo)['default_branch']
     snapshot=archive_repo(owner,repo,commit)
     dest=OUT/'solana'/program/'verification.json';save_json(dest,obj)
-    return {'status':'fetched','kind':'solana_verified_repository','verification':relative(dest),'retrieval_url':endpoint,**snapshot}
+    return {'status':'fetched','kind':'solana_verified_repository' if obj.get('is_verified') else 'solana_registry_repository','onchain_verification_matches':bool(obj.get('is_verified')),'verification':relative(dest),'retrieval_url':endpoint,**snapshot}
 
 CHAIN_IDS = {
  'explorer.immutable.com':13371,'explorer.immutable.com/':13371,'explorer.abstractchain.io':2741,'abscan.org':2741,'opbnb.bscscan.com':204,'explorer.kava.io':2222,'explorer.kroma.network':255,'explorer.metis.io':1088,'explorer.zora.energy':7777777,
@@ -419,7 +419,7 @@ def ipfs_bytes(cid):
             if isinstance(result,Exception):raise result
             return result
         errors=[]
-        for gateway in ('https://ipfs.io/ipfs/','https://dweb.link/ipfs/'):
+        for gateway in ('https://gateway.pinata.cloud/ipfs/','https://ipfs.io/ipfs/','https://dweb.link/ipfs/'):
             try:
                 path,_=download(gateway+cid,retries=1,timeout=25);body=path.read_bytes();path.unlink(missing_ok=True);IPFS_CACHE[cid]=body;return body
             except Exception as e:errors.append(str(e))
