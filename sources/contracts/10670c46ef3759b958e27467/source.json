@@ -1,0 +1,933 @@
+{
+  "sources": {
+    "contracts/globalMarkets/portfolioToken/portfolioVault/PortfolioVault.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity 0.8.33;\n\nimport {\n  IPortfolioVault\n} from \"contracts/globalMarkets/portfolioToken/portfolioVault/IPortfolioVault.sol\";\nimport {\n  AccessControlEnumerable\n} from \"contracts/external/openzeppelin/contracts/access/AccessControlEnumerable.sol\";\nimport {\n  ReentrancyGuardTransient\n} from \"contracts/external/openzeppelin/contracts/security/ReentrancyGuardTransient.sol\";\nimport {IERC20} from \"contracts/external/openzeppelin/contracts/token/IERC20.sol\";\nimport {SafeERC20} from \"contracts/external/openzeppelin/contracts/token/SafeERC20.sol\";\n\n/**\n * @title  PortfolioVault\n * @author Ondo Finance\n * @notice Per-portfolio-token custody contract. Deposits are immediately\n *         forwarded to an external custody address; withdrawals push tokens from\n *         the vault's own balance to the caller. Only addresses with\n *         ORCHESTRATOR_ROLE can deposit or withdraw; no allowances are issued\n *         by the vault.\n *\n *         Not upgradeable — replacement is a new deploy plus\n *         `PortfolioOrchestrator.setVaultAddress`.\n */\ncontract PortfolioVault is IPortfolioVault, AccessControlEnumerable, ReentrancyGuardTransient {\n  using SafeERC20 for IERC20;\n\n  /// Role granted to the PortfolioOrchestrator(s) permitted to deposit / withdraw.\n  bytes32 public constant ORCHESTRATOR_ROLE = keccak256(\"ORCHESTRATOR_ROLE\");\n\n  /// The external custody destination that receives forwarded deposits.\n  address public immutable custodyAddress;\n\n  /// The portfolio token this vault serves (for traceability / off-chain indexing).\n  address public immutable portfolioToken;\n\n  /**\n   * @notice Event emitted when tokens are deposited and forwarded to custody\n   * @param  token       The token that was forwarded\n   * @param  destination The custody address that received the tokens\n   * @param  amount      The amount forwarded, in the token's native decimals\n   */\n  event Deposited(address indexed token, address indexed destination, uint256 amount);\n\n  /**\n   * @notice Event emitted when tokens are withdrawn from the vault to the caller\n   * @param  token     The token that was withdrawn\n   * @param  recipient The address that received the tokens (the orchestrator caller)\n   * @param  amount    The amount withdrawn, in the token's native decimals\n   */\n  event Withdrawn(address indexed token, address indexed recipient, uint256 amount);\n\n  /**\n   * @notice Event emitted when tokens are rescued from the contract via `retrieveTokens`\n   * @param  token     The address of the token that was retrieved\n   * @param  recipient The address that received the tokens\n   * @param  amount    The amount retrieved, in the token's native decimals\n   */\n  event TokensRetrieved(address indexed token, address indexed recipient, uint256 amount);\n\n  /// Error emitted when a withdrawal is requested for more than the vault's balance\n  error InsufficientBalance(address token, uint256 requested, uint256 available);\n\n  /// Error emitted when the orchestrator address provided to the constructor is zero\n  error OrchestratorAddressCantBeZero();\n\n  /// Error emitted when the custody address provided to the constructor is zero\n  error CustodyAddressCantBeZero();\n\n  /// Error emitted when the portfolio token address provided to the constructor is zero\n  error PortfolioTokenAddressCantBeZero();\n\n  /// Error emitted when the default admin address provided to the constructor is zero\n  error DefaultAdminZeroAddress();\n\n  /**\n   * @param _defaultAdmin   The DEFAULT_ADMIN_ROLE grantee (gates `retrieveTokens`\n   *                        and grant/revoke of ORCHESTRATOR_ROLE)\n   * @param _orchestrator   The initial ORCHESTRATOR_ROLE grantee\n   * @param _custodyAddress The external custody address that receives deposits\n   * @param _portfolioToken The portfolio token this vault serves\n   */\n  constructor(\n    address _defaultAdmin,\n    address _orchestrator,\n    address _custodyAddress,\n    address _portfolioToken\n  ) {\n    if (_defaultAdmin == address(0)) revert DefaultAdminZeroAddress();\n    if (_orchestrator == address(0)) revert OrchestratorAddressCantBeZero();\n    if (_custodyAddress == address(0)) revert CustodyAddressCantBeZero();\n    if (_portfolioToken == address(0)) revert PortfolioTokenAddressCantBeZero();\n\n    custodyAddress = _custodyAddress;\n    portfolioToken = _portfolioToken;\n\n    _grantRole(DEFAULT_ADMIN_ROLE, _defaultAdmin);\n    _grantRole(ORCHESTRATOR_ROLE, _orchestrator);\n  }\n\n  /**\n   * @notice Pull `amount` of `token` from the caller and forward it on to the\n   *         external custody address. The caller must have approved the vault for\n   *         at least `amount` prior to the call. Token movement is performed\n   *         entirely by the vault — the caller only grants the allowance and\n   *         triggers the transfer.\n   * @param  token  The token to pull and forward\n   * @param  amount The amount to pull and forward\n   */\n  function deposit(address token, uint256 amount)\n    external\n    nonReentrant\n    onlyRole(ORCHESTRATOR_ROLE)\n  {\n    IERC20(token).safeTransferFrom(msg.sender, custodyAddress, amount);\n    emit Deposited(token, custodyAddress, amount);\n  }\n\n  /**\n   * @notice Send `amount` of `token` from this vault to the caller. Reverts\n   *         with `InsufficientBalance` if the vault hasn't yet been funded\n   *         with at least `amount` of `token`.\n   * @param  token  The token to withdraw\n   * @param  amount The amount to withdraw to the caller\n   */\n  function withdraw(address token, uint256 amount)\n    external\n    nonReentrant\n    onlyRole(ORCHESTRATOR_ROLE)\n  {\n    uint256 available = IERC20(token).balanceOf(address(this));\n    if (available < amount) revert InsufficientBalance(token, amount, available);\n    IERC20(token).safeTransfer(msg.sender, amount);\n    emit Withdrawn(token, msg.sender, amount);\n  }\n\n  /**\n   * @notice Rescue tokens locked in this contract (e.g. airdrops, stuck dust).\n   * @param  token  The address of the token\n   * @param  to     The address of the recipient\n   * @param  amount The amount of token to transfer\n   */\n  function retrieveTokens(address token, address to, uint256 amount)\n    external\n    onlyRole(DEFAULT_ADMIN_ROLE)\n  {\n    IERC20(token).safeTransfer(to, amount);\n    emit TokensRetrieved(token, to, amount);\n  }\n}\n"
+    },
+    "contracts/globalMarkets/portfolioToken/portfolioVault/IPortfolioVault.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity ^0.8.4;\n\n/**\n * @title  IPortfolioVault\n * @author Ondo Finance\n * @notice Standardized custody interface for a portfolio token's vault.\n *         Each portfolio token has one vault. The orchestrator pushes assets\n *         in via `deposit` and pulls them back out via `withdraw`. Vaults\n *         implement their own custody policy behind this interface (e.g.\n *         immediate forwarding to an external custody address).\n *\n *         Deposits require the caller to approve the vault first — the vault\n *         pulls tokens via `safeTransferFrom`. Withdrawals push tokens out\n *         of the vault directly.\n */\ninterface IPortfolioVault {\n  // ─────────────────────────────────────────────────────────────────────────────\n  // Core Functions\n  // ─────────────────────────────────────────────────────────────────────────────\n\n  function deposit(address token, uint256 amount) external;\n\n  function withdraw(address token, uint256 amount) external;\n\n  function retrieveTokens(address token, address to, uint256 amount) external;\n\n  // ─────────────────────────────────────────────────────────────────────────────\n  // View Functions\n  // ─────────────────────────────────────────────────────────────────────────────\n\n  function custodyAddress() external view returns (address);\n\n  function portfolioToken() external view returns (address);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/access/AccessControlEnumerable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControlEnumerable.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/access/IAccessControlEnumerable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/access/AccessControl.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/EnumerableSet.sol\";\n\n/**\n * @dev Extension of {AccessControl} that allows enumerating the members of each role.\n */\nabstract contract AccessControlEnumerable is\n  IAccessControlEnumerable,\n  AccessControl\n{\n  using EnumerableSet for EnumerableSet.AddressSet;\n\n  mapping(bytes32 => EnumerableSet.AddressSet) private _roleMembers;\n\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return\n      interfaceId == type(IAccessControlEnumerable).interfaceId ||\n      super.supportsInterface(interfaceId);\n  }\n\n  /**\n   * @dev Returns one of the accounts that have `role`. `index` must be a\n   * value between 0 and {getRoleMemberCount}, non-inclusive.\n   *\n   * Role bearers are not sorted in any particular way, and their ordering may\n   * change at any point.\n   *\n   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure\n   * you perform all queries on the same block. See the following\n   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]\n   * for more information.\n   */\n  function getRoleMember(bytes32 role, uint256 index)\n    public\n    view\n    virtual\n    override\n    returns (address)\n  {\n    return _roleMembers[role].at(index);\n  }\n\n  /**\n   * @dev Returns the number of accounts that have `role`. Can be used\n   * together with {getRoleMember} to enumerate all bearers of a role.\n   */\n  function getRoleMemberCount(bytes32 role)\n    public\n    view\n    virtual\n    override\n    returns (uint256)\n  {\n    return _roleMembers[role].length();\n  }\n\n  /**\n   * @dev Overload {_grantRole} to track enumerable memberships\n   */\n  function _grantRole(bytes32 role, address account) internal virtual override {\n    super._grantRole(role, account);\n    _roleMembers[role].add(account);\n  }\n\n  /**\n   * @dev Overload {_revokeRole} to track enumerable memberships\n   */\n  function _revokeRole(bytes32 role, address account)\n    internal\n    virtual\n    override\n  {\n    super._revokeRole(role, account);\n    _roleMembers[role].remove(account);\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/security/ReentrancyGuardTransient.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.5.0) (utils/ReentrancyGuardTransient.sol)\n\npragma solidity ^0.8.24;\n\nimport {TransientSlot} from \"./TransientSlot.sol\";\n\n/**\n * @dev Variant of {ReentrancyGuard} that uses transient storage.\n *\n * NOTE: This variant only works on networks where EIP-1153 is available.\n *\n * _Available since v5.1._\n *\n * @custom:stateless\n */\nabstract contract ReentrancyGuardTransient {\n    using TransientSlot for *;\n\n    // keccak256(abi.encode(uint256(keccak256(\"openzeppelin.storage.ReentrancyGuard\")) - 1)) & ~bytes32(uint256(0xff))\n    bytes32 private constant REENTRANCY_GUARD_STORAGE =\n        0x9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00;\n\n    /**\n     * @dev Unauthorized reentrant call.\n     */\n    error ReentrancyGuardReentrantCall();\n\n    /**\n     * @dev Prevents a contract from calling itself, directly or indirectly.\n     * Calling a `nonReentrant` function from another `nonReentrant`\n     * function is not supported. It is possible to prevent this from happening\n     * by making the `nonReentrant` function external, and making it call a\n     * `private` function that does the actual work.\n     */\n    modifier nonReentrant() {\n        _nonReentrantBefore();\n        _;\n        _nonReentrantAfter();\n    }\n\n    /**\n     * @dev A `view` only version of {nonReentrant}. Use to block view functions\n     * from being called, preventing reading from inconsistent contract state.\n     *\n     * CAUTION: This is a \"view\" modifier and does not change the reentrancy\n     * status. Use it only on view functions. For payable or non-payable functions,\n     * use the standard {nonReentrant} modifier instead.\n     */\n    modifier nonReentrantView() {\n        _nonReentrantBeforeView();\n        _;\n    }\n\n    function _nonReentrantBeforeView() private view {\n        if (_reentrancyGuardEntered()) {\n            revert ReentrancyGuardReentrantCall();\n        }\n    }\n\n    function _nonReentrantBefore() private {\n        // On the first call to nonReentrant, REENTRANCY_GUARD_STORAGE.asBoolean().tload() will be false\n        _nonReentrantBeforeView();\n\n        // Any calls to nonReentrant after this point will fail\n        _reentrancyGuardStorageSlot().asBoolean().tstore(true);\n    }\n\n    function _nonReentrantAfter() private {\n        _reentrancyGuardStorageSlot().asBoolean().tstore(false);\n    }\n\n    /**\n     * @dev Returns true if the reentrancy guard is currently set to \"entered\", which indicates there is a\n     * `nonReentrant` function in the call stack.\n     */\n    function _reentrancyGuardEntered() internal view returns (bool) {\n        return _reentrancyGuardStorageSlot().asBoolean().tload();\n    }\n\n    function _reentrancyGuardStorageSlot() internal pure virtual returns (bytes32) {\n        return REENTRANCY_GUARD_STORAGE;\n    }\n}"
+    },
+    "contracts/external/openzeppelin/contracts/token/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n  /**\n   * @dev Returns the amount of tokens in existence.\n   */\n  function totalSupply() external view returns (uint256);\n\n  /**\n   * @dev Returns the amount of tokens owned by `account`.\n   */\n  function balanceOf(address account) external view returns (uint256);\n\n  /**\n   * @dev Moves `amount` tokens from the caller's account to `to`.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * Emits a {Transfer} event.\n   */\n  function transfer(address to, uint256 amount) external returns (bool);\n\n  /**\n   * @dev Returns the remaining number of tokens that `spender` will be\n   * allowed to spend on behalf of `owner` through {transferFrom}. This is\n   * zero by default.\n   *\n   * This value changes when {approve} or {transferFrom} are called.\n   */\n  function allowance(address owner, address spender)\n    external\n    view\n    returns (uint256);\n\n  /**\n   * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * IMPORTANT: Beware that changing an allowance with this method brings the risk\n   * that someone may use both the old and the new allowance by unfortunate\n   * transaction ordering. One possible solution to mitigate this race\n   * condition is to first reduce the spender's allowance to 0 and set the\n   * desired value afterwards:\n   * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n   *\n   * Emits an {Approval} event.\n   */\n  function approve(address spender, uint256 amount) external returns (bool);\n\n  /**\n   * @dev Moves `amount` tokens from `from` to `to` using the\n   * allowance mechanism. `amount` is then deducted from the caller's\n   * allowance.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * Emits a {Transfer} event.\n   */\n  function transferFrom(\n    address from,\n    address to,\n    uint256 amount\n  ) external returns (bool);\n\n  /**\n   * @dev Emitted when `value` tokens are moved from one account (`from`) to\n   * another (`to`).\n   *\n   * Note that `value` may be zero.\n   */\n  event Transfer(address indexed from, address indexed to, uint256 value);\n\n  /**\n   * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n   * a call to {approve}. `value` is the new allowance.\n   */\n  event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/token/SafeERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.2.0) (token/ERC20/utils/SafeERC20.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/token/IERC20.sol\";\n\n/**\n * @title SafeERC20\n * @dev Wrappers around ERC-20 operations that throw on failure (when the token\n * contract returns false). Tokens that return no value (and instead revert or\n * throw on failure) are also supported, non-reverting calls are assumed to be\n * successful.\n * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,\n * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.\n */\nlibrary SafeERC20 {\n    /**\n     * @dev An operation with an ERC-20 token failed.\n     */\n    error SafeERC20FailedOperation(address token);\n\n    /**\n     * @dev Indicates a failed `decreaseAllowance` request.\n     */\n    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);\n\n    /**\n     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful.\n     */\n    function safeTransfer(IERC20 token, address to, uint256 value) internal {\n        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));\n    }\n\n    /**\n     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the\n     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.\n     */\n    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {\n        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));\n    }\n\n    /**\n     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful.\n     *\n     * IMPORTANT: If the token implements ERC-7674 (ERC-20 with temporary allowance), and if the \"client\"\n     * smart contract uses ERC-7674 to set temporary allowances, then the \"client\" smart contract should avoid using\n     * this function. Performing a {safeIncreaseAllowance} or {safeDecreaseAllowance} operation on a token contract\n     * that has a non-zero temporary allowance (for that particular owner-spender) will result in unexpected behavior.\n     */\n    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {\n        uint256 oldAllowance = token.allowance(address(this), spender);\n        forceApprove(token, spender, oldAllowance + value);\n    }\n\n    /**\n     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no\n     * value, non-reverting calls are assumed to be successful.\n     *\n     * IMPORTANT: If the token implements ERC-7674 (ERC-20 with temporary allowance), and if the \"client\"\n     * smart contract uses ERC-7674 to set temporary allowances, then the \"client\" smart contract should avoid using\n     * this function. Performing a {safeIncreaseAllowance} or {safeDecreaseAllowance} operation on a token contract\n     * that has a non-zero temporary allowance (for that particular owner-spender) will result in unexpected behavior.\n     */\n    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {\n        unchecked {\n            uint256 currentAllowance = token.allowance(address(this), spender);\n            if (currentAllowance < requestedDecrease) {\n                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);\n            }\n            forceApprove(token, spender, currentAllowance - requestedDecrease);\n        }\n    }\n\n    /**\n     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval\n     * to be set to zero before setting it to a non-zero value, such as USDT.\n     *\n     * NOTE: If the token implements ERC-7674, this function will not modify any temporary allowance. This function\n     * only sets the \"standard\" allowance. Any temporary allowance will remain active, in addition to the value being\n     * set here.\n     */\n    function forceApprove(IERC20 token, address spender, uint256 value) internal {\n        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));\n\n        if (!_callOptionalReturnBool(token, approvalCall)) {\n            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));\n            _callOptionalReturn(token, approvalCall);\n        }\n    }\n\n    /**\n     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement\n     * on the return value: the return value is optional (but if data is returned, it must not be false).\n     * @param token The token targeted by the call.\n     * @param data The call data (encoded using abi.encode or one of its variants).\n     *\n     * This is a variant of {_callOptionalReturnBool} that reverts if call fails to meet the requirements.\n     */\n    function _callOptionalReturn(IERC20 token, bytes memory data) private {\n        uint256 returnSize;\n        uint256 returnValue;\n        assembly (\"memory-safe\") {\n            let success := call(gas(), token, 0, add(data, 0x20), mload(data), 0, 0x20)\n            // bubble errors\n            if iszero(success) {\n                let ptr := mload(0x40)\n                returndatacopy(ptr, 0, returndatasize())\n                revert(ptr, returndatasize())\n            }\n            returnSize := returndatasize()\n            returnValue := mload(0)\n        }\n\n        if (returnSize == 0 ? address(token).code.length == 0 : returnValue != 1) {\n            revert SafeERC20FailedOperation(address(token));\n        }\n    }\n\n    /**\n     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement\n     * on the return value: the return value is optional (but if data is returned, it must not be false).\n     * @param token The token targeted by the call.\n     * @param data The call data (encoded using abi.encode or one of its variants).\n     *\n     * This is a variant of {_callOptionalReturn} that silently catches all reverts and returns a bool instead.\n     */\n    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {\n        bool success;\n        uint256 returnSize;\n        uint256 returnValue;\n        assembly (\"memory-safe\") {\n            success := call(gas(), token, 0, add(data, 0x20), mload(data), 0, 0x20)\n            returnSize := returndatasize()\n            returnValue := mload(0)\n        }\n        return success && (returnSize == 0 ? address(token).code.length > 0 : returnValue == 1);\n    }\n}"
+    },
+    "contracts/external/openzeppelin/contracts/access/IAccessControlEnumerable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (access/IAccessControlEnumerable.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/access/IAccessControl.sol\";\n\n/**\n * @dev External interface of AccessControlEnumerable declared to support ERC165 detection.\n */\ninterface IAccessControlEnumerable is IAccessControl {\n  /**\n   * @dev Returns one of the accounts that have `role`. `index` must be a\n   * value between 0 and {getRoleMemberCount}, non-inclusive.\n   *\n   * Role bearers are not sorted in any particular way, and their ordering may\n   * change at any point.\n   *\n   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure\n   * you perform all queries on the same block. See the following\n   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]\n   * for more information.\n   */\n  function getRoleMember(bytes32 role, uint256 index)\n    external\n    view\n    returns (address);\n\n  /**\n   * @dev Returns the number of accounts that have `role`. Can be used\n   * together with {getRoleMember} to enumerate all bearers of a role.\n   */\n  function getRoleMemberCount(bytes32 role) external view returns (uint256);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/access/AccessControl.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControl.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/access/IAccessControl.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/Context.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/Strings.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/ERC165.sol\";\n\n/**\n * @dev Contract module that allows children to implement role-based access\n * control mechanisms. This is a lightweight version that doesn't allow enumerating role\n * members except through off-chain means by accessing the contract event logs. Some\n * applications may benefit from on-chain enumerability, for those cases see\n * {AccessControlEnumerable}.\n *\n * Roles are referred to by their `bytes32` identifier. These should be exposed\n * in the external API and be unique. The best way to achieve this is by\n * using `public constant` hash digests:\n *\n * ```\n * bytes32 public constant MY_ROLE = keccak256(\"MY_ROLE\");\n * ```\n *\n * Roles can be used to represent a set of permissions. To restrict access to a\n * function call, use {hasRole}:\n *\n * ```\n * function foo() public {\n *     require(hasRole(MY_ROLE, msg.sender));\n *     ...\n * }\n * ```\n *\n * Roles can be granted and revoked dynamically via the {grantRole} and\n * {revokeRole} functions. Each role has an associated admin role, and only\n * accounts that have a role's admin role can call {grantRole} and {revokeRole}.\n *\n * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means\n * that only accounts with this role will be able to grant or revoke other\n * roles. More complex role relationships can be created by using\n * {_setRoleAdmin}.\n *\n * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to\n * grant and revoke this role. Extra precautions should be taken to secure\n * accounts that have been granted it.\n */\nabstract contract AccessControl is Context, IAccessControl, ERC165 {\n  struct RoleData {\n    mapping(address => bool) members;\n    bytes32 adminRole;\n  }\n\n  mapping(bytes32 => RoleData) private _roles;\n\n  bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;\n\n  /**\n   * @dev Modifier that checks that an account has a specific role. Reverts\n   * with a standardized message including the required role.\n   *\n   * The format of the revert reason is given by the following regular expression:\n   *\n   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/\n   *\n   * _Available since v4.1._\n   */\n  modifier onlyRole(bytes32 role) {\n    _checkRole(role, _msgSender());\n    _;\n  }\n\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return\n      interfaceId == type(IAccessControl).interfaceId ||\n      super.supportsInterface(interfaceId);\n  }\n\n  /**\n   * @dev Returns `true` if `account` has been granted `role`.\n   */\n  function hasRole(bytes32 role, address account)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return _roles[role].members[account];\n  }\n\n  /**\n   * @dev Revert with a standard message if `account` is missing `role`.\n   *\n   * The format of the revert reason is given by the following regular expression:\n   *\n   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/\n   */\n  function _checkRole(bytes32 role, address account) internal view virtual {\n    if (!hasRole(role, account)) {\n      revert(\n        string(\n          abi.encodePacked(\n            \"AccessControl: account \",\n            Strings.toHexString(uint160(account), 20),\n            \" is missing role \",\n            Strings.toHexString(uint256(role), 32)\n          )\n        )\n      );\n    }\n  }\n\n  /**\n   * @dev Returns the admin role that controls `role`. See {grantRole} and\n   * {revokeRole}.\n   *\n   * To change a role's admin, use {_setRoleAdmin}.\n   */\n  function getRoleAdmin(bytes32 role)\n    public\n    view\n    virtual\n    override\n    returns (bytes32)\n  {\n    return _roles[role].adminRole;\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function grantRole(bytes32 role, address account)\n    public\n    virtual\n    override\n    onlyRole(getRoleAdmin(role))\n  {\n    _grantRole(role, account);\n  }\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * If `account` had been granted `role`, emits a {RoleRevoked} event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function revokeRole(bytes32 role, address account)\n    public\n    virtual\n    override\n    onlyRole(getRoleAdmin(role))\n  {\n    _revokeRole(role, account);\n  }\n\n  /**\n   * @dev Revokes `role` from the calling account.\n   *\n   * Roles are often managed via {grantRole} and {revokeRole}: this function's\n   * purpose is to provide a mechanism for accounts to lose their privileges\n   * if they are compromised (such as when a trusted device is misplaced).\n   *\n   * If the calling account had been revoked `role`, emits a {RoleRevoked}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must be `account`.\n   */\n  function renounceRole(bytes32 role, address account) public virtual override {\n    require(\n      account == _msgSender(),\n      \"AccessControl: can only renounce roles for self\"\n    );\n\n    _revokeRole(role, account);\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event. Note that unlike {grantRole}, this function doesn't perform any\n   * checks on the calling account.\n   *\n   * [WARNING]\n   * ====\n   * This function should only be called from the constructor when setting\n   * up the initial roles for the system.\n   *\n   * Using this function in any other way is effectively circumventing the admin\n   * system imposed by {AccessControl}.\n   * ====\n   *\n   * NOTE: This function is deprecated in favor of {_grantRole}.\n   */\n  function _setupRole(bytes32 role, address account) internal virtual {\n    _grantRole(role, account);\n  }\n\n  /**\n   * @dev Sets `adminRole` as ``role``'s admin role.\n   *\n   * Emits a {RoleAdminChanged} event.\n   */\n  function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {\n    bytes32 previousAdminRole = getRoleAdmin(role);\n    _roles[role].adminRole = adminRole;\n    emit RoleAdminChanged(role, previousAdminRole, adminRole);\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * Internal function without access restriction.\n   */\n  function _grantRole(bytes32 role, address account) internal virtual {\n    if (!hasRole(role, account)) {\n      _roles[role].members[account] = true;\n      emit RoleGranted(role, account, _msgSender());\n    }\n  }\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * Internal function without access restriction.\n   */\n  function _revokeRole(bytes32 role, address account) internal virtual {\n    if (hasRole(role, account)) {\n      _roles[role].members[account] = false;\n      emit RoleRevoked(role, account, _msgSender());\n    }\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/EnumerableSet.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/structs/EnumerableSet.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Library for managing\n * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive\n * types.\n *\n * Sets have the following properties:\n *\n * - Elements are added, removed, and checked for existence in constant time\n * (O(1)).\n * - Elements are enumerated in O(n). No guarantees are made on the ordering.\n *\n * ```\n * contract Example {\n *     // Add the library methods\n *     using EnumerableSet for EnumerableSet.AddressSet;\n *\n *     // Declare a set state variable\n *     EnumerableSet.AddressSet private mySet;\n * }\n * ```\n *\n * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)\n * and `uint256` (`UintSet`) are supported.\n */\nlibrary EnumerableSet {\n  // To implement this library for multiple types with as little code\n  // repetition as possible, we write it in terms of a generic Set type with\n  // bytes32 values.\n  // The Set implementation uses private functions, and user-facing\n  // implementations (such as AddressSet) are just wrappers around the\n  // underlying Set.\n  // This means that we can only create new EnumerableSets for types that fit\n  // in bytes32.\n\n  struct Set {\n    // Storage of set values\n    bytes32[] _values;\n    // Position of the value in the `values` array, plus 1 because index 0\n    // means a value is not in the set.\n    mapping(bytes32 => uint256) _indexes;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function _add(Set storage set, bytes32 value) private returns (bool) {\n    if (!_contains(set, value)) {\n      set._values.push(value);\n      // The value is stored at length-1, but we add 1 to all indexes\n      // and use 0 as a sentinel value\n      set._indexes[value] = set._values.length;\n      return true;\n    } else {\n      return false;\n    }\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function _remove(Set storage set, bytes32 value) private returns (bool) {\n    // We read and store the value's index to prevent multiple reads from the same storage slot\n    uint256 valueIndex = set._indexes[value];\n\n    if (valueIndex != 0) {\n      // Equivalent to contains(set, value)\n      // To delete an element from the _values array in O(1), we swap the element to delete with the last one in\n      // the array, and then remove the last element (sometimes called as 'swap and pop').\n      // This modifies the order of the array, as noted in {at}.\n\n      uint256 toDeleteIndex = valueIndex - 1;\n      uint256 lastIndex = set._values.length - 1;\n\n      if (lastIndex != toDeleteIndex) {\n        bytes32 lastvalue = set._values[lastIndex];\n\n        // Move the last value to the index where the value to delete is\n        set._values[toDeleteIndex] = lastvalue;\n        // Update the index for the moved value\n        set._indexes[lastvalue] = valueIndex; // Replace lastvalue's index to valueIndex\n      }\n\n      // Delete the slot where the moved value was stored\n      set._values.pop();\n\n      // Delete the index for the deleted slot\n      delete set._indexes[value];\n\n      return true;\n    } else {\n      return false;\n    }\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function _contains(Set storage set, bytes32 value)\n    private\n    view\n    returns (bool)\n  {\n    return set._indexes[value] != 0;\n  }\n\n  /**\n   * @dev Returns the number of values on the set. O(1).\n   */\n  function _length(Set storage set) private view returns (uint256) {\n    return set._values.length;\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function _at(Set storage set, uint256 index) private view returns (bytes32) {\n    return set._values[index];\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function _values(Set storage set) private view returns (bytes32[] memory) {\n    return set._values;\n  }\n\n  // Bytes32Set\n\n  struct Bytes32Set {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {\n    return _add(set._inner, value);\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(Bytes32Set storage set, bytes32 value)\n    internal\n    returns (bool)\n  {\n    return _remove(set._inner, value);\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(Bytes32Set storage set, bytes32 value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, value);\n  }\n\n  /**\n   * @dev Returns the number of values in the set. O(1).\n   */\n  function length(Bytes32Set storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(Bytes32Set storage set, uint256 index)\n    internal\n    view\n    returns (bytes32)\n  {\n    return _at(set._inner, index);\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(Bytes32Set storage set)\n    internal\n    view\n    returns (bytes32[] memory)\n  {\n    return _values(set._inner);\n  }\n\n  // AddressSet\n\n  struct AddressSet {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(AddressSet storage set, address value) internal returns (bool) {\n    return _add(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(AddressSet storage set, address value)\n    internal\n    returns (bool)\n  {\n    return _remove(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(AddressSet storage set, address value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Returns the number of values in the set. O(1).\n   */\n  function length(AddressSet storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(AddressSet storage set, uint256 index)\n    internal\n    view\n    returns (address)\n  {\n    return address(uint160(uint256(_at(set._inner, index))));\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(AddressSet storage set)\n    internal\n    view\n    returns (address[] memory)\n  {\n    bytes32[] memory store = _values(set._inner);\n    address[] memory result;\n\n    assembly {\n      result := store\n    }\n\n    return result;\n  }\n\n  // UintSet\n\n  struct UintSet {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(UintSet storage set, uint256 value) internal returns (bool) {\n    return _add(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(UintSet storage set, uint256 value) internal returns (bool) {\n    return _remove(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(UintSet storage set, uint256 value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Returns the number of values on the set. O(1).\n   */\n  function length(UintSet storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(UintSet storage set, uint256 index)\n    internal\n    view\n    returns (uint256)\n  {\n    return uint256(_at(set._inner, index));\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(UintSet storage set)\n    internal\n    view\n    returns (uint256[] memory)\n  {\n    bytes32[] memory store = _values(set._inner);\n    uint256[] memory result;\n\n    assembly {\n      result := store\n    }\n\n    return result;\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/security/TransientSlot.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.3.0) (utils/TransientSlot.sol)\n// This file was procedurally generated from scripts/generate/templates/TransientSlot.js.\n\npragma solidity ^0.8.24;\n\n/**\n * @dev Library for reading and writing value-types to specific transient storage slots.\n *\n * Transient slots are often used to store temporary values that are removed after the current transaction.\n * This library helps with reading and writing to such slots without the need for inline assembly.\n *\n *  * Example reading and writing values using transient storage:\n * ```solidity\n * contract Lock {\n *     using TransientSlot for *;\n *\n *     // Define the slot. Alternatively, use the SlotDerivation library to derive the slot.\n *     bytes32 internal constant _LOCK_SLOT = 0xf4678858b2b588224636b8522b729e7722d32fc491da849ed75b3fdf3c84f542;\n *\n *     modifier locked() {\n *         require(!_LOCK_SLOT.asBoolean().tload());\n *\n *         _LOCK_SLOT.asBoolean().tstore(true);\n *         _;\n *         _LOCK_SLOT.asBoolean().tstore(false);\n *     }\n * }\n * ```\n *\n * TIP: Consider using this library along with {SlotDerivation}.\n */\nlibrary TransientSlot {\n    /**\n     * @dev UDVT that represents a slot holding an address.\n     */\n    type AddressSlot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a AddressSlot.\n     */\n    function asAddress(bytes32 slot) internal pure returns (AddressSlot) {\n        return AddressSlot.wrap(slot);\n    }\n\n    /**\n     * @dev UDVT that represents a slot holding a bool.\n     */\n    type BooleanSlot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a BooleanSlot.\n     */\n    function asBoolean(bytes32 slot) internal pure returns (BooleanSlot) {\n        return BooleanSlot.wrap(slot);\n    }\n\n    /**\n     * @dev UDVT that represents a slot holding a bytes32.\n     */\n    type Bytes32Slot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a Bytes32Slot.\n     */\n    function asBytes32(bytes32 slot) internal pure returns (Bytes32Slot) {\n        return Bytes32Slot.wrap(slot);\n    }\n\n    /**\n     * @dev UDVT that represents a slot holding a uint256.\n     */\n    type Uint256Slot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a Uint256Slot.\n     */\n    function asUint256(bytes32 slot) internal pure returns (Uint256Slot) {\n        return Uint256Slot.wrap(slot);\n    }\n\n    /**\n     * @dev UDVT that represents a slot holding a int256.\n     */\n    type Int256Slot is bytes32;\n\n    /**\n     * @dev Cast an arbitrary slot to a Int256Slot.\n     */\n    function asInt256(bytes32 slot) internal pure returns (Int256Slot) {\n        return Int256Slot.wrap(slot);\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(AddressSlot slot) internal view returns (address value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(AddressSlot slot, address value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(BooleanSlot slot) internal view returns (bool value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(BooleanSlot slot, bool value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(Bytes32Slot slot) internal view returns (bytes32 value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(Bytes32Slot slot, bytes32 value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(Uint256Slot slot) internal view returns (uint256 value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(Uint256Slot slot, uint256 value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n\n    /**\n     * @dev Load the value held at location `slot` in transient storage.\n     */\n    function tload(Int256Slot slot) internal view returns (int256 value) {\n        assembly (\"memory-safe\") {\n            value := tload(slot)\n        }\n    }\n\n    /**\n     * @dev Store `value` at location `slot` in transient storage.\n     */\n    function tstore(Int256Slot slot, int256 value) internal {\n        assembly (\"memory-safe\") {\n            tstore(slot, value)\n        }\n    }\n}"
+    },
+    "contracts/external/openzeppelin/contracts/access/IAccessControl.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev External interface of AccessControl declared to support ERC165 detection.\n */\ninterface IAccessControl {\n  /**\n   * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`\n   *\n   * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite\n   * {RoleAdminChanged} not being emitted signaling this.\n   *\n   * _Available since v3.1._\n   */\n  event RoleAdminChanged(\n    bytes32 indexed role,\n    bytes32 indexed previousAdminRole,\n    bytes32 indexed newAdminRole\n  );\n\n  /**\n   * @dev Emitted when `account` is granted `role`.\n   *\n   * `sender` is the account that originated the contract call, an admin role\n   * bearer except when using {AccessControl-_setupRole}.\n   */\n  event RoleGranted(\n    bytes32 indexed role,\n    address indexed account,\n    address indexed sender\n  );\n\n  /**\n   * @dev Emitted when `account` is revoked `role`.\n   *\n   * `sender` is the account that originated the contract call:\n   *   - if using `revokeRole`, it is the admin role bearer\n   *   - if using `renounceRole`, it is the role bearer (i.e. `account`)\n   */\n  event RoleRevoked(\n    bytes32 indexed role,\n    address indexed account,\n    address indexed sender\n  );\n\n  /**\n   * @dev Returns `true` if `account` has been granted `role`.\n   */\n  function hasRole(bytes32 role, address account) external view returns (bool);\n\n  /**\n   * @dev Returns the admin role that controls `role`. See {grantRole} and\n   * {revokeRole}.\n   *\n   * To change a role's admin, use {AccessControl-_setRoleAdmin}.\n   */\n  function getRoleAdmin(bytes32 role) external view returns (bytes32);\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function grantRole(bytes32 role, address account) external;\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * If `account` had been granted `role`, emits a {RoleRevoked} event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function revokeRole(bytes32 role, address account) external;\n\n  /**\n   * @dev Revokes `role` from the calling account.\n   *\n   * Roles are often managed via {grantRole} and {revokeRole}: this function's\n   * purpose is to provide a mechanism for accounts to lose their privileges\n   * if they are compromised (such as when a trusted device is misplaced).\n   *\n   * If the calling account had been granted `role`, emits a {RoleRevoked}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must be `account`.\n   */\n  function renounceRole(bytes32 role, address account) external;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/Context.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n  function _msgSender() internal view virtual returns (address) {\n    return msg.sender;\n  }\n\n  function _msgData() internal view virtual returns (bytes calldata) {\n    return msg.data;\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/Strings.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Strings.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev String operations.\n */\nlibrary Strings {\n  bytes16 private constant _HEX_SYMBOLS = \"0123456789abcdef\";\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` decimal representation.\n   */\n  function toString(uint256 value) internal pure returns (string memory) {\n    // Inspired by OraclizeAPI's implementation - MIT licence\n    // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol\n\n    if (value == 0) {\n      return \"0\";\n    }\n    uint256 temp = value;\n    uint256 digits;\n    while (temp != 0) {\n      digits++;\n      temp /= 10;\n    }\n    bytes memory buffer = new bytes(digits);\n    while (value != 0) {\n      digits -= 1;\n      // forge-lint: disable-next-line(unsafe-typecast)\n      buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));\n      value /= 10;\n    }\n    return string(buffer);\n  }\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.\n   */\n  function toHexString(uint256 value) internal pure returns (string memory) {\n    if (value == 0) {\n      return \"0x00\";\n    }\n    uint256 temp = value;\n    uint256 length = 0;\n    while (temp != 0) {\n      length++;\n      temp >>= 8;\n    }\n    return toHexString(value, length);\n  }\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.\n   */\n  function toHexString(uint256 value, uint256 length)\n    internal\n    pure\n    returns (string memory)\n  {\n    bytes memory buffer = new bytes(2 * length + 2);\n    buffer[0] = \"0\";\n    buffer[1] = \"x\";\n    for (uint256 i = 2 * length + 1; i > 1; --i) {\n      buffer[i] = _HEX_SYMBOLS[value & 0xf];\n      value >>= 4;\n    }\n    require(value == 0, \"Strings: hex length insufficient\");\n    return string(buffer);\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/ERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/IERC165.sol\";\n\n/**\n * @dev Implementation of the {IERC165} interface.\n *\n * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check\n * for the additional interface id that will be supported. For example:\n *\n * ```solidity\n * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {\n *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);\n * }\n * ```\n *\n * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.\n */\nabstract contract ERC165 is IERC165 {\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return interfaceId == type(IERC165).interfaceId;\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n  /**\n   * @dev Returns true if this contract implements the interface defined by\n   * `interfaceId`. See the corresponding\n   * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n   * to learn more about how these ids are created.\n   *\n   * This function call must use less than 30 000 gas.\n   */\n  function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.33+commit.64118f21"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_defaultAdmin",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_orchestrator",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_custodyAddress",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_portfolioToken",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "CustodyAddressCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DefaultAdminZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "requested",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "available",
+              "type": "uint256"
+            }
+          ],
+          "name": "InsufficientBalance",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "OrchestratorAddressCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "PortfolioTokenAddressCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ReentrancyGuardReentrantCall",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "SafeERC20FailedOperation",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "destination",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Deposited",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "previousAdminRole",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "newAdminRole",
+              "type": "bytes32"
+            }
+          ],
+          "name": "RoleAdminChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            }
+          ],
+          "name": "RoleGranted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            }
+          ],
+          "name": "RoleRevoked",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokensRetrieved",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "Withdrawn",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "DEFAULT_ADMIN_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "ORCHESTRATOR_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "custodyAddress",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "deposit",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getRoleAdmin",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "index",
+              "type": "uint256"
+            }
+          ],
+          "name": "getRoleMember",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getRoleMemberCount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "grantRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "hasRole",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "portfolioToken",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "renounceRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "to",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "retrieveTokens",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "revokeRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes4",
+              "name": "interfaceId",
+              "type": "bytes4"
+            }
+          ],
+          "name": "supportsInterface",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "withdraw",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Ondo Finance",
+        "errors": {
+          "ReentrancyGuardReentrantCall()": [
+            {
+              "details": "Unauthorized reentrant call."
+            }
+          ],
+          "SafeERC20FailedOperation(address)": [
+            {
+              "details": "An operation with an ERC-20 token failed."
+            }
+          ]
+        },
+        "events": {
+          "Deposited(address,address,uint256)": {
+            "params": {
+              "amount": "The amount forwarded, in the token's native decimals",
+              "destination": "The custody address that received the tokens",
+              "token": "The token that was forwarded"
+            }
+          },
+          "RoleAdminChanged(bytes32,bytes32,bytes32)": {
+            "details": "Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole` `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite {RoleAdminChanged} not being emitted signaling this. _Available since v3.1._"
+          },
+          "RoleGranted(bytes32,address,address)": {
+            "details": "Emitted when `account` is granted `role`. `sender` is the account that originated the contract call, an admin role bearer except when using {AccessControl-_setupRole}."
+          },
+          "RoleRevoked(bytes32,address,address)": {
+            "details": "Emitted when `account` is revoked `role`. `sender` is the account that originated the contract call:   - if using `revokeRole`, it is the admin role bearer   - if using `renounceRole`, it is the role bearer (i.e. `account`)"
+          },
+          "TokensRetrieved(address,address,uint256)": {
+            "params": {
+              "amount": "The amount retrieved, in the token's native decimals",
+              "recipient": "The address that received the tokens",
+              "token": "The address of the token that was retrieved"
+            }
+          },
+          "Withdrawn(address,address,uint256)": {
+            "params": {
+              "amount": "The amount withdrawn, in the token's native decimals",
+              "recipient": "The address that received the tokens (the orchestrator caller)",
+              "token": "The token that was withdrawn"
+            }
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "constructor": {
+            "params": {
+              "_custodyAddress": "The external custody address that receives deposits",
+              "_defaultAdmin": "The DEFAULT_ADMIN_ROLE grantee (gates `retrieveTokens`                        and grant/revoke of ORCHESTRATOR_ROLE)",
+              "_orchestrator": "The initial ORCHESTRATOR_ROLE grantee",
+              "_portfolioToken": "The portfolio token this vault serves"
+            }
+          },
+          "deposit(address,uint256)": {
+            "params": {
+              "amount": "The amount to pull and forward",
+              "token": "The token to pull and forward"
+            }
+          },
+          "getRoleAdmin(bytes32)": {
+            "details": "Returns the admin role that controls `role`. See {grantRole} and {revokeRole}. To change a role's admin, use {_setRoleAdmin}."
+          },
+          "getRoleMember(bytes32,uint256)": {
+            "details": "Returns one of the accounts that have `role`. `index` must be a value between 0 and {getRoleMemberCount}, non-inclusive. Role bearers are not sorted in any particular way, and their ordering may change at any point. WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure you perform all queries on the same block. See the following https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post] for more information."
+          },
+          "getRoleMemberCount(bytes32)": {
+            "details": "Returns the number of accounts that have `role`. Can be used together with {getRoleMember} to enumerate all bearers of a role."
+          },
+          "grantRole(bytes32,address)": {
+            "details": "Grants `role` to `account`. If `account` had not been already granted `role`, emits a {RoleGranted} event. Requirements: - the caller must have ``role``'s admin role."
+          },
+          "hasRole(bytes32,address)": {
+            "details": "Returns `true` if `account` has been granted `role`."
+          },
+          "renounceRole(bytes32,address)": {
+            "details": "Revokes `role` from the calling account. Roles are often managed via {grantRole} and {revokeRole}: this function's purpose is to provide a mechanism for accounts to lose their privileges if they are compromised (such as when a trusted device is misplaced). If the calling account had been revoked `role`, emits a {RoleRevoked} event. Requirements: - the caller must be `account`."
+          },
+          "retrieveTokens(address,address,uint256)": {
+            "params": {
+              "amount": "The amount of token to transfer",
+              "to": "The address of the recipient",
+              "token": "The address of the token"
+            }
+          },
+          "revokeRole(bytes32,address)": {
+            "details": "Revokes `role` from `account`. If `account` had been granted `role`, emits a {RoleRevoked} event. Requirements: - the caller must have ``role``'s admin role."
+          },
+          "supportsInterface(bytes4)": {
+            "details": "See {IERC165-supportsInterface}."
+          },
+          "withdraw(address,uint256)": {
+            "params": {
+              "amount": "The amount to withdraw to the caller",
+              "token": "The token to withdraw"
+            }
+          }
+        },
+        "title": "PortfolioVault",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "CustodyAddressCantBeZero()": [
+            {
+              "notice": "Error emitted when the custody address provided to the constructor is zero"
+            }
+          ],
+          "DefaultAdminZeroAddress()": [
+            {
+              "notice": "Error emitted when the default admin address provided to the constructor is zero"
+            }
+          ],
+          "InsufficientBalance(address,uint256,uint256)": [
+            {
+              "notice": "Error emitted when a withdrawal is requested for more than the vault's balance"
+            }
+          ],
+          "OrchestratorAddressCantBeZero()": [
+            {
+              "notice": "Error emitted when the orchestrator address provided to the constructor is zero"
+            }
+          ],
+          "PortfolioTokenAddressCantBeZero()": [
+            {
+              "notice": "Error emitted when the portfolio token address provided to the constructor is zero"
+            }
+          ]
+        },
+        "events": {
+          "Deposited(address,address,uint256)": {
+            "notice": "Event emitted when tokens are deposited and forwarded to custody"
+          },
+          "TokensRetrieved(address,address,uint256)": {
+            "notice": "Event emitted when tokens are rescued from the contract via `retrieveTokens`"
+          },
+          "Withdrawn(address,address,uint256)": {
+            "notice": "Event emitted when tokens are withdrawn from the vault to the caller"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "ORCHESTRATOR_ROLE()": {
+            "notice": "Role granted to the PortfolioOrchestrator(s) permitted to deposit / withdraw."
+          },
+          "custodyAddress()": {
+            "notice": "The external custody destination that receives forwarded deposits."
+          },
+          "deposit(address,uint256)": {
+            "notice": "Pull `amount` of `token` from the caller and forward it on to the         external custody address. The caller must have approved the vault for         at least `amount` prior to the call. Token movement is performed         entirely by the vault — the caller only grants the allowance and         triggers the transfer."
+          },
+          "portfolioToken()": {
+            "notice": "The portfolio token this vault serves (for traceability / off-chain indexing)."
+          },
+          "retrieveTokens(address,address,uint256)": {
+            "notice": "Rescue tokens locked in this contract (e.g. airdrops, stuck dust)."
+          },
+          "withdraw(address,uint256)": {
+            "notice": "Send `amount` of `token` from this vault to the caller. Reverts         with `InsufficientBalance` if the vault hasn't yet been funded         with at least `amount` of `token`."
+          }
+        },
+        "notice": "Per-portfolio-token custody contract. Deposits are immediately         forwarded to an external custody address; withdrawals push tokens from         the vault's own balance to the caller. Only addresses with         ORCHESTRATOR_ROLE can deposit or withdraw; no allowances are issued         by the vault.         Not upgradeable — replacement is a new deploy plus         `PortfolioOrchestrator.setVaultAddress`.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/globalMarkets/portfolioToken/portfolioVault/PortfolioVault.sol": "PortfolioVault"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@aragon/=node_modules/@aragon/",
+        ":@ensdomains/=node_modules/@ensdomains/",
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":@uniswap/=node_modules/@uniswap/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":forge-tests/=forge-tests/",
+        ":hardhat-deploy/=node_modules/hardhat-deploy/",
+        ":hardhat/=node_modules/hardhat/",
+        ":lib/=lib/",
+        ":math/=node_modules/@aragon/os/contracts/lib/math/",
+        ":misc/=node_modules/@aragon/os/contracts/lib/misc/",
+        ":solidity-bytes-utils/=node_modules/solidity-bytes-utils/",
+        ":standards/=node_modules/@aragon/os/contracts/lib/standards/",
+        ":token/=node_modules/@aragon/os/contracts/lib/token/",
+        ":truffle/=node_modules/truffle/"
+      ]
+    },
+    "sources": {
+      "contracts/external/openzeppelin/contracts/access/AccessControl.sol": {
+        "keccak256": "0x0ecd514cd84bf677c4df72a09c9df014a2a33bd46faf1f57be44daca8d94c275",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2d35a4582dc4d44f41bd266d20d6efbb1349e42dfa4f1aa0d766037d1a16d09f",
+          "dweb:/ipfs/QmT6XUk3N36AGTp5Rh16NrghooE3MsoeMbYcEWERGtecwY"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/access/AccessControlEnumerable.sol": {
+        "keccak256": "0x4d60ac8ebacf3782f8f91bed2084e3ea2230a15a87fe0ca9e9317ddd91548969",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://fa0bee8ef9545676cef2e233d8d530fe9c552e54b6bf30ea20ea1df2a89abee9",
+          "dweb:/ipfs/QmcVwpAcwSR4c9AsWZxqZ6CajvSYMuj9nNu8RgWnaVCHjM"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/access/IAccessControl.sol": {
+        "keccak256": "0x02787a6b562763467c448f39369285b1903615e81c787f45c0b163a1ff9e07d5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://81b6f6b08f68a5f747d05b73c15d595efa86be1bd72ba60eb9b953f4ed939ccb",
+          "dweb:/ipfs/QmQkiz6s9tWzGcHodPRPiFZ5iTLmeSzhELjRcftnnmBkxS"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/access/IAccessControlEnumerable.sol": {
+        "keccak256": "0xa4f2ad50caa3abf78be15a89277206147978942b14af577b1fcf0fc2ab4279e9",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://9ba43f775d593cd557a97136128f6b1bfb2f34a4aba874ef17b5515093118912",
+          "dweb:/ipfs/QmXz5kb1R1q7D7hyjDi5F6JarLZNWzzNDY6X4w1kXN6Vzc"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/security/ReentrancyGuardTransient.sol": {
+        "keccak256": "0x10de7e7169d86736df699af7f900a43471b42ea3e6b0c8820f0805b4008a601d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://80abedf4e8ca2a4d675f77ca5aa7c8c436af98d0f5c9d9a4a1d7aa67aa2c303e",
+          "dweb:/ipfs/QmSZDQDr43atdf4QcYifHgdWE1GfTs8xffMZcGm38v4yRj"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/security/TransientSlot.sol": {
+        "keccak256": "0x5fb018394594d6a7aec655c3c86cbac02d71b16c8bb8964c99e85016cb728e84",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://71c6b1f75e0c269799d2da52bd04cb71cb8859344f87d731bd7e3e65bd922d4d",
+          "dweb:/ipfs/QmRT4fF3HVoG4hYey2acV9PLvs3hsKFjxwCTShdoVQXNU5"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/IERC20.sol": {
+        "keccak256": "0x2d0b233e43b64bb4afb057ccc16493c9b3c22d334a4ac6636915c7ef7f06b118",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f0702af2d619b4cbbc417b89fb215c64b2f0a2db8d1af1d3a23f2e3cabb077f0",
+          "dweb:/ipfs/QmYVTreLMBhqZH78xnqiZyr3FLbfNrrSsG7bHiSQk9dRRW"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/SafeERC20.sol": {
+        "keccak256": "0x390ad37e2acef7855f36907f6b16331e35115ac0d1a4a8641fee248019ab98ac",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://fb4c92c03e1c539c1ce103b87239db36807ab097741538cc84df989b180f2854",
+          "dweb:/ipfs/QmSGeNmEopK8aTeJboEqcJpePYddJphTiMFvUN3Q1UuWLW"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/Context.sol": {
+        "keccak256": "0x197651ff7207345936e19940e36235967fe866449caa294e19642b6c6aaa62f8",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://3cb4e784c91e106ee75877271ff11f9997a68bc9e577cab4d36d60a10b88e6e9",
+          "dweb:/ipfs/QmVuLfSBsfsqcpUcsFaY275Re3n7uQW6ErhDGpYHY92uBo"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/ERC165.sol": {
+        "keccak256": "0x53fdb65a391e724bd02a77010fa9d921569f6c70e7a4f1bd8efbe862b29c2831",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://a7dae8d1c8cdf429bc117c8e348cbf99a30c14c4ade928e3417c8a7b9579ee62",
+          "dweb:/ipfs/QmeLFoVHYkfjcjLW2kwxGCHkH8P4qQjo61d5RXuXWf3ep7"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/EnumerableSet.sol": {
+        "keccak256": "0x6dfd57320c54054f69d620239b72c0230a3912520dff78f26dec2a709592555c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f3d7ee88f342083071601363d7718c037e9e97f4622d8061af2bc455460da1ae",
+          "dweb:/ipfs/Qmcw9rfXpogtneRhNCF9w6gw6N7HTmgG2xmndURKFtYTZD"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/IERC165.sol": {
+        "keccak256": "0x64e1d4f776a4bf02f7ab4187741c2e50c767bfa04f4ef1f920edba78c2918020",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://cff6c09b4206cbf675fae7baa5e036802a16b1bad9a541db160858a5caa5b35c",
+          "dweb:/ipfs/QmRCagsWpeQGomTbdHusJuNUPJnNB8HLHkB98FPU2s9Vc6"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/Strings.sol": {
+        "keccak256": "0x48bee73df2789ccd1033f0d0306ec21fd3789aa24fccc783d25ba46229648d4d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0c289a65ab4eb36a419296f6f1cedf14a50f00060b9e0ebf7e20dc430d194069",
+          "dweb:/ipfs/QmPJRrrzXkoDd32RfcHMb6AdXzRL5E3p8UarpNhXXUG1Zz"
+        ]
+      },
+      "contracts/globalMarkets/portfolioToken/portfolioVault/IPortfolioVault.sol": {
+        "keccak256": "0xad2bfda440957d47210d5c17df7dad013ebab39d252c825ec9cdd7ff960e8755",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://514d136bdc975bf20d6ec6457a1b528b31a75679c68e1cc34b39210c080a0361",
+          "dweb:/ipfs/QmUFsEm7uYavHCbDkctKSFnjN43S8zDxVMdJeAvuKECoBT"
+        ]
+      },
+      "contracts/globalMarkets/portfolioToken/portfolioVault/PortfolioVault.sol": {
+        "keccak256": "0xcc689d052b49b612341bb477f26cacab4a75a1ac3e0d3e4d11a8c12d521c8140",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://b5df2c5a28a17e5b41d1b96aff969e3b86c4216fceeaec050339bbe1e5aabbb6",
+          "dweb:/ipfs/QmWPprokWfKsb47N8jhWz25syJiUgDqArGtP6JfjkL2Yra"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.33+commit.64118f21",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        "forge-tests/=forge-tests/",
+        "lib/=lib/",
+        "@aragon/=node_modules/@aragon/",
+        "@ensdomains/=node_modules/@ensdomains/",
+        "@openzeppelin/=node_modules/@openzeppelin/",
+        "@uniswap/=node_modules/@uniswap/",
+        "forge-std/=lib/forge-std/src/",
+        "hardhat-deploy/=node_modules/hardhat-deploy/",
+        "hardhat/=node_modules/hardhat/",
+        "math/=node_modules/@aragon/os/contracts/lib/math/",
+        "misc/=node_modules/@aragon/os/contracts/lib/misc/",
+        "solidity-bytes-utils/=node_modules/solidity-bytes-utils/",
+        "standards/=node_modules/@aragon/os/contracts/lib/standards/",
+        "token/=node_modules/@aragon/os/contracts/lib/token/",
+        "truffle/=node_modules/truffle/"
+      ]
+    },
+    "name": "PortfolioVault",
+    "fullyQualifiedName": "contracts/globalMarkets/portfolioToken/portfolioVault/PortfolioVault.sol:PortfolioVault"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "53979343",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-09-29T14:05:58Z",
+  "match": "match",
+  "chainId": "56",
+  "address": "0x058d2EFcD3C09E5c34Fd55D038Cc84f6B978F84F"
+}

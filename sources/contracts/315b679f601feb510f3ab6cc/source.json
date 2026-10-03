@@ -1,0 +1,575 @@
+{
+  "sources": {
+    "src/USDTelExchangeRate.sol": {
+      "content": "// SPDX-License-Identifier: UNLICENSED\npragma solidity ^0.8.13;\n\nimport {Ownable} from \"solady/auth/Ownable.sol\";\n\ncontract USDTelExchangeRate is Ownable {\n    struct ExchangeRate {\n        uint128 usdtelExchangeRate;\n        uint64 timestamp;\n    }\n\n    /// @dev Number of seconds in a year, used to annualize the rate growth.\n    uint256 public constant SECONDS_PER_YEAR = 365 days;\n\n    /// @dev Fixed-point scale for APY values. `1e18` represents 100% APY,\n    ///      so `_apyCeiling` must be supplied using the same scale.\n    uint256 public constant APY_SCALE = 1e18;\n\n    /// @dev The maximum APY allowed for the exchange rate.\n    uint256 public immutable _apyCeiling;\n\n    /// @dev The current exchange rate.\n    ExchangeRate public _exchangeRate;\n\n    /// @dev The address authorized to post exchange rate updates. This is kept\n    ///      separate from {owner}: the owner is a cold/admin key that manages\n    ///      this role, while the updater is a hot key operated by the rate feed\n    ///      service. A compromised updater can only push rates (bounded by the\n    ///      APY ceiling); it cannot manage ownership or the updater itself.\n    address public _updater;\n\n    error InvalidAPYCeiling(uint256 apyCeiling);\n    error InvalidInitialExchangeRate(uint128 initialExchangeRate);\n    error InvalidUpdater();\n    error ExchangeRateDecreased();\n    error StaleTimestamp();\n    error ApyCeilingExceeded(uint256 apy, uint256 apyCeiling);\n    error UnauthorizedUpdater();\n    error RenounceDisabled();\n    error TransferOwnershipDisabled();\n\n    event ExchangeRateUpdated(uint128 newUSDTelExchangeRate, uint64 timestamp);\n    event UpdaterChanged(address indexed previousUpdater, address indexed newUpdater);\n\n    /// @dev Restricts a function to the current {_updater}.\n    modifier onlyUpdater() {\n        if (msg.sender != _updater) {\n            revert UnauthorizedUpdater();\n        }\n        _;\n    }\n\n    constructor(uint256 apyCeiling, uint128 initialExchangeRate, address initialUpdater) {\n        if (apyCeiling == 0) {\n            revert InvalidAPYCeiling(apyCeiling);\n        }\n        if (initialExchangeRate == 0) {\n            revert InvalidInitialExchangeRate(initialExchangeRate);\n        }\n        if (initialUpdater == address(0)) {\n            revert InvalidUpdater();\n        }\n\n        _initializeOwner(msg.sender);\n        _apyCeiling = apyCeiling;\n        _exchangeRate = ExchangeRate(initialExchangeRate, uint64(block.timestamp));\n        _updater = initialUpdater;\n        emit UpdaterChanged(address(0), initialUpdater);\n    }\n\n    /// @notice Sets the address authorized to post exchange rate updates.\n    /// @dev Only callable by the owner. The updater cannot be the zero address;\n    ///      to rotate keys, point this at the new updater.\n    function setUpdater(address newUpdater) public onlyOwner {\n        if (newUpdater == address(0)) {\n            revert InvalidUpdater();\n        }\n        emit UpdaterChanged(_updater, newUpdater);\n        _updater = newUpdater;\n    }\n\n    function setExchangeRate(uint128 newUSDTelExchangeRate) public onlyUpdater {\n        ExchangeRate memory previous = _exchangeRate;\n\n        // The exchange rate is expected to be monotonically non-decreasing.\n        if (newUSDTelExchangeRate < previous.usdtelExchangeRate) {\n            revert ExchangeRateDecreased();\n        }\n\n        uint256 elapsed = block.timestamp - previous.timestamp;\n\n        // Only validate growth; a flat (unchanged) rate is always allowed even\n        // within the same block, but any increase requires elapsed time.\n        if (newUSDTelExchangeRate > previous.usdtelExchangeRate) {\n            if (elapsed == 0) {\n                revert StaleTimestamp();\n            }\n\n            uint256 growth = newUSDTelExchangeRate - previous.usdtelExchangeRate;\n\n            // Annualized (simple) APY for the period since the last update:\n            //   apy = (growth / previousRate) * (SECONDS_PER_YEAR / elapsed)\n            // scaled by APY_SCALE and computed without intermediate rounding.\n            uint256 apy = (growth * SECONDS_PER_YEAR * APY_SCALE) / (uint256(previous.usdtelExchangeRate) * elapsed);\n\n            if (apy > _apyCeiling) {\n                revert ApyCeilingExceeded(apy, _apyCeiling);\n            }\n        }\n\n        _exchangeRate = ExchangeRate(newUSDTelExchangeRate, uint64(block.timestamp));\n\n        emit ExchangeRateUpdated(newUSDTelExchangeRate, uint64(block.timestamp));\n    }\n\n    function getExchangeRate() public view returns (ExchangeRate memory) {\n        return _exchangeRate;\n    }\n\n    /// @dev Disabled to prevent the feed from being permanently frozen, which\n    ///      would leave it unupdatable with no recovery path. Ownership can\n    ///      still be transferred via {transferOwnership}.\n    function renounceOwnership() public payable override onlyOwner {\n        revert RenounceDisabled();\n    }\n\n    /// @dev ownnership transfer can be done only via\n    ///      {requestOwnershipHandover} and {completeOwnershipHandover} functions.\n    function transferOwnership(address newOwner) public payable override onlyOwner {\n        revert TransferOwnershipDisabled();\n    }\n}\n"
+    },
+    "lib/solady/src/auth/Ownable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.4;\n\n/// @notice Simple single owner authorization mixin.\n/// @author Solady (https://github.com/vectorized/solady/blob/main/src/auth/Ownable.sol)\n///\n/// @dev Note:\n/// This implementation does NOT auto-initialize the owner to `msg.sender`.\n/// You MUST call the `_initializeOwner` in the constructor / initializer.\n///\n/// While the ownable portion follows\n/// [EIP-173](https://eips.ethereum.org/EIPS/eip-173) for compatibility,\n/// the nomenclature for the 2-step ownership handover may be unique to this codebase.\nabstract contract Ownable {\n    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/\n    /*                       CUSTOM ERRORS                        */\n    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/\n\n    /// @dev The caller is not authorized to call the function.\n    error Unauthorized();\n\n    /// @dev The `newOwner` cannot be the zero address.\n    error NewOwnerIsZeroAddress();\n\n    /// @dev The `pendingOwner` does not have a valid handover request.\n    error NoHandoverRequest();\n\n    /// @dev Cannot double-initialize.\n    error AlreadyInitialized();\n\n    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/\n    /*                           EVENTS                           */\n    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/\n\n    /// @dev The ownership is transferred from `oldOwner` to `newOwner`.\n    /// This event is intentionally kept the same as OpenZeppelin's Ownable to be\n    /// compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173),\n    /// despite it not being as lightweight as a single argument event.\n    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);\n\n    /// @dev An ownership handover to `pendingOwner` has been requested.\n    event OwnershipHandoverRequested(address indexed pendingOwner);\n\n    /// @dev The ownership handover to `pendingOwner` has been canceled.\n    event OwnershipHandoverCanceled(address indexed pendingOwner);\n\n    /// @dev `keccak256(bytes(\"OwnershipTransferred(address,address)\"))`.\n    uint256 private constant _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE =\n        0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0;\n\n    /// @dev `keccak256(bytes(\"OwnershipHandoverRequested(address)\"))`.\n    uint256 private constant _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE =\n        0xdbf36a107da19e49527a7176a1babf963b4b0ff8cde35ee35d6cd8f1f9ac7e1d;\n\n    /// @dev `keccak256(bytes(\"OwnershipHandoverCanceled(address)\"))`.\n    uint256 private constant _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE =\n        0xfa7b8eab7da67f412cc9575ed43464468f9bfbae89d1675917346ca6d8fe3c92;\n\n    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/\n    /*                          STORAGE                           */\n    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/\n\n    /// @dev The owner slot is given by:\n    /// `bytes32(~uint256(uint32(bytes4(keccak256(\"_OWNER_SLOT_NOT\")))))`.\n    /// It is intentionally chosen to be a high value\n    /// to avoid collision with lower slots.\n    /// The choice of manual storage layout is to enable compatibility\n    /// with both regular and upgradeable contracts.\n    bytes32 internal constant _OWNER_SLOT =\n        0xffffffffffffffffffffffffffffffffffffffffffffffffffffffff74873927;\n\n    /// The ownership handover slot of `newOwner` is given by:\n    /// ```\n    ///     mstore(0x00, or(shl(96, user), _HANDOVER_SLOT_SEED))\n    ///     let handoverSlot := keccak256(0x00, 0x20)\n    /// ```\n    /// It stores the expiry timestamp of the two-step ownership handover.\n    uint256 private constant _HANDOVER_SLOT_SEED = 0x389a75e1;\n\n    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/\n    /*                     INTERNAL FUNCTIONS                     */\n    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/\n\n    /// @dev Override to return true to make `_initializeOwner` prevent double-initialization.\n    function _guardInitializeOwner() internal pure virtual returns (bool guard) {}\n\n    /// @dev Initializes the owner directly without authorization guard.\n    /// This function must be called upon initialization,\n    /// regardless of whether the contract is upgradeable or not.\n    /// This is to enable generalization to both regular and upgradeable contracts,\n    /// and to save gas in case the initial owner is not the caller.\n    /// For performance reasons, this function will not check if there\n    /// is an existing owner.\n    function _initializeOwner(address newOwner) internal virtual {\n        if (_guardInitializeOwner()) {\n            /// @solidity memory-safe-assembly\n            assembly {\n                let ownerSlot := _OWNER_SLOT\n                if sload(ownerSlot) {\n                    mstore(0x00, 0x0dc149f0) // `AlreadyInitialized()`.\n                    revert(0x1c, 0x04)\n                }\n                // Clean the upper 96 bits.\n                newOwner := shr(96, shl(96, newOwner))\n                // Store the new value.\n                sstore(ownerSlot, or(newOwner, shl(255, iszero(newOwner))))\n                // Emit the {OwnershipTransferred} event.\n                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)\n            }\n        } else {\n            /// @solidity memory-safe-assembly\n            assembly {\n                // Clean the upper 96 bits.\n                newOwner := shr(96, shl(96, newOwner))\n                // Store the new value.\n                sstore(_OWNER_SLOT, newOwner)\n                // Emit the {OwnershipTransferred} event.\n                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, 0, newOwner)\n            }\n        }\n    }\n\n    /// @dev Sets the owner directly without authorization guard.\n    function _setOwner(address newOwner) internal virtual {\n        if (_guardInitializeOwner()) {\n            /// @solidity memory-safe-assembly\n            assembly {\n                let ownerSlot := _OWNER_SLOT\n                // Clean the upper 96 bits.\n                newOwner := shr(96, shl(96, newOwner))\n                // Emit the {OwnershipTransferred} event.\n                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)\n                // Store the new value.\n                sstore(ownerSlot, or(newOwner, shl(255, iszero(newOwner))))\n            }\n        } else {\n            /// @solidity memory-safe-assembly\n            assembly {\n                let ownerSlot := _OWNER_SLOT\n                // Clean the upper 96 bits.\n                newOwner := shr(96, shl(96, newOwner))\n                // Emit the {OwnershipTransferred} event.\n                log3(0, 0, _OWNERSHIP_TRANSFERRED_EVENT_SIGNATURE, sload(ownerSlot), newOwner)\n                // Store the new value.\n                sstore(ownerSlot, newOwner)\n            }\n        }\n    }\n\n    /// @dev Throws if the sender is not the owner.\n    function _checkOwner() internal view virtual {\n        /// @solidity memory-safe-assembly\n        assembly {\n            // If the caller is not the stored owner, revert.\n            if iszero(eq(caller(), sload(_OWNER_SLOT))) {\n                mstore(0x00, 0x82b42900) // `Unauthorized()`.\n                revert(0x1c, 0x04)\n            }\n        }\n    }\n\n    /// @dev Returns how long a two-step ownership handover is valid for in seconds.\n    /// Override to return a different value if needed.\n    /// Made internal to conserve bytecode. Wrap it in a public function if needed.\n    function _ownershipHandoverValidFor() internal view virtual returns (uint64) {\n        return 48 * 3600;\n    }\n\n    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/\n    /*                  PUBLIC UPDATE FUNCTIONS                   */\n    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/\n\n    /// @dev Allows the owner to transfer the ownership to `newOwner`.\n    function transferOwnership(address newOwner) public payable virtual onlyOwner {\n        /// @solidity memory-safe-assembly\n        assembly {\n            if iszero(shl(96, newOwner)) {\n                mstore(0x00, 0x7448fbae) // `NewOwnerIsZeroAddress()`.\n                revert(0x1c, 0x04)\n            }\n        }\n        _setOwner(newOwner);\n    }\n\n    /// @dev Allows the owner to renounce their ownership.\n    function renounceOwnership() public payable virtual onlyOwner {\n        _setOwner(address(0));\n    }\n\n    /// @dev Request a two-step ownership handover to the caller.\n    /// The request will automatically expire in 48 hours (172800 seconds) by default.\n    function requestOwnershipHandover() public payable virtual {\n        unchecked {\n            uint256 expires = block.timestamp + _ownershipHandoverValidFor();\n            /// @solidity memory-safe-assembly\n            assembly {\n                // Compute and set the handover slot to `expires`.\n                mstore(0x0c, _HANDOVER_SLOT_SEED)\n                mstore(0x00, caller())\n                sstore(keccak256(0x0c, 0x20), expires)\n                // Emit the {OwnershipHandoverRequested} event.\n                log2(0, 0, _OWNERSHIP_HANDOVER_REQUESTED_EVENT_SIGNATURE, caller())\n            }\n        }\n    }\n\n    /// @dev Cancels the two-step ownership handover to the caller, if any.\n    function cancelOwnershipHandover() public payable virtual {\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Compute and set the handover slot to 0.\n            mstore(0x0c, _HANDOVER_SLOT_SEED)\n            mstore(0x00, caller())\n            sstore(keccak256(0x0c, 0x20), 0)\n            // Emit the {OwnershipHandoverCanceled} event.\n            log2(0, 0, _OWNERSHIP_HANDOVER_CANCELED_EVENT_SIGNATURE, caller())\n        }\n    }\n\n    /// @dev Allows the owner to complete the two-step ownership handover to `pendingOwner`.\n    /// Reverts if there is no existing ownership handover requested by `pendingOwner`.\n    function completeOwnershipHandover(address pendingOwner) public payable virtual onlyOwner {\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Compute and set the handover slot to 0.\n            mstore(0x0c, _HANDOVER_SLOT_SEED)\n            mstore(0x00, pendingOwner)\n            let handoverSlot := keccak256(0x0c, 0x20)\n            // If the handover does not exist, or has expired.\n            if gt(timestamp(), sload(handoverSlot)) {\n                mstore(0x00, 0x6f5e8818) // `NoHandoverRequest()`.\n                revert(0x1c, 0x04)\n            }\n            // Set the handover slot to 0.\n            sstore(handoverSlot, 0)\n        }\n        _setOwner(pendingOwner);\n    }\n\n    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/\n    /*                   PUBLIC READ FUNCTIONS                    */\n    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/\n\n    /// @dev Returns the owner of the contract.\n    function owner() public view virtual returns (address result) {\n        /// @solidity memory-safe-assembly\n        assembly {\n            result := sload(_OWNER_SLOT)\n        }\n    }\n\n    /// @dev Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`.\n    function ownershipHandoverExpiresAt(address pendingOwner)\n        public\n        view\n        virtual\n        returns (uint256 result)\n    {\n        /// @solidity memory-safe-assembly\n        assembly {\n            // Compute the handover slot.\n            mstore(0x0c, _HANDOVER_SLOT_SEED)\n            mstore(0x00, pendingOwner)\n            // Load the handover slot.\n            result := sload(keccak256(0x0c, 0x20))\n        }\n    }\n\n    /*´:°•.°+.*•´.*:˚.°*.˚•´.°:°•.°•.*•´.*:˚.°*.˚•´.°:°•.°+.*•´.*:*/\n    /*                         MODIFIERS                          */\n    /*.•°:°.´+˚.*°.˚:*.´•*.+°.•°:´*.´•*.•°.•°:°.´:•˚°.*°.˚:*.´+°.•*/\n\n    /// @dev Marks a function as only callable by the owner.\n    modifier onlyOwner() virtual {\n        _checkOwner();\n        _;\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.25+commit.b61c2a91"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "apyCeiling",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint128",
+              "name": "initialExchangeRate",
+              "type": "uint128"
+            },
+            {
+              "internalType": "address",
+              "name": "initialUpdater",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "AlreadyInitialized",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "apy",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "apyCeiling",
+              "type": "uint256"
+            }
+          ],
+          "name": "ApyCeilingExceeded",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ExchangeRateDecreased",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "apyCeiling",
+              "type": "uint256"
+            }
+          ],
+          "name": "InvalidAPYCeiling",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint128",
+              "name": "initialExchangeRate",
+              "type": "uint128"
+            }
+          ],
+          "name": "InvalidInitialExchangeRate",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidUpdater",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NewOwnerIsZeroAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NoHandoverRequest",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "RenounceDisabled",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "StaleTimestamp",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TransferOwnershipDisabled",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Unauthorized",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "UnauthorizedUpdater",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint128",
+              "name": "newUSDTelExchangeRate",
+              "type": "uint128"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint64",
+              "name": "timestamp",
+              "type": "uint64"
+            }
+          ],
+          "name": "ExchangeRateUpdated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "pendingOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipHandoverCanceled",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "pendingOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipHandoverRequested",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "oldOwner",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipTransferred",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "previousUpdater",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newUpdater",
+              "type": "address"
+            }
+          ],
+          "name": "UpdaterChanged",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "APY_SCALE",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "SECONDS_PER_YEAR",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "_apyCeiling",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "_exchangeRate",
+          "outputs": [
+            {
+              "internalType": "uint128",
+              "name": "usdtelExchangeRate",
+              "type": "uint128"
+            },
+            {
+              "internalType": "uint64",
+              "name": "timestamp",
+              "type": "uint64"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "_updater",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "cancelOwnershipHandover",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "pendingOwner",
+              "type": "address"
+            }
+          ],
+          "name": "completeOwnershipHandover",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "getExchangeRate",
+          "outputs": [
+            {
+              "components": [
+                {
+                  "internalType": "uint128",
+                  "name": "usdtelExchangeRate",
+                  "type": "uint128"
+                },
+                {
+                  "internalType": "uint64",
+                  "name": "timestamp",
+                  "type": "uint64"
+                }
+              ],
+              "internalType": "struct USDTelExchangeRate.ExchangeRate",
+              "name": "",
+              "type": "tuple"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "result",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "pendingOwner",
+              "type": "address"
+            }
+          ],
+          "name": "ownershipHandoverExpiresAt",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "result",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "renounceOwnership",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "requestOwnershipHandover",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint128",
+              "name": "newUSDTelExchangeRate",
+              "type": "uint128"
+            }
+          ],
+          "name": "setExchangeRate",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newUpdater",
+              "type": "address"
+            }
+          ],
+          "name": "setUpdater",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "transferOwnership",
+          "outputs": [],
+          "stateMutability": "payable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "errors": {
+          "AlreadyInitialized()": [
+            {
+              "details": "Cannot double-initialize."
+            }
+          ],
+          "NewOwnerIsZeroAddress()": [
+            {
+              "details": "The `newOwner` cannot be the zero address."
+            }
+          ],
+          "NoHandoverRequest()": [
+            {
+              "details": "The `pendingOwner` does not have a valid handover request."
+            }
+          ],
+          "Unauthorized()": [
+            {
+              "details": "The caller is not authorized to call the function."
+            }
+          ]
+        },
+        "events": {
+          "OwnershipHandoverCanceled(address)": {
+            "details": "The ownership handover to `pendingOwner` has been canceled."
+          },
+          "OwnershipHandoverRequested(address)": {
+            "details": "An ownership handover to `pendingOwner` has been requested."
+          },
+          "OwnershipTransferred(address,address)": {
+            "details": "The ownership is transferred from `oldOwner` to `newOwner`. This event is intentionally kept the same as OpenZeppelin's Ownable to be compatible with indexers and [EIP-173](https://eips.ethereum.org/EIPS/eip-173), despite it not being as lightweight as a single argument event."
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "cancelOwnershipHandover()": {
+            "details": "Cancels the two-step ownership handover to the caller, if any."
+          },
+          "completeOwnershipHandover(address)": {
+            "details": "Allows the owner to complete the two-step ownership handover to `pendingOwner`. Reverts if there is no existing ownership handover requested by `pendingOwner`."
+          },
+          "owner()": {
+            "details": "Returns the owner of the contract."
+          },
+          "ownershipHandoverExpiresAt(address)": {
+            "details": "Returns the expiry timestamp for the two-step ownership handover to `pendingOwner`."
+          },
+          "renounceOwnership()": {
+            "details": "Disabled to prevent the feed from being permanently frozen, which      would leave it unupdatable with no recovery path. Ownership can      still be transferred via {transferOwnership}."
+          },
+          "requestOwnershipHandover()": {
+            "details": "Request a two-step ownership handover to the caller. The request will automatically expire in 48 hours (172800 seconds) by default."
+          },
+          "setUpdater(address)": {
+            "details": "Only callable by the owner. The updater cannot be the zero address;      to rotate keys, point this at the new updater."
+          },
+          "transferOwnership(address)": {
+            "details": "ownnership transfer can be done only via      {requestOwnershipHandover} and {completeOwnershipHandover} functions."
+          }
+        },
+        "stateVariables": {
+          "APY_SCALE": {
+            "details": "Fixed-point scale for APY values. `1e18` represents 100% APY,      so `_apyCeiling` must be supplied using the same scale."
+          },
+          "SECONDS_PER_YEAR": {
+            "details": "Number of seconds in a year, used to annualize the rate growth."
+          },
+          "_apyCeiling": {
+            "details": "The maximum APY allowed for the exchange rate."
+          },
+          "_exchangeRate": {
+            "details": "The current exchange rate."
+          },
+          "_updater": {
+            "details": "The address authorized to post exchange rate updates. This is kept      separate from {owner}: the owner is a cold/admin key that manages      this role, while the updater is a hot key operated by the rate feed      service. A compromised updater can only push rates (bounded by the      APY ceiling); it cannot manage ownership or the updater itself."
+          }
+        },
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "setUpdater(address)": {
+            "notice": "Sets the address authorized to post exchange rate updates."
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/USDTelExchangeRate.sol": "USDTelExchangeRate"
+      },
+      "evmVersion": "cancun",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": false,
+        "runs": 200
+      },
+      "remappings": [
+        ":forge-std/=lib/forge-std/src/",
+        ":solady/=lib/solady/src/"
+      ]
+    },
+    "sources": {
+      "lib/solady/src/auth/Ownable.sol": {
+        "keccak256": "0xc208cdd9de02bbf4b5edad18b88e23a2be7ff56d2287d5649329dc7cda64b9a3",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e8fba079cc7230c617f7493a2e97873f88e59a53a5018fcb2e2b6ac42d8aa5a3",
+          "dweb:/ipfs/QmTXg8GSt8hsK2cZhbPFrund1mrwVdkLQmEPoQaFy4fhjs"
+        ]
+      },
+      "src/USDTelExchangeRate.sol": {
+        "keccak256": "0xbdf1c8d1598bcd4d278d265806f71c09ad8cf44363081a3080e6e4fcd95c608e",
+        "license": "UNLICENSED",
+        "urls": [
+          "bzz-raw://366b577bf7dc0fc7896efc0eaf76332f64a280b74162cda57ae1cdf0633b147b",
+          "dweb:/ipfs/QmcbFPAcjGgiX8KzSRaWAsgs71ta4VwdSirisQCbuD2p8a"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.25+commit.b61c2a91",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": false
+      },
+      "evmVersion": "cancun",
+      "remappings": [
+        "forge-std/=lib/forge-std/src/",
+        "solady/=lib/solady/src/"
+      ]
+    },
+    "name": "USDTelExchangeRate",
+    "fullyQualifiedName": "src/USDTelExchangeRate.sol:USDTelExchangeRate"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "40927896",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-07-10T15:29:48Z",
+  "match": "exact_match",
+  "chainId": "56",
+  "address": "0x15A6F1f2705B3916b5B1D2b19b10F320778744C1"
+}

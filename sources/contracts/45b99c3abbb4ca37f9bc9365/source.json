@@ -1,0 +1,1491 @@
+{
+  "sources": {
+    "contracts/xManager/tokenRouter/OndoTokenRouter.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity 0.8.33;\n\nimport {IOndoTokenRouter} from \"contracts/xManager/interfaces/IOndoTokenRouter.sol\";\nimport {\n  AccessControlEnumerable\n} from \"contracts/external/openzeppelin/contracts/access/AccessControlEnumerable.sol\";\nimport {\n  ReentrancyGuard\n} from \"contracts/external/openzeppelin/contracts/security/ReentrancyGuard.sol\";\nimport {IERC20} from \"contracts/external/openzeppelin/contracts/token/IERC20.sol\";\nimport {AggregatorV3Interface} from \"contracts/external/chainlink/AggregatorV3Interface.sol\";\nimport {IOndoTokenRouterEvents} from \"contracts/xManager/tokenRouter/IOndoTokenRouterEvents.sol\";\nimport {IOndoTokenRouterErrors} from \"contracts/xManager/tokenRouter/IOndoTokenRouterErrors.sol\";\nimport {SafeERC20} from \"contracts/external/openzeppelin/contracts/token/SafeERC20.sol\";\nimport {ITokenSource} from \"contracts/xManager/interfaces/ITokenSource.sol\";\nimport {ITokenRecipient} from \"contracts/xManager/interfaces/ITokenRecipient.sol\";\n\n/**\n * @title  OndoTokenRouter\n * @author Ondo Finance\n * @dev    This contract manages deposits and withdrawals of tokens for Ondo's RWA token platform\n */\ncontract OndoTokenRouter is\n  AccessControlEnumerable,\n  ReentrancyGuard,\n  IOndoTokenRouter,\n  IOndoTokenRouterEvents,\n  IOndoTokenRouterErrors\n{\n  using SafeERC20 for IERC20;\n\n  /**\n   * @notice Struct to store user-specific withdrawal token sources\n   * @param  active       Whether the user has active withdrawal sources\n   * @param  tokenSources The withdrawal sources for the given RWA token and withdraw token for a specific user\n   */\n  struct UserWithdrawTokenSources {\n    bool active;\n    ITokenSource[] tokenSources;\n  }\n\n  /**\n   * @notice Struct to store AggregatorV3 oracle information\n   * @param  oracle                         AggregatorV3 oracle address\n   * @param  maxAggregatorV3OracleTimeDelay Max time delay in seconds for aggregatorV3 oracle\n   */\n  struct AggregatorV3OracleInfo {\n    AggregatorV3Interface oracle;\n    uint256 maxAggregatorV3OracleTimeDelay;\n  }\n\n  /// Role identifier allowing RWA managers to deposit and withdraw tokens\n  bytes32 public constant RWA_MANAGER_ROLE = keccak256(\"RWA_MANAGER_ROLE\");\n\n  /// Maps RWA token to deposit token and recipient contract\n  mapping(address => mapping(address => ITokenRecipient)) public depositTokenRecipient;\n\n  /// Maps RWA token to withdrawal token and source contracts\n  mapping(address => mapping(address => ITokenSource[])) public withdrawTokenSources;\n\n  /// Maps RWA token, withdrawal token, and user ID to user-specific withdrawal token sources\n  mapping(address => mapping(address => mapping(bytes32 => UserWithdrawTokenSources))) public\n    userWithdrawTokenSources;\n\n  /// Minimum token price mapping to prevent depegged tokens from being used\n  mapping(address => uint256) public minimumTokenPrice;\n\n  /// Maps token address to a price oracle conforming to the `AggregatorV3Interface`\n  mapping(address => AggregatorV3OracleInfo) public tokenToAggregatorV3Oracle;\n\n  /**\n   * @param _defaultAdmin Address to assign the DEFAULT_ADMIN_ROLE\n   */\n  constructor(address _defaultAdmin) {\n    _grantRole(DEFAULT_ADMIN_ROLE, _defaultAdmin);\n  }\n\n  /**\n   * @notice Deposits a specified amount of tokens into the contract\n   * @param  rwaToken       The RWA token for which the deposit is involved\n   * @param  tokenToDeposit The token that is being deposited\n   * @param  depositAmount  The amount of tokens to deposit, in the token's native decimals\n   * @dev    The `msg.sender` must set the approval for the router to spend the token amount\n   */\n  function depositToken(address rwaToken, address tokenToDeposit, uint256 depositAmount)\n    public\n    nonReentrant\n    onlyRole(RWA_MANAGER_ROLE)\n  {\n    _assertTokenMinimumPrice(tokenToDeposit);\n\n    ITokenRecipient tokenRecipient = depositTokenRecipient[rwaToken][tokenToDeposit];\n    if (address(tokenRecipient) == address(0)) revert TokenRecipientNotSet();\n\n    // Transfer tokens from the caller (rwaManager) to this contract\n    IERC20(tokenToDeposit).safeTransferFrom(msg.sender, address(this), depositAmount);\n\n    IERC20(tokenToDeposit).forceApprove(address(tokenRecipient), depositAmount);\n    tokenRecipient.depositToken(tokenToDeposit, depositAmount);\n\n    emit TokenDeposited(rwaToken, tokenToDeposit, depositAmount);\n  }\n\n  /**\n   * @notice Withdraws a specified amount of tokens from the configured sources\n   * @param  rwaTokenRedeemed The RWA token for which the withdrawal is being made\n   * @param  tokenToWithdraw  The token that is being withdrawn\n   * @param  userID           The ID of the user involved in token withdrawal\n   * @param  withdrawAmount   The amount of tokens to be withdrawn, in the token's\n   *                          decimals.\n   * @dev    The userID causes the function to use the sources configured for the user if there are\n   *         any set. Submit bytes32(0) to use the non user specific sources.\n   */\n  function withdrawToken(\n    address rwaTokenRedeemed,\n    address tokenToWithdraw,\n    bytes32 userID,\n    uint256 withdrawAmount\n  ) public nonReentrant onlyRole(RWA_MANAGER_ROLE) {\n    _assertTokenMinimumPrice(tokenToWithdraw);\n\n    _gatherTokensFromWithdrawalSources(rwaTokenRedeemed, tokenToWithdraw, userID, withdrawAmount);\n\n    IERC20(tokenToWithdraw).safeTransfer(msg.sender, withdrawAmount);\n\n    emit TokenWithdrawn(rwaTokenRedeemed, tokenToWithdraw, withdrawAmount);\n  }\n\n  /**\n   * @notice Gets the amount of tokens that are available to withdraw\n   * @param  rwaToken        Address of the RWA token\n   * @param  tokenToWithdraw Address of the token to withdraw\n   * @param  userID          The userID to return the available amount for\n   * @return totalAvailable  Total amount of tokens available\n   * @dev    The userID causes the function to use the sources configured for the user if there are any set.\n   *         Submit bytes32(0) to use the non user specific sources.\n   *\n   */\n  function availableToWithdraw(address rwaToken, address tokenToWithdraw, bytes32 userID)\n    external\n    view\n    override\n    returns (uint256 totalAvailable)\n  {\n    ITokenSource[] memory tokenSources;\n\n    if (userWithdrawTokenSources[rwaToken][tokenToWithdraw][userID].active) {\n      tokenSources = userWithdrawTokenSources[rwaToken][tokenToWithdraw][userID].tokenSources;\n    } else {\n      tokenSources = withdrawTokenSources[rwaToken][tokenToWithdraw];\n    }\n\n    for (uint256 i = 0; i < tokenSources.length; ++i) {\n      totalAvailable += tokenSources[i].availableToWithdraw(tokenToWithdraw);\n    }\n  }\n\n  /**\n   * @notice Returns whether the user has active withdrawal sources for the given RWA token\n   *         and token to withdraw.\n   * @param  rwaToken       The RWA token for which the user sources are being checked\n   * @param  _withdrawToken The withdraw token for which the user sources are being checked\n   * @param  userId         The user ID for which the sources are being checked\n   * @return active         Whether their are active withdrawal sources for the given parameters\n   */\n  function getUserWithdrawTokenSourcesActive(\n    address rwaToken,\n    address _withdrawToken,\n    bytes32 userId\n  ) external view returns (bool active) {\n    return userWithdrawTokenSources[rwaToken][_withdrawToken][userId].active;\n  }\n\n  /**\n   * @notice Returns the withdraw sources for the given RWA token and withdraw token for a user\n   * @param  rwaToken       The RWA token for which the user sources are being checked\n   * @param  _withdrawToken The withdraw token for which the user sources are being checked\n   * @param  userId         The user ID for which the sources are being checked\n   * @return tokenSources   The withdraw sources for the given RWA token and withdraw token for a specific user\n   */\n  function getUserWithdrawTokenSources(address rwaToken, address _withdrawToken, bytes32 userId)\n    external\n    view\n    returns (ITokenSource[] memory tokenSources)\n  {\n    return userWithdrawTokenSources[rwaToken][_withdrawToken][userId].tokenSources;\n  }\n\n  /**\n   * @notice Gathers tokens from the available token sources\n   * @param  rwaToken                The RWA token involved in the withdraw\n   * @param  outputToken             The token that the caller expects to receive\n   * @param  requestedWithdrawAmount The amount of outputToken that the caller expects to receive\n   * @dev    Reverts if there are not enough tokens available from the sources\n   */\n  function _gatherTokensFromWithdrawalSources(\n    address rwaToken,\n    address outputToken,\n    bytes32 userID,\n    uint256 requestedWithdrawAmount\n  ) internal {\n    ITokenSource[] memory tokenSources;\n    if (userWithdrawTokenSources[rwaToken][outputToken][userID].active) {\n      tokenSources = userWithdrawTokenSources[rwaToken][outputToken][userID].tokenSources;\n    } else {\n      tokenSources = withdrawTokenSources[rwaToken][outputToken];\n    }\n\n    for (uint256 i = 0; i < tokenSources.length; ++i) {\n      ITokenSource tokenSource = tokenSources[i];\n\n      uint256 amountAvailable = tokenSource.availableToWithdraw(outputToken);\n\n      uint256 withdrawAmount =\n        amountAvailable > requestedWithdrawAmount ? requestedWithdrawAmount : amountAvailable;\n\n      if (withdrawAmount == 0) continue;\n\n      // INVARIANT - `TokenSource.withdrawToken` will always withdraw the amount requested\n      // or revert.\n      tokenSource.withdrawToken(outputToken, withdrawAmount);\n\n      requestedWithdrawAmount -= withdrawAmount;\n\n      if (requestedWithdrawAmount == 0) break;\n    }\n    if (requestedWithdrawAmount != 0) revert InsufficientWithdrawTokens();\n  }\n\n  /**\n   *  @notice Sets the array of withdrawal token sources for a given RWA token and withdrawal token\n   *  @param  rwaToken              The RWA token for which the source is responsible for\n   *  @param  _withdrawToken        The token that the source will be withdrawing\n   *  @param  _withdrawTokenSources The source contracts that will be used to withdraw\n   */\n  function setWithdrawTokenSources(\n    address rwaToken,\n    address _withdrawToken,\n    ITokenSource[] memory _withdrawTokenSources\n  ) public onlyRole(DEFAULT_ADMIN_ROLE) {\n    if (rwaToken == address(0)) {\n      revert RwaTokenCantBeZero();\n    }\n    if (_withdrawToken == address(0)) revert WithdrawTokenCantBeZero();\n    emit TokenWithdrawSourcesSet(\n      rwaToken,\n      _withdrawToken,\n      withdrawTokenSources[rwaToken][_withdrawToken],\n      _withdrawTokenSources\n    );\n\n    withdrawTokenSources[rwaToken][_withdrawToken] = _withdrawTokenSources;\n  }\n\n  /**\n   * @notice Sets the array of withdrawal token sources for a given RWA token and withdrawal token\n   *         for a specific user.\n   * @param  rwaToken              The RWA token for which the source is responsible for\n   * @param  _withdrawToken        The token that the source will be withdrawing\n   * @param  userID                The ID of the user to set sources for\n   * @param  active                Whether the new user sources are active\n   * @param  _withdrawTokenSources The source contracts that will be used to withdraw\n   */\n  function setUserWithdrawTokenSources(\n    address rwaToken,\n    address _withdrawToken,\n    bytes32 userID,\n    bool active,\n    ITokenSource[] memory _withdrawTokenSources\n  ) public onlyRole(DEFAULT_ADMIN_ROLE) {\n    if (rwaToken == address(0)) {\n      revert RwaTokenCantBeZero();\n    }\n    if (_withdrawToken == address(0)) revert WithdrawTokenCantBeZero();\n    if (userID == bytes32(0)) revert UserIDCantBeZero();\n\n    emit UserTokenWithdrawSourcesSet(\n      rwaToken,\n      _withdrawToken,\n      userID,\n      active,\n      userWithdrawTokenSources[rwaToken][_withdrawToken][userID].tokenSources,\n      _withdrawTokenSources\n    );\n\n    userWithdrawTokenSources[rwaToken][_withdrawToken][userID] =\n      UserWithdrawTokenSources({active: active, tokenSources: _withdrawTokenSources});\n  }\n\n  /**\n   * @notice Set the minimum price and oracle for a token\n   * @param  token                          The token address\n   * @param  _minimumTokenPrice             The minimum price for the token, denoted in USD with\n   *                                        the oracles decimals\n   * @param  aggregatorV3Oracle             The token price oracle address\n   * @param  maxAggregatorV3OracleTimeDelay The maximum time delay for the oracle\n   * @dev    Reverts if any of the parameters are set to zero without nullifying all the others\n   *         except for the token address\n   */\n  function setMinimumTokenPriceAndOracle(\n    address token,\n    uint256 _minimumTokenPrice,\n    address aggregatorV3Oracle,\n    uint256 maxAggregatorV3OracleTimeDelay\n  ) public onlyRole(DEFAULT_ADMIN_ROLE) {\n    if (token == address(0)) revert TokenAddressCantBeZero();\n\n    // Ensure that either all parameters are set to zero or all are set to non-zero values\n    if (!(((_minimumTokenPrice == 0)\n            && (aggregatorV3Oracle == address(0))\n            && (maxAggregatorV3OracleTimeDelay == 0))\n          || ((_minimumTokenPrice != 0)\n            && (aggregatorV3Oracle != address(0))\n            && (maxAggregatorV3OracleTimeDelay != 0)))) revert InconsistentMinimumTokenPriceParameters();\n\n    minimumTokenPrice[token] = _minimumTokenPrice;\n    tokenToAggregatorV3Oracle[token].oracle = AggregatorV3Interface(aggregatorV3Oracle);\n    tokenToAggregatorV3Oracle[token].maxAggregatorV3OracleTimeDelay = maxAggregatorV3OracleTimeDelay;\n\n    // Ensure that the token price check works as expected\n    _assertTokenMinimumPrice(token);\n\n    emit MinimumTokenPriceAndOracleSet(\n      token, _minimumTokenPrice, aggregatorV3Oracle, maxAggregatorV3OracleTimeDelay\n    );\n  }\n\n  /**\n   * @notice Asserts that the token price is above the configured minimum price\n   * @param token The token address\n   */\n  function _assertTokenMinimumPrice(address token) internal view {\n    // If the minimum price is not set then we don't need to check the minimum price.\n    if (minimumTokenPrice[token] == 0) return;\n\n    // If this check is active, then the oracle must be up to date and the price must be above the minimum.\n    (, int256 price,, uint256 updatedAt,) =\n      tokenToAggregatorV3Oracle[token].oracle.latestRoundData();\n    if (\n      updatedAt < block.timestamp - tokenToAggregatorV3Oracle[token].maxAggregatorV3OracleTimeDelay\n    ) revert OraclePriceOutdated();\n\n    if (price < 0) revert TokenPriceBelowMinimum();\n    // forge-lint: disable-next-line(unsafe-typecast)\n    if (uint256(price) < minimumTokenPrice[token]) {\n      revert TokenPriceBelowMinimum();\n    }\n  }\n\n  /**\n   * @notice Add a new token recipient for depositing liquidity\n   * @param  rwaToken               The RWA token for which the liquidity is being added\n   * @param  _depositToken          The token that the recipient expects to receive\n   * @param  _depositTokenRecipient The token recipient contract\n   */\n  function setDepositTokenRecipient(\n    address rwaToken,\n    address _depositToken,\n    ITokenRecipient _depositTokenRecipient\n  ) public onlyRole(DEFAULT_ADMIN_ROLE) {\n    if (rwaToken == address(0)) revert RwaTokenCantBeZero();\n    if (_depositToken == address(0)) revert DepositTokenCantBeZero();\n    emit TokenDepositRecipientSet(\n      rwaToken,\n      _depositToken,\n      depositTokenRecipient[rwaToken][_depositToken],\n      _depositTokenRecipient\n    );\n\n    depositTokenRecipient[rwaToken][_depositToken] = _depositTokenRecipient;\n  }\n}\n"
+    },
+    "contracts/xManager/interfaces/IOndoTokenRouter.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity ^0.8.4;\n\ninterface IOndoTokenRouter {\n  function depositToken(address rwaToken, address tokenToDeposit, uint256 depositAmount) external;\n\n  function withdrawToken(\n    address rwaTokenRedeemed,\n    address tokenToWithdraw,\n    bytes32 userID,\n    uint256 withdrawAmount\n  ) external;\n\n  function availableToWithdraw(address rwaToken, address tokenToWithdraw, bytes32 userID)\n    external\n    view\n    returns (uint256 totalAvailable);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/access/AccessControlEnumerable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControlEnumerable.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/access/IAccessControlEnumerable.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/access/AccessControl.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/EnumerableSet.sol\";\n\n/**\n * @dev Extension of {AccessControl} that allows enumerating the members of each role.\n */\nabstract contract AccessControlEnumerable is\n  IAccessControlEnumerable,\n  AccessControl\n{\n  using EnumerableSet for EnumerableSet.AddressSet;\n\n  mapping(bytes32 => EnumerableSet.AddressSet) private _roleMembers;\n\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return\n      interfaceId == type(IAccessControlEnumerable).interfaceId ||\n      super.supportsInterface(interfaceId);\n  }\n\n  /**\n   * @dev Returns one of the accounts that have `role`. `index` must be a\n   * value between 0 and {getRoleMemberCount}, non-inclusive.\n   *\n   * Role bearers are not sorted in any particular way, and their ordering may\n   * change at any point.\n   *\n   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure\n   * you perform all queries on the same block. See the following\n   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]\n   * for more information.\n   */\n  function getRoleMember(bytes32 role, uint256 index)\n    public\n    view\n    virtual\n    override\n    returns (address)\n  {\n    return _roleMembers[role].at(index);\n  }\n\n  /**\n   * @dev Returns the number of accounts that have `role`. Can be used\n   * together with {getRoleMember} to enumerate all bearers of a role.\n   */\n  function getRoleMemberCount(bytes32 role)\n    public\n    view\n    virtual\n    override\n    returns (uint256)\n  {\n    return _roleMembers[role].length();\n  }\n\n  /**\n   * @dev Overload {_grantRole} to track enumerable memberships\n   */\n  function _grantRole(bytes32 role, address account) internal virtual override {\n    super._grantRole(role, account);\n    _roleMembers[role].add(account);\n  }\n\n  /**\n   * @dev Overload {_revokeRole} to track enumerable memberships\n   */\n  function _revokeRole(bytes32 role, address account)\n    internal\n    virtual\n    override\n  {\n    super._revokeRole(role, account);\n    _roleMembers[role].remove(account);\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/security/ReentrancyGuard.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (security/ReentrancyGuard.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Contract module that helps prevent reentrant calls to a function.\n *\n * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier\n * available, which can be applied to functions to make sure there are no nested\n * (reentrant) calls to them.\n *\n * Note that because there is a single `nonReentrant` guard, functions marked as\n * `nonReentrant` may not call one another. This can be worked around by making\n * those functions `private`, and then adding `external` `nonReentrant` entry\n * points to them.\n *\n * TIP: If you would like to learn more about reentrancy and alternative ways\n * to protect against it, check out our blog post\n * https://blog.openzeppelin.com/reentrancy-after-istanbul/[Reentrancy After Istanbul].\n */\nabstract contract ReentrancyGuard {\n  // Booleans are more expensive than uint256 or any type that takes up a full\n  // word because each write operation emits an extra SLOAD to first read the\n  // slot's contents, replace the bits taken up by the boolean, and then write\n  // back. This is the compiler's defense against contract upgrades and\n  // pointer aliasing, and it cannot be disabled.\n\n  // The values being non-zero value makes deployment a bit more expensive,\n  // but in exchange the refund on every call to nonReentrant will be lower in\n  // amount. Since refunds are capped to a percentage of the total\n  // transaction's gas, it is best to keep them low in cases like this one, to\n  // increase the likelihood of the full refund coming into effect.\n  uint256 private constant _NOT_ENTERED = 1;\n  uint256 private constant _ENTERED = 2;\n\n  uint256 private _status;\n\n  constructor() {\n    _status = _NOT_ENTERED;\n  }\n\n  /**\n   * @dev Prevents a contract from calling itself, directly or indirectly.\n   * Calling a `nonReentrant` function from another `nonReentrant`\n   * function is not supported. It is possible to prevent this from happening\n   * by making the `nonReentrant` function external, and making it call a\n   * `private` function that does the actual work.\n   */\n  modifier nonReentrant() {\n    // On the first call to nonReentrant, _notEntered will be true\n    require(_status != _ENTERED, \"ReentrancyGuard: reentrant call\");\n\n    // Any calls to nonReentrant after this point will fail\n    _status = _ENTERED;\n\n    _;\n\n    // By storing the original value once again, a refund is triggered (see\n    // https://eips.ethereum.org/EIPS/eip-2200)\n    _status = _NOT_ENTERED;\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/token/IERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (token/ERC20/IERC20.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC20 standard as defined in the EIP.\n */\ninterface IERC20 {\n  /**\n   * @dev Returns the amount of tokens in existence.\n   */\n  function totalSupply() external view returns (uint256);\n\n  /**\n   * @dev Returns the amount of tokens owned by `account`.\n   */\n  function balanceOf(address account) external view returns (uint256);\n\n  /**\n   * @dev Moves `amount` tokens from the caller's account to `to`.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * Emits a {Transfer} event.\n   */\n  function transfer(address to, uint256 amount) external returns (bool);\n\n  /**\n   * @dev Returns the remaining number of tokens that `spender` will be\n   * allowed to spend on behalf of `owner` through {transferFrom}. This is\n   * zero by default.\n   *\n   * This value changes when {approve} or {transferFrom} are called.\n   */\n  function allowance(address owner, address spender)\n    external\n    view\n    returns (uint256);\n\n  /**\n   * @dev Sets `amount` as the allowance of `spender` over the caller's tokens.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * IMPORTANT: Beware that changing an allowance with this method brings the risk\n   * that someone may use both the old and the new allowance by unfortunate\n   * transaction ordering. One possible solution to mitigate this race\n   * condition is to first reduce the spender's allowance to 0 and set the\n   * desired value afterwards:\n   * https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729\n   *\n   * Emits an {Approval} event.\n   */\n  function approve(address spender, uint256 amount) external returns (bool);\n\n  /**\n   * @dev Moves `amount` tokens from `from` to `to` using the\n   * allowance mechanism. `amount` is then deducted from the caller's\n   * allowance.\n   *\n   * Returns a boolean value indicating whether the operation succeeded.\n   *\n   * Emits a {Transfer} event.\n   */\n  function transferFrom(\n    address from,\n    address to,\n    uint256 amount\n  ) external returns (bool);\n\n  /**\n   * @dev Emitted when `value` tokens are moved from one account (`from`) to\n   * another (`to`).\n   *\n   * Note that `value` may be zero.\n   */\n  event Transfer(address indexed from, address indexed to, uint256 value);\n\n  /**\n   * @dev Emitted when the allowance of a `spender` for an `owner` is set by\n   * a call to {approve}. `value` is the new allowance.\n   */\n  event Approval(address indexed owner, address indexed spender, uint256 value);\n}\n"
+    },
+    "contracts/external/chainlink/AggregatorV3Interface.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.4;\n\ninterface AggregatorV3Interface {\n  function decimals() external view returns (uint8);\n\n  function description() external view returns (string memory);\n\n  function version() external view returns (uint256);\n\n  function getRoundData(\n    uint80 _roundId\n  )\n    external\n    view\n    returns (\n      uint80 roundId,\n      int256 answer,\n      uint256 startedAt,\n      uint256 updatedAt,\n      uint80 answeredInRound\n    );\n\n  function latestRoundData()\n    external\n    view\n    returns (\n      uint80 roundId,\n      int256 answer,\n      uint256 startedAt,\n      uint256 updatedAt,\n      uint80 answeredInRound\n    );\n}\n"
+    },
+    "contracts/xManager/tokenRouter/IOndoTokenRouterEvents.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity ^0.8.4;\n\nimport {ITokenSource} from \"contracts/xManager/interfaces/ITokenSource.sol\";\nimport {ITokenRecipient} from \"contracts/xManager/interfaces/ITokenRecipient.sol\";\n\ninterface IOndoTokenRouterEvents {\n  /**\n   * @notice Emitted when a token is deposited to the router\n   * @param  rwaToken     The RWA token that the deposit is for\n   * @param  depositToken The token that was deposited\n   * @param  amount       The amount of the token that was deposited, in the token's\n   *                      decimals\n   */\n  event TokenDeposited(address indexed rwaToken, address indexed depositToken, uint256 amount);\n\n  /**\n   * @notice Emitted when a token is withdrawn via the router\n   * @param  rwaToken      The RWA token that the withdrawal is for\n   * @param  withdrawToken The token that was withdrawn\n   * @param  amount        The amount of the token that was withdrawn, in the\n   *                       token's decimals\n   */\n  event TokenWithdrawn(address indexed rwaToken, address indexed withdrawToken, uint256 amount);\n\n  /**\n   * @notice Emitted when a token recipient is set for a token\n   * @param  rwaToken          The RWA token that the recipient is being set for\n   * @param  depositToken      The token that the recipient is being set for\n   * @param  oldTokenRecipient The old recipient\n   * @param  newTokenRecipient The new recipient\n   */\n  event TokenDepositRecipientSet(\n    address indexed rwaToken,\n    address indexed depositToken,\n    ITokenRecipient oldTokenRecipient,\n    ITokenRecipient newTokenRecipient\n  );\n\n  /**\n   * @notice Emitted when a token source is set for a token\n   * @param  rwaToken        The RWA token that the source is being set for\n   * @param  withdrawToken   The token that the source is being set for\n   * @param  oldTokenSources The old sources\n   * @param  newTokenSources The new sources\n   */\n  event TokenWithdrawSourcesSet(\n    address indexed rwaToken,\n    address indexed withdrawToken,\n    ITokenSource[] oldTokenSources,\n    ITokenSource[] newTokenSources\n  );\n\n  /**\n   * @notice Emitted when a user's token withdraw sources are set\n   * @param  rwaToken        The RWA token that the sources are being set for\n   * @param  withdrawToken   The token that the sources are being set for\n   * @param  userID          The ID of the user the sources are being set for\n   * @param  active          Whether the user sources are active\n   * @param  oldTokenSources The old sources\n   * @param  newTokenSources The new sources\n   */\n  event UserTokenWithdrawSourcesSet(\n    address indexed rwaToken,\n    address indexed withdrawToken,\n    bytes32 indexed userID,\n    bool active,\n    ITokenSource[] oldTokenSources,\n    ITokenSource[] newTokenSources\n  );\n\n  /**\n   * @notice Emitted when a token's minimum price is set\n   * @param  tokenAddress The token that the minimum price is being set for\n   * @param  minimumPrice The new minimum price\n   * @param  oracle       The new token oracle\n   * @param  maxTimeDelay The maximum time delay for the oracle\n   */\n  event MinimumTokenPriceAndOracleSet(\n    address indexed tokenAddress, uint256 minimumPrice, address oracle, uint256 maxTimeDelay\n  );\n}\n"
+    },
+    "contracts/xManager/tokenRouter/IOndoTokenRouterErrors.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity ^0.8.4;\n\ninterface IOndoTokenRouterErrors {\n  /// Error thrown when attempting to set a recipient or source with a zero address for the RWA token.\n  error RwaTokenCantBeZero();\n\n  /// Error thrown when attempting to set a recipient with a zero address for the token.\n  error DepositTokenCantBeZero();\n\n  /// Error thrown when attempting to set a source with a zero address for the token.\n  error WithdrawTokenCantBeZero();\n\n  /// Error thrown when attempting to set the oracle or minimum price for a token with a zero address.\n  error TokenAddressCantBeZero();\n\n  /// Error thrown when calling `setMinimumTokenPriceAndOracle` with only some of the parameters set.\n  error InconsistentMinimumTokenPriceParameters();\n\n  /// Error thrown when the price pulled from a token's oracle is outdated.\n  error OraclePriceOutdated();\n\n  /// Error thrown a token's price is below the minimum.\n  error TokenPriceBelowMinimum();\n\n  /// Error thrown when a deposit token doesn't have a recipient set.\n  error TokenRecipientNotSet();\n\n  /// Error thrown when there aren't enough withdraw tokens available.\n  error InsufficientWithdrawTokens();\n\n  /// Error thrown when attempting to set a user ID to the zero bytes32 value.\n  error UserIDCantBeZero();\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/token/SafeERC20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.2.0) (token/ERC20/utils/SafeERC20.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/token/IERC20.sol\";\n\n/**\n * @title SafeERC20\n * @dev Wrappers around ERC-20 operations that throw on failure (when the token\n * contract returns false). Tokens that return no value (and instead revert or\n * throw on failure) are also supported, non-reverting calls are assumed to be\n * successful.\n * To use this library you can add a `using SafeERC20 for IERC20;` statement to your contract,\n * which allows you to call the safe operations as `token.safeTransfer(...)`, etc.\n */\nlibrary SafeERC20 {\n    /**\n     * @dev An operation with an ERC-20 token failed.\n     */\n    error SafeERC20FailedOperation(address token);\n\n    /**\n     * @dev Indicates a failed `decreaseAllowance` request.\n     */\n    error SafeERC20FailedDecreaseAllowance(address spender, uint256 currentAllowance, uint256 requestedDecrease);\n\n    /**\n     * @dev Transfer `value` amount of `token` from the calling contract to `to`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful.\n     */\n    function safeTransfer(IERC20 token, address to, uint256 value) internal {\n        _callOptionalReturn(token, abi.encodeCall(token.transfer, (to, value)));\n    }\n\n    /**\n     * @dev Transfer `value` amount of `token` from `from` to `to`, spending the approval given by `from` to the\n     * calling contract. If `token` returns no value, non-reverting calls are assumed to be successful.\n     */\n    function safeTransferFrom(IERC20 token, address from, address to, uint256 value) internal {\n        _callOptionalReturn(token, abi.encodeCall(token.transferFrom, (from, to, value)));\n    }\n\n    /**\n     * @dev Increase the calling contract's allowance toward `spender` by `value`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful.\n     *\n     * IMPORTANT: If the token implements ERC-7674 (ERC-20 with temporary allowance), and if the \"client\"\n     * smart contract uses ERC-7674 to set temporary allowances, then the \"client\" smart contract should avoid using\n     * this function. Performing a {safeIncreaseAllowance} or {safeDecreaseAllowance} operation on a token contract\n     * that has a non-zero temporary allowance (for that particular owner-spender) will result in unexpected behavior.\n     */\n    function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {\n        uint256 oldAllowance = token.allowance(address(this), spender);\n        forceApprove(token, spender, oldAllowance + value);\n    }\n\n    /**\n     * @dev Decrease the calling contract's allowance toward `spender` by `requestedDecrease`. If `token` returns no\n     * value, non-reverting calls are assumed to be successful.\n     *\n     * IMPORTANT: If the token implements ERC-7674 (ERC-20 with temporary allowance), and if the \"client\"\n     * smart contract uses ERC-7674 to set temporary allowances, then the \"client\" smart contract should avoid using\n     * this function. Performing a {safeIncreaseAllowance} or {safeDecreaseAllowance} operation on a token contract\n     * that has a non-zero temporary allowance (for that particular owner-spender) will result in unexpected behavior.\n     */\n    function safeDecreaseAllowance(IERC20 token, address spender, uint256 requestedDecrease) internal {\n        unchecked {\n            uint256 currentAllowance = token.allowance(address(this), spender);\n            if (currentAllowance < requestedDecrease) {\n                revert SafeERC20FailedDecreaseAllowance(spender, currentAllowance, requestedDecrease);\n            }\n            forceApprove(token, spender, currentAllowance - requestedDecrease);\n        }\n    }\n\n    /**\n     * @dev Set the calling contract's allowance toward `spender` to `value`. If `token` returns no value,\n     * non-reverting calls are assumed to be successful. Meant to be used with tokens that require the approval\n     * to be set to zero before setting it to a non-zero value, such as USDT.\n     *\n     * NOTE: If the token implements ERC-7674, this function will not modify any temporary allowance. This function\n     * only sets the \"standard\" allowance. Any temporary allowance will remain active, in addition to the value being\n     * set here.\n     */\n    function forceApprove(IERC20 token, address spender, uint256 value) internal {\n        bytes memory approvalCall = abi.encodeCall(token.approve, (spender, value));\n\n        if (!_callOptionalReturnBool(token, approvalCall)) {\n            _callOptionalReturn(token, abi.encodeCall(token.approve, (spender, 0)));\n            _callOptionalReturn(token, approvalCall);\n        }\n    }\n\n    /**\n     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement\n     * on the return value: the return value is optional (but if data is returned, it must not be false).\n     * @param token The token targeted by the call.\n     * @param data The call data (encoded using abi.encode or one of its variants).\n     *\n     * This is a variant of {_callOptionalReturnBool} that reverts if call fails to meet the requirements.\n     */\n    function _callOptionalReturn(IERC20 token, bytes memory data) private {\n        uint256 returnSize;\n        uint256 returnValue;\n        assembly (\"memory-safe\") {\n            let success := call(gas(), token, 0, add(data, 0x20), mload(data), 0, 0x20)\n            // bubble errors\n            if iszero(success) {\n                let ptr := mload(0x40)\n                returndatacopy(ptr, 0, returndatasize())\n                revert(ptr, returndatasize())\n            }\n            returnSize := returndatasize()\n            returnValue := mload(0)\n        }\n\n        if (returnSize == 0 ? address(token).code.length == 0 : returnValue != 1) {\n            revert SafeERC20FailedOperation(address(token));\n        }\n    }\n\n    /**\n     * @dev Imitates a Solidity high-level call (i.e. a regular function call to a contract), relaxing the requirement\n     * on the return value: the return value is optional (but if data is returned, it must not be false).\n     * @param token The token targeted by the call.\n     * @param data The call data (encoded using abi.encode or one of its variants).\n     *\n     * This is a variant of {_callOptionalReturn} that silently catches all reverts and returns a bool instead.\n     */\n    function _callOptionalReturnBool(IERC20 token, bytes memory data) private returns (bool) {\n        bool success;\n        uint256 returnSize;\n        uint256 returnValue;\n        assembly (\"memory-safe\") {\n            success := call(gas(), token, 0, add(data, 0x20), mload(data), 0, 0x20)\n            returnSize := returndatasize()\n            returnValue := mload(0)\n        }\n        return success && (returnSize == 0 ? address(token).code.length > 0 : returnValue == 1);\n    }\n}"
+    },
+    "contracts/xManager/interfaces/ITokenSource.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity ^0.8.4;\n\ninterface ITokenSource {\n  /**\n   * @notice Emitted when tokens are withdrawn from the source\n   * @param  requestedBy    The address of the account that requested the withdraw\n   * @param  withdrawnFrom  The address of the source contract from which the tokens were withdrawn\n   * @param  withdrawToken  The address of the token that was withdrawn\n   * @param  withdrawAmount The amount of tokens that were withdrawn, denoted in the decimals of\n   *                        `withdrawToken`\n   */\n  event TokensWithdrawn(\n    address indexed requestedBy,\n    address indexed withdrawnFrom,\n    address indexed withdrawToken,\n    uint256 withdrawAmount\n  );\n\n  /// Thrown when the requested token is not the expected token\n  error InvalidTokenAddressForTokenSource();\n\n  /// Thrown when attempting to set an address to address(0) which is not allowed\n  error ZeroAddressNotAllowed();\n\n  function withdrawToken(address tokenToWithdraw, uint256 withdrawAmount) external;\n\n  function availableToWithdraw(address tokenToWithdraw) external view returns (uint256);\n}\n"
+    },
+    "contracts/xManager/interfaces/ITokenRecipient.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\n/*\n      ▄▄█████████▄\n   ╓██▀└ ,╓▄▄▄, '▀██▄\n  ██▀ ▄██▀▀╙╙▀▀██▄ └██µ           ,,       ,,      ,     ,,,            ,,,\n ██ ,██¬ ▄████▄  ▀█▄ ╙█▄      ▄███▀▀███▄   ███▄    ██  ███▀▀▀███▄    ▄███▀▀███,\n██  ██ ╒█▀'   ╙█▌ ╙█▌ ██     ▐██      ███  █████,  ██  ██▌    └██▌  ██▌     └██▌\n██ ▐█▌ ██      ╟█  █▌ ╟█     ██▌      ▐██  ██ └███ ██  ██▌     ╟██ j██       ╟██\n╟█  ██ ╙██    ▄█▀ ▐█▌ ██     ╙██      ██▌  ██   ╙████  ██▌    ▄██▀  ██▌     ,██▀\n ██ \"██, ╙▀▀███████████⌐      ╙████████▀   ██     ╙██  ███████▀▀     ╙███████▀`\n  ██▄ ╙▀██▄▄▄▄▄,,,                ¬─                                    '─¬\n   ╙▀██▄ '╙╙╙▀▀▀▀▀▀▀▀\n      ╙▀▀██████R⌐\n */\npragma solidity ^0.8.4;\n\ninterface ITokenRecipient {\n  /**\n   * @notice Emitted when tokens are deposited into the recipient\n   * @param  depositToken       The address of the token deposited\n   * @param  depositDestination The address of the recipient contract that received the tokens\n   * @param  depositAmount      The amount of tokens that were deposited, denoted in the decimals\n   *                            of `depositToken`\n   */\n  event TokensDeposited(\n    address indexed depositToken, address indexed depositDestination, uint256 depositAmount\n  );\n\n  /// Error thrown when attempting to set a zero address\n  error ZeroAddressNotAllowed();\n\n  function depositToken(address depositToken, uint256 depositAmount) external;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/access/IAccessControlEnumerable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (access/IAccessControlEnumerable.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/access/IAccessControl.sol\";\n\n/**\n * @dev External interface of AccessControlEnumerable declared to support ERC165 detection.\n */\ninterface IAccessControlEnumerable is IAccessControl {\n  /**\n   * @dev Returns one of the accounts that have `role`. `index` must be a\n   * value between 0 and {getRoleMemberCount}, non-inclusive.\n   *\n   * Role bearers are not sorted in any particular way, and their ordering may\n   * change at any point.\n   *\n   * WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure\n   * you perform all queries on the same block. See the following\n   * https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post]\n   * for more information.\n   */\n  function getRoleMember(bytes32 role, uint256 index)\n    external\n    view\n    returns (address);\n\n  /**\n   * @dev Returns the number of accounts that have `role`. Can be used\n   * together with {getRoleMember} to enumerate all bearers of a role.\n   */\n  function getRoleMemberCount(bytes32 role) external view returns (uint256);\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/access/AccessControl.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v4.5.0) (access/AccessControl.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/access/IAccessControl.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/Context.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/Strings.sol\";\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/ERC165.sol\";\n\n/**\n * @dev Contract module that allows children to implement role-based access\n * control mechanisms. This is a lightweight version that doesn't allow enumerating role\n * members except through off-chain means by accessing the contract event logs. Some\n * applications may benefit from on-chain enumerability, for those cases see\n * {AccessControlEnumerable}.\n *\n * Roles are referred to by their `bytes32` identifier. These should be exposed\n * in the external API and be unique. The best way to achieve this is by\n * using `public constant` hash digests:\n *\n * ```\n * bytes32 public constant MY_ROLE = keccak256(\"MY_ROLE\");\n * ```\n *\n * Roles can be used to represent a set of permissions. To restrict access to a\n * function call, use {hasRole}:\n *\n * ```\n * function foo() public {\n *     require(hasRole(MY_ROLE, msg.sender));\n *     ...\n * }\n * ```\n *\n * Roles can be granted and revoked dynamically via the {grantRole} and\n * {revokeRole} functions. Each role has an associated admin role, and only\n * accounts that have a role's admin role can call {grantRole} and {revokeRole}.\n *\n * By default, the admin role for all roles is `DEFAULT_ADMIN_ROLE`, which means\n * that only accounts with this role will be able to grant or revoke other\n * roles. More complex role relationships can be created by using\n * {_setRoleAdmin}.\n *\n * WARNING: The `DEFAULT_ADMIN_ROLE` is also its own admin: it has permission to\n * grant and revoke this role. Extra precautions should be taken to secure\n * accounts that have been granted it.\n */\nabstract contract AccessControl is Context, IAccessControl, ERC165 {\n  struct RoleData {\n    mapping(address => bool) members;\n    bytes32 adminRole;\n  }\n\n  mapping(bytes32 => RoleData) private _roles;\n\n  bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;\n\n  /**\n   * @dev Modifier that checks that an account has a specific role. Reverts\n   * with a standardized message including the required role.\n   *\n   * The format of the revert reason is given by the following regular expression:\n   *\n   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/\n   *\n   * _Available since v4.1._\n   */\n  modifier onlyRole(bytes32 role) {\n    _checkRole(role, _msgSender());\n    _;\n  }\n\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return\n      interfaceId == type(IAccessControl).interfaceId ||\n      super.supportsInterface(interfaceId);\n  }\n\n  /**\n   * @dev Returns `true` if `account` has been granted `role`.\n   */\n  function hasRole(bytes32 role, address account)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return _roles[role].members[account];\n  }\n\n  /**\n   * @dev Revert with a standard message if `account` is missing `role`.\n   *\n   * The format of the revert reason is given by the following regular expression:\n   *\n   *  /^AccessControl: account (0x[0-9a-f]{40}) is missing role (0x[0-9a-f]{64})$/\n   */\n  function _checkRole(bytes32 role, address account) internal view virtual {\n    if (!hasRole(role, account)) {\n      revert(\n        string(\n          abi.encodePacked(\n            \"AccessControl: account \",\n            Strings.toHexString(uint160(account), 20),\n            \" is missing role \",\n            Strings.toHexString(uint256(role), 32)\n          )\n        )\n      );\n    }\n  }\n\n  /**\n   * @dev Returns the admin role that controls `role`. See {grantRole} and\n   * {revokeRole}.\n   *\n   * To change a role's admin, use {_setRoleAdmin}.\n   */\n  function getRoleAdmin(bytes32 role)\n    public\n    view\n    virtual\n    override\n    returns (bytes32)\n  {\n    return _roles[role].adminRole;\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function grantRole(bytes32 role, address account)\n    public\n    virtual\n    override\n    onlyRole(getRoleAdmin(role))\n  {\n    _grantRole(role, account);\n  }\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * If `account` had been granted `role`, emits a {RoleRevoked} event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function revokeRole(bytes32 role, address account)\n    public\n    virtual\n    override\n    onlyRole(getRoleAdmin(role))\n  {\n    _revokeRole(role, account);\n  }\n\n  /**\n   * @dev Revokes `role` from the calling account.\n   *\n   * Roles are often managed via {grantRole} and {revokeRole}: this function's\n   * purpose is to provide a mechanism for accounts to lose their privileges\n   * if they are compromised (such as when a trusted device is misplaced).\n   *\n   * If the calling account had been revoked `role`, emits a {RoleRevoked}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must be `account`.\n   */\n  function renounceRole(bytes32 role, address account) public virtual override {\n    require(\n      account == _msgSender(),\n      \"AccessControl: can only renounce roles for self\"\n    );\n\n    _revokeRole(role, account);\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event. Note that unlike {grantRole}, this function doesn't perform any\n   * checks on the calling account.\n   *\n   * [WARNING]\n   * ====\n   * This function should only be called from the constructor when setting\n   * up the initial roles for the system.\n   *\n   * Using this function in any other way is effectively circumventing the admin\n   * system imposed by {AccessControl}.\n   * ====\n   *\n   * NOTE: This function is deprecated in favor of {_grantRole}.\n   */\n  function _setupRole(bytes32 role, address account) internal virtual {\n    _grantRole(role, account);\n  }\n\n  /**\n   * @dev Sets `adminRole` as ``role``'s admin role.\n   *\n   * Emits a {RoleAdminChanged} event.\n   */\n  function _setRoleAdmin(bytes32 role, bytes32 adminRole) internal virtual {\n    bytes32 previousAdminRole = getRoleAdmin(role);\n    _roles[role].adminRole = adminRole;\n    emit RoleAdminChanged(role, previousAdminRole, adminRole);\n  }\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * Internal function without access restriction.\n   */\n  function _grantRole(bytes32 role, address account) internal virtual {\n    if (!hasRole(role, account)) {\n      _roles[role].members[account] = true;\n      emit RoleGranted(role, account, _msgSender());\n    }\n  }\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * Internal function without access restriction.\n   */\n  function _revokeRole(bytes32 role, address account) internal virtual {\n    if (hasRole(role, account)) {\n      _roles[role].members[account] = false;\n      emit RoleRevoked(role, account, _msgSender());\n    }\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/EnumerableSet.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/structs/EnumerableSet.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Library for managing\n * https://en.wikipedia.org/wiki/Set_(abstract_data_type)[sets] of primitive\n * types.\n *\n * Sets have the following properties:\n *\n * - Elements are added, removed, and checked for existence in constant time\n * (O(1)).\n * - Elements are enumerated in O(n). No guarantees are made on the ordering.\n *\n * ```\n * contract Example {\n *     // Add the library methods\n *     using EnumerableSet for EnumerableSet.AddressSet;\n *\n *     // Declare a set state variable\n *     EnumerableSet.AddressSet private mySet;\n * }\n * ```\n *\n * As of v3.3.0, sets of type `bytes32` (`Bytes32Set`), `address` (`AddressSet`)\n * and `uint256` (`UintSet`) are supported.\n */\nlibrary EnumerableSet {\n  // To implement this library for multiple types with as little code\n  // repetition as possible, we write it in terms of a generic Set type with\n  // bytes32 values.\n  // The Set implementation uses private functions, and user-facing\n  // implementations (such as AddressSet) are just wrappers around the\n  // underlying Set.\n  // This means that we can only create new EnumerableSets for types that fit\n  // in bytes32.\n\n  struct Set {\n    // Storage of set values\n    bytes32[] _values;\n    // Position of the value in the `values` array, plus 1 because index 0\n    // means a value is not in the set.\n    mapping(bytes32 => uint256) _indexes;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function _add(Set storage set, bytes32 value) private returns (bool) {\n    if (!_contains(set, value)) {\n      set._values.push(value);\n      // The value is stored at length-1, but we add 1 to all indexes\n      // and use 0 as a sentinel value\n      set._indexes[value] = set._values.length;\n      return true;\n    } else {\n      return false;\n    }\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function _remove(Set storage set, bytes32 value) private returns (bool) {\n    // We read and store the value's index to prevent multiple reads from the same storage slot\n    uint256 valueIndex = set._indexes[value];\n\n    if (valueIndex != 0) {\n      // Equivalent to contains(set, value)\n      // To delete an element from the _values array in O(1), we swap the element to delete with the last one in\n      // the array, and then remove the last element (sometimes called as 'swap and pop').\n      // This modifies the order of the array, as noted in {at}.\n\n      uint256 toDeleteIndex = valueIndex - 1;\n      uint256 lastIndex = set._values.length - 1;\n\n      if (lastIndex != toDeleteIndex) {\n        bytes32 lastvalue = set._values[lastIndex];\n\n        // Move the last value to the index where the value to delete is\n        set._values[toDeleteIndex] = lastvalue;\n        // Update the index for the moved value\n        set._indexes[lastvalue] = valueIndex; // Replace lastvalue's index to valueIndex\n      }\n\n      // Delete the slot where the moved value was stored\n      set._values.pop();\n\n      // Delete the index for the deleted slot\n      delete set._indexes[value];\n\n      return true;\n    } else {\n      return false;\n    }\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function _contains(Set storage set, bytes32 value)\n    private\n    view\n    returns (bool)\n  {\n    return set._indexes[value] != 0;\n  }\n\n  /**\n   * @dev Returns the number of values on the set. O(1).\n   */\n  function _length(Set storage set) private view returns (uint256) {\n    return set._values.length;\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function _at(Set storage set, uint256 index) private view returns (bytes32) {\n    return set._values[index];\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function _values(Set storage set) private view returns (bytes32[] memory) {\n    return set._values;\n  }\n\n  // Bytes32Set\n\n  struct Bytes32Set {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(Bytes32Set storage set, bytes32 value) internal returns (bool) {\n    return _add(set._inner, value);\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(Bytes32Set storage set, bytes32 value)\n    internal\n    returns (bool)\n  {\n    return _remove(set._inner, value);\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(Bytes32Set storage set, bytes32 value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, value);\n  }\n\n  /**\n   * @dev Returns the number of values in the set. O(1).\n   */\n  function length(Bytes32Set storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(Bytes32Set storage set, uint256 index)\n    internal\n    view\n    returns (bytes32)\n  {\n    return _at(set._inner, index);\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(Bytes32Set storage set)\n    internal\n    view\n    returns (bytes32[] memory)\n  {\n    return _values(set._inner);\n  }\n\n  // AddressSet\n\n  struct AddressSet {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(AddressSet storage set, address value) internal returns (bool) {\n    return _add(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(AddressSet storage set, address value)\n    internal\n    returns (bool)\n  {\n    return _remove(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(AddressSet storage set, address value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, bytes32(uint256(uint160(value))));\n  }\n\n  /**\n   * @dev Returns the number of values in the set. O(1).\n   */\n  function length(AddressSet storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(AddressSet storage set, uint256 index)\n    internal\n    view\n    returns (address)\n  {\n    return address(uint160(uint256(_at(set._inner, index))));\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(AddressSet storage set)\n    internal\n    view\n    returns (address[] memory)\n  {\n    bytes32[] memory store = _values(set._inner);\n    address[] memory result;\n\n    assembly {\n      result := store\n    }\n\n    return result;\n  }\n\n  // UintSet\n\n  struct UintSet {\n    Set _inner;\n  }\n\n  /**\n   * @dev Add a value to a set. O(1).\n   *\n   * Returns true if the value was added to the set, that is if it was not\n   * already present.\n   */\n  function add(UintSet storage set, uint256 value) internal returns (bool) {\n    return _add(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Removes a value from a set. O(1).\n   *\n   * Returns true if the value was removed from the set, that is if it was\n   * present.\n   */\n  function remove(UintSet storage set, uint256 value) internal returns (bool) {\n    return _remove(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Returns true if the value is in the set. O(1).\n   */\n  function contains(UintSet storage set, uint256 value)\n    internal\n    view\n    returns (bool)\n  {\n    return _contains(set._inner, bytes32(value));\n  }\n\n  /**\n   * @dev Returns the number of values on the set. O(1).\n   */\n  function length(UintSet storage set) internal view returns (uint256) {\n    return _length(set._inner);\n  }\n\n  /**\n   * @dev Returns the value stored at position `index` in the set. O(1).\n   *\n   * Note that there are no guarantees on the ordering of values inside the\n   * array, and it may change when more values are added or removed.\n   *\n   * Requirements:\n   *\n   * - `index` must be strictly less than {length}.\n   */\n  function at(UintSet storage set, uint256 index)\n    internal\n    view\n    returns (uint256)\n  {\n    return uint256(_at(set._inner, index));\n  }\n\n  /**\n   * @dev Return the entire set in an array\n   *\n   * WARNING: This operation will copy the entire storage to memory, which can be quite expensive. This is designed\n   * to mostly be used by view accessors that are queried without any gas fees. Developers should keep in mind that\n   * this function has an unbounded cost, and using it as part of a state-changing function may render the function\n   * uncallable if the set grows to a point where copying to memory consumes too much gas to fit in a block.\n   */\n  function values(UintSet storage set)\n    internal\n    view\n    returns (uint256[] memory)\n  {\n    bytes32[] memory store = _values(set._inner);\n    uint256[] memory result;\n\n    assembly {\n      result := store\n    }\n\n    return result;\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/access/IAccessControl.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (access/IAccessControl.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev External interface of AccessControl declared to support ERC165 detection.\n */\ninterface IAccessControl {\n  /**\n   * @dev Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole`\n   *\n   * `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite\n   * {RoleAdminChanged} not being emitted signaling this.\n   *\n   * _Available since v3.1._\n   */\n  event RoleAdminChanged(\n    bytes32 indexed role,\n    bytes32 indexed previousAdminRole,\n    bytes32 indexed newAdminRole\n  );\n\n  /**\n   * @dev Emitted when `account` is granted `role`.\n   *\n   * `sender` is the account that originated the contract call, an admin role\n   * bearer except when using {AccessControl-_setupRole}.\n   */\n  event RoleGranted(\n    bytes32 indexed role,\n    address indexed account,\n    address indexed sender\n  );\n\n  /**\n   * @dev Emitted when `account` is revoked `role`.\n   *\n   * `sender` is the account that originated the contract call:\n   *   - if using `revokeRole`, it is the admin role bearer\n   *   - if using `renounceRole`, it is the role bearer (i.e. `account`)\n   */\n  event RoleRevoked(\n    bytes32 indexed role,\n    address indexed account,\n    address indexed sender\n  );\n\n  /**\n   * @dev Returns `true` if `account` has been granted `role`.\n   */\n  function hasRole(bytes32 role, address account) external view returns (bool);\n\n  /**\n   * @dev Returns the admin role that controls `role`. See {grantRole} and\n   * {revokeRole}.\n   *\n   * To change a role's admin, use {AccessControl-_setRoleAdmin}.\n   */\n  function getRoleAdmin(bytes32 role) external view returns (bytes32);\n\n  /**\n   * @dev Grants `role` to `account`.\n   *\n   * If `account` had not been already granted `role`, emits a {RoleGranted}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function grantRole(bytes32 role, address account) external;\n\n  /**\n   * @dev Revokes `role` from `account`.\n   *\n   * If `account` had been granted `role`, emits a {RoleRevoked} event.\n   *\n   * Requirements:\n   *\n   * - the caller must have ``role``'s admin role.\n   */\n  function revokeRole(bytes32 role, address account) external;\n\n  /**\n   * @dev Revokes `role` from the calling account.\n   *\n   * Roles are often managed via {grantRole} and {revokeRole}: this function's\n   * purpose is to provide a mechanism for accounts to lose their privileges\n   * if they are compromised (such as when a trusted device is misplaced).\n   *\n   * If the calling account had been granted `role`, emits a {RoleRevoked}\n   * event.\n   *\n   * Requirements:\n   *\n   * - the caller must be `account`.\n   */\n  function renounceRole(bytes32 role, address account) external;\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/Context.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Context.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n  function _msgSender() internal view virtual returns (address) {\n    return msg.sender;\n  }\n\n  function _msgData() internal view virtual returns (bytes calldata) {\n    return msg.data;\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/Strings.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/Strings.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev String operations.\n */\nlibrary Strings {\n  bytes16 private constant _HEX_SYMBOLS = \"0123456789abcdef\";\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` decimal representation.\n   */\n  function toString(uint256 value) internal pure returns (string memory) {\n    // Inspired by OraclizeAPI's implementation - MIT licence\n    // https://github.com/oraclize/ethereum-api/blob/b42146b063c7d6ee1358846c198246239e9360e8/oraclizeAPI_0.4.25.sol\n\n    if (value == 0) {\n      return \"0\";\n    }\n    uint256 temp = value;\n    uint256 digits;\n    while (temp != 0) {\n      digits++;\n      temp /= 10;\n    }\n    bytes memory buffer = new bytes(digits);\n    while (value != 0) {\n      digits -= 1;\n      // forge-lint: disable-next-line(unsafe-typecast)\n      buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));\n      value /= 10;\n    }\n    return string(buffer);\n  }\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation.\n   */\n  function toHexString(uint256 value) internal pure returns (string memory) {\n    if (value == 0) {\n      return \"0x00\";\n    }\n    uint256 temp = value;\n    uint256 length = 0;\n    while (temp != 0) {\n      length++;\n      temp >>= 8;\n    }\n    return toHexString(value, length);\n  }\n\n  /**\n   * @dev Converts a `uint256` to its ASCII `string` hexadecimal representation with fixed length.\n   */\n  function toHexString(uint256 value, uint256 length)\n    internal\n    pure\n    returns (string memory)\n  {\n    bytes memory buffer = new bytes(2 * length + 2);\n    buffer[0] = \"0\";\n    buffer[1] = \"x\";\n    for (uint256 i = 2 * length + 1; i > 1; --i) {\n      buffer[i] = _HEX_SYMBOLS[value & 0xf];\n      value >>= 4;\n    }\n    require(value == 0, \"Strings: hex length insufficient\");\n    return string(buffer);\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/ERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/introspection/ERC165.sol)\n\npragma solidity ^0.8.0;\n\n// forge-lint: disable-next-line(unaliased-plain-import)\nimport \"contracts/external/openzeppelin/contracts/utils/IERC165.sol\";\n\n/**\n * @dev Implementation of the {IERC165} interface.\n *\n * Contracts that want to implement ERC165 should inherit from this contract and override {supportsInterface} to check\n * for the additional interface id that will be supported. For example:\n *\n * ```solidity\n * function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {\n *     return interfaceId == type(MyInterface).interfaceId || super.supportsInterface(interfaceId);\n * }\n * ```\n *\n * Alternatively, {ERC165Storage} provides an easier to use but more expensive implementation.\n */\nabstract contract ERC165 is IERC165 {\n  /**\n   * @dev See {IERC165-supportsInterface}.\n   */\n  function supportsInterface(bytes4 interfaceId)\n    public\n    view\n    virtual\n    override\n    returns (bool)\n  {\n    return interfaceId == type(IERC165).interfaceId;\n  }\n}\n"
+    },
+    "contracts/external/openzeppelin/contracts/utils/IERC165.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (utils/introspection/IERC165.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev Interface of the ERC165 standard, as defined in the\n * https://eips.ethereum.org/EIPS/eip-165[EIP].\n *\n * Implementers can declare support of contract interfaces, which can then be\n * queried by others ({ERC165Checker}).\n *\n * For an implementation, see {ERC165}.\n */\ninterface IERC165 {\n  /**\n   * @dev Returns true if this contract implements the interface defined by\n   * `interfaceId`. See the corresponding\n   * https://eips.ethereum.org/EIPS/eip-165#how-interfaces-are-identified[EIP section]\n   * to learn more about how these ids are created.\n   *\n   * This function call must use less than 30 000 gas.\n   */\n  function supportsInterface(bytes4 interfaceId) external view returns (bool);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.33+commit.64118f21"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_defaultAdmin",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "DepositTokenCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InconsistentMinimumTokenPriceParameters",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InsufficientWithdrawTokens",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "OraclePriceOutdated",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "RwaTokenCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            }
+          ],
+          "name": "SafeERC20FailedOperation",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TokenAddressCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TokenPriceBelowMinimum",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TokenRecipientNotSet",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "UserIDCantBeZero",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "WithdrawTokenCantBeZero",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "tokenAddress",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "minimumPrice",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "oracle",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "maxTimeDelay",
+              "type": "uint256"
+            }
+          ],
+          "name": "MinimumTokenPriceAndOracleSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "previousAdminRole",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "newAdminRole",
+              "type": "bytes32"
+            }
+          ],
+          "name": "RoleAdminChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            }
+          ],
+          "name": "RoleGranted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            }
+          ],
+          "name": "RoleRevoked",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "depositToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "contract ITokenRecipient",
+              "name": "oldTokenRecipient",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "contract ITokenRecipient",
+              "name": "newTokenRecipient",
+              "type": "address"
+            }
+          ],
+          "name": "TokenDepositRecipientSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "depositToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokenDeposited",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "withdrawToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "contract ITokenSource[]",
+              "name": "oldTokenSources",
+              "type": "address[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "contract ITokenSource[]",
+              "name": "newTokenSources",
+              "type": "address[]"
+            }
+          ],
+          "name": "TokenWithdrawSourcesSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "withdrawToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "TokenWithdrawn",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "withdrawToken",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "bytes32",
+              "name": "userID",
+              "type": "bytes32"
+            },
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "active",
+              "type": "bool"
+            },
+            {
+              "indexed": false,
+              "internalType": "contract ITokenSource[]",
+              "name": "oldTokenSources",
+              "type": "address[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "contract ITokenSource[]",
+              "name": "newTokenSources",
+              "type": "address[]"
+            }
+          ],
+          "name": "UserTokenWithdrawSourcesSet",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "DEFAULT_ADMIN_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "RWA_MANAGER_ROLE",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenToWithdraw",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "userID",
+              "type": "bytes32"
+            }
+          ],
+          "name": "availableToWithdraw",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "totalAvailable",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenToDeposit",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "depositAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "depositToken",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "depositTokenRecipient",
+          "outputs": [
+            {
+              "internalType": "contract ITokenRecipient",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getRoleAdmin",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "index",
+              "type": "uint256"
+            }
+          ],
+          "name": "getRoleMember",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getRoleMemberCount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_withdrawToken",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "userId",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getUserWithdrawTokenSources",
+          "outputs": [
+            {
+              "internalType": "contract ITokenSource[]",
+              "name": "tokenSources",
+              "type": "address[]"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_withdrawToken",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "userId",
+              "type": "bytes32"
+            }
+          ],
+          "name": "getUserWithdrawTokenSourcesActive",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "active",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "grantRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "hasRole",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "minimumTokenPrice",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "renounceRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes32",
+              "name": "role",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "revokeRole",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_depositToken",
+              "type": "address"
+            },
+            {
+              "internalType": "contract ITokenRecipient",
+              "name": "_depositTokenRecipient",
+              "type": "address"
+            }
+          ],
+          "name": "setDepositTokenRecipient",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "_minimumTokenPrice",
+              "type": "uint256"
+            },
+            {
+              "internalType": "address",
+              "name": "aggregatorV3Oracle",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxAggregatorV3OracleTimeDelay",
+              "type": "uint256"
+            }
+          ],
+          "name": "setMinimumTokenPriceAndOracle",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_withdrawToken",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "userID",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "bool",
+              "name": "active",
+              "type": "bool"
+            },
+            {
+              "internalType": "contract ITokenSource[]",
+              "name": "_withdrawTokenSources",
+              "type": "address[]"
+            }
+          ],
+          "name": "setUserWithdrawTokenSources",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "rwaToken",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_withdrawToken",
+              "type": "address"
+            },
+            {
+              "internalType": "contract ITokenSource[]",
+              "name": "_withdrawTokenSources",
+              "type": "address[]"
+            }
+          ],
+          "name": "setWithdrawTokenSources",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "bytes4",
+              "name": "interfaceId",
+              "type": "bytes4"
+            }
+          ],
+          "name": "supportsInterface",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "tokenToAggregatorV3Oracle",
+          "outputs": [
+            {
+              "internalType": "contract AggregatorV3Interface",
+              "name": "oracle",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "maxAggregatorV3OracleTimeDelay",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "name": "userWithdrawTokenSources",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "active",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "rwaTokenRedeemed",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "tokenToWithdraw",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "userID",
+              "type": "bytes32"
+            },
+            {
+              "internalType": "uint256",
+              "name": "withdrawAmount",
+              "type": "uint256"
+            }
+          ],
+          "name": "withdrawToken",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "withdrawTokenSources",
+          "outputs": [
+            {
+              "internalType": "contract ITokenSource",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Ondo Finance",
+        "details": "This contract manages deposits and withdrawals of tokens for Ondo's RWA token platform",
+        "errors": {
+          "SafeERC20FailedOperation(address)": [
+            {
+              "details": "An operation with an ERC-20 token failed."
+            }
+          ]
+        },
+        "events": {
+          "MinimumTokenPriceAndOracleSet(address,uint256,address,uint256)": {
+            "params": {
+              "maxTimeDelay": "The maximum time delay for the oracle",
+              "minimumPrice": "The new minimum price",
+              "oracle": "The new token oracle",
+              "tokenAddress": "The token that the minimum price is being set for"
+            }
+          },
+          "RoleAdminChanged(bytes32,bytes32,bytes32)": {
+            "details": "Emitted when `newAdminRole` is set as ``role``'s admin role, replacing `previousAdminRole` `DEFAULT_ADMIN_ROLE` is the starting admin for all roles, despite {RoleAdminChanged} not being emitted signaling this. _Available since v3.1._"
+          },
+          "RoleGranted(bytes32,address,address)": {
+            "details": "Emitted when `account` is granted `role`. `sender` is the account that originated the contract call, an admin role bearer except when using {AccessControl-_setupRole}."
+          },
+          "RoleRevoked(bytes32,address,address)": {
+            "details": "Emitted when `account` is revoked `role`. `sender` is the account that originated the contract call:   - if using `revokeRole`, it is the admin role bearer   - if using `renounceRole`, it is the role bearer (i.e. `account`)"
+          },
+          "TokenDepositRecipientSet(address,address,address,address)": {
+            "params": {
+              "depositToken": "The token that the recipient is being set for",
+              "newTokenRecipient": "The new recipient",
+              "oldTokenRecipient": "The old recipient",
+              "rwaToken": "The RWA token that the recipient is being set for"
+            }
+          },
+          "TokenDeposited(address,address,uint256)": {
+            "params": {
+              "amount": "The amount of the token that was deposited, in the token's                      decimals",
+              "depositToken": "The token that was deposited",
+              "rwaToken": "The RWA token that the deposit is for"
+            }
+          },
+          "TokenWithdrawSourcesSet(address,address,address[],address[])": {
+            "params": {
+              "newTokenSources": "The new sources",
+              "oldTokenSources": "The old sources",
+              "rwaToken": "The RWA token that the source is being set for",
+              "withdrawToken": "The token that the source is being set for"
+            }
+          },
+          "TokenWithdrawn(address,address,uint256)": {
+            "params": {
+              "amount": "The amount of the token that was withdrawn, in the                       token's decimals",
+              "rwaToken": "The RWA token that the withdrawal is for",
+              "withdrawToken": "The token that was withdrawn"
+            }
+          },
+          "UserTokenWithdrawSourcesSet(address,address,bytes32,bool,address[],address[])": {
+            "params": {
+              "active": "Whether the user sources are active",
+              "newTokenSources": "The new sources",
+              "oldTokenSources": "The old sources",
+              "rwaToken": "The RWA token that the sources are being set for",
+              "userID": "The ID of the user the sources are being set for",
+              "withdrawToken": "The token that the sources are being set for"
+            }
+          }
+        },
+        "kind": "dev",
+        "methods": {
+          "availableToWithdraw(address,address,bytes32)": {
+            "details": "The userID causes the function to use the sources configured for the user if there are any set.         Submit bytes32(0) to use the non user specific sources.",
+            "params": {
+              "rwaToken": "Address of the RWA token",
+              "tokenToWithdraw": "Address of the token to withdraw",
+              "userID": "The userID to return the available amount for"
+            },
+            "returns": {
+              "totalAvailable": " Total amount of tokens available"
+            }
+          },
+          "constructor": {
+            "params": {
+              "_defaultAdmin": "Address to assign the DEFAULT_ADMIN_ROLE"
+            }
+          },
+          "depositToken(address,address,uint256)": {
+            "details": "The `msg.sender` must set the approval for the router to spend the token amount",
+            "params": {
+              "depositAmount": "The amount of tokens to deposit, in the token's native decimals",
+              "rwaToken": "The RWA token for which the deposit is involved",
+              "tokenToDeposit": "The token that is being deposited"
+            }
+          },
+          "getRoleAdmin(bytes32)": {
+            "details": "Returns the admin role that controls `role`. See {grantRole} and {revokeRole}. To change a role's admin, use {_setRoleAdmin}."
+          },
+          "getRoleMember(bytes32,uint256)": {
+            "details": "Returns one of the accounts that have `role`. `index` must be a value between 0 and {getRoleMemberCount}, non-inclusive. Role bearers are not sorted in any particular way, and their ordering may change at any point. WARNING: When using {getRoleMember} and {getRoleMemberCount}, make sure you perform all queries on the same block. See the following https://forum.openzeppelin.com/t/iterating-over-elements-on-enumerableset-in-openzeppelin-contracts/2296[forum post] for more information."
+          },
+          "getRoleMemberCount(bytes32)": {
+            "details": "Returns the number of accounts that have `role`. Can be used together with {getRoleMember} to enumerate all bearers of a role."
+          },
+          "getUserWithdrawTokenSources(address,address,bytes32)": {
+            "params": {
+              "_withdrawToken": "The withdraw token for which the user sources are being checked",
+              "rwaToken": "The RWA token for which the user sources are being checked",
+              "userId": "The user ID for which the sources are being checked"
+            },
+            "returns": {
+              "tokenSources": "  The withdraw sources for the given RWA token and withdraw token for a specific user"
+            }
+          },
+          "getUserWithdrawTokenSourcesActive(address,address,bytes32)": {
+            "params": {
+              "_withdrawToken": "The withdraw token for which the user sources are being checked",
+              "rwaToken": "The RWA token for which the user sources are being checked",
+              "userId": "The user ID for which the sources are being checked"
+            },
+            "returns": {
+              "active": "        Whether their are active withdrawal sources for the given parameters"
+            }
+          },
+          "grantRole(bytes32,address)": {
+            "details": "Grants `role` to `account`. If `account` had not been already granted `role`, emits a {RoleGranted} event. Requirements: - the caller must have ``role``'s admin role."
+          },
+          "hasRole(bytes32,address)": {
+            "details": "Returns `true` if `account` has been granted `role`."
+          },
+          "renounceRole(bytes32,address)": {
+            "details": "Revokes `role` from the calling account. Roles are often managed via {grantRole} and {revokeRole}: this function's purpose is to provide a mechanism for accounts to lose their privileges if they are compromised (such as when a trusted device is misplaced). If the calling account had been revoked `role`, emits a {RoleRevoked} event. Requirements: - the caller must be `account`."
+          },
+          "revokeRole(bytes32,address)": {
+            "details": "Revokes `role` from `account`. If `account` had been granted `role`, emits a {RoleRevoked} event. Requirements: - the caller must have ``role``'s admin role."
+          },
+          "setDepositTokenRecipient(address,address,address)": {
+            "params": {
+              "_depositToken": "The token that the recipient expects to receive",
+              "_depositTokenRecipient": "The token recipient contract",
+              "rwaToken": "The RWA token for which the liquidity is being added"
+            }
+          },
+          "setMinimumTokenPriceAndOracle(address,uint256,address,uint256)": {
+            "details": "Reverts if any of the parameters are set to zero without nullifying all the others         except for the token address",
+            "params": {
+              "_minimumTokenPrice": "The minimum price for the token, denoted in USD with                                        the oracles decimals",
+              "aggregatorV3Oracle": "The token price oracle address",
+              "maxAggregatorV3OracleTimeDelay": "The maximum time delay for the oracle",
+              "token": "The token address"
+            }
+          },
+          "setUserWithdrawTokenSources(address,address,bytes32,bool,address[])": {
+            "params": {
+              "_withdrawToken": "The token that the source will be withdrawing",
+              "_withdrawTokenSources": "The source contracts that will be used to withdraw",
+              "active": "Whether the new user sources are active",
+              "rwaToken": "The RWA token for which the source is responsible for",
+              "userID": "The ID of the user to set sources for"
+            }
+          },
+          "setWithdrawTokenSources(address,address,address[])": {
+            "params": {
+              "_withdrawToken": "The token that the source will be withdrawing",
+              "_withdrawTokenSources": "The source contracts that will be used to withdraw",
+              "rwaToken": "The RWA token for which the source is responsible for"
+            }
+          },
+          "supportsInterface(bytes4)": {
+            "details": "See {IERC165-supportsInterface}."
+          },
+          "withdrawToken(address,address,bytes32,uint256)": {
+            "details": "The userID causes the function to use the sources configured for the user if there are         any set. Submit bytes32(0) to use the non user specific sources.",
+            "params": {
+              "rwaTokenRedeemed": "The RWA token for which the withdrawal is being made",
+              "tokenToWithdraw": "The token that is being withdrawn",
+              "userID": "The ID of the user involved in token withdrawal",
+              "withdrawAmount": "The amount of tokens to be withdrawn, in the token's                          decimals."
+            }
+          }
+        },
+        "title": "OndoTokenRouter",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "DepositTokenCantBeZero()": [
+            {
+              "notice": "Error thrown when attempting to set a recipient with a zero address for the token."
+            }
+          ],
+          "InconsistentMinimumTokenPriceParameters()": [
+            {
+              "notice": "Error thrown when calling `setMinimumTokenPriceAndOracle` with only some of the parameters set."
+            }
+          ],
+          "InsufficientWithdrawTokens()": [
+            {
+              "notice": "Error thrown when there aren't enough withdraw tokens available."
+            }
+          ],
+          "OraclePriceOutdated()": [
+            {
+              "notice": "Error thrown when the price pulled from a token's oracle is outdated."
+            }
+          ],
+          "RwaTokenCantBeZero()": [
+            {
+              "notice": "Error thrown when attempting to set a recipient or source with a zero address for the RWA token."
+            }
+          ],
+          "TokenAddressCantBeZero()": [
+            {
+              "notice": "Error thrown when attempting to set the oracle or minimum price for a token with a zero address."
+            }
+          ],
+          "TokenPriceBelowMinimum()": [
+            {
+              "notice": "Error thrown a token's price is below the minimum."
+            }
+          ],
+          "TokenRecipientNotSet()": [
+            {
+              "notice": "Error thrown when a deposit token doesn't have a recipient set."
+            }
+          ],
+          "UserIDCantBeZero()": [
+            {
+              "notice": "Error thrown when attempting to set a user ID to the zero bytes32 value."
+            }
+          ],
+          "WithdrawTokenCantBeZero()": [
+            {
+              "notice": "Error thrown when attempting to set a source with a zero address for the token."
+            }
+          ]
+        },
+        "events": {
+          "MinimumTokenPriceAndOracleSet(address,uint256,address,uint256)": {
+            "notice": "Emitted when a token's minimum price is set"
+          },
+          "TokenDepositRecipientSet(address,address,address,address)": {
+            "notice": "Emitted when a token recipient is set for a token"
+          },
+          "TokenDeposited(address,address,uint256)": {
+            "notice": "Emitted when a token is deposited to the router"
+          },
+          "TokenWithdrawSourcesSet(address,address,address[],address[])": {
+            "notice": "Emitted when a token source is set for a token"
+          },
+          "TokenWithdrawn(address,address,uint256)": {
+            "notice": "Emitted when a token is withdrawn via the router"
+          },
+          "UserTokenWithdrawSourcesSet(address,address,bytes32,bool,address[],address[])": {
+            "notice": "Emitted when a user's token withdraw sources are set"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "RWA_MANAGER_ROLE()": {
+            "notice": "Role identifier allowing RWA managers to deposit and withdraw tokens"
+          },
+          "availableToWithdraw(address,address,bytes32)": {
+            "notice": "Gets the amount of tokens that are available to withdraw"
+          },
+          "depositToken(address,address,uint256)": {
+            "notice": "Deposits a specified amount of tokens into the contract"
+          },
+          "depositTokenRecipient(address,address)": {
+            "notice": "Maps RWA token to deposit token and recipient contract"
+          },
+          "getUserWithdrawTokenSources(address,address,bytes32)": {
+            "notice": "Returns the withdraw sources for the given RWA token and withdraw token for a user"
+          },
+          "getUserWithdrawTokenSourcesActive(address,address,bytes32)": {
+            "notice": "Returns whether the user has active withdrawal sources for the given RWA token         and token to withdraw."
+          },
+          "minimumTokenPrice(address)": {
+            "notice": "Minimum token price mapping to prevent depegged tokens from being used"
+          },
+          "setDepositTokenRecipient(address,address,address)": {
+            "notice": "Add a new token recipient for depositing liquidity"
+          },
+          "setMinimumTokenPriceAndOracle(address,uint256,address,uint256)": {
+            "notice": "Set the minimum price and oracle for a token"
+          },
+          "setUserWithdrawTokenSources(address,address,bytes32,bool,address[])": {
+            "notice": "Sets the array of withdrawal token sources for a given RWA token and withdrawal token         for a specific user."
+          },
+          "setWithdrawTokenSources(address,address,address[])": {
+            "notice": "Sets the array of withdrawal token sources for a given RWA token and withdrawal token"
+          },
+          "tokenToAggregatorV3Oracle(address)": {
+            "notice": "Maps token address to a price oracle conforming to the `AggregatorV3Interface`"
+          },
+          "userWithdrawTokenSources(address,address,bytes32)": {
+            "notice": "Maps RWA token, withdrawal token, and user ID to user-specific withdrawal token sources"
+          },
+          "withdrawToken(address,address,bytes32,uint256)": {
+            "notice": "Withdraws a specified amount of tokens from the configured sources"
+          },
+          "withdrawTokenSources(address,address,uint256)": {
+            "notice": "Maps RWA token to withdrawal token and source contracts"
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/xManager/tokenRouter/OndoTokenRouter.sol": "OndoTokenRouter"
+      },
+      "evmVersion": "prague",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/=node_modules/@openzeppelin/",
+        ":@uniswap/=node_modules/@uniswap/",
+        ":eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        ":forge-std/=lib/forge-std/src/",
+        ":forge-tests/=forge-tests/",
+        ":hardhat-deploy/=node_modules/hardhat-deploy/",
+        ":hardhat/=node_modules/hardhat/",
+        ":lib/=lib/",
+        ":solidity-bytes-utils/=node_modules/solidity-bytes-utils/",
+        ":truffle/=node_modules/truffle/"
+      ]
+    },
+    "sources": {
+      "contracts/external/chainlink/AggregatorV3Interface.sol": {
+        "keccak256": "0x6a9fa7f1fb6693b49719b85e93c8db8eff0e757e4e2921ab95f280f11664f3ff",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://7acdd62bf436320eeb9d772c8d2c8b00f63c6c42fd599aa48b27fe45e955ea91",
+          "dweb:/ipfs/QmVopnVh3jqMqPCYisGNV1xHEgmtyLSp728rZRJ1Pc3jYm"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/access/AccessControl.sol": {
+        "keccak256": "0x0ecd514cd84bf677c4df72a09c9df014a2a33bd46faf1f57be44daca8d94c275",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2d35a4582dc4d44f41bd266d20d6efbb1349e42dfa4f1aa0d766037d1a16d09f",
+          "dweb:/ipfs/QmT6XUk3N36AGTp5Rh16NrghooE3MsoeMbYcEWERGtecwY"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/access/AccessControlEnumerable.sol": {
+        "keccak256": "0x4d60ac8ebacf3782f8f91bed2084e3ea2230a15a87fe0ca9e9317ddd91548969",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://fa0bee8ef9545676cef2e233d8d530fe9c552e54b6bf30ea20ea1df2a89abee9",
+          "dweb:/ipfs/QmcVwpAcwSR4c9AsWZxqZ6CajvSYMuj9nNu8RgWnaVCHjM"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/access/IAccessControl.sol": {
+        "keccak256": "0x02787a6b562763467c448f39369285b1903615e81c787f45c0b163a1ff9e07d5",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://81b6f6b08f68a5f747d05b73c15d595efa86be1bd72ba60eb9b953f4ed939ccb",
+          "dweb:/ipfs/QmQkiz6s9tWzGcHodPRPiFZ5iTLmeSzhELjRcftnnmBkxS"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/access/IAccessControlEnumerable.sol": {
+        "keccak256": "0xa4f2ad50caa3abf78be15a89277206147978942b14af577b1fcf0fc2ab4279e9",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://9ba43f775d593cd557a97136128f6b1bfb2f34a4aba874ef17b5515093118912",
+          "dweb:/ipfs/QmXz5kb1R1q7D7hyjDi5F6JarLZNWzzNDY6X4w1kXN6Vzc"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/security/ReentrancyGuard.sol": {
+        "keccak256": "0x0134fde2cc9450792bc761f05588383e3b1baf78454dba8b6a592dd39895cd08",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://07706a7f7f427fc28e40c29d8c12989e9623e22b8b9da0eba7c5ba4bf466bad0",
+          "dweb:/ipfs/QmQLpwxp4hX8j7tjGGGovdS4WGr57v4vDEFCjPue6EapbV"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/IERC20.sol": {
+        "keccak256": "0x2d0b233e43b64bb4afb057ccc16493c9b3c22d334a4ac6636915c7ef7f06b118",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f0702af2d619b4cbbc417b89fb215c64b2f0a2db8d1af1d3a23f2e3cabb077f0",
+          "dweb:/ipfs/QmYVTreLMBhqZH78xnqiZyr3FLbfNrrSsG7bHiSQk9dRRW"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/token/SafeERC20.sol": {
+        "keccak256": "0x390ad37e2acef7855f36907f6b16331e35115ac0d1a4a8641fee248019ab98ac",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://fb4c92c03e1c539c1ce103b87239db36807ab097741538cc84df989b180f2854",
+          "dweb:/ipfs/QmSGeNmEopK8aTeJboEqcJpePYddJphTiMFvUN3Q1UuWLW"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/Context.sol": {
+        "keccak256": "0x197651ff7207345936e19940e36235967fe866449caa294e19642b6c6aaa62f8",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://3cb4e784c91e106ee75877271ff11f9997a68bc9e577cab4d36d60a10b88e6e9",
+          "dweb:/ipfs/QmVuLfSBsfsqcpUcsFaY275Re3n7uQW6ErhDGpYHY92uBo"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/ERC165.sol": {
+        "keccak256": "0x53fdb65a391e724bd02a77010fa9d921569f6c70e7a4f1bd8efbe862b29c2831",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://a7dae8d1c8cdf429bc117c8e348cbf99a30c14c4ade928e3417c8a7b9579ee62",
+          "dweb:/ipfs/QmeLFoVHYkfjcjLW2kwxGCHkH8P4qQjo61d5RXuXWf3ep7"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/EnumerableSet.sol": {
+        "keccak256": "0x6dfd57320c54054f69d620239b72c0230a3912520dff78f26dec2a709592555c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://f3d7ee88f342083071601363d7718c037e9e97f4622d8061af2bc455460da1ae",
+          "dweb:/ipfs/Qmcw9rfXpogtneRhNCF9w6gw6N7HTmgG2xmndURKFtYTZD"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/IERC165.sol": {
+        "keccak256": "0x64e1d4f776a4bf02f7ab4187741c2e50c767bfa04f4ef1f920edba78c2918020",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://cff6c09b4206cbf675fae7baa5e036802a16b1bad9a541db160858a5caa5b35c",
+          "dweb:/ipfs/QmRCagsWpeQGomTbdHusJuNUPJnNB8HLHkB98FPU2s9Vc6"
+        ]
+      },
+      "contracts/external/openzeppelin/contracts/utils/Strings.sol": {
+        "keccak256": "0x48bee73df2789ccd1033f0d0306ec21fd3789aa24fccc783d25ba46229648d4d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://0c289a65ab4eb36a419296f6f1cedf14a50f00060b9e0ebf7e20dc430d194069",
+          "dweb:/ipfs/QmPJRrrzXkoDd32RfcHMb6AdXzRL5E3p8UarpNhXXUG1Zz"
+        ]
+      },
+      "contracts/xManager/interfaces/IOndoTokenRouter.sol": {
+        "keccak256": "0x401c7a75389137f07c947e55e602d9eddb523ea328c0bb811d63a548cb5aba12",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://55dbfe5772c6c1770a7c76bfa996faaa4aaa959f3cb67dd098a87e65ce15bf29",
+          "dweb:/ipfs/QmSeTirpdH3g8qLyz2AMg7iazZGpjj5M1APtaHxVTF5fTT"
+        ]
+      },
+      "contracts/xManager/interfaces/ITokenRecipient.sol": {
+        "keccak256": "0xb8e51e063aef0a8432c949b08eee1ea413f5ac2d63d877c06d56bd0b0569bce7",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://2b82681b7cb7cc38f78a1da81f88cb133028e2ba4fbb08d7805a9a09dc32abbd",
+          "dweb:/ipfs/QmRA4qw44r15ptFR7Dt6in2KCFbvcFH2Wf6iT36GGYxi2T"
+        ]
+      },
+      "contracts/xManager/interfaces/ITokenSource.sol": {
+        "keccak256": "0x812d075f4218d7ae7751ff1788fe2cf74ab9b1fa175da51e9c0ae294278b0a29",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://de38ee19add1a1ddead0a2eb816f9583339f65fe90b0a8401d2e93b17697cd1f",
+          "dweb:/ipfs/QmcVL3o6ZxtsJDmuUxaJDTZmruBJJn1CfzfzC6EniYuuEC"
+        ]
+      },
+      "contracts/xManager/tokenRouter/IOndoTokenRouterErrors.sol": {
+        "keccak256": "0x092ddd734562e2b17c43b1e5ea9118dbf9e4f841f4550d8c947d42044bbe4576",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://cab2ba9725241c8d3fd5f066eab601f5132a50afd2a1e554fb1ab0eaf90475e1",
+          "dweb:/ipfs/QmU8q4hwrZoMyhR1JqAoTcn7jZFwnsGdAtBY58huzNnpbi"
+        ]
+      },
+      "contracts/xManager/tokenRouter/IOndoTokenRouterEvents.sol": {
+        "keccak256": "0x716d1f38169debb1273cf02216d689fde6ed6cbd99386f0c7de92af5b97fb5db",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://c032fca4a99e34c005f699a224975e61261599403149aaaed2e0bdd9b8b990b6",
+          "dweb:/ipfs/Qma7btRxn5kmw5zCPCrWLniucpdNtocSBuk5fHeUrcLWrd"
+        ]
+      },
+      "contracts/xManager/tokenRouter/OndoTokenRouter.sol": {
+        "keccak256": "0x7d1383d61e1fe3eb8d04bcb7d423005b5d01ed6347dd9f77a287218065c1b821",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://c0256b0dd98250f1f08367f317a199798b352c2feaf1798173318e44a15f23e5",
+          "dweb:/ipfs/QmSm3CDXbXSTodbqm4sVJK6XDsXwzdxBaLzP5vtVjKtoQG"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.33+commit.64118f21",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "prague",
+      "remappings": [
+        "eth-gas-reporter/=node_modules/eth-gas-reporter/",
+        "forge-tests/=forge-tests/",
+        "lib/=lib/",
+        "@openzeppelin/=node_modules/@openzeppelin/",
+        "@uniswap/=node_modules/@uniswap/",
+        "forge-std/=lib/forge-std/src/",
+        "hardhat-deploy/=node_modules/hardhat-deploy/",
+        "hardhat/=node_modules/hardhat/",
+        "solidity-bytes-utils/=node_modules/solidity-bytes-utils/",
+        "truffle/=node_modules/truffle/"
+      ]
+    },
+    "name": "OndoTokenRouter",
+    "fullyQualifiedName": "contracts/xManager/tokenRouter/OndoTokenRouter.sol:OndoTokenRouter"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "53978346",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-09-29T14:04:54Z",
+  "match": "match",
+  "chainId": "56",
+  "address": "0x643Aa7AD6D443fB25745F4072B169D334a827077"
+}
