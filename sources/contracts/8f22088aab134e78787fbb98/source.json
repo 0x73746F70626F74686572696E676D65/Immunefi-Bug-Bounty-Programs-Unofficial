@@ -1,0 +1,1184 @@
+{
+  "sources": {
+    "contracts/proxy/Manager.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport {IManager} from \"./IManager.sol\";\nimport {IController} from \"./IController.sol\";\n\n// Copy of https://github.com/livepeer/protocol/blob/confluence/contracts/Manager.sol\n// Tests at https://github.com/livepeer/protocol/blob/confluence/test/unit/ManagerProxy.js\ncontract Manager is IManager {\n    // Controller that contract is registered with\n    IController public controller;\n\n    // Check if sender is controller\n    modifier onlyController() {\n        _onlyController();\n        _;\n    }\n\n    // Check if sender is controller owner\n    modifier onlyControllerOwner() {\n        _onlyControllerOwner();\n        _;\n    }\n\n    // Check if controller is not paused\n    modifier whenSystemNotPaused() {\n        _whenSystemNotPaused();\n        _;\n    }\n\n    // Check if controller is paused\n    modifier whenSystemPaused() {\n        _whenSystemPaused();\n        _;\n    }\n\n    constructor(address _controller) {\n        controller = IController(_controller);\n    }\n\n    /**\n     * @notice Set controller. Only callable by current controller\n     * @param _controller Controller contract address\n     */\n    function setController(address _controller) external onlyController {\n        controller = IController(_controller);\n\n        emit SetController(_controller);\n    }\n\n    function _onlyController() private view {\n        require(msg.sender == address(controller), \"caller must be Controller\");\n    }\n\n    function _onlyControllerOwner() private view {\n        require(\n            msg.sender == controller.owner(),\n            \"caller must be Controller owner\"\n        );\n    }\n\n    function _whenSystemNotPaused() private view {\n        require(!controller.paused(), \"system is paused\");\n    }\n\n    function _whenSystemPaused() private view {\n        require(controller.paused(), \"system is not paused\");\n    }\n}\n"
+    },
+    "contracts/proxy/IManager.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IManager {\n    event SetController(address controller);\n\n    function setController(address _controller) external;\n}\n"
+    },
+    "contracts/proxy/IController.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IController {\n    function owner() external view returns (address);\n\n    function paused() external view returns (bool);\n\n    function getContract(bytes32 _id) external view returns (address);\n}\n"
+    },
+    "contracts/proxy/ManagerProxy.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport \"./ManagerProxyTarget.sol\";\n\n/**\n * @title ManagerProxy\n * @notice A proxy contract that uses delegatecall to execute function calls on a target contract using its own storage context.\n The target contract is a Manager contract that is registered with the Controller.\n * @dev Both this proxy contract and its target contract MUST inherit from ManagerProxyTarget in order to guarantee\n that both contracts have the same storage layout. Differing storage layouts in a proxy contract and target contract can\n potentially break the delegate proxy upgradeability mechanism. Since this proxy contract inherits from ManagerProxyTarget which inherits\n from Manager, it implements the setController() function. The target contract will also implement setController() since it also inherits\n from ManagerProxyTarget. Thus, any transaction sent to the proxy that calls setController() will execute against the proxy instead\n of the target. As a result, developers should keep in mind that the proxy will always execute the same logic for setController() regardless\n of the setController() implementation on the target contract. Generally, developers should not add any additional functions to this proxy contract\n because any function implemented on the proxy will always be executed against the proxy and the call **will not** be forwarded to the target contract\n */\ncontract ManagerProxy is ManagerProxyTarget {\n    /**\n     * @notice ManagerProxy constructor. Invokes constructor of base Manager contract with provided Controller address.\n     * Also, sets the contract ID of the target contract that function calls will be executed on.\n     * @param _controller Address of Controller that this contract will be registered with\n     * @param _targetContractId contract ID of the target contract\n     */\n    constructor(address _controller, bytes32 _targetContractId)\n        Manager(_controller)\n    {\n        targetContractId = _targetContractId;\n    }\n\n    /**\n     * @notice Fallback function that delegates calls to target contract when there is no msg.data\n     */\n    receive() external payable {\n        _fallback();\n    }\n\n    /**\n     * @notice Fallback function that delegates calls to target contract when there is msg.data\n     */\n    fallback() external payable {\n        _fallback();\n    }\n\n    /**\n     * @dev Uses delegatecall to execute function calls on this proxy contract's target contract using its own storage context.\n     This fallback function will look up the address of the target contract using the Controller and the target contract ID.\n     It will then use the calldata for a function call as the data payload for a delegatecall on the target contract. The return value\n     of the executed function call will also be returned\n     */\n    function _fallback() private {\n        address target = controller.getContract(targetContractId);\n        require(target != address(0), \"target contract must be registered\");\n\n        assembly {\n            // Solidity keeps a free memory pointer at position 0x40 in memory\n            let freeMemoryPtrPosition := 0x40\n            // Load the free memory pointer\n            let calldataMemoryOffset := mload(freeMemoryPtrPosition)\n            // Update free memory pointer to after memory space we reserve for calldata\n            mstore(\n                freeMemoryPtrPosition,\n                add(calldataMemoryOffset, calldatasize())\n            )\n            // Copy calldata (method signature and params of the call) to memory\n            calldatacopy(calldataMemoryOffset, 0x0, calldatasize())\n\n            // Call method on target contract using calldata which is loaded into memory\n            let ret := delegatecall(\n                gas(),\n                target,\n                calldataMemoryOffset,\n                calldatasize(),\n                0,\n                0\n            )\n\n            // Load the free memory pointer\n            let returndataMemoryOffset := mload(freeMemoryPtrPosition)\n            // Update free memory pointer to after memory space we reserve for returndata\n            mstore(\n                freeMemoryPtrPosition,\n                add(returndataMemoryOffset, returndatasize())\n            )\n            // Copy returndata (result of the method invoked by the delegatecall) to memory\n            returndatacopy(returndataMemoryOffset, 0x0, returndatasize())\n\n            switch ret\n            case 0 {\n                // Method call failed - revert\n                // Return any error message stored in mem[returndataMemoryOffset..(returndataMemoryOffset + returndatasize)]\n                revert(returndataMemoryOffset, returndatasize())\n            }\n            default {\n                // Return result of method call stored in mem[returndataMemoryOffset..(returndataMemoryOffset + returndatasize)]\n                return(returndataMemoryOffset, returndatasize())\n            }\n        }\n    }\n}\n"
+    },
+    "contracts/proxy/ManagerProxyTarget.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport \"./Manager.sol\";\n\n/**\n * @title ManagerProxyTarget\n * @notice The base contract that target contracts used by a proxy contract should inherit from\n * @dev Both the target contract and the proxy contract (implemented as ManagerProxy) MUST inherit from ManagerProxyTarget in order to guarantee\n that both contracts have the same storage layout. Differing storage layouts in a proxy contract and target contract can\n potentially break the delegate proxy upgradeability mechanism\n */\nabstract contract ManagerProxyTarget is Manager {\n    // Used to look up target contract address in controller's registry\n    bytes32 public targetContractId;\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.9+commit.e5eed63a"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_controller",
+              "type": "address"
+            },
+            {
+              "internalType": "bytes32",
+              "name": "_targetContractId",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "controller",
+              "type": "address"
+            }
+          ],
+          "name": "SetController",
+          "type": "event"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "fallback"
+        },
+        {
+          "inputs": [],
+          "name": "controller",
+          "outputs": [
+            {
+              "internalType": "contract IController",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_controller",
+              "type": "address"
+            }
+          ],
+          "name": "setController",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "targetContractId",
+          "outputs": [
+            {
+              "internalType": "bytes32",
+              "name": "",
+              "type": "bytes32"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "receive"
+        }
+      ],
+      "devdoc": {
+        "details": "Both this proxy contract and its target contract MUST inherit from ManagerProxyTarget in order to guarantee that both contracts have the same storage layout. Differing storage layouts in a proxy contract and target contract can potentially break the delegate proxy upgradeability mechanism. Since this proxy contract inherits from ManagerProxyTarget which inherits from Manager, it implements the setController() function. The target contract will also implement setController() since it also inherits from ManagerProxyTarget. Thus, any transaction sent to the proxy that calls setController() will execute against the proxy instead of the target. As a result, developers should keep in mind that the proxy will always execute the same logic for setController() regardless of the setController() implementation on the target contract. Generally, developers should not add any additional functions to this proxy contract because any function implemented on the proxy will always be executed against the proxy and the call **will not** be forwarded to the target contract",
+        "kind": "dev",
+        "methods": {
+          "constructor": {
+            "params": {
+              "_controller": "Address of Controller that this contract will be registered with",
+              "_targetContractId": "contract ID of the target contract"
+            }
+          },
+          "setController(address)": {
+            "params": {
+              "_controller": "Controller contract address"
+            }
+          }
+        },
+        "title": "ManagerProxy",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "constructor": {
+            "notice": "ManagerProxy constructor. Invokes constructor of base Manager contract with provided Controller address. Also, sets the contract ID of the target contract that function calls will be executed on."
+          },
+          "setController(address)": {
+            "notice": "Set controller. Only callable by current controller"
+          }
+        },
+        "notice": "A proxy contract that uses delegatecall to execute function calls on a target contract using its own storage context. The target contract is a Manager contract that is registered with the Controller.",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/proxy/ManagerProxy.sol": "ManagerProxy"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "optimizer": {
+        "enabled": false,
+        "runs": 200
+      },
+      "remappings": []
+    },
+    "sources": {
+      "contracts/proxy/IController.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IController {\n    function owner() external view returns (address);\n\n    function paused() external view returns (bool);\n\n    function getContract(bytes32 _id) external view returns (address);\n}\n",
+        "keccak256": "0x60e4489bb10b71c8eed7c9e0be0b8d89f2f5c6c15235aaea05d64fe1eefdc891",
+        "license": "MIT"
+      },
+      "contracts/proxy/IManager.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IManager {\n    event SetController(address controller);\n\n    function setController(address _controller) external;\n}\n",
+        "keccak256": "0xa9a807c2ed7583e51b35367a4f99c4c7b05fe9b3949a0b21d3878f7944d18bbf",
+        "license": "MIT"
+      },
+      "contracts/proxy/Manager.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport {IManager} from \"./IManager.sol\";\nimport {IController} from \"./IController.sol\";\n\n// Copy of https://github.com/livepeer/protocol/blob/confluence/contracts/Manager.sol\n// Tests at https://github.com/livepeer/protocol/blob/confluence/test/unit/ManagerProxy.js\ncontract Manager is IManager {\n    // Controller that contract is registered with\n    IController public controller;\n\n    // Check if sender is controller\n    modifier onlyController() {\n        _onlyController();\n        _;\n    }\n\n    // Check if sender is controller owner\n    modifier onlyControllerOwner() {\n        _onlyControllerOwner();\n        _;\n    }\n\n    // Check if controller is not paused\n    modifier whenSystemNotPaused() {\n        _whenSystemNotPaused();\n        _;\n    }\n\n    // Check if controller is paused\n    modifier whenSystemPaused() {\n        _whenSystemPaused();\n        _;\n    }\n\n    constructor(address _controller) {\n        controller = IController(_controller);\n    }\n\n    /**\n     * @notice Set controller. Only callable by current controller\n     * @param _controller Controller contract address\n     */\n    function setController(address _controller) external onlyController {\n        controller = IController(_controller);\n\n        emit SetController(_controller);\n    }\n\n    function _onlyController() private view {\n        require(msg.sender == address(controller), \"caller must be Controller\");\n    }\n\n    function _onlyControllerOwner() private view {\n        require(\n            msg.sender == controller.owner(),\n            \"caller must be Controller owner\"\n        );\n    }\n\n    function _whenSystemNotPaused() private view {\n        require(!controller.paused(), \"system is paused\");\n    }\n\n    function _whenSystemPaused() private view {\n        require(controller.paused(), \"system is not paused\");\n    }\n}\n",
+        "keccak256": "0x5c6522421f23f344125b06b9db74220a7a4346aaa97262cf501e3bc8c2e38e08",
+        "license": "MIT"
+      },
+      "contracts/proxy/ManagerProxy.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport \"./ManagerProxyTarget.sol\";\n\n/**\n * @title ManagerProxy\n * @notice A proxy contract that uses delegatecall to execute function calls on a target contract using its own storage context.\n The target contract is a Manager contract that is registered with the Controller.\n * @dev Both this proxy contract and its target contract MUST inherit from ManagerProxyTarget in order to guarantee\n that both contracts have the same storage layout. Differing storage layouts in a proxy contract and target contract can\n potentially break the delegate proxy upgradeability mechanism. Since this proxy contract inherits from ManagerProxyTarget which inherits\n from Manager, it implements the setController() function. The target contract will also implement setController() since it also inherits\n from ManagerProxyTarget. Thus, any transaction sent to the proxy that calls setController() will execute against the proxy instead\n of the target. As a result, developers should keep in mind that the proxy will always execute the same logic for setController() regardless\n of the setController() implementation on the target contract. Generally, developers should not add any additional functions to this proxy contract\n because any function implemented on the proxy will always be executed against the proxy and the call **will not** be forwarded to the target contract\n */\ncontract ManagerProxy is ManagerProxyTarget {\n    /**\n     * @notice ManagerProxy constructor. Invokes constructor of base Manager contract with provided Controller address.\n     * Also, sets the contract ID of the target contract that function calls will be executed on.\n     * @param _controller Address of Controller that this contract will be registered with\n     * @param _targetContractId contract ID of the target contract\n     */\n    constructor(address _controller, bytes32 _targetContractId)\n        Manager(_controller)\n    {\n        targetContractId = _targetContractId;\n    }\n\n    /**\n     * @notice Fallback function that delegates calls to target contract when there is no msg.data\n     */\n    receive() external payable {\n        _fallback();\n    }\n\n    /**\n     * @notice Fallback function that delegates calls to target contract when there is msg.data\n     */\n    fallback() external payable {\n        _fallback();\n    }\n\n    /**\n     * @dev Uses delegatecall to execute function calls on this proxy contract's target contract using its own storage context.\n     This fallback function will look up the address of the target contract using the Controller and the target contract ID.\n     It will then use the calldata for a function call as the data payload for a delegatecall on the target contract. The return value\n     of the executed function call will also be returned\n     */\n    function _fallback() private {\n        address target = controller.getContract(targetContractId);\n        require(target != address(0), \"target contract must be registered\");\n\n        assembly {\n            // Solidity keeps a free memory pointer at position 0x40 in memory\n            let freeMemoryPtrPosition := 0x40\n            // Load the free memory pointer\n            let calldataMemoryOffset := mload(freeMemoryPtrPosition)\n            // Update free memory pointer to after memory space we reserve for calldata\n            mstore(\n                freeMemoryPtrPosition,\n                add(calldataMemoryOffset, calldatasize())\n            )\n            // Copy calldata (method signature and params of the call) to memory\n            calldatacopy(calldataMemoryOffset, 0x0, calldatasize())\n\n            // Call method on target contract using calldata which is loaded into memory\n            let ret := delegatecall(\n                gas(),\n                target,\n                calldataMemoryOffset,\n                calldatasize(),\n                0,\n                0\n            )\n\n            // Load the free memory pointer\n            let returndataMemoryOffset := mload(freeMemoryPtrPosition)\n            // Update free memory pointer to after memory space we reserve for returndata\n            mstore(\n                freeMemoryPtrPosition,\n                add(returndataMemoryOffset, returndatasize())\n            )\n            // Copy returndata (result of the method invoked by the delegatecall) to memory\n            returndatacopy(returndataMemoryOffset, 0x0, returndatasize())\n\n            switch ret\n            case 0 {\n                // Method call failed - revert\n                // Return any error message stored in mem[returndataMemoryOffset..(returndataMemoryOffset + returndatasize)]\n                revert(returndataMemoryOffset, returndatasize())\n            }\n            default {\n                // Return result of method call stored in mem[returndataMemoryOffset..(returndataMemoryOffset + returndatasize)]\n                return(returndataMemoryOffset, returndatasize())\n            }\n        }\n    }\n}\n",
+        "keccak256": "0x1ec956e765d36bcfdaf99d9d4f078397cf734031dd4d5dff797ebc0ee77fe019",
+        "license": "MIT"
+      },
+      "contracts/proxy/ManagerProxyTarget.sol": {
+        "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport \"./Manager.sol\";\n\n/**\n * @title ManagerProxyTarget\n * @notice The base contract that target contracts used by a proxy contract should inherit from\n * @dev Both the target contract and the proxy contract (implemented as ManagerProxy) MUST inherit from ManagerProxyTarget in order to guarantee\n that both contracts have the same storage layout. Differing storage layouts in a proxy contract and target contract can\n potentially break the delegate proxy upgradeability mechanism\n */\nabstract contract ManagerProxyTarget is Manager {\n    // Used to look up target contract address in controller's registry\n    bytes32 public targetContractId;\n}\n",
+        "keccak256": "0x920bcc2def240e06272dc06cbcb9f12976f1698cd4f1020c165af25ee837e553",
+        "license": "MIT"
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.9+commit.e5eed63a",
+    "compilerSettings": {
+      "metadata": {
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": true
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": false
+      },
+      "evmVersion": "london",
+      "remappings": []
+    },
+    "name": "ManagerProxy",
+    "fullyQualifiedName": "contracts/proxy/ManagerProxy.sol:ManagerProxy"
+  },
+  "proxyResolution": {
+    "isProxy": true,
+    "proxyType": "LivepeerManagerProxy",
+    "implementations": [
+      {
+        "address": "0x93BB030735747708b4D33093A98d4c804Cd6B58C",
+        "name": "L2Migrator"
+      }
+    ]
+  },
+  "matchId": "34195",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2024-08-08T10:34:41Z",
+  "match": "exact_match",
+  "chainId": "42161",
+  "address": "0x148D5b6B4df9530c7C76A810bd1Cdf69EC4c2085",
+  "implementation_sources": {
+    "0x93BB030735747708b4D33093A98d4c804Cd6B58C": {
+      "sources": {
+        "@openzeppelin/contracts/proxy/Clones.sol": {
+          "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (proxy/Clones.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-1167[EIP 1167] is a standard for\n * deploying minimal proxy contracts, also known as \"clones\".\n *\n * > To simply and cheaply clone contract functionality in an immutable way, this standard specifies\n * > a minimal bytecode implementation that delegates all calls to a known, fixed address.\n *\n * The library includes functions to deploy a proxy using either `create` (traditional deployment) or `create2`\n * (salted deterministic deployment). It also includes functions to predict the addresses of clones deployed using the\n * deterministic method.\n *\n * _Available since v3.4._\n */\nlibrary Clones {\n    /**\n     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.\n     *\n     * This function uses the create opcode, which should never revert.\n     */\n    function clone(address implementation) internal returns (address instance) {\n        assembly {\n            let ptr := mload(0x40)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)\n            mstore(add(ptr, 0x14), shl(0x60, implementation))\n            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)\n            instance := create(0, ptr, 0x37)\n        }\n        require(instance != address(0), \"ERC1167: create failed\");\n    }\n\n    /**\n     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.\n     *\n     * This function uses the create2 opcode and a `salt` to deterministically deploy\n     * the clone. Using the same `implementation` and `salt` multiple time will revert, since\n     * the clones cannot be deployed twice at the same address.\n     */\n    function cloneDeterministic(address implementation, bytes32 salt) internal returns (address instance) {\n        assembly {\n            let ptr := mload(0x40)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)\n            mstore(add(ptr, 0x14), shl(0x60, implementation))\n            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)\n            instance := create2(0, ptr, 0x37, salt)\n        }\n        require(instance != address(0), \"ERC1167: create2 failed\");\n    }\n\n    /**\n     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.\n     */\n    function predictDeterministicAddress(\n        address implementation,\n        bytes32 salt,\n        address deployer\n    ) internal pure returns (address predicted) {\n        assembly {\n            let ptr := mload(0x40)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)\n            mstore(add(ptr, 0x14), shl(0x60, implementation))\n            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf3ff00000000000000000000000000000000)\n            mstore(add(ptr, 0x38), shl(0x60, deployer))\n            mstore(add(ptr, 0x4c), salt)\n            mstore(add(ptr, 0x6c), keccak256(ptr, 0x37))\n            predicted := keccak256(add(ptr, 0x37), 0x55)\n        }\n    }\n\n    /**\n     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.\n     */\n    function predictDeterministicAddress(address implementation, bytes32 salt)\n        internal\n        view\n        returns (address predicted)\n    {\n        return predictDeterministicAddress(implementation, salt, address(this));\n    }\n}\n"
+        },
+        "contracts/L2/gateway/L2ArbitrumMessenger.sol": {
+          "content": "//SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport {IArbSys} from \"../../arbitrum/IArbSys.sol\";\n\nabstract contract L2ArbitrumMessenger {\n    event TxToL1(\n        address indexed _from,\n        address indexed _to,\n        uint256 indexed _id,\n        bytes _data\n    );\n\n    function sendTxToL1(\n        address user,\n        address to,\n        bytes memory data\n    ) internal returns (uint256) {\n        // note: this method doesn't support sending ether to L1 together with a call\n        uint256 id = IArbSys(address(100)).sendTxToL1(to, data);\n        emit TxToL1(user, to, id, data);\n        return id;\n    }\n\n    modifier onlyL1Counterpart(address l1Counterpart) {\n        require(\n            msg.sender == applyL1ToL2Alias(l1Counterpart),\n            \"ONLY_COUNTERPART_GATEWAY\"\n        );\n        _;\n    }\n\n    uint160 internal constant OFFSET =\n        uint160(0x1111000000000000000000000000000000001111);\n\n    // l1 addresses are transformed durng l1->l2 calls\n    function applyL1ToL2Alias(address l1Address)\n        internal\n        pure\n        returns (address l2Address)\n    {\n        l2Address = address(uint160(l1Address) + OFFSET);\n    }\n}\n"
+        },
+        "contracts/L2/gateway/L2Migrator.sol": {
+          "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport {L2ArbitrumMessenger} from \"./L2ArbitrumMessenger.sol\";\nimport {IMigrator} from \"../../interfaces/IMigrator.sol\";\nimport \"../../proxy/ManagerProxyTarget.sol\";\nimport \"@openzeppelin/contracts/proxy/Clones.sol\";\n\ninterface IBondingManager {\n    function bondForWithHint(\n        uint256 _amount,\n        address _owner,\n        address _to,\n        address _oldDelegateNewPosPrev,\n        address _oldDelegateNewPosNext,\n        address _newDelegateNewPosPrev,\n        address _newDelegateNewPosNext\n    ) external;\n}\n\ninterface ITicketBroker {\n    function fundDepositAndReserveFor(\n        address _addr,\n        uint256 _depositAmount,\n        uint256 _reserveAmount\n    ) external payable;\n}\n\ninterface IMerkleSnapshot {\n    function verify(\n        bytes32 _id,\n        bytes32[] memory _proof,\n        bytes32 _leaf\n    ) external view returns (bool);\n}\n\ninterface IDelegatorPool {\n    function initialize(address _bondingManager) external;\n\n    function claim(address _addr, uint256 _stake) external;\n}\n\ninterface ApproveLike {\n    function approve(address _addr, uint256 _amount) external;\n}\n\ncontract L2Migrator is ManagerProxyTarget, L2ArbitrumMessenger, IMigrator {\n    address public bondingManagerAddr;\n    address public ticketBrokerAddr;\n    address public merkleSnapshotAddr;\n    address public tokenAddr;\n\n    address public l1MigratorAddr;\n    address public delegatorPoolImpl;\n    bool public claimStakeEnabled;\n\n    mapping(address => bool) public migratedDelegators;\n    mapping(address => address) public delegatorPools;\n    mapping(address => uint256) public claimedDelegatedStake;\n    mapping(address => mapping(uint256 => bool)) public migratedUnbondingLocks;\n    mapping(address => bool) public migratedSenders;\n\n    event L1MigratorUpdate(address _l1MigratorAddr);\n\n    event ControllerContractUpdate(bytes32 id, address addr);\n\n    event MigrateDelegatorFinalized(MigrateDelegatorParams params);\n\n    event MigrateUnbondingLocksFinalized(MigrateUnbondingLocksParams params);\n\n    event MigrateSenderFinalized(MigrateSenderParams params);\n\n    event DelegatorPoolImplUpdate(address _delegatorPoolImpl);\n\n    event DelegatorPoolCreated(address indexed l1Addr, address delegatorPool);\n\n    event ClaimStakeEnabled(bool _enabled);\n\n    event StakeClaimed(\n        address indexed delegator,\n        address delegate,\n        uint256 stake,\n        uint256 fees\n    );\n\n    /**\n     * @notice L2Migrator constructor. Only invokes constructor of base Manager contract with provided Controller address\n     * @dev This constructor will not initialize any state variables besides `controller`.\n     * - initialize() function must be called on a proxy that uses this implementation contract immediately after deployment\n     * @param _controller Address of Controller that this contract will be registered with\n     */\n    constructor(address _controller) Manager(_controller) {}\n\n    function initialize(address _l1MigratorAddr, address _delegatorPoolImpl)\n        external\n        onlyControllerOwner\n    {\n        l1MigratorAddr = _l1MigratorAddr;\n        delegatorPoolImpl = _delegatorPoolImpl;\n\n        syncControllerContracts();\n    }\n\n    /**\n     * @notice Sets L1Migrator\n     * @param _l1MigratorAddr L1Migrator address\n     */\n    function setL1Migrator(address _l1MigratorAddr)\n        external\n        onlyControllerOwner\n    {\n        l1MigratorAddr = _l1MigratorAddr;\n        emit L1MigratorUpdate(_l1MigratorAddr);\n    }\n\n    /**\n     * @notice Sets DelegatorPool implementation contract\n     * @param _delegatorPoolImpl DelegatorPool implementation contract\n     */\n    function setDelegatorPoolImpl(address _delegatorPoolImpl)\n        external\n        onlyControllerOwner\n    {\n        delegatorPoolImpl = _delegatorPoolImpl;\n        emit DelegatorPoolImplUpdate(_delegatorPoolImpl);\n    }\n\n    /**\n     * @notice Enable/disable claimStake()\n     * @param _enabled True/false indicating claimStake() enabled/disabled\n     */\n    function setClaimStakeEnabled(bool _enabled) external onlyControllerOwner {\n        claimStakeEnabled = _enabled;\n        emit ClaimStakeEnabled(_enabled);\n    }\n\n    /**\n     * @notice Called by L1Migrator to complete transcoder/delegator state migration\n     * @param _params L1 state relevant for migration\n     */\n    function finalizeMigrateDelegator(MigrateDelegatorParams calldata _params)\n        external\n        onlyL1Counterpart(l1MigratorAddr)\n    {\n        require(\n            !migratedDelegators[_params.l1Addr],\n            \"DELEGATOR_ALREADY_MIGRATED\"\n        );\n\n        migratedDelegators[_params.l1Addr] = true;\n\n        if (_params.l1Addr == _params.delegate) {\n            // l1Addr is an orchestrator on L1:\n            // 1. Stake _params.stake on behalf of _params.l2Addr\n            // 2. Create delegator pool\n            // 3. Stake non-self delegated stake on behalf of the delegator pool\n            bondFor(_params.stake, _params.l2Addr, _params.l2Addr);\n\n            // _params.delegatedStake includes _params.stake which is the orchestrator's self-stake\n            // Subtract _params.stake to get the orchestrator's non-self delegated stake\n            uint256 nonSelfDelegatedStake = _params.delegatedStake -\n                _params.stake;\n            uint256 unclaimedNonSelfDelegatedStake = nonSelfDelegatedStake -\n                claimedDelegatedStake[_params.l1Addr];\n            if (unclaimedNonSelfDelegatedStake > 0) {\n                address poolAddr = Clones.clone(delegatorPoolImpl);\n\n                delegatorPools[_params.l1Addr] = poolAddr;\n\n                bondFor(\n                    unclaimedNonSelfDelegatedStake,\n                    poolAddr,\n                    _params.l2Addr\n                );\n\n                IDelegatorPool(poolAddr).initialize(bondingManagerAddr);\n\n                emit DelegatorPoolCreated(_params.l1Addr, poolAddr);\n            }\n        } else {\n            // l1Addr is a delegator on L1:\n            // If a delegator pool exists for _params.delegate claim stake which\n            // was already migrated by delegate on behalf of _params.l2Addr.\n            // Otherwise, stake _params.stake on behalf of _params.l2Addr.\n            address pool = delegatorPools[_params.delegate];\n\n            if (pool != address(0)) {\n                // Claim stake that is held by the delegator pool\n                IDelegatorPool(pool).claim(_params.l2Addr, _params.stake);\n            } else {\n                bondFor(_params.stake, _params.l2Addr, _params.delegate);\n            }\n        }\n\n        claimedDelegatedStake[_params.delegate] += _params.stake;\n\n        // Use .call() since l2Addr could be a contract that needs more gas than\n        // the stipend provided by .transfer()\n        // The .call() is safe without a re-entrancy guard because this function cannot be re-entered\n        // by _params.l2Addr since the function can only be called by the L1Migrator via a cross-chain retryable ticket\n        if (_params.fees > 0) {\n            (bool ok, ) = _params.l2Addr.call{value: _params.fees}(\"\");\n            require(ok, \"FINALIZE_DELEGATOR:FAIL_FEE\");\n        }\n\n        emit MigrateDelegatorFinalized(_params);\n    }\n\n    /**\n     * @notice Called by L1Migrator to complete unbonding locks migration\n     * @param _params L1 state relevant for migration\n     */\n    function finalizeMigrateUnbondingLocks(\n        MigrateUnbondingLocksParams calldata _params\n    ) external onlyL1Counterpart(l1MigratorAddr) {\n        uint256 unbondingLockIdsLen = _params.unbondingLockIds.length;\n        for (uint256 i; i < unbondingLockIdsLen; i++) {\n            uint256 id = _params.unbondingLockIds[i];\n            require(\n                !migratedUnbondingLocks[_params.l1Addr][id],\n                \"UNBONDING_LOCK_ALREADY_MIGRATED\"\n            );\n            migratedUnbondingLocks[_params.l1Addr][id] = true;\n        }\n\n        bondFor(_params.total, _params.l2Addr, _params.delegate);\n\n        emit MigrateUnbondingLocksFinalized(_params);\n    }\n\n    /**\n     * @notice Called by L1Migrator to complete sender deposit/reserve migration\n     * @param _params L1 state relevant for migration\n     */\n    function finalizeMigrateSender(MigrateSenderParams calldata _params)\n        external\n        onlyL1Counterpart(l1MigratorAddr)\n    {\n        require(!migratedSenders[_params.l1Addr], \"SENDER_ALREADY_MIGRATED\");\n\n        migratedSenders[_params.l1Addr] = true;\n\n        // msg.value for this call must be equal to deposit + reserve amounts\n        ITicketBroker(ticketBrokerAddr).fundDepositAndReserveFor{\n            value: _params.deposit + _params.reserve\n        }(_params.l2Addr, _params.deposit, _params.reserve);\n\n        emit MigrateSenderFinalized(_params);\n    }\n\n    receive() external payable {}\n\n    /**\n     * @notice Completes delegator migration using a Merkle proof that a delegator's state was included in a state\n     * snapshot represented by a Merkle tree root\n     * @dev Assume that only EOAs are included in the snapshot\n     * Regardless of the caller of this function, the EOA from L1 will be able to access its stake on L2\n     * @param _delegate Address that is migrating\n     * @param _stake Stake of delegator on L1\n     * @param _fees Fees of delegator on L1\n     * @param _proof Merkle proof of inclusion in Merkle tree state snapshot\n     * @param _newDelegate Optional address of a new delegate on L2\n     */\n    function claimStake(\n        address _delegate,\n        uint256 _stake,\n        uint256 _fees,\n        bytes32[] calldata _proof,\n        address _newDelegate\n    ) external {\n        require(claimStakeEnabled, \"CLAIM_STAKE_DISABLED\");\n\n        address delegator = msg.sender;\n\n        require(!migratedDelegators[delegator], \"CLAIM_STAKE:ALREADY_MIGRATED\");\n\n        IMerkleSnapshot merkleSnapshot = IMerkleSnapshot(merkleSnapshotAddr);\n\n        bytes32 leaf = keccak256(\n            abi.encodePacked(delegator, _delegate, _stake, _fees)\n        );\n\n        require(\n            merkleSnapshot.verify(keccak256(\"LIP-73\"), _proof, leaf),\n            \"CLAIM_STAKE:INVALID_PROOF\"\n        );\n\n        migratedDelegators[delegator] = true;\n\n        if (_delegate != address(0)) {\n            claimedDelegatedStake[_delegate] += _stake;\n\n            address pool = delegatorPools[_delegate];\n\n            address delegate = _delegate;\n            if (_newDelegate != address(0)) {\n                delegate = _newDelegate;\n            }\n\n            if (pool != address(0)) {\n                // Claim stake that is held by the delegator pool\n                IDelegatorPool(pool).claim(delegator, _stake);\n            } else {\n                bondFor(_stake, delegator, delegate);\n            }\n        }\n\n        // Only EOAs are included in the snapshot so we do not need to worry about\n        // the insufficeint gas stipend with transfer()\n        if (_fees > 0) {\n            payable(delegator).transfer(_fees);\n        }\n\n        emit StakeClaimed(delegator, _delegate, _stake, _fees);\n    }\n\n    function bondFor(\n        uint256 _amount,\n        address _owner,\n        address _to\n    ) private {\n        IBondingManager bondingManager = IBondingManager(bondingManagerAddr);\n\n        ApproveLike(tokenAddr).approve(address(bondingManager), _amount);\n        bondingManager.bondForWithHint(\n            _amount,\n            _owner,\n            _to,\n            address(0),\n            address(0),\n            address(0),\n            address(0)\n        );\n    }\n\n    /**\n     * @notice Fetches addresses and sets bondingManagerAddr, ticketBrokerAddr, merkleSnapshotAddr\n     * if they are different from the stored addresses\n     */\n    function syncControllerContracts() public {\n        // Check and update BondingManager address\n        bytes32 bondingManagerId = keccak256(\"BondingManager\");\n        address _bondingManagerAddr = controller.getContract(bondingManagerId);\n\n        if (_bondingManagerAddr != bondingManagerAddr) {\n            bondingManagerAddr = _bondingManagerAddr;\n            emit ControllerContractUpdate(\n                bondingManagerId,\n                _bondingManagerAddr\n            );\n        }\n\n        // Check and update TicketBroker address\n        bytes32 ticketBrokerId = keccak256(\"TicketBroker\");\n        address _ticketBrokerAddr = controller.getContract(ticketBrokerId);\n\n        if (_ticketBrokerAddr != ticketBrokerAddr) {\n            ticketBrokerAddr = _ticketBrokerAddr;\n            emit ControllerContractUpdate(ticketBrokerId, _ticketBrokerAddr);\n        }\n\n        // Check and update MerkleSnapshot address\n        bytes32 merkleSnapshotId = keccak256(\"MerkleSnapshot\");\n        address _merkleSnapshotAddr = controller.getContract(merkleSnapshotId);\n\n        if (_merkleSnapshotAddr != merkleSnapshotAddr) {\n            merkleSnapshotAddr = _merkleSnapshotAddr;\n            emit ControllerContractUpdate(\n                merkleSnapshotId,\n                _merkleSnapshotAddr\n            );\n        }\n\n        // Check and update LivepeerToken address\n        bytes32 tokenId = keccak256(\"LivepeerToken\");\n        address _tokenAddr = controller.getContract(tokenId);\n\n        if (_tokenAddr != tokenAddr) {\n            tokenAddr = _tokenAddr;\n            emit ControllerContractUpdate(tokenId, _tokenAddr);\n        }\n    }\n}\n"
+        },
+        "contracts/arbitrum/IArbSys.sol": {
+          "content": "// SPDX-License-Identifier: Apache-2.0\n\n/*\n * Copyright 2021, Offchain Labs, Inc.\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *    http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n */\n\npragma solidity 0.8.9;\n\n/**\n * @title Precompiled contract that exists in every Arbitrum chain at address(100), 0x0000000000000000000000000000000000000064. Exposes a variety of system-level functionality.\n */\ninterface IArbSys {\n    /**\n     * @notice Get internal version number identifying an ArbOS build\n     * @return version number as int\n     */\n    function arbOSVersion() external pure returns (uint256);\n\n    function arbChainID() external view returns (uint256);\n\n    /**\n     * @notice Get Arbitrum block number (distinct from L1 block number; Arbitrum genesis block has block number 0)\n     * @return block number as int\n     */\n    function arbBlockNumber() external view returns (uint256);\n\n    /**\n     * @notice Send given amount of Eth to dest from sender.\n     * This is a convenience function, which is equivalent to calling sendTxToL1 with empty calldataForL1.\n     * @param destination recipient address on L1\n     * @return unique identifier for this L2-to-L1 transaction.\n     */\n    function withdrawEth(address destination)\n        external\n        payable\n        returns (uint256);\n\n    /**\n     * @notice Send a transaction to L1\n     * @param destination recipient address on L1\n     * @param calldataForL1 (optional) calldata for L1 contract call\n     * @return a unique identifier for this L2-to-L1 transaction.\n     */\n    function sendTxToL1(address destination, bytes calldata calldataForL1)\n        external\n        payable\n        returns (uint256);\n\n    /**\n     * @notice get the number of transactions issued by the given external account or the account sequence number of the given contract\n     * @param account target account\n     * @return the number of transactions issued by the given external account or the account sequence number of the given contract\n     */\n    function getTransactionCount(address account)\n        external\n        view\n        returns (uint256);\n\n    /**\n     * @notice get the value of target L2 storage slot\n     * This function is only callable from address 0 to prevent contracts from being able to call it\n     * @param account target account\n     * @param index target index of storage slot\n     * @return stotage value for the given account at the given index\n     */\n    function getStorageAt(address account, uint256 index)\n        external\n        view\n        returns (uint256);\n\n    /**\n     * @notice check if current call is coming from l1\n     * @return true if the caller of this was called directly from L1\n     */\n    function isTopLevelCall() external view returns (bool);\n\n    event EthWithdrawal(address indexed destAddr, uint256 amount);\n\n    event L2ToL1Transaction(\n        address caller,\n        address indexed destination,\n        uint256 indexed uniqueId,\n        uint256 indexed batchNumber,\n        uint256 indexInBatch,\n        uint256 arbBlockNum,\n        uint256 ethBlockNum,\n        uint256 timestamp,\n        uint256 callvalue,\n        bytes data\n    );\n}\n"
+        },
+        "contracts/interfaces/IMigrator.sol": {
+          "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IMigrator {\n    struct MigrateDelegatorParams {\n        // Address that is migrating from L1\n        address l1Addr;\n        // Address to use on L2\n        // If null, l1Addr is used on L2\n        address l2Addr;\n        // Stake of l1Addr on L1\n        uint256 stake;\n        // Delegated stake of l1Addr on L1\n        uint256 delegatedStake;\n        // Fees of l1Addr on L1\n        uint256 fees;\n        // Delegate of l1Addr on L1\n        address delegate;\n    }\n\n    struct MigrateUnbondingLocksParams {\n        // Address that is migrating from L1\n        address l1Addr;\n        // Address to use on L2\n        // If null, l1Addr is used on L2\n        address l2Addr;\n        // Total tokens in unbonding locks\n        uint256 total;\n        // IDs of unbonding locks being migrated\n        uint256[] unbondingLockIds;\n        // Delegate of l1Addr on L1\n        address delegate;\n    }\n\n    struct MigrateSenderParams {\n        // Address that is migrating from L1\n        address l1Addr;\n        // Address to use on L2\n        // If null, l1Addr is used on L2\n        address l2Addr;\n        // Deposit of l1Addr on L1\n        uint256 deposit;\n        // Reserve of l1Addr on L1\n        uint256 reserve;\n    }\n}\n"
+        },
+        "contracts/proxy/IController.sol": {
+          "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IController {\n    function owner() external view returns (address);\n\n    function paused() external view returns (bool);\n\n    function getContract(bytes32 _id) external view returns (address);\n}\n"
+        },
+        "contracts/proxy/IManager.sol": {
+          "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IManager {\n    event SetController(address controller);\n\n    function setController(address _controller) external;\n}\n"
+        },
+        "contracts/proxy/Manager.sol": {
+          "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport {IManager} from \"./IManager.sol\";\nimport {IController} from \"./IController.sol\";\n\n// Copy of https://github.com/livepeer/protocol/blob/confluence/contracts/Manager.sol\n// Tests at https://github.com/livepeer/protocol/blob/confluence/test/unit/ManagerProxy.js\ncontract Manager is IManager {\n    // Controller that contract is registered with\n    IController public controller;\n\n    // Check if sender is controller\n    modifier onlyController() {\n        _onlyController();\n        _;\n    }\n\n    // Check if sender is controller owner\n    modifier onlyControllerOwner() {\n        _onlyControllerOwner();\n        _;\n    }\n\n    // Check if controller is not paused\n    modifier whenSystemNotPaused() {\n        _whenSystemNotPaused();\n        _;\n    }\n\n    // Check if controller is paused\n    modifier whenSystemPaused() {\n        _whenSystemPaused();\n        _;\n    }\n\n    constructor(address _controller) {\n        controller = IController(_controller);\n    }\n\n    /**\n     * @notice Set controller. Only callable by current controller\n     * @param _controller Controller contract address\n     */\n    function setController(address _controller) external onlyController {\n        controller = IController(_controller);\n\n        emit SetController(_controller);\n    }\n\n    function _onlyController() private view {\n        require(msg.sender == address(controller), \"caller must be Controller\");\n    }\n\n    function _onlyControllerOwner() private view {\n        require(\n            msg.sender == controller.owner(),\n            \"caller must be Controller owner\"\n        );\n    }\n\n    function _whenSystemNotPaused() private view {\n        require(!controller.paused(), \"system is paused\");\n    }\n\n    function _whenSystemPaused() private view {\n        require(controller.paused(), \"system is not paused\");\n    }\n}\n"
+        },
+        "contracts/proxy/ManagerProxyTarget.sol": {
+          "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport \"./Manager.sol\";\n\n/**\n * @title ManagerProxyTarget\n * @notice The base contract that target contracts used by a proxy contract should inherit from\n * @dev Both the target contract and the proxy contract (implemented as ManagerProxy) MUST inherit from ManagerProxyTarget in order to guarantee\n that both contracts have the same storage layout. Differing storage layouts in a proxy contract and target contract can\n potentially break the delegate proxy upgradeability mechanism\n */\nabstract contract ManagerProxyTarget is Manager {\n    // Used to look up target contract address in controller's registry\n    bytes32 public targetContractId;\n}\n"
+        }
+      },
+      "metadata": {
+        "compiler": {
+          "version": "0.8.9+commit.e5eed63a"
+        },
+        "language": "Solidity",
+        "output": {
+          "abi": [
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "_controller",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "nonpayable",
+              "type": "constructor"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "indexed": false,
+                  "internalType": "bool",
+                  "name": "_enabled",
+                  "type": "bool"
+                }
+              ],
+              "name": "ClaimStakeEnabled",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "indexed": false,
+                  "internalType": "bytes32",
+                  "name": "id",
+                  "type": "bytes32"
+                },
+                {
+                  "indexed": false,
+                  "internalType": "address",
+                  "name": "addr",
+                  "type": "address"
+                }
+              ],
+              "name": "ControllerContractUpdate",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "indexed": true,
+                  "internalType": "address",
+                  "name": "l1Addr",
+                  "type": "address"
+                },
+                {
+                  "indexed": false,
+                  "internalType": "address",
+                  "name": "delegatorPool",
+                  "type": "address"
+                }
+              ],
+              "name": "DelegatorPoolCreated",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "indexed": false,
+                  "internalType": "address",
+                  "name": "_delegatorPoolImpl",
+                  "type": "address"
+                }
+              ],
+              "name": "DelegatorPoolImplUpdate",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "indexed": false,
+                  "internalType": "address",
+                  "name": "_l1MigratorAddr",
+                  "type": "address"
+                }
+              ],
+              "name": "L1MigratorUpdate",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "l1Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "l2Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "stake",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "delegatedStake",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "fees",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "delegate",
+                      "type": "address"
+                    }
+                  ],
+                  "indexed": false,
+                  "internalType": "struct IMigrator.MigrateDelegatorParams",
+                  "name": "params",
+                  "type": "tuple"
+                }
+              ],
+              "name": "MigrateDelegatorFinalized",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "l1Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "l2Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "deposit",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "reserve",
+                      "type": "uint256"
+                    }
+                  ],
+                  "indexed": false,
+                  "internalType": "struct IMigrator.MigrateSenderParams",
+                  "name": "params",
+                  "type": "tuple"
+                }
+              ],
+              "name": "MigrateSenderFinalized",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "l1Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "l2Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "total",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256[]",
+                      "name": "unbondingLockIds",
+                      "type": "uint256[]"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "delegate",
+                      "type": "address"
+                    }
+                  ],
+                  "indexed": false,
+                  "internalType": "struct IMigrator.MigrateUnbondingLocksParams",
+                  "name": "params",
+                  "type": "tuple"
+                }
+              ],
+              "name": "MigrateUnbondingLocksFinalized",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "indexed": false,
+                  "internalType": "address",
+                  "name": "controller",
+                  "type": "address"
+                }
+              ],
+              "name": "SetController",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "indexed": true,
+                  "internalType": "address",
+                  "name": "delegator",
+                  "type": "address"
+                },
+                {
+                  "indexed": false,
+                  "internalType": "address",
+                  "name": "delegate",
+                  "type": "address"
+                },
+                {
+                  "indexed": false,
+                  "internalType": "uint256",
+                  "name": "stake",
+                  "type": "uint256"
+                },
+                {
+                  "indexed": false,
+                  "internalType": "uint256",
+                  "name": "fees",
+                  "type": "uint256"
+                }
+              ],
+              "name": "StakeClaimed",
+              "type": "event"
+            },
+            {
+              "anonymous": false,
+              "inputs": [
+                {
+                  "indexed": true,
+                  "internalType": "address",
+                  "name": "_from",
+                  "type": "address"
+                },
+                {
+                  "indexed": true,
+                  "internalType": "address",
+                  "name": "_to",
+                  "type": "address"
+                },
+                {
+                  "indexed": true,
+                  "internalType": "uint256",
+                  "name": "_id",
+                  "type": "uint256"
+                },
+                {
+                  "indexed": false,
+                  "internalType": "bytes",
+                  "name": "_data",
+                  "type": "bytes"
+                }
+              ],
+              "name": "TxToL1",
+              "type": "event"
+            },
+            {
+              "inputs": [],
+              "name": "bondingManagerAddr",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "_delegate",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "_stake",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "_fees",
+                  "type": "uint256"
+                },
+                {
+                  "internalType": "bytes32[]",
+                  "name": "_proof",
+                  "type": "bytes32[]"
+                },
+                {
+                  "internalType": "address",
+                  "name": "_newDelegate",
+                  "type": "address"
+                }
+              ],
+              "name": "claimStake",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "claimStakeEnabled",
+              "outputs": [
+                {
+                  "internalType": "bool",
+                  "name": "",
+                  "type": "bool"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "name": "claimedDelegatedStake",
+              "outputs": [
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "controller",
+              "outputs": [
+                {
+                  "internalType": "contract IController",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "delegatorPoolImpl",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "name": "delegatorPools",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "l1Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "l2Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "stake",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "delegatedStake",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "fees",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "delegate",
+                      "type": "address"
+                    }
+                  ],
+                  "internalType": "struct IMigrator.MigrateDelegatorParams",
+                  "name": "_params",
+                  "type": "tuple"
+                }
+              ],
+              "name": "finalizeMigrateDelegator",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "l1Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "l2Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "deposit",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "reserve",
+                      "type": "uint256"
+                    }
+                  ],
+                  "internalType": "struct IMigrator.MigrateSenderParams",
+                  "name": "_params",
+                  "type": "tuple"
+                }
+              ],
+              "name": "finalizeMigrateSender",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "components": [
+                    {
+                      "internalType": "address",
+                      "name": "l1Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "l2Addr",
+                      "type": "address"
+                    },
+                    {
+                      "internalType": "uint256",
+                      "name": "total",
+                      "type": "uint256"
+                    },
+                    {
+                      "internalType": "uint256[]",
+                      "name": "unbondingLockIds",
+                      "type": "uint256[]"
+                    },
+                    {
+                      "internalType": "address",
+                      "name": "delegate",
+                      "type": "address"
+                    }
+                  ],
+                  "internalType": "struct IMigrator.MigrateUnbondingLocksParams",
+                  "name": "_params",
+                  "type": "tuple"
+                }
+              ],
+              "name": "finalizeMigrateUnbondingLocks",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "_l1MigratorAddr",
+                  "type": "address"
+                },
+                {
+                  "internalType": "address",
+                  "name": "_delegatorPoolImpl",
+                  "type": "address"
+                }
+              ],
+              "name": "initialize",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "l1MigratorAddr",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "merkleSnapshotAddr",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "name": "migratedDelegators",
+              "outputs": [
+                {
+                  "internalType": "bool",
+                  "name": "",
+                  "type": "bool"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "name": "migratedSenders",
+              "outputs": [
+                {
+                  "internalType": "bool",
+                  "name": "",
+                  "type": "bool"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                },
+                {
+                  "internalType": "uint256",
+                  "name": "",
+                  "type": "uint256"
+                }
+              ],
+              "name": "migratedUnbondingLocks",
+              "outputs": [
+                {
+                  "internalType": "bool",
+                  "name": "",
+                  "type": "bool"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "bool",
+                  "name": "_enabled",
+                  "type": "bool"
+                }
+              ],
+              "name": "setClaimStakeEnabled",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "_controller",
+                  "type": "address"
+                }
+              ],
+              "name": "setController",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "_delegatorPoolImpl",
+                  "type": "address"
+                }
+              ],
+              "name": "setDelegatorPoolImpl",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [
+                {
+                  "internalType": "address",
+                  "name": "_l1MigratorAddr",
+                  "type": "address"
+                }
+              ],
+              "name": "setL1Migrator",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "syncControllerContracts",
+              "outputs": [],
+              "stateMutability": "nonpayable",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "targetContractId",
+              "outputs": [
+                {
+                  "internalType": "bytes32",
+                  "name": "",
+                  "type": "bytes32"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "ticketBrokerAddr",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "inputs": [],
+              "name": "tokenAddr",
+              "outputs": [
+                {
+                  "internalType": "address",
+                  "name": "",
+                  "type": "address"
+                }
+              ],
+              "stateMutability": "view",
+              "type": "function"
+            },
+            {
+              "stateMutability": "payable",
+              "type": "receive"
+            }
+          ],
+          "devdoc": {
+            "kind": "dev",
+            "methods": {
+              "claimStake(address,uint256,uint256,bytes32[],address)": {
+                "details": "Assume that only EOAs are included in the snapshot Regardless of the caller of this function, the EOA from L1 will be able to access its stake on L2",
+                "params": {
+                  "_delegate": "Address that is migrating",
+                  "_fees": "Fees of delegator on L1",
+                  "_newDelegate": "Optional address of a new delegate on L2",
+                  "_proof": "Merkle proof of inclusion in Merkle tree state snapshot",
+                  "_stake": "Stake of delegator on L1"
+                }
+              },
+              "constructor": {
+                "details": "This constructor will not initialize any state variables besides `controller`. - initialize() function must be called on a proxy that uses this implementation contract immediately after deployment",
+                "params": {
+                  "_controller": "Address of Controller that this contract will be registered with"
+                }
+              },
+              "finalizeMigrateDelegator((address,address,uint256,uint256,uint256,address))": {
+                "params": {
+                  "_params": "L1 state relevant for migration"
+                }
+              },
+              "finalizeMigrateSender((address,address,uint256,uint256))": {
+                "params": {
+                  "_params": "L1 state relevant for migration"
+                }
+              },
+              "finalizeMigrateUnbondingLocks((address,address,uint256,uint256[],address))": {
+                "params": {
+                  "_params": "L1 state relevant for migration"
+                }
+              },
+              "setClaimStakeEnabled(bool)": {
+                "params": {
+                  "_enabled": "True/false indicating claimStake() enabled/disabled"
+                }
+              },
+              "setController(address)": {
+                "params": {
+                  "_controller": "Controller contract address"
+                }
+              },
+              "setDelegatorPoolImpl(address)": {
+                "params": {
+                  "_delegatorPoolImpl": "DelegatorPool implementation contract"
+                }
+              },
+              "setL1Migrator(address)": {
+                "params": {
+                  "_l1MigratorAddr": "L1Migrator address"
+                }
+              }
+            },
+            "version": 1
+          },
+          "userdoc": {
+            "kind": "user",
+            "methods": {
+              "claimStake(address,uint256,uint256,bytes32[],address)": {
+                "notice": "Completes delegator migration using a Merkle proof that a delegator's state was included in a state snapshot represented by a Merkle tree root"
+              },
+              "constructor": {
+                "notice": "L2Migrator constructor. Only invokes constructor of base Manager contract with provided Controller address"
+              },
+              "finalizeMigrateDelegator((address,address,uint256,uint256,uint256,address))": {
+                "notice": "Called by L1Migrator to complete transcoder/delegator state migration"
+              },
+              "finalizeMigrateSender((address,address,uint256,uint256))": {
+                "notice": "Called by L1Migrator to complete sender deposit/reserve migration"
+              },
+              "finalizeMigrateUnbondingLocks((address,address,uint256,uint256[],address))": {
+                "notice": "Called by L1Migrator to complete unbonding locks migration"
+              },
+              "setClaimStakeEnabled(bool)": {
+                "notice": "Enable/disable claimStake()"
+              },
+              "setController(address)": {
+                "notice": "Set controller. Only callable by current controller"
+              },
+              "setDelegatorPoolImpl(address)": {
+                "notice": "Sets DelegatorPool implementation contract"
+              },
+              "setL1Migrator(address)": {
+                "notice": "Sets L1Migrator"
+              },
+              "syncControllerContracts()": {
+                "notice": "Fetches addresses and sets bondingManagerAddr, ticketBrokerAddr, merkleSnapshotAddr if they are different from the stored addresses"
+              }
+            },
+            "version": 1
+          }
+        },
+        "settings": {
+          "compilationTarget": {
+            "contracts/L2/gateway/L2Migrator.sol": "L2Migrator"
+          },
+          "evmVersion": "london",
+          "libraries": {},
+          "metadata": {
+            "bytecodeHash": "ipfs",
+            "useLiteralContent": true
+          },
+          "optimizer": {
+            "enabled": false,
+            "runs": 200
+          },
+          "remappings": []
+        },
+        "sources": {
+          "@openzeppelin/contracts/proxy/Clones.sol": {
+            "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts v4.4.1 (proxy/Clones.sol)\n\npragma solidity ^0.8.0;\n\n/**\n * @dev https://eips.ethereum.org/EIPS/eip-1167[EIP 1167] is a standard for\n * deploying minimal proxy contracts, also known as \"clones\".\n *\n * > To simply and cheaply clone contract functionality in an immutable way, this standard specifies\n * > a minimal bytecode implementation that delegates all calls to a known, fixed address.\n *\n * The library includes functions to deploy a proxy using either `create` (traditional deployment) or `create2`\n * (salted deterministic deployment). It also includes functions to predict the addresses of clones deployed using the\n * deterministic method.\n *\n * _Available since v3.4._\n */\nlibrary Clones {\n    /**\n     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.\n     *\n     * This function uses the create opcode, which should never revert.\n     */\n    function clone(address implementation) internal returns (address instance) {\n        assembly {\n            let ptr := mload(0x40)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)\n            mstore(add(ptr, 0x14), shl(0x60, implementation))\n            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)\n            instance := create(0, ptr, 0x37)\n        }\n        require(instance != address(0), \"ERC1167: create failed\");\n    }\n\n    /**\n     * @dev Deploys and returns the address of a clone that mimics the behaviour of `implementation`.\n     *\n     * This function uses the create2 opcode and a `salt` to deterministically deploy\n     * the clone. Using the same `implementation` and `salt` multiple time will revert, since\n     * the clones cannot be deployed twice at the same address.\n     */\n    function cloneDeterministic(address implementation, bytes32 salt) internal returns (address instance) {\n        assembly {\n            let ptr := mload(0x40)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)\n            mstore(add(ptr, 0x14), shl(0x60, implementation))\n            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000)\n            instance := create2(0, ptr, 0x37, salt)\n        }\n        require(instance != address(0), \"ERC1167: create2 failed\");\n    }\n\n    /**\n     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.\n     */\n    function predictDeterministicAddress(\n        address implementation,\n        bytes32 salt,\n        address deployer\n    ) internal pure returns (address predicted) {\n        assembly {\n            let ptr := mload(0x40)\n            mstore(ptr, 0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000)\n            mstore(add(ptr, 0x14), shl(0x60, implementation))\n            mstore(add(ptr, 0x28), 0x5af43d82803e903d91602b57fd5bf3ff00000000000000000000000000000000)\n            mstore(add(ptr, 0x38), shl(0x60, deployer))\n            mstore(add(ptr, 0x4c), salt)\n            mstore(add(ptr, 0x6c), keccak256(ptr, 0x37))\n            predicted := keccak256(add(ptr, 0x37), 0x55)\n        }\n    }\n\n    /**\n     * @dev Computes the address of a clone deployed using {Clones-cloneDeterministic}.\n     */\n    function predictDeterministicAddress(address implementation, bytes32 salt)\n        internal\n        view\n        returns (address predicted)\n    {\n        return predictDeterministicAddress(implementation, salt, address(this));\n    }\n}\n",
+            "keccak256": "0x1cc0efb01cbf008b768fd7b334786a6e358809198bb7e67f1c530af4957c6a21",
+            "license": "MIT"
+          },
+          "contracts/L2/gateway/L2ArbitrumMessenger.sol": {
+            "content": "//SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport {IArbSys} from \"../../arbitrum/IArbSys.sol\";\n\nabstract contract L2ArbitrumMessenger {\n    event TxToL1(\n        address indexed _from,\n        address indexed _to,\n        uint256 indexed _id,\n        bytes _data\n    );\n\n    function sendTxToL1(\n        address user,\n        address to,\n        bytes memory data\n    ) internal returns (uint256) {\n        // note: this method doesn't support sending ether to L1 together with a call\n        uint256 id = IArbSys(address(100)).sendTxToL1(to, data);\n        emit TxToL1(user, to, id, data);\n        return id;\n    }\n\n    modifier onlyL1Counterpart(address l1Counterpart) {\n        require(\n            msg.sender == applyL1ToL2Alias(l1Counterpart),\n            \"ONLY_COUNTERPART_GATEWAY\"\n        );\n        _;\n    }\n\n    uint160 internal constant OFFSET =\n        uint160(0x1111000000000000000000000000000000001111);\n\n    // l1 addresses are transformed durng l1->l2 calls\n    function applyL1ToL2Alias(address l1Address)\n        internal\n        pure\n        returns (address l2Address)\n    {\n        l2Address = address(uint160(l1Address) + OFFSET);\n    }\n}\n",
+            "keccak256": "0x869e551fffb21ebfa4a74084da87eaeac241d0a172b5e6c04b1f3573af2847cd",
+            "license": "MIT"
+          },
+          "contracts/L2/gateway/L2Migrator.sol": {
+            "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport {L2ArbitrumMessenger} from \"./L2ArbitrumMessenger.sol\";\nimport {IMigrator} from \"../../interfaces/IMigrator.sol\";\nimport \"../../proxy/ManagerProxyTarget.sol\";\nimport \"@openzeppelin/contracts/proxy/Clones.sol\";\n\ninterface IBondingManager {\n    function bondForWithHint(\n        uint256 _amount,\n        address _owner,\n        address _to,\n        address _oldDelegateNewPosPrev,\n        address _oldDelegateNewPosNext,\n        address _newDelegateNewPosPrev,\n        address _newDelegateNewPosNext\n    ) external;\n}\n\ninterface ITicketBroker {\n    function fundDepositAndReserveFor(\n        address _addr,\n        uint256 _depositAmount,\n        uint256 _reserveAmount\n    ) external payable;\n}\n\ninterface IMerkleSnapshot {\n    function verify(\n        bytes32 _id,\n        bytes32[] memory _proof,\n        bytes32 _leaf\n    ) external view returns (bool);\n}\n\ninterface IDelegatorPool {\n    function initialize(address _bondingManager) external;\n\n    function claim(address _addr, uint256 _stake) external;\n}\n\ninterface ApproveLike {\n    function approve(address _addr, uint256 _amount) external;\n}\n\ncontract L2Migrator is ManagerProxyTarget, L2ArbitrumMessenger, IMigrator {\n    address public bondingManagerAddr;\n    address public ticketBrokerAddr;\n    address public merkleSnapshotAddr;\n    address public tokenAddr;\n\n    address public l1MigratorAddr;\n    address public delegatorPoolImpl;\n    bool public claimStakeEnabled;\n\n    mapping(address => bool) public migratedDelegators;\n    mapping(address => address) public delegatorPools;\n    mapping(address => uint256) public claimedDelegatedStake;\n    mapping(address => mapping(uint256 => bool)) public migratedUnbondingLocks;\n    mapping(address => bool) public migratedSenders;\n\n    event L1MigratorUpdate(address _l1MigratorAddr);\n\n    event ControllerContractUpdate(bytes32 id, address addr);\n\n    event MigrateDelegatorFinalized(MigrateDelegatorParams params);\n\n    event MigrateUnbondingLocksFinalized(MigrateUnbondingLocksParams params);\n\n    event MigrateSenderFinalized(MigrateSenderParams params);\n\n    event DelegatorPoolImplUpdate(address _delegatorPoolImpl);\n\n    event DelegatorPoolCreated(address indexed l1Addr, address delegatorPool);\n\n    event ClaimStakeEnabled(bool _enabled);\n\n    event StakeClaimed(\n        address indexed delegator,\n        address delegate,\n        uint256 stake,\n        uint256 fees\n    );\n\n    /**\n     * @notice L2Migrator constructor. Only invokes constructor of base Manager contract with provided Controller address\n     * @dev This constructor will not initialize any state variables besides `controller`.\n     * - initialize() function must be called on a proxy that uses this implementation contract immediately after deployment\n     * @param _controller Address of Controller that this contract will be registered with\n     */\n    constructor(address _controller) Manager(_controller) {}\n\n    function initialize(address _l1MigratorAddr, address _delegatorPoolImpl)\n        external\n        onlyControllerOwner\n    {\n        l1MigratorAddr = _l1MigratorAddr;\n        delegatorPoolImpl = _delegatorPoolImpl;\n\n        syncControllerContracts();\n    }\n\n    /**\n     * @notice Sets L1Migrator\n     * @param _l1MigratorAddr L1Migrator address\n     */\n    function setL1Migrator(address _l1MigratorAddr)\n        external\n        onlyControllerOwner\n    {\n        l1MigratorAddr = _l1MigratorAddr;\n        emit L1MigratorUpdate(_l1MigratorAddr);\n    }\n\n    /**\n     * @notice Sets DelegatorPool implementation contract\n     * @param _delegatorPoolImpl DelegatorPool implementation contract\n     */\n    function setDelegatorPoolImpl(address _delegatorPoolImpl)\n        external\n        onlyControllerOwner\n    {\n        delegatorPoolImpl = _delegatorPoolImpl;\n        emit DelegatorPoolImplUpdate(_delegatorPoolImpl);\n    }\n\n    /**\n     * @notice Enable/disable claimStake()\n     * @param _enabled True/false indicating claimStake() enabled/disabled\n     */\n    function setClaimStakeEnabled(bool _enabled) external onlyControllerOwner {\n        claimStakeEnabled = _enabled;\n        emit ClaimStakeEnabled(_enabled);\n    }\n\n    /**\n     * @notice Called by L1Migrator to complete transcoder/delegator state migration\n     * @param _params L1 state relevant for migration\n     */\n    function finalizeMigrateDelegator(MigrateDelegatorParams calldata _params)\n        external\n        onlyL1Counterpart(l1MigratorAddr)\n    {\n        require(\n            !migratedDelegators[_params.l1Addr],\n            \"DELEGATOR_ALREADY_MIGRATED\"\n        );\n\n        migratedDelegators[_params.l1Addr] = true;\n\n        if (_params.l1Addr == _params.delegate) {\n            // l1Addr is an orchestrator on L1:\n            // 1. Stake _params.stake on behalf of _params.l2Addr\n            // 2. Create delegator pool\n            // 3. Stake non-self delegated stake on behalf of the delegator pool\n            bondFor(_params.stake, _params.l2Addr, _params.l2Addr);\n\n            // _params.delegatedStake includes _params.stake which is the orchestrator's self-stake\n            // Subtract _params.stake to get the orchestrator's non-self delegated stake\n            uint256 nonSelfDelegatedStake = _params.delegatedStake -\n                _params.stake;\n            uint256 unclaimedNonSelfDelegatedStake = nonSelfDelegatedStake -\n                claimedDelegatedStake[_params.l1Addr];\n            if (unclaimedNonSelfDelegatedStake > 0) {\n                address poolAddr = Clones.clone(delegatorPoolImpl);\n\n                delegatorPools[_params.l1Addr] = poolAddr;\n\n                bondFor(\n                    unclaimedNonSelfDelegatedStake,\n                    poolAddr,\n                    _params.l2Addr\n                );\n\n                IDelegatorPool(poolAddr).initialize(bondingManagerAddr);\n\n                emit DelegatorPoolCreated(_params.l1Addr, poolAddr);\n            }\n        } else {\n            // l1Addr is a delegator on L1:\n            // If a delegator pool exists for _params.delegate claim stake which\n            // was already migrated by delegate on behalf of _params.l2Addr.\n            // Otherwise, stake _params.stake on behalf of _params.l2Addr.\n            address pool = delegatorPools[_params.delegate];\n\n            if (pool != address(0)) {\n                // Claim stake that is held by the delegator pool\n                IDelegatorPool(pool).claim(_params.l2Addr, _params.stake);\n            } else {\n                bondFor(_params.stake, _params.l2Addr, _params.delegate);\n            }\n        }\n\n        claimedDelegatedStake[_params.delegate] += _params.stake;\n\n        // Use .call() since l2Addr could be a contract that needs more gas than\n        // the stipend provided by .transfer()\n        // The .call() is safe without a re-entrancy guard because this function cannot be re-entered\n        // by _params.l2Addr since the function can only be called by the L1Migrator via a cross-chain retryable ticket\n        if (_params.fees > 0) {\n            (bool ok, ) = _params.l2Addr.call{value: _params.fees}(\"\");\n            require(ok, \"FINALIZE_DELEGATOR:FAIL_FEE\");\n        }\n\n        emit MigrateDelegatorFinalized(_params);\n    }\n\n    /**\n     * @notice Called by L1Migrator to complete unbonding locks migration\n     * @param _params L1 state relevant for migration\n     */\n    function finalizeMigrateUnbondingLocks(\n        MigrateUnbondingLocksParams calldata _params\n    ) external onlyL1Counterpart(l1MigratorAddr) {\n        uint256 unbondingLockIdsLen = _params.unbondingLockIds.length;\n        for (uint256 i; i < unbondingLockIdsLen; i++) {\n            uint256 id = _params.unbondingLockIds[i];\n            require(\n                !migratedUnbondingLocks[_params.l1Addr][id],\n                \"UNBONDING_LOCK_ALREADY_MIGRATED\"\n            );\n            migratedUnbondingLocks[_params.l1Addr][id] = true;\n        }\n\n        bondFor(_params.total, _params.l2Addr, _params.delegate);\n\n        emit MigrateUnbondingLocksFinalized(_params);\n    }\n\n    /**\n     * @notice Called by L1Migrator to complete sender deposit/reserve migration\n     * @param _params L1 state relevant for migration\n     */\n    function finalizeMigrateSender(MigrateSenderParams calldata _params)\n        external\n        onlyL1Counterpart(l1MigratorAddr)\n    {\n        require(!migratedSenders[_params.l1Addr], \"SENDER_ALREADY_MIGRATED\");\n\n        migratedSenders[_params.l1Addr] = true;\n\n        // msg.value for this call must be equal to deposit + reserve amounts\n        ITicketBroker(ticketBrokerAddr).fundDepositAndReserveFor{\n            value: _params.deposit + _params.reserve\n        }(_params.l2Addr, _params.deposit, _params.reserve);\n\n        emit MigrateSenderFinalized(_params);\n    }\n\n    receive() external payable {}\n\n    /**\n     * @notice Completes delegator migration using a Merkle proof that a delegator's state was included in a state\n     * snapshot represented by a Merkle tree root\n     * @dev Assume that only EOAs are included in the snapshot\n     * Regardless of the caller of this function, the EOA from L1 will be able to access its stake on L2\n     * @param _delegate Address that is migrating\n     * @param _stake Stake of delegator on L1\n     * @param _fees Fees of delegator on L1\n     * @param _proof Merkle proof of inclusion in Merkle tree state snapshot\n     * @param _newDelegate Optional address of a new delegate on L2\n     */\n    function claimStake(\n        address _delegate,\n        uint256 _stake,\n        uint256 _fees,\n        bytes32[] calldata _proof,\n        address _newDelegate\n    ) external {\n        require(claimStakeEnabled, \"CLAIM_STAKE_DISABLED\");\n\n        address delegator = msg.sender;\n\n        require(!migratedDelegators[delegator], \"CLAIM_STAKE:ALREADY_MIGRATED\");\n\n        IMerkleSnapshot merkleSnapshot = IMerkleSnapshot(merkleSnapshotAddr);\n\n        bytes32 leaf = keccak256(\n            abi.encodePacked(delegator, _delegate, _stake, _fees)\n        );\n\n        require(\n            merkleSnapshot.verify(keccak256(\"LIP-73\"), _proof, leaf),\n            \"CLAIM_STAKE:INVALID_PROOF\"\n        );\n\n        migratedDelegators[delegator] = true;\n\n        if (_delegate != address(0)) {\n            claimedDelegatedStake[_delegate] += _stake;\n\n            address pool = delegatorPools[_delegate];\n\n            address delegate = _delegate;\n            if (_newDelegate != address(0)) {\n                delegate = _newDelegate;\n            }\n\n            if (pool != address(0)) {\n                // Claim stake that is held by the delegator pool\n                IDelegatorPool(pool).claim(delegator, _stake);\n            } else {\n                bondFor(_stake, delegator, delegate);\n            }\n        }\n\n        // Only EOAs are included in the snapshot so we do not need to worry about\n        // the insufficeint gas stipend with transfer()\n        if (_fees > 0) {\n            payable(delegator).transfer(_fees);\n        }\n\n        emit StakeClaimed(delegator, _delegate, _stake, _fees);\n    }\n\n    function bondFor(\n        uint256 _amount,\n        address _owner,\n        address _to\n    ) private {\n        IBondingManager bondingManager = IBondingManager(bondingManagerAddr);\n\n        ApproveLike(tokenAddr).approve(address(bondingManager), _amount);\n        bondingManager.bondForWithHint(\n            _amount,\n            _owner,\n            _to,\n            address(0),\n            address(0),\n            address(0),\n            address(0)\n        );\n    }\n\n    /**\n     * @notice Fetches addresses and sets bondingManagerAddr, ticketBrokerAddr, merkleSnapshotAddr\n     * if they are different from the stored addresses\n     */\n    function syncControllerContracts() public {\n        // Check and update BondingManager address\n        bytes32 bondingManagerId = keccak256(\"BondingManager\");\n        address _bondingManagerAddr = controller.getContract(bondingManagerId);\n\n        if (_bondingManagerAddr != bondingManagerAddr) {\n            bondingManagerAddr = _bondingManagerAddr;\n            emit ControllerContractUpdate(\n                bondingManagerId,\n                _bondingManagerAddr\n            );\n        }\n\n        // Check and update TicketBroker address\n        bytes32 ticketBrokerId = keccak256(\"TicketBroker\");\n        address _ticketBrokerAddr = controller.getContract(ticketBrokerId);\n\n        if (_ticketBrokerAddr != ticketBrokerAddr) {\n            ticketBrokerAddr = _ticketBrokerAddr;\n            emit ControllerContractUpdate(ticketBrokerId, _ticketBrokerAddr);\n        }\n\n        // Check and update MerkleSnapshot address\n        bytes32 merkleSnapshotId = keccak256(\"MerkleSnapshot\");\n        address _merkleSnapshotAddr = controller.getContract(merkleSnapshotId);\n\n        if (_merkleSnapshotAddr != merkleSnapshotAddr) {\n            merkleSnapshotAddr = _merkleSnapshotAddr;\n            emit ControllerContractUpdate(\n                merkleSnapshotId,\n                _merkleSnapshotAddr\n            );\n        }\n\n        // Check and update LivepeerToken address\n        bytes32 tokenId = keccak256(\"LivepeerToken\");\n        address _tokenAddr = controller.getContract(tokenId);\n\n        if (_tokenAddr != tokenAddr) {\n            tokenAddr = _tokenAddr;\n            emit ControllerContractUpdate(tokenId, _tokenAddr);\n        }\n    }\n}\n",
+            "keccak256": "0xffe1038cbac14c7cb05913f367307d908423cc5d5be4a4458e7925991e216583",
+            "license": "MIT"
+          },
+          "contracts/arbitrum/IArbSys.sol": {
+            "content": "// SPDX-License-Identifier: Apache-2.0\n\n/*\n * Copyright 2021, Offchain Labs, Inc.\n *\n * Licensed under the Apache License, Version 2.0 (the \"License\");\n * you may not use this file except in compliance with the License.\n * You may obtain a copy of the License at\n *\n *    http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n */\n\npragma solidity 0.8.9;\n\n/**\n * @title Precompiled contract that exists in every Arbitrum chain at address(100), 0x0000000000000000000000000000000000000064. Exposes a variety of system-level functionality.\n */\ninterface IArbSys {\n    /**\n     * @notice Get internal version number identifying an ArbOS build\n     * @return version number as int\n     */\n    function arbOSVersion() external pure returns (uint256);\n\n    function arbChainID() external view returns (uint256);\n\n    /**\n     * @notice Get Arbitrum block number (distinct from L1 block number; Arbitrum genesis block has block number 0)\n     * @return block number as int\n     */\n    function arbBlockNumber() external view returns (uint256);\n\n    /**\n     * @notice Send given amount of Eth to dest from sender.\n     * This is a convenience function, which is equivalent to calling sendTxToL1 with empty calldataForL1.\n     * @param destination recipient address on L1\n     * @return unique identifier for this L2-to-L1 transaction.\n     */\n    function withdrawEth(address destination)\n        external\n        payable\n        returns (uint256);\n\n    /**\n     * @notice Send a transaction to L1\n     * @param destination recipient address on L1\n     * @param calldataForL1 (optional) calldata for L1 contract call\n     * @return a unique identifier for this L2-to-L1 transaction.\n     */\n    function sendTxToL1(address destination, bytes calldata calldataForL1)\n        external\n        payable\n        returns (uint256);\n\n    /**\n     * @notice get the number of transactions issued by the given external account or the account sequence number of the given contract\n     * @param account target account\n     * @return the number of transactions issued by the given external account or the account sequence number of the given contract\n     */\n    function getTransactionCount(address account)\n        external\n        view\n        returns (uint256);\n\n    /**\n     * @notice get the value of target L2 storage slot\n     * This function is only callable from address 0 to prevent contracts from being able to call it\n     * @param account target account\n     * @param index target index of storage slot\n     * @return stotage value for the given account at the given index\n     */\n    function getStorageAt(address account, uint256 index)\n        external\n        view\n        returns (uint256);\n\n    /**\n     * @notice check if current call is coming from l1\n     * @return true if the caller of this was called directly from L1\n     */\n    function isTopLevelCall() external view returns (bool);\n\n    event EthWithdrawal(address indexed destAddr, uint256 amount);\n\n    event L2ToL1Transaction(\n        address caller,\n        address indexed destination,\n        uint256 indexed uniqueId,\n        uint256 indexed batchNumber,\n        uint256 indexInBatch,\n        uint256 arbBlockNum,\n        uint256 ethBlockNum,\n        uint256 timestamp,\n        uint256 callvalue,\n        bytes data\n    );\n}\n",
+            "keccak256": "0xeafce4b664922441749c64794de5a3ca5e21f19c23355069cea0b2bb41651b41",
+            "license": "Apache-2.0"
+          },
+          "contracts/interfaces/IMigrator.sol": {
+            "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IMigrator {\n    struct MigrateDelegatorParams {\n        // Address that is migrating from L1\n        address l1Addr;\n        // Address to use on L2\n        // If null, l1Addr is used on L2\n        address l2Addr;\n        // Stake of l1Addr on L1\n        uint256 stake;\n        // Delegated stake of l1Addr on L1\n        uint256 delegatedStake;\n        // Fees of l1Addr on L1\n        uint256 fees;\n        // Delegate of l1Addr on L1\n        address delegate;\n    }\n\n    struct MigrateUnbondingLocksParams {\n        // Address that is migrating from L1\n        address l1Addr;\n        // Address to use on L2\n        // If null, l1Addr is used on L2\n        address l2Addr;\n        // Total tokens in unbonding locks\n        uint256 total;\n        // IDs of unbonding locks being migrated\n        uint256[] unbondingLockIds;\n        // Delegate of l1Addr on L1\n        address delegate;\n    }\n\n    struct MigrateSenderParams {\n        // Address that is migrating from L1\n        address l1Addr;\n        // Address to use on L2\n        // If null, l1Addr is used on L2\n        address l2Addr;\n        // Deposit of l1Addr on L1\n        uint256 deposit;\n        // Reserve of l1Addr on L1\n        uint256 reserve;\n    }\n}\n",
+            "keccak256": "0x31c31945a127dfeba48fe9a5a0b50a07ec8d9d685e94e037b1525930c0c85133",
+            "license": "MIT"
+          },
+          "contracts/proxy/IController.sol": {
+            "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IController {\n    function owner() external view returns (address);\n\n    function paused() external view returns (bool);\n\n    function getContract(bytes32 _id) external view returns (address);\n}\n",
+            "keccak256": "0x60e4489bb10b71c8eed7c9e0be0b8d89f2f5c6c15235aaea05d64fe1eefdc891",
+            "license": "MIT"
+          },
+          "contracts/proxy/IManager.sol": {
+            "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\ninterface IManager {\n    event SetController(address controller);\n\n    function setController(address _controller) external;\n}\n",
+            "keccak256": "0xa9a807c2ed7583e51b35367a4f99c4c7b05fe9b3949a0b21d3878f7944d18bbf",
+            "license": "MIT"
+          },
+          "contracts/proxy/Manager.sol": {
+            "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport {IManager} from \"./IManager.sol\";\nimport {IController} from \"./IController.sol\";\n\n// Copy of https://github.com/livepeer/protocol/blob/confluence/contracts/Manager.sol\n// Tests at https://github.com/livepeer/protocol/blob/confluence/test/unit/ManagerProxy.js\ncontract Manager is IManager {\n    // Controller that contract is registered with\n    IController public controller;\n\n    // Check if sender is controller\n    modifier onlyController() {\n        _onlyController();\n        _;\n    }\n\n    // Check if sender is controller owner\n    modifier onlyControllerOwner() {\n        _onlyControllerOwner();\n        _;\n    }\n\n    // Check if controller is not paused\n    modifier whenSystemNotPaused() {\n        _whenSystemNotPaused();\n        _;\n    }\n\n    // Check if controller is paused\n    modifier whenSystemPaused() {\n        _whenSystemPaused();\n        _;\n    }\n\n    constructor(address _controller) {\n        controller = IController(_controller);\n    }\n\n    /**\n     * @notice Set controller. Only callable by current controller\n     * @param _controller Controller contract address\n     */\n    function setController(address _controller) external onlyController {\n        controller = IController(_controller);\n\n        emit SetController(_controller);\n    }\n\n    function _onlyController() private view {\n        require(msg.sender == address(controller), \"caller must be Controller\");\n    }\n\n    function _onlyControllerOwner() private view {\n        require(\n            msg.sender == controller.owner(),\n            \"caller must be Controller owner\"\n        );\n    }\n\n    function _whenSystemNotPaused() private view {\n        require(!controller.paused(), \"system is paused\");\n    }\n\n    function _whenSystemPaused() private view {\n        require(controller.paused(), \"system is not paused\");\n    }\n}\n",
+            "keccak256": "0x5c6522421f23f344125b06b9db74220a7a4346aaa97262cf501e3bc8c2e38e08",
+            "license": "MIT"
+          },
+          "contracts/proxy/ManagerProxyTarget.sol": {
+            "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.9;\n\nimport \"./Manager.sol\";\n\n/**\n * @title ManagerProxyTarget\n * @notice The base contract that target contracts used by a proxy contract should inherit from\n * @dev Both the target contract and the proxy contract (implemented as ManagerProxy) MUST inherit from ManagerProxyTarget in order to guarantee\n that both contracts have the same storage layout. Differing storage layouts in a proxy contract and target contract can\n potentially break the delegate proxy upgradeability mechanism\n */\nabstract contract ManagerProxyTarget is Manager {\n    // Used to look up target contract address in controller's registry\n    bytes32 public targetContractId;\n}\n",
+            "keccak256": "0x920bcc2def240e06272dc06cbcb9f12976f1698cd4f1020c165af25ee837e553",
+            "license": "MIT"
+          }
+        },
+        "version": 1
+      },
+      "compilation": {
+        "language": "Solidity",
+        "compiler": "solc",
+        "compilerVersion": "0.8.9+commit.e5eed63a",
+        "compilerSettings": {
+          "metadata": {
+            "bytecodeHash": "ipfs",
+            "useLiteralContent": true
+          },
+          "libraries": {},
+          "optimizer": {
+            "runs": 200,
+            "enabled": false
+          },
+          "evmVersion": "london",
+          "remappings": []
+        },
+        "name": "L2Migrator",
+        "fullyQualifiedName": "contracts/L2/gateway/L2Migrator.sol:L2Migrator"
+      },
+      "proxyResolution": {
+        "isProxy": false,
+        "proxyType": null,
+        "implementations": []
+      },
+      "matchId": "12159366",
+      "creationMatch": "exact_match",
+      "runtimeMatch": "exact_match",
+      "verifiedAt": "2025-12-29T00:24:09Z",
+      "match": "exact_match",
+      "chainId": "42161",
+      "address": "0x93BB030735747708b4D33093A98d4c804Cd6B58C"
+    }
+  }
+}
