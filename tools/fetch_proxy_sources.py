@@ -69,9 +69,13 @@ def fetch_impl(parent,address):
 def main(retry_failed=False):
     results={r['id']:r for r in json.loads(RESULTS.read_text())} if RESULTS.exists() else {}
     recovery_file=f.OUT/'proxy-recoveries.json'
-    if recovery_file.exists():
-        for row in json.loads(recovery_file.read_text()):
-            if row.get('status')=='fetched' and results.get(row['id'],{}).get('status')!='fetched':results[row['id']]=row
+    def merge_recoveries():
+        added=[]
+        if recovery_file.exists():
+            for row in json.loads(recovery_file.read_text()):
+                if row.get('status')=='fetched' and results.get(row['id'],{}).get('status')!='fetched':results[row['id']]=row;added.append(row)
+        return added
+    merge_recoveries()
     primary=json.loads((f.OUT/'results.json').read_text())
     for row in primary:
         if row.get('status')!='fetched' or not row.get('source'):continue
@@ -105,6 +109,7 @@ def main(retry_failed=False):
                 if len(results)%75==0:
                     f.save_json(RESULTS,list(results.values()));f.push(f'Archive proxy implementation source: {len(results)} deployments processed')
         f.save_json(RESULTS,list(results.values()));f.push(f'Archive proxy implementation source: {len(results)} deployments processed')
+        parents.extend(merge_recoveries())
     print('Proxy implementation results',len(results),flush=True)
 
 if __name__=='__main__':main()
