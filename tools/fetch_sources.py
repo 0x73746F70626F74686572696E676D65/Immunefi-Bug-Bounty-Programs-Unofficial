@@ -392,7 +392,7 @@ def solana(entry):
 
 CHAIN_IDS = {
  'explorer.immutable.com':13371,'explorer.immutable.com/':13371,'explorer.abstractchain.io':2741,'abscan.org':2741,'opbnb.bscscan.com':204,'explorer.kava.io':2222,'explorer.kroma.network':255,'explorer.metis.io':1088,'explorer.zora.energy':7777777,
- 'purrsec.com':999,'beratrail.io':80094,
+ 'purrsec.com':999,'beratrail.io':80094,'evm.confluxscan.net':1030,'explorer.morph.network':2818,'explore.mainnet.tempo.xyz':4217,'aurorascan.dev':1313161554,'moonbeam.moonscan.io':1284,'blockexplorer.boba.network':288,'hecoinfo.com':128,
  'explore.tempo.xyz':4217,'cornscan.io':21000000,'flarescan.com':14,'hashscan.io':295,'xdcscan.com':50,'taikoscan.io':167000,'blastscan.io':81457,
  'etherscan.io':1,'polygonscan.com':137,'arbiscan.io':42161,'snowtrace.io':43114,
  'snowscan.xyz':43114,'basescan.org':8453,'bscscan.com':56,'optimistic.etherscan.io':10,
@@ -410,6 +410,9 @@ CHAIN_IDS = {
 }
 BLOCKSCOUT_ALIASES={'optimistic.etherscan.io':'optimism.blockscout.com','explorer.optimism.io':'optimism.blockscout.com','basescan.org':'base.blockscout.com','etherscan.io':'eth.blockscout.com','gnosisscan.io':'gnosis.blockscout.com','polygonscan.com':'polygon.blockscout.com','arbiscan.io':'arbitrum.blockscout.com','scrollscan.com':'scroll.blockscout.com','uniscan.xyz':'unichain.blockscout.com','worldscan.org':'worldchain-mainnet.explorer.alchemy.com'}
 RPC_ENDPOINTS={1:'https://ethereum-rpc.publicnode.com',137:'https://polygon-bor-rpc.publicnode.com',42161:'https://arbitrum-one-rpc.publicnode.com',10:'https://optimism-rpc.publicnode.com',8453:'https://base-rpc.publicnode.com',56:'https://bsc-rpc.publicnode.com',43114:'https://avalanche-c-chain-rpc.publicnode.com',100:'https://gnosis-rpc.publicnode.com',250:'https://fantom-rpc.publicnode.com',146:'https://sonic-rpc.publicnode.com',80094:'https://berachain-rpc.publicnode.com',130:'https://unichain-rpc.publicnode.com',999:'https://rpc.hyperliquid.xyz/evm',4217:'https://rpc.tempo.xyz'}
+RPC_ENDPOINTS.update({42220:'https://forno.celo.org',1030:'https://evm.confluxrpc.com',2818:'https://rpc.morphl2.io',1313161554:'https://mainnet.aurora.dev',30:'https://public-node.rsk.co',196:'https://rpc.xlayer.tech',1284:'https://rpc.api.moonbeam.network',1285:'https://rpc.api.moonriver.moonbeam.network'})
+BLOCKSCOUT_ALIASES.update({'celoscan.io':'celo.blockscout.com','aurorascan.dev':'explorer.aurora.dev','explorer.morph.network':'explorer.morphl2.io'})
+RPC_VERIFIED={};RPC_LOCKS={};RPC_GUARD=threading.Lock()
 IPFS_CACHE={};IPFS_GUARD=threading.Lock();IPFS_LOCKS={}
 def ipfs_bytes(cid):
     with IPFS_GUARD:lock=IPFS_LOCKS.setdefault(cid,threading.Lock())
@@ -441,6 +444,16 @@ def bytecode_cid(code):
 def bytecode_metadata_source(entry,chain,address):
     endpoint=RPC_ENDPOINTS.get(chain)
     if not endpoint:raise RuntimeError('No configured public RPC for bytecode metadata retrieval')
+    with RPC_GUARD:lock=RPC_LOCKS.setdefault(endpoint,threading.Lock())
+    with lock:
+        if endpoint not in RPC_VERIFIED:
+            try:
+                file,_=download(endpoint,post_json={'jsonrpc':'2.0','id':1,'method':'eth_chainId','params':[]},retries=1,timeout=20)
+                data=json.loads(file.read_bytes());file.unlink(missing_ok=True)
+                if int(data.get('result','0x0'),16)!=chain:raise RuntimeError('The RPC chain ID does not match the metadata network')
+                RPC_VERIFIED[endpoint]=True
+            except Exception as e:RPC_VERIFIED[endpoint]=str(e)
+        if RPC_VERIFIED[endpoint] is not True:raise RuntimeError('RPC chain check failed: '+RPC_VERIFIED[endpoint])
     code=get_json(endpoint,post_json={'jsonrpc':'2.0','id':1,'method':'eth_getCode','params':[address,'latest']}).get('result')
     if not isinstance(code,str) or code=='0x':raise RuntimeError('The RPC exposes no deployed contract bytecode')
     cid=bytecode_cid(code)
