@@ -121,7 +121,13 @@ def github(entry):
             repos.extend(batch)
             if len(batch)<100:break
             page+=1
-        return {'status':'fetched','kind':'github_organization','repositories':[archive_repo(*r['full_name'].split('/'),r['default_branch']) for r in repos if r.get('size',0)>0]}
+        snapshots=[];failures=[]
+        save_json(OUT/'organizations'/(safe(owner)+'.json'),{'organization':owner,'listed_at':stamp(),'repositories':[{'full_name':r['full_name'],'default_branch':r['default_branch'],'size':r.get('size',0)} for r in repos]})
+        for r in repos:
+            if r.get('size',0)==0:continue
+            try:snapshots.append(archive_repo(*r['full_name'].split('/'),r['default_branch']))
+            except Exception as e:failures.append({'repository':r['full_name'],'error':str(e)})
+        return {'status':'partial' if failures else 'fetched','kind':'github_organization','repositories':snapshots,'failures':failures}
     owner,repo=parts[:2];repo=repo.removesuffix('.git');info=repo_info(owner,repo);ref=info['default_branch'];path=''
     if len(parts)>3 and parts[2] in ('blob','tree'):
         # Resolve longest valid ref prefix; branches can contain slashes.
@@ -246,12 +252,13 @@ def generic(entry):
         else:status='source_unavailable'
     elif any(a.get('isPrimacyOfImpact') for a in entry.get('assets',[])) and host in ('immunefi.com','www.immunefi.com'):
         status='scope_placeholder'
+    elif any(a.get('type') in ('smart_contract','blockchain_dlt') for a in entry.get('assets',[])):status='source_unavailable'
     else:status='public_page_only'
     dest=OUT/'pages'/entry['id'];dest.mkdir(parents=True,exist_ok=True)
     with gzip.open(dest/'response.gz','wb') as g:g.write(body)
     result={'status':status,'kind':'public_response','response':relative(dest/'response.gz'),'retrieval_url':fetch_url,'fetched_at':stamp(),'response_sha256':hashlib.sha256(body).hexdigest()}
     # Public web assets: preserve browser-delivered first-party script sources as well.
-    if not address and status=='public_page_only':
+    if not address and status=='public_page_only' and any(a.get('type')=='websites_and_applications' for a in entry.get('assets',[])):
         scripts=[]
         for src in re.findall(r'<script\b[^>]*\bsrc=["\x27]([^"\x27]+)',text,re.I):
             target=urllib.parse.urljoin(fetch_url,html.unescape(src))
@@ -358,7 +365,7 @@ def summarize(entries,results):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--workers',type=int,default=16);parser.add_argument('--retry',action='store_true');parser.add_argument('--kind',choices=['all','github','other'],default='all');parser.add_argument('--push',action='store_true');args=parser.parse_args()
     entries=inventory();results_path=OUT/'results.json';results={r['id']:r for r in json.loads(results_path.read_text())} if results_path.exists() else {}
-    pending=[e for k,e in entries.items() if (k not in results or (args.retry and results[k]['status'] in ('failed','source_unavailable','missing_scoped_path'))) and (args.kind=='all' or (('github.com' in urllib.parse.urlsplit(e['url']).netloc)==(args.kind=='github')))]
+    pending=[e for k,e in entries.items() if (k not in results or (args.retry and results[k]['status'] in ('failed','partial','source_unavailable','missing_scoped_path'))) and (args.kind=='all' or (('github.com' in urllib.parse.urlsplit(e['url']).netloc)==(args.kind=='github')))]
     print('Fetching',len(pending),'URLs using',args.workers,'workers',flush=True)
     summarize(entries,results)
     if args.push:push('Initialize source inventory for metadata-active Immunefi programs')
