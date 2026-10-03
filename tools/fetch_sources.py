@@ -604,6 +604,11 @@ def summarize(entries,results):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--workers',type=int,default=16);parser.add_argument('--retry',action='store_true');parser.add_argument('--kind',choices=['all','github','other'],default='all');parser.add_argument('--push',action='store_true');args=parser.parse_args()
     entries=inventory();results_path=OUT/'results.json';results={r['id']:r for r in json.loads(results_path.read_text())} if results_path.exists() else {}
+    recovery_manifest=OUT/'recoveries.json'
+    if recovery_manifest.exists():
+        for recovery in json.loads(recovery_manifest.read_text()):
+            key=recovery['id']
+            if key in entries and recovery.get('status')=='fetched' and (ROOT/recovery.get('source','')).is_file() and results.get(key,{}).get('status')!='fetched':results[key]=recovery
     pending=[e for k,e in entries.items() if (k not in results or (args.retry and results[k]['status'] in ('failed','partial','source_unavailable','unverified_contract','missing_scoped_path'))) and (args.kind=='all' or (('github.com' in urllib.parse.urlsplit(e['url']).netloc)==(args.kind=='github')))]
     print('Fetching',len(pending),'URLs using',args.workers,'workers',flush=True)
     summarize(entries,results)
