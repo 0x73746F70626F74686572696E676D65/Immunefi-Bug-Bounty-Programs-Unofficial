@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """Resolve and archive the pinned Git submodules of downloaded source snapshots."""
-import concurrent.futures, configparser, json, pathlib, subprocess, urllib.parse
+import concurrent.futures, configparser, json, pathlib, subprocess, threading, urllib.parse
+MODULE_LOCKS={};MODULE_GUARD=threading.Lock()
 import fetch_sources as f
 
 def resolve_module(parent, path, configured_url):
     owner,repo=urllib.parse.urlsplit(parent['repository']).path.strip('/').split('/')[:2]
-    endpoint=f'https://api.github.com/repos/{owner}/{repo}/contents/{urllib.parse.quote(path,safe="/")}?ref={parent["commit"]}'
-    obj=f.get_json(endpoint);commit=obj['sha'];url=obj.get('submodule_git_url') or configured_url
+    cache=f.WORK/('git-tree-'+f.digest(parent['repository']+parent['commit']))
+    with MODULE_GUARD:lock=MODULE_LOCKS.setdefault(str(cache),threading.Lock())
+    with lock:
+        if not (cache/'ready').exists():
+            cache.mkdir(exist_ok=True);subprocess.run(['git','init','--bare',str(cache)],check=True,capture_output=True)
+            subprocess.run(['git','-C',str(cache),'remote','add','origin',parent['repository']+'.git'],capture_output=True)
+            proc=subprocess.run(['git','-C',str(cache),'fetch','--filter=blob:none','--depth=1','origin',parent['commit']],capture_output=True,text=True,timeout=180)
+            if proc.returncode:raise RuntimeError(proc.stderr[-500:])
+            (cache/'ready').touch()
+    line=subprocess.check_output(['git','-C',str(cache),'ls-tree',parent['commit'],'--',path],text=True).strip()
+    if not line.startswith('160000 commit '):raise RuntimeError('Configured submodule path is not a Git submodule at the pinned commit: '+path)
+    commit=line.split()[2];url=configured_url
     if url.startswith(('./','../')):url=urllib.parse.urljoin(parent['repository']+'.git/',url)
     if url.startswith('git@github.com:'):url='https://github.com/'+url[len('git@github.com:'):]
     if url.startswith('ssh://git@github.com/'):url='https://github.com/'+url[len('ssh://git@github.com/'):]

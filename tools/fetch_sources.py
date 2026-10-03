@@ -27,6 +27,8 @@ def download(url, target=None, retries=3, timeout=90, post_json=None):
     last = ''
     for attempt in range(retries):
         extra=['-H','Content-Type: application/json','--data',json.dumps(post_json)] if post_json is not None else []
+        api_token=os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+        if api_token and urllib.parse.urlsplit(url).netloc=='api.github.com':extra+=['-H','Authorization: Bearer '+api_token]
         proc = subprocess.run(['curl','--location','--silent','--show-error','--compressed','--connect-timeout','20','--max-time',str(timeout),'--output',str(transfer),'--write-out','%{http_code}',*extra,url], capture_output=True, text=True)
         code = proc.stdout[-3:]
         if proc.returncode == 0 and code.startswith('2'):
@@ -74,18 +76,40 @@ def inventory(refresh=False):
     save_json(OUT/'inventory.json',list(entries.values()))
     return entries
 
-REPO_CACHE={}; REPO_LOCK=threading.Lock(); SNAP_LOCKS={}; SNAP_GUARD=threading.Lock()
+REPO_CACHE={}; REPO_LOCK=threading.Lock(); REPO_LOCKS={}; SNAP_LOCKS={}; SNAP_GUARD=threading.Lock()
 def repo_info(owner, repo):
     key=(owner.lower(),repo.lower())
-    with REPO_LOCK: cached=REPO_CACHE.get(key)
-    if cached:return cached
-    info=get_json(f'https://api.github.com/repos/{owner}/{repo}')
-    with REPO_LOCK:REPO_CACHE[key]=info
-    return info
+    with REPO_LOCK:lock=REPO_LOCKS.setdefault(key,threading.Lock())
+    with lock:
+        if key in REPO_CACHE:return REPO_CACHE[key]
+        url=f'https://github.com/{owner}/{repo}'
+        error=''
+        for attempt in range(3):
+            proc=subprocess.run(['git','ls-remote','--symref',url+'.git','HEAD','refs/heads/*','refs/tags/*'],capture_output=True,text=True,timeout=90)
+            if proc.returncode==0:break
+            error=proc.stderr[-500:];time.sleep(2**attempt)
+        if proc.returncode:raise RuntimeError(error)
+        refs={};default=None
+        for line in proc.stdout.splitlines():
+            if line.startswith('ref: refs/heads/') and line.endswith('\tHEAD'):default=line.split('\t')[0][len('ref: refs/heads/'):]
+            elif '\t' in line:
+                sha,name=line.split('\t',1);refs[name]=sha
+        if not default:
+            if not refs:raise RuntimeError('Repository has no Git refs')
+            default='HEAD'
+        info={'full_name':owner+'/'+repo,'html_url':url,'default_branch':default,'refs':refs}
+        REPO_CACHE[key]=info;return info
+
+def resolve_commit(owner,repo,ref,info=None):
+    info=info or repo_info(owner,repo)
+    if re.fullmatch(r'[a-fA-F0-9]{40}',ref):return ref.lower()
+    for name in ('refs/tags/'+ref+'^{}','refs/heads/'+ref,'refs/tags/'+ref,ref):
+        if name in info['refs']:return info['refs'][name]
+    return get_json(f'https://api.github.com/repos/{owner}/{repo}/commits/{urllib.parse.quote(ref,safe="")}')['sha']
 
 def archive_repo(owner, repo, ref):
     info=repo_info(owner,repo); owner,repo=info['full_name'].split('/')
-    commit=get_json(f'https://api.github.com/repos/{owner}/{repo}/commits/{urllib.parse.quote(ref,safe="")}')['sha']
+    commit=resolve_commit(owner,repo,ref,info)
     dest=OUT/'github'/safe(owner)/safe(repo)/commit
     with SNAP_GUARD: lock=SNAP_LOCKS.setdefault(str(dest),threading.Lock())
     with lock:
@@ -135,15 +159,14 @@ def github(entry):
         return {'status':'partial' if failures else 'fetched','kind':'github_organization','repositories':snapshots,'failures':failures}
     owner,repo=parts[:2];repo=repo.removesuffix('.git');info=repo_info(owner,repo);ref=info['default_branch'];path=''
     if len(parts)>3 and parts[2] in ('blob','tree'):
-        # Resolve longest valid ref prefix; branches can contain slashes.
-        tail=parts[3:]; resolved=None
-        for count in range(1,len(tail)+1):
+        tail=parts[3:];resolved=None
+        for count in range(len(tail),0,-1):
             candidate='/'.join(tail[:count])
-            try:
-                get_json(f'https://api.github.com/repos/{owner}/{repo}/commits/{urllib.parse.quote(candidate,safe="")}');resolved=(candidate,'/'.join(tail[count:]));break
-            except Exception:
-                if count>5:break
-        if not resolved:raise RuntimeError('Referenced GitHub ref is unavailable: '+ '/'.join(tail))
+            if any(k in info['refs'] for k in ('refs/heads/'+candidate,'refs/tags/'+candidate)) or re.fullmatch(r'[a-fA-F0-9]{7,40}',candidate):
+                resolved=(candidate,'/'.join(tail[count:]));break
+        if not resolved:
+            # Historic refs can disappear from advertised branches and tags.
+            candidate=tail[0];resolve_commit(owner,repo,candidate,info);resolved=(candidate,'/'.join(tail[1:]))
         ref,path=resolved
     elif len(parts)>2 and parts[2]=='releases':
         if len(parts)>4 and parts[3]=='tag':ref='/'.join(parts[4:])
@@ -384,17 +407,38 @@ def fetch(entry):
         except Exception as e:result['alternate_error']=str(e)
     return {**entry,**result,'elapsed_seconds':round(time.time()-start,2)}
 
+def push_head():
+    for attempt in range(8):
+        p=subprocess.run(['git','push','origin','HEAD:main'],cwd=ROOT,capture_output=True,text=True)
+        if p.returncode==0:
+            print('PUSHED',subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),flush=True);return
+        error=p.stderr[-1000:]
+        print('Push retry',attempt+1,error,flush=True)
+        if 'non-fast-forward' in error or 'fetch first' in error:
+            fetched=subprocess.run(['git','fetch','origin','main'],cwd=ROOT,capture_output=True,text=True)
+            if fetched.returncode==0:subprocess.run(['git','rebase','origin/main'],cwd=ROOT,check=True,stdout=subprocess.DEVNULL)
+        time.sleep(min(2**(attempt+1),30))
+    raise RuntimeError('Git push remains unavailable after retries: '+error)
+
 def push(message):
-    subprocess.run(['git','add','--','sources','tools','README.md','.gitignore','.gitattributes'],cwd=ROOT,check=True)
-    if subprocess.run(['git','diff','--cached','--quiet'],cwd=ROOT).returncode==0:return
-    subprocess.run(['git','commit','-m',message],cwd=ROOT,check=True,stdout=subprocess.DEVNULL)
-    p=subprocess.run(['git','push','origin','HEAD:main'],cwd=ROOT,capture_output=True,text=True)
-    if p.returncode:
-        # Preserve upstream automated metadata updates by replaying our additive commits.
-        subprocess.run(['git','fetch','origin','main'],cwd=ROOT,check=True,stdout=subprocess.DEVNULL)
-        subprocess.run(['git','rebase','origin/main'],cwd=ROOT,check=True,stdout=subprocess.DEVNULL)
-        subprocess.run(['git','push','origin','HEAD:main'],cwd=ROOT,check=True)
-    print('PUSHED',subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),flush=True)
+    paths=['sources','tools','README.md','.gitignore','.gitattributes']
+    subprocess.run(['git','add','--',*paths],cwd=ROOT,check=True)
+    changed=subprocess.check_output(['git','diff','--cached','--name-only','-z'],cwd=ROOT).decode().split('\0')
+    changed=[x for x in changed if x]
+    batches=[];batch=[];size=0
+    for filename in changed:
+        file=ROOT/filename;length=file.stat().st_size if file.exists() else 0
+        if batch and size+length>500*1024*1024:batches.append(batch);batch=[];size=0
+        batch.append(filename);size+=length
+    if batch:batches.append(batch)
+    if len(batches)>1:
+        subprocess.run(['git','restore','--staged','--',*paths],cwd=ROOT,check=True)
+    for index,batch in enumerate(batches):
+        if len(batches)>1:subprocess.run(['git','add','--',*batch],cwd=ROOT,check=True)
+        suffix=f' (batch {index+1}/{len(batches)})' if len(batches)>1 else ''
+        subprocess.run(['git','commit','-m',message+suffix],cwd=ROOT,check=True,stdout=subprocess.DEVNULL)
+        push_head()
+    if not batches:push_head()
 
 def summarize(entries,results):
     from collections import Counter
