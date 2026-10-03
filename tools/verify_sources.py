@@ -27,12 +27,18 @@ def main():
         contracts+=1;source_files+=len(sources)
     pending=[e for e in inventory if e['id'] not in by_id]
     unresolved=[r for r in results if r['status'] in ('failed','partial','source_unavailable','missing_scoped_path','unverified_contract')]
+    auxiliary={}
+    for name in ('submodules','proxy-sources'):
+        manifest=f.OUT/(name+'.json')
+        records=json.loads(manifest.read_text()) if manifest.exists() else []
+        auxiliary[name]={'records':len(records),'statuses':dict(collections.Counter(r['status'] for r in records)),'unresolved':[r for r in records if r['status']!='fetched']}
+    source_less=[r for r in results if r['status']!='fetched']
     selection=json.loads((f.OUT/'metadata'/'selection.json').read_text());coverage={}
     for slug in selection['active_programs']:
         urls=[e for e in inventory if slug in e['programs']]
         coverage[slug]={'inventory_urls':len(urls),'statuses':dict(collections.Counter(by_id[e['id']]['status'] if e['id'] in by_id else 'pending' for e in urls))}
     f.save_json(f.OUT/'coverage.json',coverage);f.save_json(f.OUT/'unresolved.json',unresolved)
-    report={'verified_at':f.stamp(),'active_programs':len(selection['active_programs']),'inventory_urls':len(inventory),'processed_urls':len(results),'pending_urls':len(pending),'unresolved_urls':len(unresolved),'repository_snapshots_checked':archives,'archive_bytes_checked':total_bytes,'contract_source_records_checked':contracts,'contract_source_files':source_files,'integrity_errors':errors,'all_inventory_urls_attempted':not pending,'all_inventory_urls_have_source':not pending and not unresolved}
+    report={'verified_at':f.stamp(),'active_programs':len(selection['active_programs']),'inventory_urls':len(inventory),'processed_urls':len(results),'pending_urls':len(pending),'unresolved_urls':len(unresolved),'repository_snapshots_checked':archives,'archive_bytes_checked':total_bytes,'contract_source_records_checked':contracts,'contract_source_files':source_files,'integrity_errors':errors,'all_inventory_urls_attempted':not pending,'statuses':dict(collections.Counter(r['status'] for r in results)),'urls_without_source':len(source_less),'auxiliary_sources':auxiliary,'all_inventory_urls_have_source':not pending and not source_less}
     f.save_json(f.OUT/'verification.json',report);print(json.dumps(report),flush=True);f.push('Verify archived source integrity and record active-program coverage')
     if errors or pending:raise SystemExit(1)
 

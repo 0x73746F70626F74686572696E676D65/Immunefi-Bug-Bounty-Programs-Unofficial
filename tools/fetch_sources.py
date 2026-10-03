@@ -562,7 +562,7 @@ def summarize(entries,results):
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--workers',type=int,default=16);parser.add_argument('--retry',action='store_true');parser.add_argument('--kind',choices=['all','github','other'],default='all');parser.add_argument('--push',action='store_true');args=parser.parse_args()
     entries=inventory();results_path=OUT/'results.json';results={r['id']:r for r in json.loads(results_path.read_text())} if results_path.exists() else {}
-    pending=[e for k,e in entries.items() if (k not in results or (args.retry and results[k]['status'] in ('failed','partial','source_unavailable','missing_scoped_path'))) and (args.kind=='all' or (('github.com' in urllib.parse.urlsplit(e['url']).netloc)==(args.kind=='github')))]
+    pending=[e for k,e in entries.items() if (k not in results or (args.retry and results[k]['status'] in ('failed','partial','source_unavailable','unverified_contract','missing_scoped_path'))) and (args.kind=='all' or (('github.com' in urllib.parse.urlsplit(e['url']).netloc)==(args.kind=='github')))]
     print('Fetching',len(pending),'URLs using',args.workers,'workers',flush=True)
     summarize(entries,results)
     if args.push:push('Initialize source inventory for metadata-active Immunefi programs')
