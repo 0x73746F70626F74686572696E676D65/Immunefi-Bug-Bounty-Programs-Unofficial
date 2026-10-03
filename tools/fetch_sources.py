@@ -111,7 +111,10 @@ def archive_repo(owner, repo, ref):
         save_json(index,result);return result
 
 def github(entry):
-    parts=urllib.parse.unquote(urllib.parse.urlsplit(entry['url']).path).strip('/').split('/')
+    url=entry['url']
+    if url=='https://github.com/has...edera-transaction-tool':
+        url='https://github.com/hashgraph/hedera-transaction-tool'
+    parts=urllib.parse.unquote(urllib.parse.urlsplit(url).path).strip('/').split('/')
     if len(parts)<2 or not parts[1]:
         owner=parts[0]
         if '...' in owner:raise RuntimeError('Truncated upstream GitHub URL in metadata')
@@ -147,7 +150,7 @@ def github(entry):
     snapshot=archive_repo(owner,repo,ref)
     files=json.loads((ROOT/snapshot['file_index']).read_text())
     exists=not path or any(x['path']==path or x['path'].startswith(path.rstrip('/')+'/') for x in files)
-    return {'status':'fetched' if exists else 'missing_scoped_path','kind':'github','scope_path':path,'scope_path_present':exists,**snapshot}
+    return {'status':'fetched' if exists else 'missing_scoped_path','kind':'github','scope_path':path,'scope_path_present':exists,'resolved_repository_url':info['html_url'],**({'metadata_url_repair':{'original_url':entry['url'],'resolved_url':url,'reason':'The upstream metadata truncates the hashgraph/hedera-transaction-tool URL.'}} if url!=entry['url'] else {}),**snapshot}
 
 class PreParser(__import__('html.parser',fromlist=['HTMLParser']).HTMLParser):
     def __init__(self):super().__init__();self.depth=0;self.current=None;self.items=[]
@@ -343,7 +346,7 @@ def fetch(entry):
     return {**entry,**result,'elapsed_seconds':round(time.time()-start,2)}
 
 def push(message):
-    subprocess.run(['git','add','--','sources','tools/fetch_sources.py','README.md','.gitignore'],cwd=ROOT,check=True)
+    subprocess.run(['git','add','--','sources','tools','README.md','.gitignore','.gitattributes'],cwd=ROOT,check=True)
     if subprocess.run(['git','diff','--cached','--quiet'],cwd=ROOT).returncode==0:return
     subprocess.run(['git','commit','-m',message],cwd=ROOT,check=True,stdout=subprocess.DEVNULL)
     p=subprocess.run(['git','push','origin','HEAD:main'],cwd=ROOT,capture_output=True,text=True)
