@@ -34,7 +34,7 @@ def download(url, target=None, retries=3, timeout=90, post_json=None):
         if proc.returncode == 0 and code.startswith('2'):
             transfer.replace(target); return target, int(code)
         last = f'HTTP {code}; curl {proc.returncode}: {proc.stderr[:200]}'
-        if code in ('404','410'): break
+        if code in ('400','401','403','404','405','410','422'): break
         time.sleep(min(2**attempt, 4))
     transfer.unlink(missing_ok=True)
     target.unlink(missing_ok=True)
@@ -257,7 +257,7 @@ def generic(entry):
     if host=='tronscan.org':return tron(entry)
     if host=='explorer.zksync.io':return zksync(entry)
     if host=='crates.io':return crate(entry)
-    if address and any(s in host for s in ('blockscout','explorer.inkonchain','explorer.gobob','explorer.hemi','explorer.tac','explorer.lyra','explorer.mantle','explorer.intuition','explorer.plume','explorer.orderly','explorer.morph')):
+    if address and any(s in host for s in ('blockscout','explorer.','pacific-explorer.')):
         try:return blockscout(entry,host,address.group())
         except Exception:pass
     fetch_url=url.split('#')[0]
@@ -338,6 +338,7 @@ def tron(entry):
     obj['sources']=sources;return persist_contract(entry,obj,'tron_verified_contract',endpoint)
 
 CHAIN_IDS = {
+ 'explorer.immutable.com':13371,'explorer.immutable.com/':13371,'explorer.abstractchain.io':2741,'abscan.org':2741,'opbnb.bscscan.com':204,'explorer.kava.io':2222,'explorer.kroma.network':255,'explorer.metis.io':1088,'explorer.zora.energy':7777777,
  'explore.tempo.xyz':4217,'cornscan.io':21000000,'flarescan.com':14,'hashscan.io':295,'xdcscan.com':50,'taikoscan.io':167000,'blastscan.io':81457,
  'etherscan.io':1,'polygonscan.com':137,'arbiscan.io':42161,'snowtrace.io':43114,
  'snowscan.xyz':43114,'basescan.org':8453,'bscscan.com':56,'optimistic.etherscan.io':10,
