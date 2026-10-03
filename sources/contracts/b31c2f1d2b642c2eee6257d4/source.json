@@ -1,0 +1,603 @@
+{
+  "sources": {
+    "contracts/bridges/BaseBridgeReceiver.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\nimport \"../ITimelock.sol\";\n\ncontract BaseBridgeReceiver {\n    /** Custom errors **/\n    error AlreadyInitialized();\n    error BadData();\n    error InvalidProposalId();\n    error InvalidTimelockAdmin();\n    error ProposalNotExecutable();\n    error TransactionAlreadyQueued();\n    error Unauthorized();\n\n    /** Events **/\n    event Initialized(address indexed govTimelock, address indexed localTimelock);\n    event ProposalCreated(address indexed rootMessageSender, uint id, address[] targets, uint[] values, string[] signatures, bytes[] calldatas, uint eta);\n    event ProposalExecuted(uint indexed id);\n\n    /** Public variables **/\n\n    /// @notice Address of the governing contract that this bridge receiver expects to\n    ///  receive messages from; likely an address from another chain (e.g. mainnet)\n    address public govTimelock;\n\n    /// @notice Address of the timelock on this chain that the bridge receiver\n    /// will send messages to\n    address public localTimelock;\n\n    /// @notice Whether contract has been initialized\n    bool public initialized;\n\n    /// @notice Total count of proposals generated\n    uint public proposalCount;\n\n    struct Proposal {\n        uint id;\n        address[] targets;\n        uint[] values;\n        string[] signatures;\n        bytes[] calldatas;\n        uint eta;\n        bool executed;\n    }\n\n    /// @notice Mapping of proposal ids to their full proposal data\n    mapping (uint => Proposal) public proposals;\n\n    enum ProposalState {\n        Queued,\n        Expired,\n        Executed\n    }\n\n    /**\n     * @notice Initialize the contract\n     * @param _govTimelock Address of the governing contract that this contract\n     * will receive messages from (likely on another chain)\n     * @param _localTimelock Address of the timelock contract that this contract\n     * will send messages to\n     */\n    function initialize(address _govTimelock, address _localTimelock) external {\n        if (initialized) revert AlreadyInitialized();\n        if (ITimelock(_localTimelock).admin() != address(this)) revert InvalidTimelockAdmin();\n        govTimelock = _govTimelock;\n        localTimelock = _localTimelock;\n        initialized = true;\n        emit Initialized(_govTimelock, _localTimelock);\n    }\n\n    /**\n     * @notice Process a message sent from the governing timelock (across a bridge)\n     * @param rootMessageSender Address of the contract that sent the bridged message\n     * @param data ABI-encoded bytes containing the transactions to be queued on the local timelock\n     */\n    function processMessage(\n        address rootMessageSender,\n        bytes calldata data\n    ) internal {\n        if (rootMessageSender != govTimelock) revert Unauthorized();\n\n        address[] memory targets;\n        uint256[] memory values;\n        string[] memory signatures;\n        bytes[] memory calldatas;\n\n        (targets, values, signatures, calldatas) = abi.decode(\n            data,\n            (address[], uint256[], string[], bytes[])\n        );\n\n        if (values.length != targets.length) revert BadData();\n        if (signatures.length != targets.length) revert BadData();\n        if (calldatas.length != targets.length) revert BadData();\n\n        uint delay = ITimelock(localTimelock).delay();\n        uint eta = block.timestamp + delay;\n\n        for (uint i = 0; i < targets.length; i++) {\n            if (ITimelock(localTimelock).queuedTransactions(keccak256(abi.encode(targets[i], values[i], signatures[i], calldatas[i], eta)))) revert TransactionAlreadyQueued();\n            ITimelock(localTimelock).queueTransaction(targets[i], values[i], signatures[i], calldatas[i], eta);\n        }\n\n        proposalCount++;\n        Proposal memory proposal = Proposal({\n            id: proposalCount,\n            targets: targets,\n            values: values,\n            signatures: signatures,\n            calldatas: calldatas,\n            eta: eta,\n            executed: false\n        });\n\n        proposals[proposal.id] = proposal;\n        emit ProposalCreated(rootMessageSender, proposal.id, targets, values, signatures, calldatas, eta);\n    }\n\n    /**\n     * @notice Execute a queued proposal\n     * @param proposalId The id of the proposal to execute\n     */\n    function executeProposal(uint proposalId) external {\n        if (state(proposalId) != ProposalState.Queued) revert ProposalNotExecutable();\n        Proposal storage proposal = proposals[proposalId];\n        proposal.executed = true;\n        for (uint i = 0; i < proposal.targets.length; i++) {\n            ITimelock(localTimelock).executeTransaction(proposal.targets[i], proposal.values[i], proposal.signatures[i], proposal.calldatas[i], proposal.eta);\n        }\n        emit ProposalExecuted(proposalId);\n    }\n\n    /**\n     * @notice Get the state of a proposal\n     * @param proposalId Id of the proposal\n     * @return The state of the given proposal (queued, expired or executed)\n     */\n    function state(uint proposalId) public view returns (ProposalState) {\n        if (proposalId > proposalCount || proposalId == 0) revert InvalidProposalId();\n        Proposal memory proposal = proposals[proposalId];\n        if (proposal.executed) {\n            return ProposalState.Executed;\n        } else if (block.timestamp > (proposal.eta + ITimelock(localTimelock).GRACE_PERIOD())) {\n            return ProposalState.Expired;\n        } else {\n            return ProposalState.Queued;\n        }\n    }\n}"
+    },
+    "contracts/bridges/scroll/IScrollMessenger.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\n/// @notice IScrollMessenger is the interface for Scroll's messenger contract\ninterface IScrollMessenger {\n  function xDomainMessageSender() external view returns (address);\n}\n"
+    },
+    "contracts/bridges/scroll/ScrollBridgeReceiver.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\nimport \"../SweepableBridgeReceiver.sol\";\nimport \"./IScrollMessenger.sol\";\n\n/// @title Scroll Bridge Receiver\n/// @notice Contract that processes messages passed from Compound governance using the Scroll bridge\ncontract ScrollBridgeReceiver is SweepableBridgeReceiver {\n    error InvalidL2Messenger();\n\n    event NewL2Messenger(address indexed oldL2Messenger, address indexed newL2Messenger);\n\n    /// @notice Address of Scroll L2 Messenger contract\n    address public l2Messenger;\n\n    /// @notice Construct a new ScrollBridgeReceiver instance\n    /// @param l2Messenger_ Address of Scroll L2 Messenger contract\n    constructor(address l2Messenger_) {\n        l2Messenger = l2Messenger_;\n        emit NewL2Messenger(address(0), l2Messenger_);\n    }\n\n    /// @notice Update the L2 Messenger address\n    /// @param newL2Messenger New address for L2 Messenger contract\n    function changeL2Messenger(address newL2Messenger) public {\n        if (msg.sender != localTimelock) revert Unauthorized();\n        address oldL2Messenger = l2Messenger;\n        l2Messenger = newL2Messenger;\n        emit NewL2Messenger(oldL2Messenger, newL2Messenger);\n    }\n\n    /// @notice Fallback function to handle messages\n    fallback() external payable {\n        if (msg.sender != l2Messenger) revert InvalidL2Messenger();\n        address messageSender = IScrollMessenger(msg.sender).xDomainMessageSender();\n        processMessage(messageSender, msg.data);\n    }\n}"
+    },
+    "contracts/bridges/SweepableBridgeReceiver.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\nimport \"../IERC20NonStandard.sol\";\nimport \"./BaseBridgeReceiver.sol\";\n\ncontract SweepableBridgeReceiver is BaseBridgeReceiver {\n    error FailedToSendNativeToken();\n    error TransferOutFailed();\n\n    /**\n     * @notice A public function to sweep accidental ERC-20 transfers to this contract\n     * @dev Note: Make sure to check that the asset being swept out is not malicious\n     * @param recipient The address that will receive the swept funds\n     * @param asset The address of the ERC-20 token to sweep\n     */\n    function sweepToken(address recipient, address asset) external {\n        if (msg.sender != localTimelock) revert Unauthorized();\n\n        uint256 balance = IERC20NonStandard(asset).balanceOf(address(this));\n        doTransferOut(asset, recipient, balance);\n    }\n\n    /**\n     * @notice A public function to sweep accidental native token transfers to this contract\n     * @param recipient The address that will receive the swept funds\n     */\n    function sweepNativeToken(address recipient) external {\n        if (msg.sender != localTimelock) revert Unauthorized();\n\n        uint256 balance = address(this).balance;\n        (bool success, ) = recipient.call{ value: balance }(\"\");\n        if (!success) revert FailedToSendNativeToken();\n    }\n\n    /**\n     * @notice Similar to ERC-20 transfer, except it properly handles `transfer` from non-standard ERC-20 tokens\n     * @param asset The ERC-20 token to transfer out\n     * @param to The recipient of the token transfer\n     * @param amount The amount of the token to transfer\n     * @dev Note: This wrapper safely handles non-standard ERC-20 tokens that do not return a value. See here: https://medium.com/coinmonks/missing-return-value-bug-at-least-130-tokens-affected-d67bf08521ca\n     */\n    function doTransferOut(address asset, address to, uint amount) internal {\n        IERC20NonStandard(asset).transfer(to, amount);\n\n        bool success;\n        assembly {\n            switch returndatasize()\n                case 0 {                      // This is a non-standard ERC-20\n                    success := not(0)         // set success to true\n                }\n                case 32 {                     // This is a compliant ERC-20\n                    returndatacopy(0, 0, 32)\n                    success := mload(0)       // Set `success = returndata` of override external call\n                }\n                default {                     // This is an excessively non-compliant ERC-20, revert.\n                    revert(0, 0)\n                }\n        }\n        if (!success) revert TransferOutFailed();\n    }\n}"
+    },
+    "contracts/IERC20NonStandard.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\n/**\n * @title IERC20NonStandard\n * @dev Version of ERC20 with no return values for `approve`, `transfer`, and `transferFrom`\n *  See https://medium.com/coinmonks/missing-return-value-bug-at-least-130-tokens-affected-d67bf08521ca\n */\ninterface IERC20NonStandard {\n    function approve(address spender, uint256 amount) external;\n    function transfer(address to, uint256 value) external;\n    function transferFrom(address from, address to, uint256 value) external;\n    function balanceOf(address account) external view returns (uint256);\n}"
+    },
+    "contracts/ITimelock.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.15;\n\n/**\n * @dev Interface for interacting with a Timelock\n */\ninterface ITimelock {\n    /// @notice Event emitted when a pending admin accepts admin position\n    event NewAdmin(address indexed newAdmin);\n\n    /// @notice Event emitted when new pending admin is set by the timelock\n    event NewPendingAdmin(address indexed newPendingAdmin);\n\n    /// @notice Event emitted when Timelock sets new delay value\n    event NewDelay(uint indexed newDelay);\n\n    /// @notice Event emitted when admin cancels an enqueued transaction\n    event CancelTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature,  bytes data, uint eta);\n\n    /// @notice Event emitted when admin executes an enqueued transaction\n    event ExecuteTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature,  bytes data, uint eta);\n\n    /// @notice Event emitted when admin enqueues a transaction\n    event QueueTransaction(bytes32 indexed txHash, address indexed target, uint value, string signature, bytes data, uint eta);\n\n    /// @notice The length of time, once the delay has passed, in which a transaction can be executed before it becomes stale\n    function GRACE_PERIOD() virtual external view returns (uint);\n\n    /// @notice The minimum value that the `delay` variable can be set to\n    function MINIMUM_DELAY() virtual external view returns (uint);\n\n    /// @notice The maximum value that the `delay` variable can be set to\n    function MAXIMUM_DELAY() virtual external view returns (uint);\n\n    /// @notice Address that has admin privileges\n    function admin() virtual external view returns (address);\n\n    /// @notice The address that may become the new admin by calling `acceptAdmin()`\n    function pendingAdmin() virtual external view returns (address);\n\n    /**\n     * @notice Set the pending admin\n     * @param pendingAdmin_ New pending admin address\n     */\n    function setPendingAdmin(address pendingAdmin_) virtual external;\n\n    /**\n     * @notice Accept the position of admin (if caller is the current pendingAdmin)\n     */\n    function acceptAdmin() virtual external;\n\n    /// @notice Duration that a transaction must be queued before it can be executed\n    function delay() virtual external view returns (uint);\n\n    /**\n     * @notice Set the delay value\n     * @param delay New delay value\n     */\n    function setDelay(uint delay) virtual external;\n\n    /// @notice Mapping of transaction hashes to whether that transaction is currently enqueued\n    function queuedTransactions(bytes32 txHash) virtual external returns (bool);\n\n    /**\n     * @notice Enque a transaction\n     * @param target Address that the transaction is targeted at\n     * @param value Value to send to target address\n     * @param signature Function signature to call on target address\n     * @param data Calldata for function called on target address\n     * @param eta Timestamp of when the transaction can be executed\n     * @return txHash of the enqueued transaction\n     */\n    function queueTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) virtual external returns (bytes32);\n\n    /**\n     * @notice Cancel an enqueued transaction\n     * @param target Address that the transaction is targeted at\n     * @param value Value of the transaction to cancel\n     * @param signature Function signature of the transaction to cancel\n     * @param data Calldata for the transaction to cancel\n     * @param eta Timestamp of the transaction to cancel\n     */\n    function cancelTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) virtual external;\n\n    /**\n     * @notice Execute an enqueued transaction\n     * @param target Target address of the transaction to execute\n     * @param value Value of the transaction to execute\n     * @param signature Function signature of the transaction to execute\n     * @param data Calldata for the transaction to execute\n     * @param eta Timestamp of the transaction to execute\n     * @return bytes returned from executing transaction\n     */\n    function executeTransaction(address target, uint value, string memory signature, bytes memory data, uint eta) virtual external payable returns (bytes memory);\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.15+commit.e14f2714"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "l2Messenger_",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "AlreadyInitialized",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "BadData",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "FailedToSendNativeToken",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidL2Messenger",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidProposalId",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidTimelockAdmin",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ProposalNotExecutable",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TransactionAlreadyQueued",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "TransferOutFailed",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "Unauthorized",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "govTimelock",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "localTimelock",
+              "type": "address"
+            }
+          ],
+          "name": "Initialized",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "oldL2Messenger",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newL2Messenger",
+              "type": "address"
+            }
+          ],
+          "name": "NewL2Messenger",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "rootMessageSender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "address[]",
+              "name": "targets",
+              "type": "address[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256[]",
+              "name": "values",
+              "type": "uint256[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "string[]",
+              "name": "signatures",
+              "type": "string[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "bytes[]",
+              "name": "calldatas",
+              "type": "bytes[]"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "eta",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalCreated",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            }
+          ],
+          "name": "ProposalExecuted",
+          "type": "event"
+        },
+        {
+          "stateMutability": "payable",
+          "type": "fallback"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newL2Messenger",
+              "type": "address"
+            }
+          ],
+          "name": "changeL2Messenger",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "executeProposal",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "govTimelock",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_govTimelock",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_localTimelock",
+              "type": "address"
+            }
+          ],
+          "name": "initialize",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "initialized",
+          "outputs": [
+            {
+              "internalType": "bool",
+              "name": "",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "l2Messenger",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "localTimelock",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "proposalCount",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "name": "proposals",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "id",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "eta",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "executed",
+              "type": "bool"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "proposalId",
+              "type": "uint256"
+            }
+          ],
+          "name": "state",
+          "outputs": [
+            {
+              "internalType": "enum BaseBridgeReceiver.ProposalState",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            }
+          ],
+          "name": "sweepNativeToken",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "recipient",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            }
+          ],
+          "name": "sweepToken",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "changeL2Messenger(address)": {
+            "params": {
+              "newL2Messenger": "New address for L2 Messenger contract"
+            }
+          },
+          "constructor": {
+            "params": {
+              "l2Messenger_": "Address of Scroll L2 Messenger contract"
+            }
+          },
+          "executeProposal(uint256)": {
+            "params": {
+              "proposalId": "The id of the proposal to execute"
+            }
+          },
+          "initialize(address,address)": {
+            "params": {
+              "_govTimelock": "Address of the governing contract that this contract will receive messages from (likely on another chain)",
+              "_localTimelock": "Address of the timelock contract that this contract will send messages to"
+            }
+          },
+          "state(uint256)": {
+            "params": {
+              "proposalId": "Id of the proposal"
+            },
+            "returns": {
+              "_0": "The state of the given proposal (queued, expired or executed)"
+            }
+          },
+          "sweepNativeToken(address)": {
+            "params": {
+              "recipient": "The address that will receive the swept funds"
+            }
+          },
+          "sweepToken(address,address)": {
+            "details": "Note: Make sure to check that the asset being swept out is not malicious",
+            "params": {
+              "asset": "The address of the ERC-20 token to sweep",
+              "recipient": "The address that will receive the swept funds"
+            }
+          }
+        },
+        "title": "Scroll Bridge Receiver",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "AlreadyInitialized()": [
+            {
+              "notice": "Custom errors *"
+            }
+          ]
+        },
+        "events": {
+          "Initialized(address,address)": {
+            "notice": "Events *"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "changeL2Messenger(address)": {
+            "notice": "Update the L2 Messenger address"
+          },
+          "constructor": {
+            "notice": "Construct a new ScrollBridgeReceiver instance"
+          },
+          "executeProposal(uint256)": {
+            "notice": "Execute a queued proposal"
+          },
+          "govTimelock()": {
+            "notice": "Address of the governing contract that this bridge receiver expects to  receive messages from; likely an address from another chain (e.g. mainnet)"
+          },
+          "initialize(address,address)": {
+            "notice": "Initialize the contract"
+          },
+          "initialized()": {
+            "notice": "Whether contract has been initialized"
+          },
+          "l2Messenger()": {
+            "notice": "Address of Scroll L2 Messenger contract"
+          },
+          "localTimelock()": {
+            "notice": "Address of the timelock on this chain that the bridge receiver will send messages to"
+          },
+          "proposalCount()": {
+            "notice": "Total count of proposals generated"
+          },
+          "proposals(uint256)": {
+            "notice": "Mapping of proposal ids to their full proposal data"
+          },
+          "state(uint256)": {
+            "notice": "Get the state of a proposal"
+          },
+          "sweepNativeToken(address)": {
+            "notice": "A public function to sweep accidental native token transfers to this contract"
+          },
+          "sweepToken(address,address)": {
+            "notice": "A public function to sweep accidental ERC-20 transfers to this contract"
+          }
+        },
+        "notice": "Contract that processes messages passed from Compound governance using the Scroll bridge",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "contracts/bridges/scroll/ScrollBridgeReceiver.sol": "ScrollBridgeReceiver"
+      },
+      "evmVersion": "london",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "details": {
+          "constantOptimizer": true,
+          "cse": true,
+          "deduplicate": true,
+          "inliner": true,
+          "jumpdestRemover": true,
+          "orderLiterals": true,
+          "peephole": true,
+          "yul": true,
+          "yulDetails": {
+            "optimizerSteps": "dhfoDgvulfnTUtnIf [xa[r]scLM cCTUtTOntnfDIul Lcul Vcul [j] Tpeul xa[rul] xa[r]cL gvif CTUca[r]LsTOtfDnca[r]Iulc] jmul[jul] VcTOcul jmul",
+            "stackAllocation": true
+          }
+        },
+        "runs": 1
+      },
+      "remappings": [],
+      "viaIR": true
+    },
+    "sources": {
+      "contracts/IERC20NonStandard.sol": {
+        "keccak256": "0x352ff3474020e1a8c1b2f7a06e47e5435230a7e93580ea811558c02df1d87f95",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://046434bba8e1d82be113a1c14104747a1aa0e1031fa66b7062230c8eb9045fb0",
+          "dweb:/ipfs/Qmbktm3m2gnXSz7qhsF6Mywg8JGX6fFpfE5uRm3QftrJoT"
+        ]
+      },
+      "contracts/ITimelock.sol": {
+        "keccak256": "0x42b2e0fc37eed207eebf011cb8aa8006f1f75451540ea681d24e9b9a20594165",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://ff9ddcf38543c7a77c142fa49b6ff1ce32fb88d3bea17fea29c64de211a73dce",
+          "dweb:/ipfs/QmSef1fHRbgomFzpLG9mpGrDkaYEVsDjJWUXTbsqtPf5h6"
+        ]
+      },
+      "contracts/bridges/BaseBridgeReceiver.sol": {
+        "keccak256": "0x088d8bbe0ee6830ff8fb20ce2989b1299b134775b2b69e72856df9aa0eee3018",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://731134f9ab2a5e7da668eb894b0ffe3061cd5a4350cc7380762686b638883974",
+          "dweb:/ipfs/QmWDgSHMrcfwbNxi8FHHBKm1cGyt3ZcP1wYyu33k2wh2tu"
+        ]
+      },
+      "contracts/bridges/SweepableBridgeReceiver.sol": {
+        "keccak256": "0x48b42403e9fcba17dd6cff165444e324d8bed98a8000506cac888d6abe01c9b6",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://d1a28eab66781fa8a2726fd05ff5a2cbb09f38cf0f0acdaeceed0afc95c88bf4",
+          "dweb:/ipfs/QmYTifZNDTQwB1zp6amAVy5GZr2df5P8LzaWigpsDnSyPP"
+        ]
+      },
+      "contracts/bridges/scroll/IScrollMessenger.sol": {
+        "keccak256": "0x237983fdd3c603fbcbb2e18c5833efda8f1f56bf1114485d6934a77a92d8488d",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://220aa3b016d53f21f71e67238b3f45346eb6eeaad1d354adbb4b4084c25a137c",
+          "dweb:/ipfs/QmZjAG6pya6wucvRBm5yRMS2i4sJBKuDR5sdUeoi2YmGX3"
+        ]
+      },
+      "contracts/bridges/scroll/ScrollBridgeReceiver.sol": {
+        "keccak256": "0x5abab77924d7b8e14ee860ee3e49e5f1e5e4fb020fcbd622fad7d2de18778d96",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://49e0d4c1f6ffc15d4e0d1bb1137b9d0ced339966a5b715361ee2bc20a76ad909",
+          "dweb:/ipfs/Qmb7RifLDUhCdjH5FZitje4U6VouvigN7WkT31zATCBBSf"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.15+commit.e14f2714",
+    "compilerSettings": {
+      "viaIR": true,
+      "libraries": {},
+      "optimizer": {
+        "runs": 1,
+        "details": {
+          "yulDetails": {
+            "optimizerSteps": "dhfoDgvulfnTUtnIf [xa[r]scLM cCTUtTOntnfDIul Lcul Vcul [j] Tpeul xa[rul] xa[r]cL gvif CTUca[r]LsTOtfDnca[r]Iulc] jmul[jul] VcTOcul jmul"
+          }
+        },
+        "enabled": true
+      }
+    },
+    "name": "ScrollBridgeReceiver",
+    "fullyQualifiedName": "contracts/bridges/scroll/ScrollBridgeReceiver.sol:ScrollBridgeReceiver"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "27585805",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2026-04-04T14:14:05Z",
+  "match": "exact_match",
+  "chainId": "534352",
+  "address": "0xC6bf5A64896D679Cf89843DbeC6c0f5d3C9b610D"
+}
