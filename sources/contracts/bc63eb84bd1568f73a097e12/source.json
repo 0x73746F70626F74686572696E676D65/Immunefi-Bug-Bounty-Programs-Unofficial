@@ -1,0 +1,1350 @@
+{
+  "sources": {
+    "Oracle/BenqiDualOracle.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.24;\n\nimport \"./interfaces/IPriceOracle.sol\";\nimport \"./interfaces/IQiToken.sol\";\nimport \"./interfaces/IQiErc20.sol\";\nimport \"./BenqiPriceOracle.sol\";\nimport \"@openzeppelin/contracts/access/Ownable2Step.sol\";\n\n/**\n * @title BenqiDualOracle\n * @author BENQI Finance\n * @notice Implements a dual oracle system with Edge as primary and Chainlink as backup\n * @dev Dual oracle system with mechanisms for:\n *      - Staleness detection\n *      - Price deviation detection\n *      - Automatic fallback between oracles\n *      - Manual override to use only one oracle in case of compromise\n */\ncontract BenqiDualOracle is IPriceOracle, Ownable2Step {\n    // ============ State Variables ============\n\n    /// @notice Enum representing different oracle modes\n    enum OracleMode {\n        EDGE_ONLY, // Use only Edge oracle\n        CL_ONLY, // Use only Chainlink oracle\n        DUAL // Use both oracles (default)\n\n    }\n\n    /// @notice Current oracle mode\n    OracleMode public oracleMode = OracleMode.DUAL;\n\n    /// @notice Primary oracle (Edge)\n    BenqiPriceOracle public immutable edgeOracle;\n\n    /// @notice Backup oracle (Chainlink)\n    BenqiPriceOracle public immutable chainlinkOracle;\n\n    /// @notice Configuration parameters for each asset's oracle feeds\n    struct AssetOracleConfig {\n        uint256 stalenessThreshold; // Time in seconds before a price is considered stale\n        bool isConfigured; // Whether the asset is configured\n        uint256 deviationThreshold; // Custom deviation threshold for this asset (0 = use default)\n    }\n\n    /// @notice Mapping from asset address to oracle configuration\n    mapping(address => AssetOracleConfig) public assetConfigs;\n\n    /// @notice Default maximum allowed deviation between oracle prices (5% in 18 decimals)\n    uint256 public deviationThreshold = 5e16;\n\n    /// @notice Maximum allowed deviation threshold (20% in 18 decimals)\n    uint256 public maxDeviationThreshold = 20e16;\n\n    /// @notice Address of the qiAVAX token\n    address public qiAvaxAddress;\n\n    /// @notice AVAX's \"underlying\" address representation\n    address public constant AVAX_UNDERLYING = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;\n\n    // ============ Errors ============\n\n    /// @notice Error for zero or invalid addresses\n    error InvalidAddress();\n\n    /// @notice Error when Edge oracle returns zero price\n    error EdgeOracleZeroPrice();\n\n    /// @notice Error when Chainlink oracle returns zero price\n    error ChainlinkOracleZeroPrice();\n\n    /// @notice Error when Edge oracle is unresponsive\n    error EdgeOracleUnresponsive();\n\n    /// @notice Error when Chainlink oracle is unresponsive\n    error ChainlinkOracleUnresponsive();\n\n    /// @notice Error when asset is not configured in the system\n    error UnconfiguredAsset();\n\n    /// @notice Error when both oracles report stale prices\n    error BothOraclesStale();\n\n    /// @notice Error when price deviation exceeds threshold\n    error PriceDeviationDetected();\n\n    /// @notice Error when deviation threshold is set too high\n    error DeviationThresholdTooHigh();\n\n    /// @notice Error when maximum deviation threshold is set too high\n    error MaxDeviationThresholdTooHigh();\n\n    /// @notice Error when no oracle is selected for price setting\n    error NoOracleSelected();\n\n    /// @notice Error when setting a zero price\n    error ZeroPrice();\n\n    /// @notice Error when Edge oracle price is stale\n    error EdgeOracleStalePriceError(address asset, uint256 timestamp, uint256 stalenessThreshold);\n\n    /// @notice Error when Chainlink oracle price is stale\n    error ChainlinkOracleStalePriceError(address asset, uint256 timestamp, uint256 stalenessThreshold);\n\n    /// @notice Error when manual price has significant deviation from feed price\n    error ManualPriceDeviationError(address asset, uint256 manualPrice, uint256 feedPrice);\n\n    /// @notice Error when both oracles have the same addresses\n    error SameOracleAddresses();\n\n    /// @notice Error when deviation threshold is invalid\n    error InvalidDeviationThreshold();\n\n    /// @notice Error when no valid feed price is available for validation during manual price setting\n    error NoValidFeedForValidation(address asset);\n\n    // ============ Events ============\n\n    /// @notice Emitted when an asset's oracle feeds are configured\n    event AssetOraclesConfigured(\n        address indexed asset,\n        address edgeFeed,\n        address chainlinkFeed,\n        uint256 stalenessThreshold,\n        uint256 deviationThreshold\n    );\n\n    /// @notice Emitted when Edge oracle reports a stale price\n    event EdgeOracleStalePrice(address indexed asset, uint256 timestamp, uint256 stalenessThreshold);\n\n    /// @notice Emitted when Chainlink oracle reports a stale price\n    event ChainlinkOracleStalePrice(address indexed asset, uint256 timestamp, uint256 stalenessThreshold);\n\n    /// @notice Emitted when there's a significant deviation between oracle prices\n    event OraclePriceDeviation(\n        address indexed asset, uint256 edgePrice, uint256 chainlinkPrice, uint256 deviation, uint256 threshold\n    );\n\n    /// @notice Emitted when global deviation threshold is changed\n    event DeviationThresholdChanged(uint256 oldThreshold, uint256 newThreshold);\n\n    /// @notice Emitted when maximum deviation threshold is changed\n    event MaxDeviationThresholdChanged(uint256 oldThreshold, uint256 newThreshold);\n\n    /// @notice Emitted when oracle admin rights are transferred\n    event OracleAdminTransferred(address indexed newAdmin);\n\n    /// @notice Emitted when oracle mode is changed\n    event OracleModeChanged(OracleMode oldMode, OracleMode newMode);\n\n    /// @notice Emitted when direct price is set\n    event DirectPriceSet(address indexed asset, uint256 price, bool setInEdge, bool setInChainlink);\n\n    /// @notice Emitted when underlying price is set\n    event UnderlyingPriceSet(address indexed qiToken, uint256 price, bool setInEdge, bool setInChainlink);\n\n    // ============ Constructor ============\n\n    /**\n     * @notice Constructs the dual oracle system\n     * @param _edgeOracle Address of the Edge oracle contract\n     * @param _chainlinkOracle Address of the Chainlink oracle contract\n     * @param _qiAvaxAddress Address of the qiAVAX token\n     */\n    constructor(BenqiPriceOracle _edgeOracle, BenqiPriceOracle _chainlinkOracle, address _qiAvaxAddress)\n        Ownable(msg.sender)\n    {\n        if (\n            address(_edgeOracle) == address(0) || address(_chainlinkOracle) == address(0)\n                || _qiAvaxAddress == address(0)\n        ) {\n            revert InvalidAddress();\n        }\n\n        if (address(_chainlinkOracle) == address(_edgeOracle)) revert SameOracleAddresses();\n\n        edgeOracle = _edgeOracle;\n        chainlinkOracle = _chainlinkOracle;\n        qiAvaxAddress = _qiAvaxAddress;\n    }\n\n    // ============ External Functions ============\n\n    /**\n     * @notice Sets up oracle feeds for an asset\n     * @dev Configures both Edge and Chainlink oracles for a single asset\n     * @param asset The ERC20 token address to configure\n     * @param edgeFeed The Edge price feed address\n     * @param chainlinkFeed The Chainlink price feed address\n     * @param stalenessThreshold Time in seconds before a price is considered stale\n     * @param customDeviationThreshold Custom deviation threshold for this asset (0 = use default)\n     */\n    function setAssetOracles(\n        address asset,\n        address edgeFeed,\n        address chainlinkFeed,\n        uint256 stalenessThreshold,\n        uint256 customDeviationThreshold\n    ) external onlyOwner {\n        // Input validation\n        if (asset == address(0) || edgeFeed == address(0) || chainlinkFeed == address(0)) {\n            revert InvalidAddress();\n        }\n        if (stalenessThreshold == 0) {\n            revert InvalidAddress();\n        }\n\n        // Get the underlying token address for feed configuration\n        address underlying;\n        if (asset == qiAvaxAddress) {\n            underlying = AVAX_UNDERLYING;\n        } else {\n            underlying = address(IQiErc20(asset).underlying());\n        }\n\n        // Configure feeds FIRST (before validation)\n        // This allows validation to work when DualOracle owns the underlying oracles\n        edgeOracle.setFeed(underlying, edgeFeed);\n        chainlinkOracle.setFeed(underlying, chainlinkFeed);\n\n        // Now validate Edge feed responsiveness and get price\n        uint256 edgePrice;\n        uint256 edgeTimestamp;\n        try edgeOracle.getUnderlyingPriceWithTimestamp(IQiToken(asset)) returns (uint256 price, uint256 timestamp) {\n            if (price == 0) revert EdgeOracleZeroPrice();\n            edgePrice = price;\n            edgeTimestamp = timestamp;\n        } catch {\n            revert EdgeOracleUnresponsive();\n        }\n\n        // Validate Chainlink feed interface and get price\n        uint256 chainlinkPrice;\n        uint256 chainlinkTimestamp;\n        try chainlinkOracle.getUnderlyingPriceWithTimestamp(IQiToken(asset)) returns (uint256 price, uint256 timestamp)\n        {\n            if (price == 0) revert ChainlinkOracleZeroPrice();\n            chainlinkPrice = price;\n            chainlinkTimestamp = timestamp;\n        } catch {\n            revert ChainlinkOracleUnresponsive();\n        }\n\n        // Check if either price is stale\n        if (isPriceStale(edgeTimestamp, stalenessThreshold)) {\n            revert EdgeOracleStalePriceError(asset, edgeTimestamp, stalenessThreshold);\n        }\n        if (isPriceStale(chainlinkTimestamp, stalenessThreshold)) {\n            revert ChainlinkOracleStalePriceError(asset, chainlinkTimestamp, stalenessThreshold);\n        }\n\n        // Calculate and check price deviation\n        uint256 deviation = calculateDeviation(edgePrice, chainlinkPrice);\n        uint256 assetDeviationThreshold = customDeviationThreshold > 0 ? customDeviationThreshold : deviationThreshold;\n\n        if (assetDeviationThreshold > maxDeviationThreshold) revert DeviationThresholdTooHigh();\n\n        if (deviation > assetDeviationThreshold) {\n            emit OraclePriceDeviation(asset, edgePrice, chainlinkPrice, deviation, assetDeviationThreshold);\n            revert PriceDeviationDetected();\n        }\n\n        // Store the configuration\n        assetConfigs[asset] = AssetOracleConfig({\n            stalenessThreshold: stalenessThreshold,\n            isConfigured: true,\n            deviationThreshold: assetDeviationThreshold\n        });\n\n        emit AssetOraclesConfigured(asset, edgeFeed, chainlinkFeed, stalenessThreshold, assetDeviationThreshold);\n    }\n\n    /**\n     * @notice Gets the feed addresses for a qiToken from both oracles\n     * @dev Reads feed addresses directly from the oracle contracts using the underlying token\n     * @param qiToken The qiToken to get feed addresses for\n     * @return edgeFeed The Edge oracle feed address\n     * @return chainlinkFeed The Chainlink oracle feed address\n     */\n    function getFeeds(address qiToken) external view returns (address edgeFeed, address chainlinkFeed) {\n        address underlying;\n        if (qiToken == qiAvaxAddress) {\n            underlying = AVAX_UNDERLYING;\n        } else {\n            underlying = address(IQiErc20(qiToken).underlying());\n        }\n\n        return (address(edgeOracle.getFeed(underlying)), address(chainlinkOracle.getFeed(underlying)));\n    }\n\n    /**\n     * @notice Sets the oracle mode\n     * @dev Only callable by owner, allows switching between dual mode and single oracle modes\n     * @param _mode The oracle mode to set\n     */\n    function setOracleMode(OracleMode _mode) external onlyOwner {\n        OracleMode oldMode = oracleMode;\n        oracleMode = _mode;\n\n        emit OracleModeChanged(oldMode, _mode);\n    }\n\n    /**\n     * @notice Gets the price of an underlying asset\n     * @dev Implements the fallback logic between Edge and Chainlink oracles\n     * @param qiToken The QiToken whose underlying asset price is being fetched\n     * @return The price of the underlying asset in USD, scaled to 18 decimals\n     */\n    function getUnderlyingPrice(IQiToken qiToken) public view override returns (uint256) {\n        address asset = address(qiToken);\n        AssetOracleConfig memory config = assetConfigs[asset];\n\n        if (!config.isConfigured) revert UnconfiguredAsset();\n\n        if (oracleMode == OracleMode.EDGE_ONLY) {\n            (uint256 edgePriceResult, uint256 edgeTimestampSingle, bool isStaleResult) =\n                getOraclePriceWithFreshness(qiToken, true, config.stalenessThreshold);\n            // Zero price check is inside getOraclePriceWithFreshness (it reverts if price is 0)\n            if (isStaleResult) {\n                revert EdgeOracleStalePriceError(asset, edgeTimestampSingle, config.stalenessThreshold);\n            }\n            return edgePriceResult;\n        }\n\n        if (oracleMode == OracleMode.CL_ONLY) {\n            (uint256 chainlinkPriceResult, uint256 chainlinkTimestampSingle, bool isStaleResult) =\n                getOraclePriceWithFreshness(qiToken, false, config.stalenessThreshold);\n            // Zero price check is inside getOraclePriceWithFreshness\n            if (isStaleResult) {\n                revert ChainlinkOracleStalePriceError(asset, chainlinkTimestampSingle, config.stalenessThreshold);\n            }\n            return chainlinkPriceResult;\n        }\n\n        // Default dual oracle logic\n        uint256 edgePrice;\n        uint256 chainlinkPrice;\n        uint256 edgeTimestamp;\n        uint256 chainlinkTimestamp;\n        bool isEdgeStale;\n        bool isChainlinkStale;\n\n        (edgePrice, edgeTimestamp, isEdgeStale) = getOraclePriceWithFreshness(\n            qiToken,\n            true, // isEdge\n            config.stalenessThreshold\n        );\n\n        (chainlinkPrice, chainlinkTimestamp, isChainlinkStale) = getOraclePriceWithFreshness(\n            qiToken,\n            false, // isEdge\n            config.stalenessThreshold\n        );\n\n        // First check if both are stale\n        if (isEdgeStale && isChainlinkStale) {\n            // We can't emit events in a view function, so we just revert with the appropriate error\n            revert BothOraclesStale();\n        }\n\n        // Then check individual staleness\n        if (isEdgeStale) {\n            // Return Chainlink when Edge is stale without emitting event\n            return chainlinkPrice;\n        }\n\n        if (isChainlinkStale) {\n            // Use Edge when Chainlink is stale without emitting event\n            return edgePrice;\n        }\n\n        // Both prices are fresh, validate against each other\n        uint256 deviation = calculateDeviation(edgePrice, chainlinkPrice);\n        uint256 thresholdToUse = config.deviationThreshold > 0 ? config.deviationThreshold : deviationThreshold;\n\n        if (deviation > thresholdToUse) {\n            // We can't emit events in view functions, so just revert\n            revert PriceDeviationDetected();\n        }\n\n        // Edge is primary oracle when both are valid\n        return edgePrice;\n    }\n\n    /**\n     * @notice Set the global deviation threshold\n     * @dev Only callable by owner\n     * @param newThreshold New deviation threshold (in 18 decimals)\n     */\n    function setDeviationThreshold(uint256 newThreshold) external onlyOwner {\n        if (newThreshold == 0) revert InvalidDeviationThreshold();\n        if (newThreshold > maxDeviationThreshold) revert DeviationThresholdTooHigh();\n\n        uint256 oldThreshold = deviationThreshold;\n        deviationThreshold = newThreshold;\n\n        emit DeviationThresholdChanged(oldThreshold, newThreshold);\n    }\n\n    /**\n     * @notice Set the maximum allowed deviation threshold\n     * @dev Only callable by owner\n     * @param newMaxThreshold New maximum deviation threshold (in 18 decimals)\n     */\n    function setMaxDeviationThreshold(uint256 newMaxThreshold) external onlyOwner {\n        if (newMaxThreshold == 0) revert InvalidAddress();\n        if (newMaxThreshold > 50e16) revert MaxDeviationThresholdTooHigh(); // Hard cap at 50%\n\n        uint256 oldThreshold = maxDeviationThreshold;\n        maxDeviationThreshold = newMaxThreshold;\n\n        // If current deviation threshold is higher than new max, adjust it\n        if (deviationThreshold > newMaxThreshold) {\n            uint256 oldDeviationThreshold = deviationThreshold;\n            deviationThreshold = newMaxThreshold;\n            emit DeviationThresholdChanged(oldDeviationThreshold, newMaxThreshold);\n        }\n\n        emit MaxDeviationThresholdChanged(oldThreshold, newMaxThreshold);\n    }\n\n    /**\n     * @notice Transfers admin rights of both oracle contracts to a new address\n     * @dev Only callable by owner\n     * @param newAdmin The address to receive admin rights\n     */\n    function transferOracleAdmins(address newAdmin) external onlyOwner {\n        if (newAdmin == address(0)) revert InvalidAddress();\n\n        // Transfer Edge Oracle admin\n        edgeOracle.setAdmin(newAdmin);\n\n        // Transfer Chainlink Oracle admin\n        chainlinkOracle.setAdmin(newAdmin);\n\n        emit OracleAdminTransferred(newAdmin);\n    }\n\n    /**\n     * @notice Sets the direct price for an asset in both underlying oracles\n     * @dev Only callable by owner, propagates the price to both oracles\n     * @param asset The asset address to set the price for\n     * @param price The price to set (scaled to 18 decimals)\n     * @param setInEdge Whether to set the price in the Edge oracle\n     * @param setInChainlink Whether to set the price in the Chainlink oracle\n     * @param manualOverrideAllowed If true, skips feed price deviation validation\n     */\n    function setDirectPrice(\n        address asset,\n        uint256 price,\n        bool setInEdge,\n        bool setInChainlink,\n        bool manualOverrideAllowed\n    ) external onlyOwner {\n        if (asset == address(0)) revert InvalidAddress();\n        if (!setInEdge && !setInChainlink) revert NoOracleSelected();\n        if (price == 0) revert ZeroPrice();\n\n        // Validate against Edge and Chainlink feeds if override is not allowed\n        if (!manualOverrideAllowed) {\n            validateFeedPriceDeviation(asset, price);\n        }\n\n        // Set price in Edge oracle\n        if (setInEdge) {\n            edgeOracle.setDirectPrice(asset, price);\n        }\n\n        // Set price in Chainlink oracle\n        if (setInChainlink) {\n            chainlinkOracle.setDirectPrice(asset, price);\n        }\n\n        emit DirectPriceSet(asset, price, setInEdge, setInChainlink);\n    }\n\n    /**\n     * @notice Sets the underlying price for a QiToken in both underlying oracles\n     * @dev Only callable by owner, propagates the price to both oracles\n     * @param qiToken The QiToken to set the underlying price for\n     * @param underlyingPriceMantissa The price to set (scaled to 18 decimals)\n     * @param setInEdge Whether to set the price in the Edge oracle\n     * @param setInChainlink Whether to set the price in the Chainlink oracle\n     * @param manualOverrideAllowed If true, skips feed price deviation validation\n     */\n    function setUnderlyingPrice(\n        IQiToken qiToken,\n        uint256 underlyingPriceMantissa,\n        bool setInEdge,\n        bool setInChainlink,\n        bool manualOverrideAllowed\n    ) external onlyOwner {\n        if (address(qiToken) == address(0)) revert InvalidAddress();\n        if (!setInEdge && !setInChainlink) revert NoOracleSelected();\n        if (underlyingPriceMantissa == 0) revert ZeroPrice();\n\n        // Get the underlying asset address\n        address underlying;\n        if (address(qiToken) == qiAvaxAddress) {\n            underlying = AVAX_UNDERLYING;\n        } else {\n            underlying = address(IQiErc20(address(qiToken)).underlying());\n        }\n\n        // Validate against Edge and Chainlink feeds if override is not allowed\n        if (!manualOverrideAllowed) {\n            validateFeedPriceDeviation(underlying, underlyingPriceMantissa);\n        }\n\n        // Set price in Edge oracle\n        if (setInEdge) {\n            edgeOracle.setUnderlyingPrice(qiToken, underlyingPriceMantissa);\n        }\n\n        // Set price in Chainlink oracle\n        if (setInChainlink) {\n            chainlinkOracle.setUnderlyingPrice(qiToken, underlyingPriceMantissa);\n        }\n\n        emit UnderlyingPriceSet(address(qiToken), underlyingPriceMantissa, setInEdge, setInChainlink);\n    }\n\n    // ============ Internal Functions ============\n\n    /**\n     * @notice Validates a manual price against oracle feed prices to prevent large deviations\n     * @param asset The asset address to check feed prices for\n     * @param manualPrice The manual price to validate against feed prices\n     * @dev Reverts with ManualPriceDeviationError if deviation is too large.\n     * @dev Reverts with NoValidFeedForValidation if no valid feed price is found for comparison.\n     */\n    function validateFeedPriceDeviation(address asset, uint256 manualPrice) internal view {\n        bool hasValidFeedForValidation = false;\n\n        // Check Edge feed if available\n        IAggregatorV2V3Interface edgeFeed = edgeOracle.getFeed(asset);\n        if (address(edgeFeed) != address(0)) {\n            uint256 feedPrice = getFeedPrice(edgeFeed);\n            if (feedPrice > 0) {\n                hasValidFeedForValidation = true;\n                // Check for significant deviation (10x or 0.1x difference)\n                if (manualPrice > feedPrice * 10 || feedPrice > manualPrice * 10) {\n                    revert ManualPriceDeviationError(asset, manualPrice, feedPrice);\n                }\n            }\n        }\n\n        // Check Chainlink feed if available\n        IAggregatorV2V3Interface chainlinkFeed = chainlinkOracle.getFeed(asset);\n        if (address(chainlinkFeed) != address(0)) {\n            uint256 feedPrice = getFeedPrice(chainlinkFeed);\n            if (feedPrice > 0) {\n                hasValidFeedForValidation = true;\n                // Check for significant deviation (10x or 0.1x difference)\n                if (manualPrice > feedPrice * 10 || feedPrice > manualPrice * 10) {\n                    revert ManualPriceDeviationError(asset, manualPrice, feedPrice);\n                }\n            }\n        }\n\n        // If this function is called (implying manualOverrideAllowed was false in the caller)\n        // and no feed provided a valid price for validation, then revert.\n        if (!hasValidFeedForValidation) {\n            revert NoValidFeedForValidation(asset);\n        }\n    }\n\n    /**\n     * @notice Safely gets a normalized price from a feed\n     * @param feed The price feed to read from\n     * @return price The normalized price (18 decimals) or 0 if an error occurs\n     */\n    function getFeedPrice(IAggregatorV2V3Interface feed) internal view returns (uint256 price) {\n        try feed.latestRoundData() returns (uint80, int256 answer, uint256, uint256, uint80) {\n            if (answer > 0) {\n                uint256 feedDecimals = feed.decimals();\n                price = normalizePrice(uint256(answer), uint8(feedDecimals));\n            }\n        } catch {\n            // Return 0 on any error\n            price = 0;\n        }\n        return price;\n    }\n\n    /**\n     * @notice Checks if a price is stale based on timestamp\n     * @param timestamp The timestamp when the price was last updated\n     * @param stalenessThreshold The threshold in seconds\n     * @return Whether the price is stale\n     */\n    function isPriceStale(uint256 timestamp, uint256 stalenessThreshold) internal view returns (bool) {\n        return block.timestamp > timestamp + stalenessThreshold;\n    }\n\n    /**\n     * @notice Normalizes price to 18 decimals\n     * @param price The price to normalize\n     * @param currentDecimals The current decimal places of the price\n     * @return The price normalized to 18 decimals\n     */\n    function normalizePrice(uint256 price, uint8 currentDecimals) internal pure returns (uint256) {\n        if (currentDecimals == 18) {\n            return price;\n        } else if (currentDecimals < 18) {\n            return price * (10 ** (18 - currentDecimals));\n        } else {\n            return price / (10 ** (currentDecimals - 18));\n        }\n    }\n\n    /**\n     * @notice Calculates percentage deviation between two prices\n     * @dev Formula: |price1 - price2| / max(price1, price2) * 100%\n     *      This ensures we get the relative difference as a percentage of the larger price\n     *      which gives a more conservative deviation estimate\n     * @param price1 First price (scaled to 18 decimals)\n     * @param price2 Second price (scaled to 18 decimals)\n     * @return The deviation as a percentage in 18 decimals (e.g., 0.05e18 = 5%)\n     */\n    function calculateDeviation(uint256 price1, uint256 price2) internal pure returns (uint256) {\n        // Return maximum deviation if either price is zero\n        if (price1 == 0 || price2 == 0) {\n            return type(uint256).max;\n        }\n\n        // Calculate absolute difference\n        uint256 priceDiff = price1 > price2 ? price1 - price2 : price2 - price1;\n\n        // Use the larger price as denominator for a more conservative estimate\n        uint256 largerPrice = price1 > price2 ? price1 : price2;\n\n        // Maintain higher precision throughout the calculation\n        return (priceDiff * 1e36) / largerPrice / 1e18;\n    }\n\n    /**\n     * @notice Gets price from an oracle and checks if it's fresh\n     * @param qiToken The QiToken to get price for\n     * @param isEdge Whether to use Edge oracle (true) or Chainlink oracle (false)\n     * @param stalenessThreshold Staleness threshold in seconds\n     * @return price The price from the oracle\n     * @return timestamp The timestamp when the price was last updated\n     * @return isStale Whether the price is considered stale\n     */\n    function getOraclePriceWithFreshness(IQiToken qiToken, bool isEdge, uint256 stalenessThreshold)\n        internal\n        view\n        returns (uint256 price, uint256 timestamp, bool isStale)\n    {\n        if (isEdge) {\n            // Get from Edge oracle\n            (price, timestamp) = edgeOracle.getUnderlyingPriceWithTimestamp(qiToken);\n            if (price == 0) revert EdgeOracleZeroPrice();\n        } else {\n            // Get from Chainlink oracle\n            (price, timestamp) = chainlinkOracle.getUnderlyingPriceWithTimestamp(qiToken);\n            if (price == 0) revert ChainlinkOracleZeroPrice();\n        }\n\n        // Check for staleness\n        isStale = isPriceStale(timestamp, stalenessThreshold);\n\n        return (price, timestamp, isStale);\n    }\n}\n"
+    },
+    "Oracle/BenqiPriceOracle.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.24;\n\nimport \"./interfaces/IPriceOracle.sol\";\nimport \"./interfaces/IQiToken.sol\";\nimport \"./interfaces/IQiErc20.sol\";\nimport \"./interfaces/IEIP20Interface.sol\";\nimport \"./interfaces/IAggregatorV2V3Interface.sol\";\nimport \"./interfaces/IBenqiPriceOracle.sol\";\n\n/**\n * @title BenqiPriceOracle\n * @author BENQI Finance\n * @notice Generic price oracle implementation that can be deployed for different feed providers\n * @dev Can be deployed multiple times for different price feed providers (e.g., Chainlink, Edge)\n */\ncontract BenqiPriceOracle is IBenqiPriceOracle {\n    address public admin;\n\n    mapping(address => uint256) internal prices;\n    // Maps underlying token addresses to their corresponding price feeds\n    mapping(address => IAggregatorV2V3Interface) public feeds;\n\n    address public constant AVAX_UNDERLYING = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;\n    address public immutable qiAvaxAddress;\n\n    event PricePosted(\n        address asset, uint256 previousPriceMantissa, uint256 requestedPriceMantissa, uint256 newPriceMantissa\n    );\n    event NewAdmin(address oldAdmin, address newAdmin);\n    event FeedSet(address feed, address token);\n\n    constructor(address _qiAvaxAddress) {\n        admin = msg.sender;\n        qiAvaxAddress = _qiAvaxAddress;\n    }\n\n    function getUnderlyingPrice(IQiToken qiToken) external view override returns (uint256) {\n        address qiTokenAddress = address(qiToken);\n        IAggregatorV2V3Interface feed;\n\n        if (qiTokenAddress == qiAvaxAddress) {\n            feed = getFeed(AVAX_UNDERLYING);\n        } else {\n            address underlying = address(IQiErc20(address(qiToken)).underlying());\n            feed = getFeed(underlying);\n        }\n\n        (uint256 price,) = getPriceAndTimestamp(feed, qiToken);\n        return price;\n    }\n\n    function getUnderlyingPriceWithTimestamp(IQiToken qiToken) external view override returns (uint256, uint256) {\n        address qiTokenAddress = address(qiToken);\n        IAggregatorV2V3Interface feed;\n\n        if (qiTokenAddress == qiAvaxAddress) {\n            feed = getFeed(AVAX_UNDERLYING);\n        } else {\n            address underlying = address(IQiErc20(address(qiToken)).underlying());\n            feed = getFeed(underlying);\n        }\n\n        return getPriceAndTimestamp(feed, qiToken);\n    }\n\n    function getPriceAndTimestamp(IAggregatorV2V3Interface feed, IQiToken qiToken)\n        internal\n        view\n        returns (uint256, uint256)\n    {\n        address tokenAddress =\n            address(qiToken) == qiAvaxAddress ? AVAX_UNDERLYING : address(IQiErc20(address(qiToken)).underlying());\n        IEIP20Interface token = IEIP20Interface(tokenAddress);\n\n        // Check for manually set price first\n        if (prices[tokenAddress] != 0) {\n            uint256 manualPrice = prices[tokenAddress];\n            // Only adjust for decimals if it's not AVAX\n            if (address(qiToken) != qiAvaxAddress) {\n                uint256 tokenDecimalDelta = 18 - token.decimals();\n                if (tokenDecimalDelta > 0) {\n                    manualPrice = manualPrice * (10 ** tokenDecimalDelta);\n                }\n            }\n            return (manualPrice, block.timestamp);\n        }\n\n        // If no manual price, proceed with feed data\n        (, int256 answer,, uint256 updatedAt,) = feed.latestRoundData();\n\n        require(answer > 0, \"negative or zero price not allowed\");\n\n        uint256 feedPrice = uint256(answer);\n\n        // If it's not AVAX, adjust for token decimals\n        if (address(qiToken) != qiAvaxAddress) {\n            uint256 tokenDecimalDelta = 18 - token.decimals();\n            if (tokenDecimalDelta > 0) {\n                feedPrice = feedPrice * (10 ** tokenDecimalDelta);\n            }\n        }\n\n        // Convert to 18 decimals if needed\n        uint256 feedDecimalDelta = 18 - feed.decimals();\n        if (feedDecimalDelta > 0) {\n            feedPrice = feedPrice * (10 ** feedDecimalDelta);\n        }\n\n        return (feedPrice, updatedAt);\n    }\n\n    function setUnderlyingPrice(IQiToken qiToken, uint256 underlyingPriceMantissa) external override onlyAdmin {\n        address asset;\n        if (address(qiToken) == qiAvaxAddress) {\n            asset = AVAX_UNDERLYING;\n        } else {\n            asset = address(IQiErc20(address(qiToken)).underlying());\n        }\n        emit PricePosted(asset, prices[asset], underlyingPriceMantissa, underlyingPriceMantissa);\n        prices[asset] = underlyingPriceMantissa;\n    }\n\n    function setDirectPrice(address asset, uint256 price) external override onlyAdmin {\n        emit PricePosted(asset, prices[asset], price, price);\n        prices[asset] = price;\n    }\n\n    function setFeed(address token, address feed) external override onlyAdmin {\n        require(feed != address(0) && feed != address(this), \"invalid feed address\");\n        emit FeedSet(feed, token);\n        feeds[token] = IAggregatorV2V3Interface(feed);\n    }\n\n    function getFeed(address token) public view override returns (IAggregatorV2V3Interface) {\n        return feeds[token];\n    }\n\n    function assetPrices(address asset) external view override returns (uint256) {\n        return prices[asset];\n    }\n\n    function setAdmin(address newAdmin) external override onlyAdmin {\n        address oldAdmin = admin;\n        admin = newAdmin;\n\n        emit NewAdmin(oldAdmin, newAdmin);\n    }\n\n    modifier onlyAdmin() {\n        require(msg.sender == admin, \"only admin may call\");\n        _;\n    }\n}\n"
+    },
+    "Oracle/interfaces/IAggregatorV2V3Interface.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IAggregatorV2V3Interface {\n    // V2 Interface\n    function latestAnswer() external view returns (int256);\n    function latestTimestamp() external view returns (uint256);\n    function latestRound() external view returns (uint256);\n    function getAnswer(uint256 roundId) external view returns (int256);\n    function getTimestamp(uint256 roundId) external view returns (uint256);\n\n    event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 timestamp);\n    event NewRound(uint256 indexed roundId, address indexed startedBy, uint256 startedAt);\n\n    // V3 Interface\n    function decimals() external view returns (uint8);\n    function description() external view returns (string memory);\n    function version() external view returns (uint256);\n\n    function getRoundData(uint80 _roundId)\n        external\n        view\n        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);\n\n    function latestRoundData()\n        external\n        view\n        returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);\n}\n"
+    },
+    "Oracle/interfaces/IBenqiPriceOracle.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\nimport \"./IPriceOracle.sol\";\nimport \"./IQiToken.sol\";\nimport \"./IAggregatorV2V3Interface.sol\";\n\n/**\n * @title IBenqiPriceOracle\n * @author BENQI Finance\n * @notice Interface for the generic price oracle implementation\n */\ninterface IBenqiPriceOracle is IPriceOracle {\n    function admin() external view returns (address);\n    function feeds(address) external view returns (IAggregatorV2V3Interface);\n    function qiAvaxAddress() external view returns (address);\n\n    function getUnderlyingPrice(IQiToken qiToken) external view returns (uint256);\n    function getUnderlyingPriceWithTimestamp(IQiToken qiToken) external view returns (uint256, uint256);\n    function setUnderlyingPrice(IQiToken qiToken, uint256 underlyingPriceMantissa) external;\n    function setDirectPrice(address asset, uint256 price) external;\n    function setFeed(address token, address feed) external;\n    function getFeed(address token) external view returns (IAggregatorV2V3Interface);\n    function assetPrices(address asset) external view returns (uint256);\n    function setAdmin(address newAdmin) external;\n}\n"
+    },
+    "Oracle/interfaces/IEIP20Interface.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IEIP20Interface {\n    function name() external view returns (string memory);\n    function symbol() external view returns (string memory);\n    function decimals() external view returns (uint8);\n    function totalSupply() external view returns (uint256);\n    function balanceOf(address owner) external view returns (uint256);\n    function transfer(address dst, uint256 amount) external returns (bool);\n    function transferFrom(address src, address dst, uint256 amount) external returns (bool);\n    function approve(address spender, uint256 amount) external returns (bool);\n    function allowance(address owner, address spender) external view returns (uint256);\n\n    event Transfer(address indexed from, address indexed to, uint256 amount);\n    event Approval(address indexed owner, address indexed spender, uint256 amount);\n}\n"
+    },
+    "Oracle/interfaces/IPriceOracle.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\nimport \"./IQiToken.sol\";\n\ninterface IPriceOracle {\n    function getUnderlyingPrice(IQiToken qiToken) external view returns (uint256);\n}\n"
+    },
+    "Oracle/interfaces/IQiErc20.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IQiErc20 {\n    function initialize(\n        address underlying_,\n        address comptroller_,\n        address interestRateModel_,\n        uint256 initialExchangeRateMantissa_,\n        string memory name_,\n        string memory symbol_,\n        uint8 decimals_\n    ) external;\n\n    function mint(uint256 mintAmount) external returns (uint256);\n    function redeem(uint256 redeemTokens) external returns (uint256);\n    function redeemUnderlying(uint256 redeemAmount) external returns (uint256);\n    function borrow(uint256 borrowAmount) external returns (uint256);\n    function repayBorrow(uint256 repayAmount) external returns (uint256);\n    function repayBorrowBehalf(address borrower, uint256 repayAmount) external returns (uint256);\n    function liquidateBorrow(address borrower, uint256 repayAmount, address qiTokenCollateral)\n        external\n        returns (uint256);\n    function sweepToken(address token) external;\n    function _addReserves(uint256 addAmount) external returns (uint256);\n    function underlying() external view returns (address);\n}\n"
+    },
+    "Oracle/interfaces/IQiToken.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n\ninterface IQiToken {\n    function initialize(\n        address comptroller_,\n        address interestRateModel_,\n        uint256 initialExchangeRateMantissa_,\n        string memory name_,\n        string memory symbol_,\n        uint8 decimals_\n    ) external;\n\n    function transfer(address dst, uint256 amount) external returns (bool);\n    function transferFrom(address src, address dst, uint256 amount) external returns (bool);\n    function approve(address spender, uint256 amount) external returns (bool);\n    function allowance(address owner, address spender) external view returns (uint256);\n    function balanceOf(address owner) external view returns (uint256);\n    function balanceOfUnderlying(address owner) external returns (uint256);\n    function getAccountSnapshot(address account) external view returns (uint256, uint256, uint256, uint256);\n    function borrowRatePerBlock() external view returns (uint256);\n    function supplyRatePerBlock() external view returns (uint256);\n    function totalBorrowsCurrent() external returns (uint256);\n    function borrowBalanceCurrent(address account) external returns (uint256);\n    function borrowBalanceStored(address account) external view returns (uint256);\n    function exchangeRateCurrent() external returns (uint256);\n    function exchangeRateStored() external view returns (uint256);\n    function getCash() external view returns (uint256);\n    function accrueInterest() external returns (uint256);\n    function seize(address liquidator, address borrower, uint256 seizeTokens) external returns (uint256);\n    function symbol() external view returns (string memory);\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/access/Ownable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.0) (access/Ownable.sol)\n\npragma solidity ^0.8.20;\n\nimport {Context} from \"../utils/Context.sol\";\n\n/**\n * @dev Contract module which provides a basic access control mechanism, where\n * there is an account (an owner) that can be granted exclusive access to\n * specific functions.\n *\n * The initial owner is set to the address provided by the deployer. This can\n * later be changed with {transferOwnership}.\n *\n * This module is used through inheritance. It will make available the modifier\n * `onlyOwner`, which can be applied to your functions to restrict their use to\n * the owner.\n */\nabstract contract Ownable is Context {\n    address private _owner;\n\n    /**\n     * @dev The caller account is not authorized to perform an operation.\n     */\n    error OwnableUnauthorizedAccount(address account);\n\n    /**\n     * @dev The owner is not a valid owner account. (eg. `address(0)`)\n     */\n    error OwnableInvalidOwner(address owner);\n\n    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);\n\n    /**\n     * @dev Initializes the contract setting the address provided by the deployer as the initial owner.\n     */\n    constructor(address initialOwner) {\n        if (initialOwner == address(0)) {\n            revert OwnableInvalidOwner(address(0));\n        }\n        _transferOwnership(initialOwner);\n    }\n\n    /**\n     * @dev Throws if called by any account other than the owner.\n     */\n    modifier onlyOwner() {\n        _checkOwner();\n        _;\n    }\n\n    /**\n     * @dev Returns the address of the current owner.\n     */\n    function owner() public view virtual returns (address) {\n        return _owner;\n    }\n\n    /**\n     * @dev Throws if the sender is not the owner.\n     */\n    function _checkOwner() internal view virtual {\n        if (owner() != _msgSender()) {\n            revert OwnableUnauthorizedAccount(_msgSender());\n        }\n    }\n\n    /**\n     * @dev Leaves the contract without owner. It will not be possible to call\n     * `onlyOwner` functions. Can only be called by the current owner.\n     *\n     * NOTE: Renouncing ownership will leave the contract without an owner,\n     * thereby disabling any functionality that is only available to the owner.\n     */\n    function renounceOwnership() public virtual onlyOwner {\n        _transferOwnership(address(0));\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Can only be called by the current owner.\n     */\n    function transferOwnership(address newOwner) public virtual onlyOwner {\n        if (newOwner == address(0)) {\n            revert OwnableInvalidOwner(address(0));\n        }\n        _transferOwnership(newOwner);\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`).\n     * Internal function without access restriction.\n     */\n    function _transferOwnership(address newOwner) internal virtual {\n        address oldOwner = _owner;\n        _owner = newOwner;\n        emit OwnershipTransferred(oldOwner, newOwner);\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.1.0) (access/Ownable2Step.sol)\n\npragma solidity ^0.8.20;\n\nimport {Ownable} from \"./Ownable.sol\";\n\n/**\n * @dev Contract module which provides access control mechanism, where\n * there is an account (an owner) that can be granted exclusive access to\n * specific functions.\n *\n * This extension of the {Ownable} contract includes a two-step mechanism to transfer\n * ownership, where the new owner must call {acceptOwnership} in order to replace the\n * old one. This can help prevent common mistakes, such as transfers of ownership to\n * incorrect accounts, or to contracts that are unable to interact with the\n * permission system.\n *\n * The initial owner is specified at deployment time in the constructor for `Ownable`. This\n * can later be changed with {transferOwnership} and {acceptOwnership}.\n *\n * This module is used through inheritance. It will make available all functions\n * from parent (Ownable).\n */\nabstract contract Ownable2Step is Ownable {\n    address private _pendingOwner;\n\n    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);\n\n    /**\n     * @dev Returns the address of the pending owner.\n     */\n    function pendingOwner() public view virtual returns (address) {\n        return _pendingOwner;\n    }\n\n    /**\n     * @dev Starts the ownership transfer of the contract to a new account. Replaces the pending transfer if there is one.\n     * Can only be called by the current owner.\n     *\n     * Setting `newOwner` to the zero address is allowed; this can be used to cancel an initiated ownership transfer.\n     */\n    function transferOwnership(address newOwner) public virtual override onlyOwner {\n        _pendingOwner = newOwner;\n        emit OwnershipTransferStarted(owner(), newOwner);\n    }\n\n    /**\n     * @dev Transfers ownership of the contract to a new account (`newOwner`) and deletes any pending owner.\n     * Internal function without access restriction.\n     */\n    function _transferOwnership(address newOwner) internal virtual override {\n        delete _pendingOwner;\n        super._transferOwnership(newOwner);\n    }\n\n    /**\n     * @dev The new owner accepts the ownership transfer.\n     */\n    function acceptOwnership() public virtual {\n        address sender = _msgSender();\n        if (pendingOwner() != sender) {\n            revert OwnableUnauthorizedAccount(sender);\n        }\n        _transferOwnership(sender);\n    }\n}\n"
+    },
+    "lib/openzeppelin-contracts/contracts/utils/Context.sol": {
+      "content": "// SPDX-License-Identifier: MIT\n// OpenZeppelin Contracts (last updated v5.0.1) (utils/Context.sol)\n\npragma solidity ^0.8.20;\n\n/**\n * @dev Provides information about the current execution context, including the\n * sender of the transaction and its data. While these are generally available\n * via msg.sender and msg.data, they should not be accessed in such a direct\n * manner, since when dealing with meta-transactions the account sending and\n * paying for execution may not be the actual sender (as far as an application\n * is concerned).\n *\n * This contract is only required for intermediate, library-like contracts.\n */\nabstract contract Context {\n    function _msgSender() internal view virtual returns (address) {\n        return msg.sender;\n    }\n\n    function _msgData() internal view virtual returns (bytes calldata) {\n        return msg.data;\n    }\n\n    function _contextSuffixLength() internal view virtual returns (uint256) {\n        return 0;\n    }\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.24+commit.e11b9ed9"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "contract BenqiPriceOracle",
+              "name": "_edgeOracle",
+              "type": "address"
+            },
+            {
+              "internalType": "contract BenqiPriceOracle",
+              "name": "_chainlinkOracle",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "_qiAvaxAddress",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [],
+          "name": "BothOraclesStale",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "timestamp",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "stalenessThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "ChainlinkOracleStalePriceError",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ChainlinkOracleUnresponsive",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ChainlinkOracleZeroPrice",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "DeviationThresholdTooHigh",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "timestamp",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "stalenessThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "EdgeOracleStalePriceError",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "EdgeOracleUnresponsive",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "EdgeOracleZeroPrice",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidAddress",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "InvalidDeviationThreshold",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "manualPrice",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "feedPrice",
+              "type": "uint256"
+            }
+          ],
+          "name": "ManualPriceDeviationError",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "MaxDeviationThresholdTooHigh",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "NoOracleSelected",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            }
+          ],
+          "name": "NoValidFeedForValidation",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "owner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnableInvalidOwner",
+          "type": "error"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "account",
+              "type": "address"
+            }
+          ],
+          "name": "OwnableUnauthorizedAccount",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "PriceDeviationDetected",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "SameOracleAddresses",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "UnconfiguredAsset",
+          "type": "error"
+        },
+        {
+          "inputs": [],
+          "name": "ZeroPrice",
+          "type": "error"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "edgeFeed",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "chainlinkFeed",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "stalenessThreshold",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "deviationThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "AssetOraclesConfigured",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "timestamp",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "stalenessThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "ChainlinkOracleStalePrice",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "oldThreshold",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "DeviationThresholdChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "price",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "setInEdge",
+              "type": "bool"
+            },
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "setInChainlink",
+              "type": "bool"
+            }
+          ],
+          "name": "DirectPriceSet",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "timestamp",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "stalenessThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "EdgeOracleStalePrice",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "oldThreshold",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "newThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "MaxDeviationThresholdChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "OracleAdminTransferred",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "enum BenqiDualOracle.OracleMode",
+              "name": "oldMode",
+              "type": "uint8"
+            },
+            {
+              "indexed": false,
+              "internalType": "enum BenqiDualOracle.OracleMode",
+              "name": "newMode",
+              "type": "uint8"
+            }
+          ],
+          "name": "OracleModeChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "edgePrice",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "chainlinkPrice",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "deviation",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "threshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "OraclePriceDeviation",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "previousOwner",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipTransferStarted",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "previousOwner",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "OwnershipTransferred",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "qiToken",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "price",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "setInEdge",
+              "type": "bool"
+            },
+            {
+              "indexed": false,
+              "internalType": "bool",
+              "name": "setInChainlink",
+              "type": "bool"
+            }
+          ],
+          "name": "UnderlyingPriceSet",
+          "type": "event"
+        },
+        {
+          "inputs": [],
+          "name": "AVAX_UNDERLYING",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "acceptOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "name": "assetConfigs",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "stalenessThreshold",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "isConfigured",
+              "type": "bool"
+            },
+            {
+              "internalType": "uint256",
+              "name": "deviationThreshold",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "chainlinkOracle",
+          "outputs": [
+            {
+              "internalType": "contract BenqiPriceOracle",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "deviationThreshold",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "edgeOracle",
+          "outputs": [
+            {
+              "internalType": "contract BenqiPriceOracle",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "qiToken",
+              "type": "address"
+            }
+          ],
+          "name": "getFeeds",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "edgeFeed",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "chainlinkFeed",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract IQiToken",
+              "name": "qiToken",
+              "type": "address"
+            }
+          ],
+          "name": "getUnderlyingPrice",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "maxDeviationThreshold",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "oracleMode",
+          "outputs": [
+            {
+              "internalType": "enum BenqiDualOracle.OracleMode",
+              "name": "",
+              "type": "uint8"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "pendingOwner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "qiAvaxAddress",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "renounceOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "edgeFeed",
+              "type": "address"
+            },
+            {
+              "internalType": "address",
+              "name": "chainlinkFeed",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "stalenessThreshold",
+              "type": "uint256"
+            },
+            {
+              "internalType": "uint256",
+              "name": "customDeviationThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "setAssetOracles",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "newThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "setDeviationThreshold",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "asset",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "price",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "setInEdge",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "setInChainlink",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "manualOverrideAllowed",
+              "type": "bool"
+            }
+          ],
+          "name": "setDirectPrice",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "uint256",
+              "name": "newMaxThreshold",
+              "type": "uint256"
+            }
+          ],
+          "name": "setMaxDeviationThreshold",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "enum BenqiDualOracle.OracleMode",
+              "name": "_mode",
+              "type": "uint8"
+            }
+          ],
+          "name": "setOracleMode",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "contract IQiToken",
+              "name": "qiToken",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "underlyingPriceMantissa",
+              "type": "uint256"
+            },
+            {
+              "internalType": "bool",
+              "name": "setInEdge",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "setInChainlink",
+              "type": "bool"
+            },
+            {
+              "internalType": "bool",
+              "name": "manualOverrideAllowed",
+              "type": "bool"
+            }
+          ],
+          "name": "setUnderlyingPrice",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "transferOracleAdmins",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "transferOwnership",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "BENQI Finance",
+        "details": "Dual oracle system with mechanisms for:      - Staleness detection      - Price deviation detection      - Automatic fallback between oracles      - Manual override to use only one oracle in case of compromise",
+        "errors": {
+          "OwnableInvalidOwner(address)": [
+            {
+              "details": "The owner is not a valid owner account. (eg. `address(0)`)"
+            }
+          ],
+          "OwnableUnauthorizedAccount(address)": [
+            {
+              "details": "The caller account is not authorized to perform an operation."
+            }
+          ]
+        },
+        "kind": "dev",
+        "methods": {
+          "acceptOwnership()": {
+            "details": "The new owner accepts the ownership transfer."
+          },
+          "constructor": {
+            "params": {
+              "_chainlinkOracle": "Address of the Chainlink oracle contract",
+              "_edgeOracle": "Address of the Edge oracle contract",
+              "_qiAvaxAddress": "Address of the qiAVAX token"
+            }
+          },
+          "getFeeds(address)": {
+            "details": "Reads feed addresses directly from the oracle contracts using the underlying token",
+            "params": {
+              "qiToken": "The qiToken to get feed addresses for"
+            },
+            "returns": {
+              "chainlinkFeed": "The Chainlink oracle feed address",
+              "edgeFeed": "The Edge oracle feed address"
+            }
+          },
+          "getUnderlyingPrice(address)": {
+            "details": "Implements the fallback logic between Edge and Chainlink oracles",
+            "params": {
+              "qiToken": "The QiToken whose underlying asset price is being fetched"
+            },
+            "returns": {
+              "_0": "The price of the underlying asset in USD, scaled to 18 decimals"
+            }
+          },
+          "owner()": {
+            "details": "Returns the address of the current owner."
+          },
+          "pendingOwner()": {
+            "details": "Returns the address of the pending owner."
+          },
+          "renounceOwnership()": {
+            "details": "Leaves the contract without owner. It will not be possible to call `onlyOwner` functions. Can only be called by the current owner. NOTE: Renouncing ownership will leave the contract without an owner, thereby disabling any functionality that is only available to the owner."
+          },
+          "setAssetOracles(address,address,address,uint256,uint256)": {
+            "details": "Configures both Edge and Chainlink oracles for a single asset",
+            "params": {
+              "asset": "The ERC20 token address to configure",
+              "chainlinkFeed": "The Chainlink price feed address",
+              "customDeviationThreshold": "Custom deviation threshold for this asset (0 = use default)",
+              "edgeFeed": "The Edge price feed address",
+              "stalenessThreshold": "Time in seconds before a price is considered stale"
+            }
+          },
+          "setDeviationThreshold(uint256)": {
+            "details": "Only callable by owner",
+            "params": {
+              "newThreshold": "New deviation threshold (in 18 decimals)"
+            }
+          },
+          "setDirectPrice(address,uint256,bool,bool,bool)": {
+            "details": "Only callable by owner, propagates the price to both oracles",
+            "params": {
+              "asset": "The asset address to set the price for",
+              "manualOverrideAllowed": "If true, skips feed price deviation validation",
+              "price": "The price to set (scaled to 18 decimals)",
+              "setInChainlink": "Whether to set the price in the Chainlink oracle",
+              "setInEdge": "Whether to set the price in the Edge oracle"
+            }
+          },
+          "setMaxDeviationThreshold(uint256)": {
+            "details": "Only callable by owner",
+            "params": {
+              "newMaxThreshold": "New maximum deviation threshold (in 18 decimals)"
+            }
+          },
+          "setOracleMode(uint8)": {
+            "details": "Only callable by owner, allows switching between dual mode and single oracle modes",
+            "params": {
+              "_mode": "The oracle mode to set"
+            }
+          },
+          "setUnderlyingPrice(address,uint256,bool,bool,bool)": {
+            "details": "Only callable by owner, propagates the price to both oracles",
+            "params": {
+              "manualOverrideAllowed": "If true, skips feed price deviation validation",
+              "qiToken": "The QiToken to set the underlying price for",
+              "setInChainlink": "Whether to set the price in the Chainlink oracle",
+              "setInEdge": "Whether to set the price in the Edge oracle",
+              "underlyingPriceMantissa": "The price to set (scaled to 18 decimals)"
+            }
+          },
+          "transferOracleAdmins(address)": {
+            "details": "Only callable by owner",
+            "params": {
+              "newAdmin": "The address to receive admin rights"
+            }
+          },
+          "transferOwnership(address)": {
+            "details": "Starts the ownership transfer of the contract to a new account. Replaces the pending transfer if there is one. Can only be called by the current owner. Setting `newOwner` to the zero address is allowed; this can be used to cancel an initiated ownership transfer."
+          }
+        },
+        "title": "BenqiDualOracle",
+        "version": 1
+      },
+      "userdoc": {
+        "errors": {
+          "BothOraclesStale()": [
+            {
+              "notice": "Error when both oracles report stale prices"
+            }
+          ],
+          "ChainlinkOracleStalePriceError(address,uint256,uint256)": [
+            {
+              "notice": "Error when Chainlink oracle price is stale"
+            }
+          ],
+          "ChainlinkOracleUnresponsive()": [
+            {
+              "notice": "Error when Chainlink oracle is unresponsive"
+            }
+          ],
+          "ChainlinkOracleZeroPrice()": [
+            {
+              "notice": "Error when Chainlink oracle returns zero price"
+            }
+          ],
+          "DeviationThresholdTooHigh()": [
+            {
+              "notice": "Error when deviation threshold is set too high"
+            }
+          ],
+          "EdgeOracleStalePriceError(address,uint256,uint256)": [
+            {
+              "notice": "Error when Edge oracle price is stale"
+            }
+          ],
+          "EdgeOracleUnresponsive()": [
+            {
+              "notice": "Error when Edge oracle is unresponsive"
+            }
+          ],
+          "EdgeOracleZeroPrice()": [
+            {
+              "notice": "Error when Edge oracle returns zero price"
+            }
+          ],
+          "InvalidAddress()": [
+            {
+              "notice": "Error for zero or invalid addresses"
+            }
+          ],
+          "InvalidDeviationThreshold()": [
+            {
+              "notice": "Error when deviation threshold is invalid"
+            }
+          ],
+          "ManualPriceDeviationError(address,uint256,uint256)": [
+            {
+              "notice": "Error when manual price has significant deviation from feed price"
+            }
+          ],
+          "MaxDeviationThresholdTooHigh()": [
+            {
+              "notice": "Error when maximum deviation threshold is set too high"
+            }
+          ],
+          "NoOracleSelected()": [
+            {
+              "notice": "Error when no oracle is selected for price setting"
+            }
+          ],
+          "NoValidFeedForValidation(address)": [
+            {
+              "notice": "Error when no valid feed price is available for validation during manual price setting"
+            }
+          ],
+          "PriceDeviationDetected()": [
+            {
+              "notice": "Error when price deviation exceeds threshold"
+            }
+          ],
+          "SameOracleAddresses()": [
+            {
+              "notice": "Error when both oracles have the same addresses"
+            }
+          ],
+          "UnconfiguredAsset()": [
+            {
+              "notice": "Error when asset is not configured in the system"
+            }
+          ],
+          "ZeroPrice()": [
+            {
+              "notice": "Error when setting a zero price"
+            }
+          ]
+        },
+        "events": {
+          "AssetOraclesConfigured(address,address,address,uint256,uint256)": {
+            "notice": "Emitted when an asset's oracle feeds are configured"
+          },
+          "ChainlinkOracleStalePrice(address,uint256,uint256)": {
+            "notice": "Emitted when Chainlink oracle reports a stale price"
+          },
+          "DeviationThresholdChanged(uint256,uint256)": {
+            "notice": "Emitted when global deviation threshold is changed"
+          },
+          "DirectPriceSet(address,uint256,bool,bool)": {
+            "notice": "Emitted when direct price is set"
+          },
+          "EdgeOracleStalePrice(address,uint256,uint256)": {
+            "notice": "Emitted when Edge oracle reports a stale price"
+          },
+          "MaxDeviationThresholdChanged(uint256,uint256)": {
+            "notice": "Emitted when maximum deviation threshold is changed"
+          },
+          "OracleAdminTransferred(address)": {
+            "notice": "Emitted when oracle admin rights are transferred"
+          },
+          "OracleModeChanged(uint8,uint8)": {
+            "notice": "Emitted when oracle mode is changed"
+          },
+          "OraclePriceDeviation(address,uint256,uint256,uint256,uint256)": {
+            "notice": "Emitted when there's a significant deviation between oracle prices"
+          },
+          "UnderlyingPriceSet(address,uint256,bool,bool)": {
+            "notice": "Emitted when underlying price is set"
+          }
+        },
+        "kind": "user",
+        "methods": {
+          "AVAX_UNDERLYING()": {
+            "notice": "AVAX's \"underlying\" address representation"
+          },
+          "assetConfigs(address)": {
+            "notice": "Mapping from asset address to oracle configuration"
+          },
+          "chainlinkOracle()": {
+            "notice": "Backup oracle (Chainlink)"
+          },
+          "constructor": {
+            "notice": "Constructs the dual oracle system"
+          },
+          "deviationThreshold()": {
+            "notice": "Default maximum allowed deviation between oracle prices (5% in 18 decimals)"
+          },
+          "edgeOracle()": {
+            "notice": "Primary oracle (Edge)"
+          },
+          "getFeeds(address)": {
+            "notice": "Gets the feed addresses for a qiToken from both oracles"
+          },
+          "getUnderlyingPrice(address)": {
+            "notice": "Gets the price of an underlying asset"
+          },
+          "maxDeviationThreshold()": {
+            "notice": "Maximum allowed deviation threshold (20% in 18 decimals)"
+          },
+          "oracleMode()": {
+            "notice": "Current oracle mode"
+          },
+          "qiAvaxAddress()": {
+            "notice": "Address of the qiAVAX token"
+          },
+          "setAssetOracles(address,address,address,uint256,uint256)": {
+            "notice": "Sets up oracle feeds for an asset"
+          },
+          "setDeviationThreshold(uint256)": {
+            "notice": "Set the global deviation threshold"
+          },
+          "setDirectPrice(address,uint256,bool,bool,bool)": {
+            "notice": "Sets the direct price for an asset in both underlying oracles"
+          },
+          "setMaxDeviationThreshold(uint256)": {
+            "notice": "Set the maximum allowed deviation threshold"
+          },
+          "setOracleMode(uint8)": {
+            "notice": "Sets the oracle mode"
+          },
+          "setUnderlyingPrice(address,uint256,bool,bool,bool)": {
+            "notice": "Sets the underlying price for a QiToken in both underlying oracles"
+          },
+          "transferOracleAdmins(address)": {
+            "notice": "Transfers admin rights of both oracle contracts to a new address"
+          }
+        },
+        "notice": "Implements a dual oracle system with Edge as primary and Chainlink as backup",
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "Oracle/BenqiDualOracle.sol": "BenqiDualOracle"
+      },
+      "evmVersion": "cancun",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+        ":chainlink/=lib/chainlink/",
+        ":erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        ":forge-std/=lib/forge-std/src/",
+        ":halmos-cheatcodes/=lib/openzeppelin-contracts/lib/halmos-cheatcodes/src/",
+        ":openzeppelin-contracts/=lib/openzeppelin-contracts/"
+      ]
+    },
+    "sources": {
+      "Oracle/BenqiDualOracle.sol": {
+        "keccak256": "0xc0ee13da5fa430b96b1ddf6c66f96c41e2bf91849c7a2fe4ff1255a1f4ce897d",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://34c49f33c8f967af7bf26ef4972b24f5f38fc3878824be18a59e22b1858bf1a3",
+          "dweb:/ipfs/QmQAFjAui9boHbSH7sLjtCEPvd5AZeTKpAuhxRujuZqW4y"
+        ]
+      },
+      "Oracle/BenqiPriceOracle.sol": {
+        "keccak256": "0xd2ea54898477201b8e2806858585772110f315a1286be88452d122a1c10eb702",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://ba3331085543f052c99aa385f50bb743688b6e67670261cd603f6170a68c7277",
+          "dweb:/ipfs/QmWC1hukFq34H74JsaC1qXhrPBpRcFJuPVBMnt96QYWzNc"
+        ]
+      },
+      "Oracle/interfaces/IAggregatorV2V3Interface.sol": {
+        "keccak256": "0x54045cafe0c355cb40aa946b7b29f5107f8b358888b0621ba14548091f1b1e60",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://cd80840c8b736b2431c1a2055c284127cf57ea66c3738845bd083661adac7f34",
+          "dweb:/ipfs/QmVKmyva8p8rDC58tboAzcJwEanu9kAUmUjM2BMgdk9LVX"
+        ]
+      },
+      "Oracle/interfaces/IBenqiPriceOracle.sol": {
+        "keccak256": "0xaac9cbca3c0104971751e9ab072ef0f69ed388fafa38768dba7af7145da7944c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://727d25c64cca133a63137e0e9d8cabe70d13f5725aba10914d4cb179526d34cd",
+          "dweb:/ipfs/QmNzMjsCiGBRwyzbwtoVAiowbGBQ8B9s3nauFSEN2ERrq5"
+        ]
+      },
+      "Oracle/interfaces/IEIP20Interface.sol": {
+        "keccak256": "0x28af6f1802a5e90695e2d5bc8c2ada2ca95cf244e88b48fb91b9a6be6f41c54e",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://3298976f2fd09c129f4b0720bf23d992fd99dfc7d456193813f2340e35d5731f",
+          "dweb:/ipfs/QmXDYUfUMcjTC2YAi2w9NM4rXbFzV5Uv1j8uuK6EvW21Hw"
+        ]
+      },
+      "Oracle/interfaces/IPriceOracle.sol": {
+        "keccak256": "0xbabbce0277da5b47fc76da4e072bb4687f39fc9adb5368a0986fc36dafa342a2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e488abb4c316f6617690bbc077032802f0d6eadceaa6850710366ddf8fbf1b52",
+          "dweb:/ipfs/QmXkx8bjUNhNpdZXCznnEwnQS66AoVnZB5dCDeRsDbRB2y"
+        ]
+      },
+      "Oracle/interfaces/IQiErc20.sol": {
+        "keccak256": "0xf77f35a2888f5a98e2b903c471993f7c5cd404262576052b6b69e05617a77904",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e2d7c287dfef8d3e1a7f679b7110a6c39e293ddcd41676b228f48f3004b35112",
+          "dweb:/ipfs/QmXfx6mqS1PLy5ezesjWnzV4ph43BtF7sWwCRNVXMeXx77"
+        ]
+      },
+      "Oracle/interfaces/IQiToken.sol": {
+        "keccak256": "0x18ff0562d0a717d1159e6b3f950a2559918a89ed7eb1dbb2977e5f53660936e2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://be22cd6cce2b72f8323a31e85c9058663b3d54ee49afe526e3341e091922d1e3",
+          "dweb:/ipfs/QmXSoFjkFLJyYzvUYaGwwvPkDHH4W6MY82bRS97qfpHe3m"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/access/Ownable.sol": {
+        "keccak256": "0xff6d0bb2e285473e5311d9d3caacb525ae3538a80758c10649a4d61029b017bb",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://8ed324d3920bb545059d66ab97d43e43ee85fd3bd52e03e401f020afb0b120f6",
+          "dweb:/ipfs/QmfEckWLmZkDDcoWrkEvMWhms66xwTLff9DDhegYpvHo1a"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/access/Ownable2Step.sol": {
+        "keccak256": "0xdcad8898fda432696597752e8ec361b87d85c82cb258115427af006dacf7128c",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://e2c9d517f0c136d54bd00cd57959d25681d4d6273f5bbbc263afe228303772f0",
+          "dweb:/ipfs/QmReNFjXBiufByiAAzfSQ2SM5r3qeUErn46BmN3yVRvrek"
+        ]
+      },
+      "lib/openzeppelin-contracts/contracts/utils/Context.sol": {
+        "keccak256": "0x493033a8d1b176a037b2cc6a04dad01a5c157722049bbecf632ca876224dd4b2",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://6a708e8a5bdb1011c2c381c9a5cfd8a9a956d7d0a9dc1bd8bcdaf52f76ef2f12",
+          "dweb:/ipfs/Qmax9WHBnVsZP46ZxEMNRQpLQnrdE4dK8LehML1Py8FowF"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.24+commit.e11b9ed9",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "libraries": {},
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "cancun",
+      "remappings": [
+        "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+        "chainlink/=lib/chainlink/",
+        "erc4626-tests/=lib/openzeppelin-contracts/lib/erc4626-tests/",
+        "forge-std/=lib/forge-std/src/",
+        "halmos-cheatcodes/=lib/openzeppelin-contracts/lib/halmos-cheatcodes/src/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/"
+      ]
+    },
+    "name": "BenqiDualOracle",
+    "fullyQualifiedName": "Oracle/BenqiDualOracle.sol:BenqiDualOracle"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "9543876",
+  "creationMatch": "exact_match",
+  "runtimeMatch": "exact_match",
+  "verifiedAt": "2025-10-20T09:12:21Z",
+  "match": "exact_match",
+  "chainId": "43114",
+  "address": "0x926C0857bcB6b109C1260c3b6660EfA8E633d73A"
+}
