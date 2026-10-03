@@ -620,7 +620,14 @@ def main():
         queue=iter(pending)
         futures={pool.submit(fetch,e):e for e in [next(queue,None) for _ in range(args.workers)] if e is not None}
         while futures:
-            future=next(concurrent.futures.as_completed(futures))
+            finished,_=concurrent.futures.wait(futures,timeout=30,return_when=concurrent.futures.FIRST_COMPLETED)
+            if not finished:
+                if time.time()-last>90:
+                    summarize(entries,results)
+                    if args.push:push(f'Checkpoint source downloads: {len(results)}/{len(entries)} URLs processed')
+                    last=time.time()
+                continue
+            future=next(iter(finished))
             futures.pop(future)
             r=future.result();results[r['id']]=r;n+=1
             print(f"{n}/{len(pending)} {r['status']} {r['url']}"+((' '+r['error']) if 'error' in r else ''),flush=True)
