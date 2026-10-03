@@ -437,7 +437,7 @@ def ipfs_bytes(cid):
             if isinstance(result,Exception):raise result
             return result
         errors=[]
-        for gateway in ('https://gateway.pinata.cloud/ipfs/','https://ipfs.io/ipfs/','https://dweb.link/ipfs/'):
+        for gateway in ('https://ipfs.filebase.io/ipfs/','https://gateway.pinata.cloud/ipfs/','https://ipfs.io/ipfs/','https://dweb.link/ipfs/'):
             try:
                 path,_=download(gateway+cid,retries=1,timeout=25);body=path.read_bytes();path.unlink(missing_ok=True);IPFS_CACHE[cid]=body;return body
             except Exception as e:errors.append(str(e))
