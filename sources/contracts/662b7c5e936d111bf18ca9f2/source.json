@@ -1,0 +1,573 @@
+{
+  "file_path": "YBCRewardDistributor.vy",
+  "creation_status": "success",
+  "source_code": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title YBC Reward Distributor\n@author Yearn Finance\n@license GNU AGPLv3\n@notice YBC module that deals with distributing rewards originating from the Collective's staking position(s).\n        Any state change forwarded by the upstream YBC weight aggregator results in a rewards claim through\n        the YBC and is distributed proportionally to each member according to their aggregated staked balance.\n        The contract can be killed, permanently disabling further yield claiming from the YBC while keeping\n        the ability for members to claim already earned rewards intact.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IYBC:\n    def call(_target: address, _data: Bytes[2048]): nonpayable\n\ninterface IComponent:\n    def claim(_account: address) -> uint256: nonpayable\n\ninterface IHooks:\n    def on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _value: uint256): nonpayable\n    def on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n\ninterface IWeightAggregator:\n    def supply() -> uint256: view\n    def staked(_account: address) -> uint256: view\n\nimplements: IHooks\nimplements: IComponent\n\nybc: public(immutable(IYBC))\ntoken: public(immutable(IERC20))\nmanagement: public(address)\npending_management: public(address)\nkilled: public(bool)\nweight_aggregator: public(IWeightAggregator)\nupstream_weights: public(address)\nclaim_from: public(address)\nclaimers: public(HashMap[address, bool])\n\nlast_balance: public(uint256)\nreward_integral: public(uint256)\naccount_reward_integral: public(HashMap[address, uint256])\npending_rewards: public(HashMap[address, uint256])\n\nevent Claim:\n    account: indexed(address)\n    rewards: uint256\n\nevent Kill: pass\n\nevent SetWeightAggregator:\n    aggregator: indexed(address)\n\nevent SetUpstreamWeights:\n    upstream: indexed(address)\n\nevent SetClaimFrom:\n    claim: indexed(address)\n\nevent SetClaimer:\n    account: indexed(address)\n    claimer: bool\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPRECISION: constant(uint256) = 10**30\n\n@deploy\ndef __init__(_ybc: address, _token: address):\n    \"\"\"\n    @notice Constructor\n    @param _ybc YBC address\n    @param _token Reward token address\n    \"\"\"\n    ybc = IYBC(_ybc)\n    token = IERC20(_token)\n    self.management = msg.sender\n\n@external\ndef claim(_account: address) -> uint256:\n    \"\"\"\n    @notice Claim rewards on behalf of an account\n    @param _account Account to claim rewards for\n    @return Amount of rewards tokens claimed\n    \"\"\"\n    staked: uint256 = staticcall self.weight_aggregator.staked(_account)\n    if staked == 0 and self.pending_rewards[_account] == 0:\n        # shortcut accounts that have never participated in the YBC\n        return 0\n\n    assert self.claimers[msg.sender]\n\n    supply: uint256 = staticcall self.weight_aggregator.supply()\n    self._sync_integral(supply)\n    pending: uint256 = self._sync_account_integral(_account, staked)\n    if pending > 0:\n        self.pending_rewards[_account] = 0\n        self.last_balance -= pending\n        assert extcall token.transfer(msg.sender, pending, default_return_value=True)\n        log Claim(account=_account, rewards=pending)\n\n    return pending\n\n@external\ndef sync_rewards():\n    \"\"\"\n    @notice Synchronize rewards by claiming from the YBC\n    \"\"\"\n    supply: uint256 = staticcall self.weight_aggregator.supply()\n    self._sync_integral(supply)\n\n@external\ndef on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon transfer of tokens\n    @param _caller Originator of the transfer\n    @param _from Sender of the token\n    @param _to Recipient of the tokens\n    @param _supply Total staked of all YBC members\n    @param _prev_staked_from Staked balance of sender before transfer\n    @param _prev_staked_to Staked balance of recipient before transfer\n    @param _amount Amount of tokens to transfer\n    @dev Should only be called if both sender and recipient are members of the YBC\n    \"\"\"\n    assert msg.sender == self.upstream_weights\n\n    self._sync_integral(_supply)\n    self._sync_account_integral(_from, _prev_staked_from)\n    self._sync_account_integral(_to, _prev_staked_to)\n\n@external\ndef on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon staking of tokens\n    @param _caller Originator of the tokens\n    @param _account Recipient of the staked tokens\n    @param _prev_supply Total staked of all YBC members, before stake\n    @param _prev_staked Staked balance of recipient before stake\n    @param _amount Amount of tokens to stake\n    @dev Should only be called if account is a member of the YBC\n    \"\"\"\n    assert msg.sender == self.upstream_weights\n\n    self._sync_integral(_prev_supply)\n    self._sync_account_integral(_account, _prev_staked)\n\n@external\ndef on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon unstaking of tokens\n    @param _account Originator of the staked tokens\n    @param _prev_supply Total staked of all YBC members, before unstake\n    @param _prev_staked Staked balance of originator before unstake\n    @param _amount Amount of tokens to unstake\n    @dev Should only be called if account is a member of the YBC\n    \"\"\"\n    assert msg.sender == self.upstream_weights\n\n    self._sync_integral(_prev_supply)\n    self._sync_account_integral(_account, _prev_staked)\n\n@external\ndef kill():\n    \"\"\"\n    @notice Kill the contract, permanently disabling claiming of new rewards from the YBC\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert not self.killed\n\n    self.killed = True\n    log Kill()\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _token != token.address or self.killed\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_weight_aggregator(_aggregator: address):\n    \"\"\"\n    @notice Set the YBC weight aggregator\n    @param _aggregator Weight aggregator address\n    @dev Can only be called by management\n    @dev Should only aggregate weights of members of the YBC\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.weight_aggregator = IWeightAggregator(_aggregator)\n    log SetWeightAggregator(aggregator=_aggregator)\n\n@external\ndef set_upstream_weights(_upstream: address):\n    \"\"\"\n    @notice Set the upstream address where weight hooks are originating from\n    @param _upstream Upstream weight hook address\n    @dev Can only be called by management\n    @dev Upstream should only send hooks for members of the YBC\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.upstream_weights = _upstream\n    log SetUpstreamWeights(upstream=_upstream)\n\n@external\ndef set_claim_from(_claim: address):\n    \"\"\"\n    @notice Set the address to claim YBC rewards from\n    @param _claim Claim contract\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.claim_from = _claim\n    log SetClaimFrom(claim=_claim)\n\n@external\ndef set_claimer(_account: address, _claimer: bool):\n    \"\"\"\n    @notice Whitelist account as reward claimer\n    @param _account Account\n    @param _claimer True: add to whitelist, False: remove from whitelist\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.claimers[_account] = _claimer\n    log SetClaimer(account=_account, claimer=_claimer)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\ndef _sync_integral(_supply: uint256):\n    \"\"\"\n    @notice Claim rewards through the YBC and update integral.\n            Should be called before any state change\n    \"\"\"\n    if _supply < 10**12:\n        # no reward accrual if YBC members dont have anything staked\n        return\n\n    if not self.killed:\n        # claim rewards from YBC\n        extcall ybc.call(self.claim_from, abi_encode(self, method_id=method_id(\"claim(address)\")))\n\n    # use token balance change to be able to accept donations\n    balance: uint256 = staticcall token.balanceOf(self)\n    rewards: uint256 = balance - self.last_balance\n\n    self.last_balance = balance\n    self.reward_integral += rewards * PRECISION // _supply\n\n@internal\ndef _sync_account_integral(_account: address, _staked: uint256) -> uint256:\n    \"\"\"\n    @notice Update users integral by attributing rewards to them.\n            Should be called before any state change involving the user\n    \"\"\"\n    integral: uint256 = self.reward_integral\n    pending: uint256 = self.pending_rewards[_account]\n\n    if _staked > 0:\n        pending += (integral - self.account_reward_integral[_account]) * _staked // PRECISION\n        self.pending_rewards[_account] = pending\n    self.account_reward_integral[_account] = integral\n\n    return pending",
+  "deployed_bytecode": "0x5f3560e01c60026016820660011b610b4c01601e395f51565b631e83409a811861095557602436103417610b48576004358060a01c610b4857610180526003546398807d846101c052610180516101e05260206101c060246101dc845afa610069573d5f5f3e3d5ffd5b60203d10610b48576101c09050516101a0526101a05161009957600a610180516020525f5260405f20541561009b565b5f5b156100af575f6101c05260206101c0610213565b6006336020525f5260405f205415610b485760035463047fc9aa6101e05260206101e060046101fc845afa6100e6573d5f5f3e3d5ffd5b60203d10610b48576101e09050516101c0526101c051604052610107610959565b604061018060405e61011a610200610a9e565b610200516101e0526101e0511561020d575f600a610180516020525f5260405f20556007546101e051808203828111610b4857905090506007556020610b985f395f5163a9059cbb6102005233610220526101e051610240526020610200604461021c5f855af161018d573d5f5f3e3d5ffd5b3d6101a457803b15610b48576001610260526101ce565b3d602081183d6020100218806102000161022011610b4857610200518060011c610b485761026052505b61026090505115610b4857610180517f47cee97cb7acd717b3c0aa1435d004cd5b3c8c57d70dbceb4e4458bbd60e39d46101e051610200526020610200a25b60206101e05bf35b63476232ad81186109555734610b485760035463047fc9aa6101a05260206101a060046101bc845afa61024a573d5f5f3e3d5ffd5b60203d10610b48576101a0905051610180526101805160405261026b610959565b005b63a92d8b5281186103005760e436103417610b48576004358060a01c610b4857610180526024358060a01c610b48576101a0526044358060a01c610b48576101c0526004543318610b48576064356040526102c6610959565b6101a0516040526084356060526102de6101e0610a9e565b6101e0506101c05160405260a4356060526102fa6101e0610a9e565b6101e050005b63aaa626b681186109555734610b485760085460405260206040f35b63311c744f81186109555760a436103417610b48576004358060a01c610b4857610180526024358060a01c610b48576101a0526004543318610b4857604435604052610366610959565b6101a05160405260643560605261037e6101c0610a9e565b6101c050005b63abdf488481186103dd57608436103417610b48576004358060a01c610b4857610180526004543318610b48576024356040526103bf610959565b610180516040526044356060526103d76101a0610a9e565b6101a050005b6388a8d60281186109555734610b48575f5460405260206040f35b6341c0e1b581186104435734610b48575f543318610b4857600254610b485760016002557fbe26733c2bf6ff3ea5ba8cfe744422bd49052ff9ed5685c9e81e6f9321dbaddd5f6040a1005b63be5241f5811861095557602436103417610b48576004358060a01c610b48576040525f543318610b48576040516003556040517f77133ac9c63a1066a18fb66f8c8219f3d4aac870af2b64d4c0b2028f16c236615f6060a2005b6301681a62811861095557602436103417610b48577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526104f8565b636ea056a9811861095557604436103417610b48576024356060525b6004358060a01c610b48576040525f543318610b48576020610b985f395f516040511461052657600161052a565b6002545b15610b485760605160805260605119610574576040516370a0823160a0523060c052602060a0602460bc845afa610563573d5f5f3e3d5ffd5b60203d10610b485760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af16105a1573d5f5f3e3d5ffd5b3d6105b857803b15610b48576001610100526105df565b3d602081183d60201002188060a00160c011610b485760a0518060011c610b485761010052505b61010090505115610b4857005b63cfcd38b9811861095557602436103417610b48576004358060a01c610b48576040525f543318610b48576040516004556040517fffffae87477c2954622703ffa7b5a2fe5246a279988ffdea173cbc03d3a509a15f6060a2005b636c3ef35081186106a257602436103417610b48576004358060a01c610b48576040525f543318610b48576040516005556040517f6204fdd2b5739db0c92206f8eca8e4d67322d19af23eeb4b85afa82dd6e544b15f6060a2005b63770817ec81186109555734610b485760015460405260206040f35b63bbc223f5811861073a57604436103417610b48576004358060a01c610b48576040526024358060011c610b48576060525f543318610b485760605160066040516020525f5260405f20556040517f4dc837210548516568378153706718ba26db8d3f26eb60b45084ce5194c2872860605160805260206080a2005b630727adb381186109555734610b485760075460405260206040f35b63fd066ecc81186107b157602436103417610b48576004358060a01c610b48576040525f543318610b48576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c81186107f95734610b48576001543318610b48575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b621a474081186109555734610b48576020610b7860403960206040f35b63fc0c546a81186108345734610b48576020610b9860403960206040f35b632975e99a811861095557602436103417610b48576004358060a01c610b4857604052600a6040516020525f5260405f205460605260206060f35b631f3a0e4181186109555734610b485760025460405260206040f35b6322ef32ed81186109555734610b485760035460405260206040f35b63723768ba81186108c35734610b485760045460405260206040f35b63d2ea3fb081186108df5734610b485760055460405260206040f35b632ac7183e811861095557602436103417610b48576004358060a01c610b485760405260096040516020525f5260405f205460605260206060f35b63da62fba9811861095557602436103417610b48576004358060a01c610b485760405260066040516020525f5260405f205460605260206060f35b5f5ffd5b64e8d4a50fff6040511115610a9c576002546109f3576020610b785f395f51631b8b921d60c052604060055460e0528061010052631e83409a60645260043060845260200160605260608160e001604482825e8051806020830101601f825f03163682375050601f19601f825160200101169050905081015050803b15610b48575f60c060a460dc5f855af16109f1573d5f5f3e3d5ffd5b505b6020610b985f395f516370a082316080523060a052602060806024609c845afa610a1f573d5f5f3e3d5ffd5b60203d10610b48576080905051606052606051600754808203828111610b4857905090506080526060516007556008546080516c0c9f2c9cd04674edea400000008102816c0c9f2c9cd04674edea40000000820418610b485790506040518015610b485780820490509050808201828110610b4857905090506008555b565b600854608052600a6040516020525f5260405f205460a05260605115610b2e5760a05160805160096040516020525f5260405f2054808203828111610b485790509050606051808202811583838304141715610b4857905090506c0c9f2c9cd04674edea4000000081049050808201828110610b48579050905060a05260a051600a6040516020525f5260405f20555b60805160096040516020525f5260405f205560a051815250565b5f80fd026d091a0955086f064703f8049e0955095502150816031c08a7088b00180955075606be095504dc038405ec000000000000000000000000d6afd78c05f0d425f2b46359746dd44991dcb315000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf6204",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "YBCRewardDistributor.vy": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "0xd6AFd78C05f0d425F2b46359746dD44991dCB315",
+      {
+        "name": "_ybc",
+        "type": "address"
+      }
+    ],
+    [
+      "0xBe53A109B494E5c9f97b9Cd39Fe969BE68BF6204",
+      {
+        "name": "_token",
+        "type": "address"
+      }
+    ]
+  ],
+  "compiler_version": "v0.4.2+commit.c216787f",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-06-06T02:13:46.031012Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x610b98515034610054576020610c085f395f518060a01c610054576040526020610c285f395f518060a01c61005457606052604051610b7852606051610b9852335f55610b7861005861000039610bb8610000f35b5f80fd5f3560e01c60026016820660011b610b4c01601e395f51565b631e83409a811861095557602436103417610b48576004358060a01c610b4857610180526003546398807d846101c052610180516101e05260206101c060246101dc845afa610069573d5f5f3e3d5ffd5b60203d10610b48576101c09050516101a0526101a05161009957600a610180516020525f5260405f20541561009b565b5f5b156100af575f6101c05260206101c0610213565b6006336020525f5260405f205415610b485760035463047fc9aa6101e05260206101e060046101fc845afa6100e6573d5f5f3e3d5ffd5b60203d10610b48576101e09050516101c0526101c051604052610107610959565b604061018060405e61011a610200610a9e565b610200516101e0526101e0511561020d575f600a610180516020525f5260405f20556007546101e051808203828111610b4857905090506007556020610b985f395f5163a9059cbb6102005233610220526101e051610240526020610200604461021c5f855af161018d573d5f5f3e3d5ffd5b3d6101a457803b15610b48576001610260526101ce565b3d602081183d6020100218806102000161022011610b4857610200518060011c610b485761026052505b61026090505115610b4857610180517f47cee97cb7acd717b3c0aa1435d004cd5b3c8c57d70dbceb4e4458bbd60e39d46101e051610200526020610200a25b60206101e05bf35b63476232ad81186109555734610b485760035463047fc9aa6101a05260206101a060046101bc845afa61024a573d5f5f3e3d5ffd5b60203d10610b48576101a0905051610180526101805160405261026b610959565b005b63a92d8b5281186103005760e436103417610b48576004358060a01c610b4857610180526024358060a01c610b48576101a0526044358060a01c610b48576101c0526004543318610b48576064356040526102c6610959565b6101a0516040526084356060526102de6101e0610a9e565b6101e0506101c05160405260a4356060526102fa6101e0610a9e565b6101e050005b63aaa626b681186109555734610b485760085460405260206040f35b63311c744f81186109555760a436103417610b48576004358060a01c610b4857610180526024358060a01c610b48576101a0526004543318610b4857604435604052610366610959565b6101a05160405260643560605261037e6101c0610a9e565b6101c050005b63abdf488481186103dd57608436103417610b48576004358060a01c610b4857610180526004543318610b48576024356040526103bf610959565b610180516040526044356060526103d76101a0610a9e565b6101a050005b6388a8d60281186109555734610b48575f5460405260206040f35b6341c0e1b581186104435734610b48575f543318610b4857600254610b485760016002557fbe26733c2bf6ff3ea5ba8cfe744422bd49052ff9ed5685c9e81e6f9321dbaddd5f6040a1005b63be5241f5811861095557602436103417610b48576004358060a01c610b48576040525f543318610b48576040516003556040517f77133ac9c63a1066a18fb66f8c8219f3d4aac870af2b64d4c0b2028f16c236615f6060a2005b6301681a62811861095557602436103417610b48577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526104f8565b636ea056a9811861095557604436103417610b48576024356060525b6004358060a01c610b48576040525f543318610b48576020610b985f395f516040511461052657600161052a565b6002545b15610b485760605160805260605119610574576040516370a0823160a0523060c052602060a0602460bc845afa610563573d5f5f3e3d5ffd5b60203d10610b485760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af16105a1573d5f5f3e3d5ffd5b3d6105b857803b15610b48576001610100526105df565b3d602081183d60201002188060a00160c011610b485760a0518060011c610b485761010052505b61010090505115610b4857005b63cfcd38b9811861095557602436103417610b48576004358060a01c610b48576040525f543318610b48576040516004556040517fffffae87477c2954622703ffa7b5a2fe5246a279988ffdea173cbc03d3a509a15f6060a2005b636c3ef35081186106a257602436103417610b48576004358060a01c610b48576040525f543318610b48576040516005556040517f6204fdd2b5739db0c92206f8eca8e4d67322d19af23eeb4b85afa82dd6e544b15f6060a2005b63770817ec81186109555734610b485760015460405260206040f35b63bbc223f5811861073a57604436103417610b48576004358060a01c610b48576040526024358060011c610b48576060525f543318610b485760605160066040516020525f5260405f20556040517f4dc837210548516568378153706718ba26db8d3f26eb60b45084ce5194c2872860605160805260206080a2005b630727adb381186109555734610b485760075460405260206040f35b63fd066ecc81186107b157602436103417610b48576004358060a01c610b48576040525f543318610b48576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c81186107f95734610b48576001543318610b48575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b621a474081186109555734610b48576020610b7860403960206040f35b63fc0c546a81186108345734610b48576020610b9860403960206040f35b632975e99a811861095557602436103417610b48576004358060a01c610b4857604052600a6040516020525f5260405f205460605260206060f35b631f3a0e4181186109555734610b485760025460405260206040f35b6322ef32ed81186109555734610b485760035460405260206040f35b63723768ba81186108c35734610b485760045460405260206040f35b63d2ea3fb081186108df5734610b485760055460405260206040f35b632ac7183e811861095557602436103417610b48576004358060a01c610b485760405260096040516020525f5260405f205460605260206060f35b63da62fba9811861095557602436103417610b48576004358060a01c610b485760405260066040516020525f5260405f205460605260206060f35b5f5ffd5b64e8d4a50fff6040511115610a9c576002546109f3576020610b785f395f51631b8b921d60c052604060055460e0528061010052631e83409a60645260043060845260200160605260608160e001604482825e8051806020830101601f825f03163682375050601f19601f825160200101169050905081015050803b15610b48575f60c060a460dc5f855af16109f1573d5f5f3e3d5ffd5b505b6020610b985f395f516370a082316080523060a052602060806024609c845afa610a1f573d5f5f3e3d5ffd5b60203d10610b48576080905051606052606051600754808203828111610b4857905090506080526060516007556008546080516c0c9f2c9cd04674edea400000008102816c0c9f2c9cd04674edea40000000820418610b485790506040518015610b485780820490509050808201828110610b4857905090506008555b565b600854608052600a6040516020525f5260405f205460a05260605115610b2e5760a05160805160096040516020525f5260405f2054808203828111610b485790509050606051808202811583838304141715610b4857905090506c0c9f2c9cd04674edea4000000081049050808201828110610b48579050905060a05260a051600a6040516020525f5260405f20555b60805160096040516020525f5260405f205560a051815250565b5f80fd026d091a0955086f064703f8049e0955095502150816031c08a7088b00180955075606be095504dc038405ec8558204a08d930d4402f987f9a1babd0e408c44b136d58288ba7af75adbfba72703767190b7881182c1840a1657679706572830004020038000000000000000000000000d6afd78c05f0d425f2b46359746dd44991dcb315000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf6204",
+  "name": "YBCRewardDistributor",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "rewards",
+          "type": "uint256"
+        }
+      ],
+      "name": "Claim",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [],
+      "name": "Kill",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "aggregator",
+          "type": "address"
+        }
+      ],
+      "name": "SetWeightAggregator",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "upstream",
+          "type": "address"
+        }
+      ],
+      "name": "SetUpstreamWeights",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "claim",
+          "type": "address"
+        }
+      ],
+      "name": "SetClaimFrom",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "claimer",
+          "type": "bool"
+        }
+      ],
+      "name": "SetClaimer",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "PendingManagement",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "SetManagement",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        }
+      ],
+      "name": "claim",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "sync_rewards",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_caller",
+          "type": "address"
+        },
+        {
+          "name": "_from",
+          "type": "address"
+        },
+        {
+          "name": "_to",
+          "type": "address"
+        },
+        {
+          "name": "_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked_from",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked_to",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_transfer",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_caller",
+          "type": "address"
+        },
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_prev_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_stake",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_prev_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_unstake",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "kill",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_aggregator",
+          "type": "address"
+        }
+      ],
+      "name": "set_weight_aggregator",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_upstream",
+          "type": "address"
+        }
+      ],
+      "name": "set_upstream_weights",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_claim",
+          "type": "address"
+        }
+      ],
+      "name": "set_claim_from",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_claimer",
+          "type": "bool"
+        }
+      ],
+      "name": "set_claimer",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_management",
+          "type": "address"
+        }
+      ],
+      "name": "set_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accept_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "ybc",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "token",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "killed",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "weight_aggregator",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "upstream_weights",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "claim_from",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "claimers",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "last_balance",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "reward_integral",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "account_reward_integral",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "pending_rewards",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_ybc",
+          "type": "address"
+        },
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": "0x000000000000000000000000d6afd78c05f0d425f2b46359746dd44991dcb315000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf6204",
+  "sources": {
+    "YBCRewardDistributor.vy": {
+      "content": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title YBC Reward Distributor\n@author Yearn Finance\n@license GNU AGPLv3\n@notice YBC module that deals with distributing rewards originating from the Collective's staking position(s).\n        Any state change forwarded by the upstream YBC weight aggregator results in a rewards claim through\n        the YBC and is distributed proportionally to each member according to their aggregated staked balance.\n        The contract can be killed, permanently disabling further yield claiming from the YBC while keeping\n        the ability for members to claim already earned rewards intact.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IYBC:\n    def call(_target: address, _data: Bytes[2048]): nonpayable\n\ninterface IComponent:\n    def claim(_account: address) -> uint256: nonpayable\n\ninterface IHooks:\n    def on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _value: uint256): nonpayable\n    def on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n\ninterface IWeightAggregator:\n    def supply() -> uint256: view\n    def staked(_account: address) -> uint256: view\n\nimplements: IHooks\nimplements: IComponent\n\nybc: public(immutable(IYBC))\ntoken: public(immutable(IERC20))\nmanagement: public(address)\npending_management: public(address)\nkilled: public(bool)\nweight_aggregator: public(IWeightAggregator)\nupstream_weights: public(address)\nclaim_from: public(address)\nclaimers: public(HashMap[address, bool])\n\nlast_balance: public(uint256)\nreward_integral: public(uint256)\naccount_reward_integral: public(HashMap[address, uint256])\npending_rewards: public(HashMap[address, uint256])\n\nevent Claim:\n    account: indexed(address)\n    rewards: uint256\n\nevent Kill: pass\n\nevent SetWeightAggregator:\n    aggregator: indexed(address)\n\nevent SetUpstreamWeights:\n    upstream: indexed(address)\n\nevent SetClaimFrom:\n    claim: indexed(address)\n\nevent SetClaimer:\n    account: indexed(address)\n    claimer: bool\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPRECISION: constant(uint256) = 10**30\n\n@deploy\ndef __init__(_ybc: address, _token: address):\n    \"\"\"\n    @notice Constructor\n    @param _ybc YBC address\n    @param _token Reward token address\n    \"\"\"\n    ybc = IYBC(_ybc)\n    token = IERC20(_token)\n    self.management = msg.sender\n\n@external\ndef claim(_account: address) -> uint256:\n    \"\"\"\n    @notice Claim rewards on behalf of an account\n    @param _account Account to claim rewards for\n    @return Amount of rewards tokens claimed\n    \"\"\"\n    staked: uint256 = staticcall self.weight_aggregator.staked(_account)\n    if staked == 0 and self.pending_rewards[_account] == 0:\n        # shortcut accounts that have never participated in the YBC\n        return 0\n\n    assert self.claimers[msg.sender]\n\n    supply: uint256 = staticcall self.weight_aggregator.supply()\n    self._sync_integral(supply)\n    pending: uint256 = self._sync_account_integral(_account, staked)\n    if pending > 0:\n        self.pending_rewards[_account] = 0\n        self.last_balance -= pending\n        assert extcall token.transfer(msg.sender, pending, default_return_value=True)\n        log Claim(account=_account, rewards=pending)\n\n    return pending\n\n@external\ndef sync_rewards():\n    \"\"\"\n    @notice Synchronize rewards by claiming from the YBC\n    \"\"\"\n    supply: uint256 = staticcall self.weight_aggregator.supply()\n    self._sync_integral(supply)\n\n@external\ndef on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon transfer of tokens\n    @param _caller Originator of the transfer\n    @param _from Sender of the token\n    @param _to Recipient of the tokens\n    @param _supply Total staked of all YBC members\n    @param _prev_staked_from Staked balance of sender before transfer\n    @param _prev_staked_to Staked balance of recipient before transfer\n    @param _amount Amount of tokens to transfer\n    @dev Should only be called if both sender and recipient are members of the YBC\n    \"\"\"\n    assert msg.sender == self.upstream_weights\n\n    self._sync_integral(_supply)\n    self._sync_account_integral(_from, _prev_staked_from)\n    self._sync_account_integral(_to, _prev_staked_to)\n\n@external\ndef on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon staking of tokens\n    @param _caller Originator of the tokens\n    @param _account Recipient of the staked tokens\n    @param _prev_supply Total staked of all YBC members, before stake\n    @param _prev_staked Staked balance of recipient before stake\n    @param _amount Amount of tokens to stake\n    @dev Should only be called if account is a member of the YBC\n    \"\"\"\n    assert msg.sender == self.upstream_weights\n\n    self._sync_integral(_prev_supply)\n    self._sync_account_integral(_account, _prev_staked)\n\n@external\ndef on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon unstaking of tokens\n    @param _account Originator of the staked tokens\n    @param _prev_supply Total staked of all YBC members, before unstake\n    @param _prev_staked Staked balance of originator before unstake\n    @param _amount Amount of tokens to unstake\n    @dev Should only be called if account is a member of the YBC\n    \"\"\"\n    assert msg.sender == self.upstream_weights\n\n    self._sync_integral(_prev_supply)\n    self._sync_account_integral(_account, _prev_staked)\n\n@external\ndef kill():\n    \"\"\"\n    @notice Kill the contract, permanently disabling claiming of new rewards from the YBC\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert not self.killed\n\n    self.killed = True\n    log Kill()\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _token != token.address or self.killed\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_weight_aggregator(_aggregator: address):\n    \"\"\"\n    @notice Set the YBC weight aggregator\n    @param _aggregator Weight aggregator address\n    @dev Can only be called by management\n    @dev Should only aggregate weights of members of the YBC\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.weight_aggregator = IWeightAggregator(_aggregator)\n    log SetWeightAggregator(aggregator=_aggregator)\n\n@external\ndef set_upstream_weights(_upstream: address):\n    \"\"\"\n    @notice Set the upstream address where weight hooks are originating from\n    @param _upstream Upstream weight hook address\n    @dev Can only be called by management\n    @dev Upstream should only send hooks for members of the YBC\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.upstream_weights = _upstream\n    log SetUpstreamWeights(upstream=_upstream)\n\n@external\ndef set_claim_from(_claim: address):\n    \"\"\"\n    @notice Set the address to claim YBC rewards from\n    @param _claim Claim contract\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.claim_from = _claim\n    log SetClaimFrom(claim=_claim)\n\n@external\ndef set_claimer(_account: address, _claimer: bool):\n    \"\"\"\n    @notice Whitelist account as reward claimer\n    @param _account Account\n    @param _claimer True: add to whitelist, False: remove from whitelist\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.claimers[_account] = _claimer\n    log SetClaimer(account=_account, claimer=_claimer)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\ndef _sync_integral(_supply: uint256):\n    \"\"\"\n    @notice Claim rewards through the YBC and update integral.\n            Should be called before any state change\n    \"\"\"\n    if _supply < 10**12:\n        # no reward accrual if YBC members dont have anything staked\n        return\n\n    if not self.killed:\n        # claim rewards from YBC\n        extcall ybc.call(self.claim_from, abi_encode(self, method_id=method_id(\"claim(address)\")))\n\n    # use token balance change to be able to accept donations\n    balance: uint256 = staticcall token.balanceOf(self)\n    rewards: uint256 = balance - self.last_balance\n\n    self.last_balance = balance\n    self.reward_integral += rewards * PRECISION // _supply\n\n@internal\ndef _sync_account_integral(_account: address, _staked: uint256) -> uint256:\n    \"\"\"\n    @notice Update users integral by attributing rewards to them.\n            Should be called before any state change involving the user\n    \"\"\"\n    integral: uint256 = self.reward_integral\n    pending: uint256 = self.pending_rewards[_account]\n\n    if _staked > 0:\n        pending += (integral - self.account_reward_integral[_account]) * _staked // PRECISION\n        self.pending_rewards[_account] = pending\n    self.account_reward_integral[_account] = integral\n\n    return pending"
+    }
+  }
+}

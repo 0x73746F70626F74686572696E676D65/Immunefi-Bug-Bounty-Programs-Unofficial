@@ -1,0 +1,499 @@
+{
+  "file_path": "TeamRegistry.vy",
+  "creation_status": "success",
+  "source_code": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Team Registry\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Maintains the canonical list of teams. Inactive teams can be retired,\n        which means they will no longer be considered registered in the following epoch.\n        The registry also stores the official deployments for the revenue recipient and funding \n        distributor, which are used be each of the teams to submit revenue and claim funding.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IRegistry:\n    def num_teams() -> uint256: view\n    def teams(_idx: uint256) -> address: view\n    def is_team(_team: address) -> bool: view\n    def revenue_recipient() -> address: view\n    def funding_distributor() -> address: view\nimplements: IRegistry\n\ninterface ITeam:\n    def setup(_name: String[100], _owner: address): nonpayable\n    def migrate(_registry: address): nonpayable\n\ngenesis: public(immutable(uint256))\nmanagement: public(address)\npending_management: public(address)\nsuccessor: public(address)\nimplementation: public(address)\nrevenue_recipient: public(address)\nfunding_distributor: public(address)\n\nnum_teams: public(uint256)\nteams: public(HashMap[uint256, address])\nteam_retirements: public(HashMap[address, uint256])\n\nevent AddTeam:\n    idx: indexed(uint256)\n    team: indexed(address)\n\nevent RetireTeam:\n    team: indexed(address)\n    period: uint256\n\nevent Deprecate:\n    successor: indexed(address)\n\nevent MigrateTeam:\n    team: indexed(address)\n\nevent SetImplementation:\n    implementation: indexed(address)\n\nevent SetRevenueRecipient:\n    recipient: indexed(address)\n\nevent SetFundingDistributor:\n    distributor: indexed(address)\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPERIOD_LENGTH: constant(uint256) = 6 * 14 * 24 * 60 * 60\n\n@deploy\ndef __init__(_genesis: uint256):\n    \"\"\"\n    @notice Constructor\n    @param _genesis Budget period genesis timestamp\n    \"\"\"\n    genesis = _genesis\n    self.management = msg.sender\n\n@external\n@view\ndef period() -> uint256:\n    \"\"\"\n    @notice Query the current budget period number\n    @return The current budget period number\n    \"\"\"\n    return self._period()\n\n@external\n@view\ndef is_team(_team: address) -> bool:\n    \"\"\"\n    @notice Query whether an address is a registered team\n    @param _team Adress to query status for\n    @return True: address is a registered team, False: address is not a team\n    @dev Retired teams are not considered registered\n    \"\"\"\n    return self.team_retirements[_team] > self._period()\n\n@external\ndef add_team(_name: String[100], _owner: address) -> (uint256, address):\n    \"\"\"\n    @notice Deploy a team and add it to the registry\n    @param _name Team name. Must be unique\n    @param _owner Team owner address\n    @return Tuple of team index and team contract address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert len(_name) > 0\n    team: address = create_minimal_proxy_to(self.implementation, salt=keccak256(_name))\n    assert self.team_retirements[team] == 0\n    extcall ITeam(team).setup(_name, _owner)\n\n    idx: uint256 = self.num_teams\n    self.num_teams = idx + 1\n    self.teams[idx] = team\n    self.team_retirements[team] = max_value(uint256)\n\n    log AddTeam(idx=idx, team=team)\n    return (idx, team)\n\n@external\ndef retire_team(_team: address):\n    \"\"\"\n    @notice Mark a team for retirement next epoch\n    @param _team Team adress\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    period: uint256 = self._period() + 1\n    assert self.team_retirements[_team] > period\n\n    self.team_retirements[_team] = period\n    log RetireTeam(team=_team, period=period)\n\n@external\ndef migrate_team(_team: address):\n    \"\"\"\n    @notice Migrate a team to the new registry\n    @param _team Team adress\n    @dev Can only be called once this registry is deprecated\n    \"\"\"\n    successor: address = self.successor\n    assert successor != empty(address)\n    assert self.team_retirements[_team] > self._period() + 1\n\n    extcall ITeam(_team).migrate(successor)\n    log MigrateTeam(team=_team)\n\n@external\ndef deprecate(_successor: address):\n    \"\"\"\n    @notice Deprecate this registry and appoint a successor\n    @param _successor The new registry\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _successor != empty(address)\n    assert self.successor == empty(address)\n\n    self.successor = _successor\n    log Deprecate(successor=_successor)\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_implementation(_implementation: address):\n    \"\"\"\n    @notice Set the team implementation contract. Only affects new deployments\n    @param _implementation Team implementation address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.implementation = _implementation\n    log SetImplementation(implementation=_implementation)\n\n@external\ndef set_revenue_recipient(_recipient: address):\n    \"\"\"\n    @notice Set the revenue recipient\n    @param _recipient Revenue recipient address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.revenue_recipient = _recipient\n    log SetRevenueRecipient(recipient=_recipient)\n\n@external\ndef set_funding_distributor(_distributor: address):\n    \"\"\"\n    @notice Set the funding distributor\n    @param _distributor Funding distributor address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.funding_distributor = _distributor\n    log SetFundingDistributor(distributor=_distributor)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _period() -> uint256:\n    return unsafe_div(block.timestamp - genesis, PERIOD_LENGTH)",
+  "deployed_bytecode": "0x5f3560e01c60026019820660011b61088901601e395f51565b63ef78d4fd811861085f57346108855760206100346040610863565b6040f35b63d4486c93811861085f57602436103417610885576004358060a01c610885576040526100656060610863565b60605160086040516020525f5260405f20541160805260206080f35b6367feb855811861085f576044361034176108855760043560040180356064811161088557506020813501808260403750506024358060a01c6108855760e0525f5433186108855760405115610885577f602d3d8160093d39f3363d3d373d3d3d363d73000000000000000000000000006101205260035460601b610133527f5af43d82803e903d91602b57fd5bf300000000000000000000000000000000006101475260405160602060366101205ff58061013f573d5f5f3e3d5ffd5b610100526008610100516020525f5260405f2054610885576101005163ae34ebb061012052604080610140528061014001602060405101806040835e508051806020830101601f825f03163682375050601f19601f8251602001011690508101905060e0516101605250803b15610885575f61012060e461013c5f855af16101c9573d5f5f3e3d5ffd5b50600654610120526101205160018101818110610885579050600655610100516007610120516020525f5260405f20557fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6008610100516020525f5260405f205561010051610120517e758b0c262d2c6ac192e1180da799fdd8fe6c941b3cbbe9a412cc063da173ed5f610140a3610120516101405261010051610160526040610140f35b63aeaf5d6e811861085f57602436103417610885576004358060a01c610885576040525f543318610885576102a36080610863565b6080516001810181811061088557905060605260605160086040516020525f5260405f205411156108855760605160086040516020525f5260405f20556040517f8960906020ce0c340327827898ab72cf6a2a3807cc1f3bf5cae108bc64225a0960605160805260206080a2005b6377fb8bca811861085f57602436103417610885576004358060a01c61088557604052600254606052606051156108855761034c6080610863565b6080516001810181811061088557905060086040516020525f5260405f205411156108855760405163ce5494bb60805260605160a052803b15610885575f60806024609c5f855af16103a0573d5f5f3e3d5ffd5b506040517f2ececafde97871e480c461e0948c8c5d4c0861431f9c1fca7bf59525421530435f6080a2005b630753c30c811861085f57602436103417610885576004358060a01c610885576040525f543318610885576040511561088557600254610885576040516002556040517fcc358699805e9a8b7f77b522628c7cb9abd07d9efb86b6fb616af1609036a99e5f6060a2005b6301681a62811861047357602436103417610885577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526104d7565b63759be10c811861085f5734610885576001543318610885575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b636ea056a981186105aa57604436103417610885576024356060525b6004358060a01c610885576040525f5433186108855760605160805260605119610532576040516370a0823160a0523060c052602060a0602460bc845afa610521573d5f5f3e3d5ffd5b60203d106108855760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af161055f573d5f5f3e3d5ffd5b3d61057657803b156108855760016101005261059d565b3d602081183d60201002188060a00160c0116108855760a0518060011c6108855761010052505b6101009050511561088557005b637b68a3f0811861085f57602436103417610885576004358060a01c610885576040525f543318610885576040516004556040517fc78db815273500121f45210c79684585b55d8d3ace67b53aacc4a87c68b4dd2e5f6060a2005b634cd69da0811861066057602436103417610885576004358060a01c610885576040525f543318610885576040516003556040517fddebe6de740fe0dd01cc33ffa314d11c6ac6acbbe50b80513c4c360ae7aa4f045f6060a2005b633ed2b77a811861085f576024361034176108855760076004356020525f5260405f205460405260206040f35b63ef9af68b81186106e857602436103417610885576004358060a01c610885576040525f543318610885576040516005556040517f6c358fff01d8ccb1663351d0e1c9539c5245d053a47c19b2b2a35a715da3010c5f6060a2005b63a7f0b3de811861085f57346108855760206108bb60403960206040f35b63fd066ecc811861076157602436103417610885576004358060a01c610885576040525f543318610885576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63a31f96fe811861085f57346108855760065460405260206040f35b6388a8d602811861085f5734610885575f5460405260206040f35b63770817ec81186107b457346108855760015460405260206040f35b636e671435811861085f57346108855760045460405260206040f35b636ff968c3811861085f57346108855760025460405260206040f35b635c60da1b811861085f57346108855760035460405260206040f35b6317afccdf811861085f57346108855760055460405260206040f35b6395008d70811861085f57602436103417610885576004358060a01c6108855760405260086040516020525f5260405f205460605260206060f35b5f5ffd5b626ebe004260206108bb5f395f51808203828111610885579050905004815250565b5f80fd085f0311026e0706003804bb008103cb068d07d0077d085f085f07ec0435080807980824085f0018085f085f0605085f085f0000000000000000000000000000000000000000000000000000000069151f80",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "TeamRegistry.vy": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "1762992000",
+      {
+        "name": "_genesis",
+        "type": "uint256"
+      }
+    ]
+  ],
+  "compiler_version": "v0.4.2+commit.c216787f",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-07-01T20:47:37.554675Z",
+  "implementations": [
+    {
+      "address_hash": "0xa59B34c87f97Bdf95Ab3E532FD9b7D1Fcd23BF43",
+      "name": "Team"
+    }
+  ],
+  "proxy_type": "basic_implementation",
+  "external_libraries": [],
+  "creation_bytecode": "0x6108bb51503461002b5760206109225f395f516108bb52335f556108bb61002f610000396108db610000f35b5f80fd5f3560e01c60026019820660011b61088901601e395f51565b63ef78d4fd811861085f57346108855760206100346040610863565b6040f35b63d4486c93811861085f57602436103417610885576004358060a01c610885576040526100656060610863565b60605160086040516020525f5260405f20541160805260206080f35b6367feb855811861085f576044361034176108855760043560040180356064811161088557506020813501808260403750506024358060a01c6108855760e0525f5433186108855760405115610885577f602d3d8160093d39f3363d3d373d3d3d363d73000000000000000000000000006101205260035460601b610133527f5af43d82803e903d91602b57fd5bf300000000000000000000000000000000006101475260405160602060366101205ff58061013f573d5f5f3e3d5ffd5b610100526008610100516020525f5260405f2054610885576101005163ae34ebb061012052604080610140528061014001602060405101806040835e508051806020830101601f825f03163682375050601f19601f8251602001011690508101905060e0516101605250803b15610885575f61012060e461013c5f855af16101c9573d5f5f3e3d5ffd5b50600654610120526101205160018101818110610885579050600655610100516007610120516020525f5260405f20557fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6008610100516020525f5260405f205561010051610120517e758b0c262d2c6ac192e1180da799fdd8fe6c941b3cbbe9a412cc063da173ed5f610140a3610120516101405261010051610160526040610140f35b63aeaf5d6e811861085f57602436103417610885576004358060a01c610885576040525f543318610885576102a36080610863565b6080516001810181811061088557905060605260605160086040516020525f5260405f205411156108855760605160086040516020525f5260405f20556040517f8960906020ce0c340327827898ab72cf6a2a3807cc1f3bf5cae108bc64225a0960605160805260206080a2005b6377fb8bca811861085f57602436103417610885576004358060a01c61088557604052600254606052606051156108855761034c6080610863565b6080516001810181811061088557905060086040516020525f5260405f205411156108855760405163ce5494bb60805260605160a052803b15610885575f60806024609c5f855af16103a0573d5f5f3e3d5ffd5b506040517f2ececafde97871e480c461e0948c8c5d4c0861431f9c1fca7bf59525421530435f6080a2005b630753c30c811861085f57602436103417610885576004358060a01c610885576040525f543318610885576040511561088557600254610885576040516002556040517fcc358699805e9a8b7f77b522628c7cb9abd07d9efb86b6fb616af1609036a99e5f6060a2005b6301681a62811861047357602436103417610885577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526104d7565b63759be10c811861085f5734610885576001543318610885575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b636ea056a981186105aa57604436103417610885576024356060525b6004358060a01c610885576040525f5433186108855760605160805260605119610532576040516370a0823160a0523060c052602060a0602460bc845afa610521573d5f5f3e3d5ffd5b60203d106108855760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af161055f573d5f5f3e3d5ffd5b3d61057657803b156108855760016101005261059d565b3d602081183d60201002188060a00160c0116108855760a0518060011c6108855761010052505b6101009050511561088557005b637b68a3f0811861085f57602436103417610885576004358060a01c610885576040525f543318610885576040516004556040517fc78db815273500121f45210c79684585b55d8d3ace67b53aacc4a87c68b4dd2e5f6060a2005b634cd69da0811861066057602436103417610885576004358060a01c610885576040525f543318610885576040516003556040517fddebe6de740fe0dd01cc33ffa314d11c6ac6acbbe50b80513c4c360ae7aa4f045f6060a2005b633ed2b77a811861085f576024361034176108855760076004356020525f5260405f205460405260206040f35b63ef9af68b81186106e857602436103417610885576004358060a01c610885576040525f543318610885576040516005556040517f6c358fff01d8ccb1663351d0e1c9539c5245d053a47c19b2b2a35a715da3010c5f6060a2005b63a7f0b3de811861085f57346108855760206108bb60403960206040f35b63fd066ecc811861076157602436103417610885576004358060a01c610885576040525f543318610885576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63a31f96fe811861085f57346108855760065460405260206040f35b6388a8d602811861085f5734610885575f5460405260206040f35b63770817ec81186107b457346108855760015460405260206040f35b636e671435811861085f57346108855760045460405260206040f35b636ff968c3811861085f57346108855760025460405260206040f35b635c60da1b811861085f57346108855760035460405260206040f35b6317afccdf811861085f57346108855760055460405260206040f35b6395008d70811861085f57602436103417610885576004358060a01c6108855760405260086040516020525f5260405f205460605260206060f35b5f5ffd5b626ebe004260206108bb5f395f51808203828111610885579050905004815250565b5f80fd085f0311026e0706003804bb008103cb068d07d0077d085f085f07ec0435080807980824085f0018085f085f0605085f085f855820acb1872147c66f96a72097b721b26bf5292d8b6ee609ad96b036ce98706a75001908bb8118321820a16576797065728300040200380000000000000000000000000000000000000000000000000000000069151f80",
+  "name": "TeamRegistry",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "idx",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "name": "team",
+          "type": "address"
+        }
+      ],
+      "name": "AddTeam",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "team",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "period",
+          "type": "uint256"
+        }
+      ],
+      "name": "RetireTeam",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "successor",
+          "type": "address"
+        }
+      ],
+      "name": "Deprecate",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "team",
+          "type": "address"
+        }
+      ],
+      "name": "MigrateTeam",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "implementation",
+          "type": "address"
+        }
+      ],
+      "name": "SetImplementation",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "recipient",
+          "type": "address"
+        }
+      ],
+      "name": "SetRevenueRecipient",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "distributor",
+          "type": "address"
+        }
+      ],
+      "name": "SetFundingDistributor",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "PendingManagement",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "SetManagement",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "period",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_team",
+          "type": "address"
+        }
+      ],
+      "name": "is_team",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_name",
+          "type": "string"
+        },
+        {
+          "name": "_owner",
+          "type": "address"
+        }
+      ],
+      "name": "add_team",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_team",
+          "type": "address"
+        }
+      ],
+      "name": "retire_team",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_team",
+          "type": "address"
+        }
+      ],
+      "name": "migrate_team",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_successor",
+          "type": "address"
+        }
+      ],
+      "name": "deprecate",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_implementation",
+          "type": "address"
+        }
+      ],
+      "name": "set_implementation",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_recipient",
+          "type": "address"
+        }
+      ],
+      "name": "set_revenue_recipient",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_distributor",
+          "type": "address"
+        }
+      ],
+      "name": "set_funding_distributor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_management",
+          "type": "address"
+        }
+      ],
+      "name": "set_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accept_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "genesis",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "successor",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "implementation",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "revenue_recipient",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "funding_distributor",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "num_teams",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "uint256"
+        }
+      ],
+      "name": "teams",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "team_retirements",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_genesis",
+          "type": "uint256"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": "0x0000000000000000000000000000000000000000000000000000000069151f80",
+  "sources": {
+    "TeamRegistry.vy": {
+      "content": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Team Registry\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Maintains the canonical list of teams. Inactive teams can be retired,\n        which means they will no longer be considered registered in the following epoch.\n        The registry also stores the official deployments for the revenue recipient and funding \n        distributor, which are used be each of the teams to submit revenue and claim funding.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IRegistry:\n    def num_teams() -> uint256: view\n    def teams(_idx: uint256) -> address: view\n    def is_team(_team: address) -> bool: view\n    def revenue_recipient() -> address: view\n    def funding_distributor() -> address: view\nimplements: IRegistry\n\ninterface ITeam:\n    def setup(_name: String[100], _owner: address): nonpayable\n    def migrate(_registry: address): nonpayable\n\ngenesis: public(immutable(uint256))\nmanagement: public(address)\npending_management: public(address)\nsuccessor: public(address)\nimplementation: public(address)\nrevenue_recipient: public(address)\nfunding_distributor: public(address)\n\nnum_teams: public(uint256)\nteams: public(HashMap[uint256, address])\nteam_retirements: public(HashMap[address, uint256])\n\nevent AddTeam:\n    idx: indexed(uint256)\n    team: indexed(address)\n\nevent RetireTeam:\n    team: indexed(address)\n    period: uint256\n\nevent Deprecate:\n    successor: indexed(address)\n\nevent MigrateTeam:\n    team: indexed(address)\n\nevent SetImplementation:\n    implementation: indexed(address)\n\nevent SetRevenueRecipient:\n    recipient: indexed(address)\n\nevent SetFundingDistributor:\n    distributor: indexed(address)\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPERIOD_LENGTH: constant(uint256) = 6 * 14 * 24 * 60 * 60\n\n@deploy\ndef __init__(_genesis: uint256):\n    \"\"\"\n    @notice Constructor\n    @param _genesis Budget period genesis timestamp\n    \"\"\"\n    genesis = _genesis\n    self.management = msg.sender\n\n@external\n@view\ndef period() -> uint256:\n    \"\"\"\n    @notice Query the current budget period number\n    @return The current budget period number\n    \"\"\"\n    return self._period()\n\n@external\n@view\ndef is_team(_team: address) -> bool:\n    \"\"\"\n    @notice Query whether an address is a registered team\n    @param _team Adress to query status for\n    @return True: address is a registered team, False: address is not a team\n    @dev Retired teams are not considered registered\n    \"\"\"\n    return self.team_retirements[_team] > self._period()\n\n@external\ndef add_team(_name: String[100], _owner: address) -> (uint256, address):\n    \"\"\"\n    @notice Deploy a team and add it to the registry\n    @param _name Team name. Must be unique\n    @param _owner Team owner address\n    @return Tuple of team index and team contract address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert len(_name) > 0\n    team: address = create_minimal_proxy_to(self.implementation, salt=keccak256(_name))\n    assert self.team_retirements[team] == 0\n    extcall ITeam(team).setup(_name, _owner)\n\n    idx: uint256 = self.num_teams\n    self.num_teams = idx + 1\n    self.teams[idx] = team\n    self.team_retirements[team] = max_value(uint256)\n\n    log AddTeam(idx=idx, team=team)\n    return (idx, team)\n\n@external\ndef retire_team(_team: address):\n    \"\"\"\n    @notice Mark a team for retirement next epoch\n    @param _team Team adress\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    period: uint256 = self._period() + 1\n    assert self.team_retirements[_team] > period\n\n    self.team_retirements[_team] = period\n    log RetireTeam(team=_team, period=period)\n\n@external\ndef migrate_team(_team: address):\n    \"\"\"\n    @notice Migrate a team to the new registry\n    @param _team Team adress\n    @dev Can only be called once this registry is deprecated\n    \"\"\"\n    successor: address = self.successor\n    assert successor != empty(address)\n    assert self.team_retirements[_team] > self._period() + 1\n\n    extcall ITeam(_team).migrate(successor)\n    log MigrateTeam(team=_team)\n\n@external\ndef deprecate(_successor: address):\n    \"\"\"\n    @notice Deprecate this registry and appoint a successor\n    @param _successor The new registry\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _successor != empty(address)\n    assert self.successor == empty(address)\n\n    self.successor = _successor\n    log Deprecate(successor=_successor)\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_implementation(_implementation: address):\n    \"\"\"\n    @notice Set the team implementation contract. Only affects new deployments\n    @param _implementation Team implementation address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.implementation = _implementation\n    log SetImplementation(implementation=_implementation)\n\n@external\ndef set_revenue_recipient(_recipient: address):\n    \"\"\"\n    @notice Set the revenue recipient\n    @param _recipient Revenue recipient address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.revenue_recipient = _recipient\n    log SetRevenueRecipient(recipient=_recipient)\n\n@external\ndef set_funding_distributor(_distributor: address):\n    \"\"\"\n    @notice Set the funding distributor\n    @param _distributor Funding distributor address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.funding_distributor = _distributor\n    log SetFundingDistributor(distributor=_distributor)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _period() -> uint256:\n    return unsafe_div(block.timestamp - genesis, PERIOD_LENGTH)"
+    }
+  }
+}

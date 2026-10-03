@@ -1,0 +1,414 @@
+{
+  "file_path": "StakingMiddleware.vy",
+  "creation_status": "success",
+  "source_code": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Staking Middleware\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Middleware contract for StakedYFI hooks. Maintains a list of addresses that have instant\n        withdrawals enabled, as well as a blacklist for transfers only. It forwards all state\n        modifying calls to a downstream address as well as to the weight aggregator.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IHooks:\n    def on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _value: uint256): nonpayable\n    def on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def instant_withdrawal(_account: address) -> bool: view\n\nimplements: IHooks\n\nupstream: public(immutable(address))\ndownstream: public(immutable(IHooks))\naggregator: public(immutable(IHooks))\nmanagement: public(address)\npending_management: public(address)\n\ninstant_withdrawal: public(HashMap[address, bool])\nblacklist: public(HashMap[address, bool])\n\nevent SetInstantWithdrawal:\n    account: indexed(address)\n    instant: bool\n\nevent SetBlacklist:\n    account: indexed(address)\n    blacklist: bool\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\n@deploy\ndef __init__(_upstream: address, _downstream: address, _aggregator: address):\n    \"\"\"\n    @notice Constructor\n    @param _upstream The address where hook calls originate from\n    @param _downstream The address where hook calls are forwarded to\n    @param _aggregator The address of the weight aggregator contract\n    \"\"\"\n    upstream = _upstream\n    downstream = IHooks(_downstream)\n    aggregator = IHooks(_aggregator)\n    self.management = msg.sender\n\n@external\ndef on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon transfer of tokens\n    @param _caller Originator of the transfer\n    @param _from Sender of the token\n    @param _to Recipient of the tokens\n    @param _supply Total token supply\n    @param _prev_staked_from Staked balance of sender before transfer\n    @param _prev_staked_to Staked balance of recipient before transfer\n    @param _amount Amount of tokens to transfer\n    \"\"\"\n    assert msg.sender == upstream\n    assert not self.blacklist[_from]\n\n    extcall downstream.on_transfer(_caller, _from, _to, _supply, _prev_staked_from, _prev_staked_to, _amount)\n    extcall aggregator.on_transfer(_caller, _from, _to, _supply, _prev_staked_from, _prev_staked_to, _amount)\n\n@external\ndef on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon staking of tokens\n    @param _caller Originator of the tokens\n    @param _account Recipient of the staked tokens\n    @param _prev_supply Total token supply before stake\n    @param _prev_staked Staked balance of recipient before stake\n    @param _amount Amount of tokens to stake\n    \"\"\"\n    assert msg.sender == upstream\n\n    extcall downstream.on_stake(_caller, _account, _prev_supply, _prev_staked, _amount)\n    extcall aggregator.on_stake(_caller, _account, _prev_supply, _prev_staked, _amount)\n\n@external\ndef on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon unstaking of tokens\n    @param _account Originator of the staked tokens\n    @param _prev_supply Total token supply before unstake\n    @param _prev_staked Staked balance of originator before unstake\n    @param _amount Amount of tokens to unstake\n    \"\"\"\n    assert msg.sender == upstream\n\n    extcall downstream.on_unstake(_account, _prev_supply, _prev_staked, _amount)\n    extcall aggregator.on_unstake(_account, _prev_supply, _prev_staked, _amount)\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_instant_withdrawal(_account: address, _instant: bool):\n    \"\"\"\n    @notice Set the instant withdrawal status for a specific account\n    @param _account Account to set instant withdrawal status for\n    @param _instant True: allow instant withdrawals, False: disallow instant withdrawals\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.instant_withdrawal[_account] = _instant\n    log SetInstantWithdrawal(account=_account, instant=_instant)\n\n@external\ndef set_blacklist(_account: address, _blacklist: bool):\n    \"\"\"\n    @notice Set the transfer blacklist status for a specific account\n    @param _account Account to set transfer blacklist status for\n    @param _blacklist True: add to blacklist, False: remove from blacklist\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.blacklist[_account] = _blacklist\n    log SetBlacklist(account=_account, blacklist=_blacklist)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)",
+  "deployed_bytecode": "0x5f3560e01c60026012820660011b61063c01601e395f51565b63a92d8b5281186100f95760e436103417610638576004358060a01c610638576040526024358060a01c610638576060526044358060a01c6106385760805260206106605f395f5133186106385760036060516020525f5260405f20546106385760206106805f395f5163a92d8b5260a0526060604060c05e6080606461012037803b15610638575f60a060e460bc5f855af16100b7573d5f5f3e3d5ffd5b5060206106a05f395f5163a92d8b5260a0526060604060c05e6080606461012037803b15610638575f60a060e460bc5f855af16100f6573d5f5f3e3d5ffd5b50005b63245a7bfc811861063457346106385760206106a060403960206040f35b63311c744f81186106345760a436103417610638576004358060a01c610638576040526024358060a01c6106385760605260206106605f395f5133186106385760206106805f395f5163311c744f6080526040604060a05e6060604460e037803b15610638575f608060a4609c5f855af1610194573d5f5f3e3d5ffd5b5060206106a05f395f5163311c744f6080526040604060a05e6060604460e037803b15610638575f608060a4609c5f855af16101d2573d5f5f3e3d5ffd5b50005b63abdf4884811861028357608436103417610638576004358060a01c6106385760405260206106605f395f5133186106385760206106805f395f5163abdf48846060526040516080526060602460a037803b15610638575f60606084607c5f855af1610243573d5f5f3e3d5ffd5b5060206106a05f395f5163abdf48846060526040516080526060602460a037803b15610638575f60606084607c5f855af1610280573d5f5f3e3d5ffd5b50005b6388a8d60281186106345734610638575f5460405260206040f35b6301681a62811861063457602436103417610638577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526102f8565b636ea056a9811861063457604436103417610638576024356060525b6004358060a01c610638576040525f5433186106385760605160805260605119610353576040516370a0823160a0523060c052602060a0602460bc845afa610342573d5f5f3e3d5ffd5b60203d106106385760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af1610380573d5f5f3e3d5ffd5b3d61039757803b15610638576001610100526103be565b3d602081183d60201002188060a00160c0116106385760a0518060011c6106385761010052505b6101009050511561063857005b6373e7c7f0811861063457604436103417610638576004358060a01c610638576040526024358060011c610638576060525f5433186106385760605160026040516020525f5260405f20556040517f2ce25c283baa4de5030956d3166b98d0ab824ffee0e995a532857a10f37e9a7d60605160805260206080a2005b63d5756361811861063457604436103417610638576004358060a01c610638576040526024358060011c610638576060525f5433186106385760605160036040516020525f5260405f20556040517ffed07c88bd5d31bfd0ce77ed7ffdc74a163a61cfc5edcec801e3a7954e33d6e760605160805260206080a2005b63fd066ecc811861063457602436103417610638576004358060a01c610638576040525f543318610638576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c81186105665734610638576001543318610638575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63770817ec811861063457346106385760015460405260206040f35b636a99a5238118610634573461063857602061066060403960206040f35b63359582ca8118610634573461063857602061068060403960206040f35b63f26c71ba81186105f957602436103417610638576004358060a01c6106385760405260026040516020525f5260405f205460605260206060f35b63f9f92be4811861063457602436103417610638576004358060a01c6106385760405260036040516020525f5260405f205460605260206060f35b5f5ffd5b5f80fd05a0063406340634029e011700180634051e058201d5063404c3044703cb02dc05be063400000000000000000000000042b25284e8ae427d79da78b65dffc232aaecc01600000000000000000000000095547ede56cf74b73dd78a37f547127dffda61130000000000000000000000006973cf85d479b9253e13e71f377e8cd2c2dfecd7",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "StakingMiddleware.vy": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "0x42b25284E8ae427D79da78b65DFFC232aAECc016",
+      {
+        "name": "_upstream",
+        "type": "address"
+      }
+    ],
+    [
+      "0x95547eDe56cF74B73dd78a37f547127dffDA6113",
+      {
+        "name": "_downstream",
+        "type": "address"
+      }
+    ],
+    [
+      "0x6973CF85d479b9253E13E71F377E8CD2c2dfECd7",
+      {
+        "name": "_aggregator",
+        "type": "address"
+      }
+    ]
+  ],
+  "compiler_version": "v0.4.2+commit.c216787f",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-06-06T00:30:50.362796Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x6106a051503461006f57602061070b5f395f518060a01c61006f57604052602061072b5f395f518060a01c61006f57606052602061074b5f395f518060a01c61006f5760805260405161066052606051610680526080516106a052335f55610660610073610000396106c0610000f35b5f80fd5f3560e01c60026012820660011b61063c01601e395f51565b63a92d8b5281186100f95760e436103417610638576004358060a01c610638576040526024358060a01c610638576060526044358060a01c6106385760805260206106605f395f5133186106385760036060516020525f5260405f20546106385760206106805f395f5163a92d8b5260a0526060604060c05e6080606461012037803b15610638575f60a060e460bc5f855af16100b7573d5f5f3e3d5ffd5b5060206106a05f395f5163a92d8b5260a0526060604060c05e6080606461012037803b15610638575f60a060e460bc5f855af16100f6573d5f5f3e3d5ffd5b50005b63245a7bfc811861063457346106385760206106a060403960206040f35b63311c744f81186106345760a436103417610638576004358060a01c610638576040526024358060a01c6106385760605260206106605f395f5133186106385760206106805f395f5163311c744f6080526040604060a05e6060604460e037803b15610638575f608060a4609c5f855af1610194573d5f5f3e3d5ffd5b5060206106a05f395f5163311c744f6080526040604060a05e6060604460e037803b15610638575f608060a4609c5f855af16101d2573d5f5f3e3d5ffd5b50005b63abdf4884811861028357608436103417610638576004358060a01c6106385760405260206106605f395f5133186106385760206106805f395f5163abdf48846060526040516080526060602460a037803b15610638575f60606084607c5f855af1610243573d5f5f3e3d5ffd5b5060206106a05f395f5163abdf48846060526040516080526060602460a037803b15610638575f60606084607c5f855af1610280573d5f5f3e3d5ffd5b50005b6388a8d60281186106345734610638575f5460405260206040f35b6301681a62811861063457602436103417610638577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526102f8565b636ea056a9811861063457604436103417610638576024356060525b6004358060a01c610638576040525f5433186106385760605160805260605119610353576040516370a0823160a0523060c052602060a0602460bc845afa610342573d5f5f3e3d5ffd5b60203d106106385760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af1610380573d5f5f3e3d5ffd5b3d61039757803b15610638576001610100526103be565b3d602081183d60201002188060a00160c0116106385760a0518060011c6106385761010052505b6101009050511561063857005b6373e7c7f0811861063457604436103417610638576004358060a01c610638576040526024358060011c610638576060525f5433186106385760605160026040516020525f5260405f20556040517f2ce25c283baa4de5030956d3166b98d0ab824ffee0e995a532857a10f37e9a7d60605160805260206080a2005b63d5756361811861063457604436103417610638576004358060a01c610638576040526024358060011c610638576060525f5433186106385760605160036040516020525f5260405f20556040517ffed07c88bd5d31bfd0ce77ed7ffdc74a163a61cfc5edcec801e3a7954e33d6e760605160805260206080a2005b63fd066ecc811861063457602436103417610638576004358060a01c610638576040525f543318610638576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c81186105665734610638576001543318610638575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63770817ec811861063457346106385760015460405260206040f35b636a99a5238118610634573461063857602061066060403960206040f35b63359582ca8118610634573461063857602061068060403960206040f35b63f26c71ba81186105f957602436103417610638576004358060a01c6106385760405260026040516020525f5260405f205460605260206060f35b63f9f92be4811861063457602436103417610638576004358060a01c6106385760405260036040516020525f5260405f205460605260206060f35b5f5ffd5b5f80fd05a0063406340634029e011700180634051e058201d5063404c3044703cb02dc05be0634855820627c3b4ad6a1526a2c28b71f33809ae5b9d04c03b1c1be444343d50156703e8f1906608118241860a165767970657283000402003800000000000000000000000042b25284e8ae427d79da78b65dffc232aaecc01600000000000000000000000095547ede56cf74b73dd78a37f547127dffda61130000000000000000000000006973cf85d479b9253e13e71f377e8cd2c2dfecd7",
+  "name": "StakingMiddleware",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "instant",
+          "type": "bool"
+        }
+      ],
+      "name": "SetInstantWithdrawal",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "blacklist",
+          "type": "bool"
+        }
+      ],
+      "name": "SetBlacklist",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "PendingManagement",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "SetManagement",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_caller",
+          "type": "address"
+        },
+        {
+          "name": "_from",
+          "type": "address"
+        },
+        {
+          "name": "_to",
+          "type": "address"
+        },
+        {
+          "name": "_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked_from",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked_to",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_transfer",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_caller",
+          "type": "address"
+        },
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_prev_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_stake",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_prev_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_unstake",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_instant",
+          "type": "bool"
+        }
+      ],
+      "name": "set_instant_withdrawal",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_blacklist",
+          "type": "bool"
+        }
+      ],
+      "name": "set_blacklist",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_management",
+          "type": "address"
+        }
+      ],
+      "name": "set_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accept_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "upstream",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "downstream",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "aggregator",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "instant_withdrawal",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "blacklist",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_upstream",
+          "type": "address"
+        },
+        {
+          "name": "_downstream",
+          "type": "address"
+        },
+        {
+          "name": "_aggregator",
+          "type": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": "0x00000000000000000000000042b25284e8ae427d79da78b65dffc232aaecc01600000000000000000000000095547ede56cf74b73dd78a37f547127dffda61130000000000000000000000006973cf85d479b9253e13e71f377e8cd2c2dfecd7",
+  "sources": {
+    "StakingMiddleware.vy": {
+      "content": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Staking Middleware\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Middleware contract for StakedYFI hooks. Maintains a list of addresses that have instant\n        withdrawals enabled, as well as a blacklist for transfers only. It forwards all state\n        modifying calls to a downstream address as well as to the weight aggregator.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IHooks:\n    def on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _value: uint256): nonpayable\n    def on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def instant_withdrawal(_account: address) -> bool: view\n\nimplements: IHooks\n\nupstream: public(immutable(address))\ndownstream: public(immutable(IHooks))\naggregator: public(immutable(IHooks))\nmanagement: public(address)\npending_management: public(address)\n\ninstant_withdrawal: public(HashMap[address, bool])\nblacklist: public(HashMap[address, bool])\n\nevent SetInstantWithdrawal:\n    account: indexed(address)\n    instant: bool\n\nevent SetBlacklist:\n    account: indexed(address)\n    blacklist: bool\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\n@deploy\ndef __init__(_upstream: address, _downstream: address, _aggregator: address):\n    \"\"\"\n    @notice Constructor\n    @param _upstream The address where hook calls originate from\n    @param _downstream The address where hook calls are forwarded to\n    @param _aggregator The address of the weight aggregator contract\n    \"\"\"\n    upstream = _upstream\n    downstream = IHooks(_downstream)\n    aggregator = IHooks(_aggregator)\n    self.management = msg.sender\n\n@external\ndef on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon transfer of tokens\n    @param _caller Originator of the transfer\n    @param _from Sender of the token\n    @param _to Recipient of the tokens\n    @param _supply Total token supply\n    @param _prev_staked_from Staked balance of sender before transfer\n    @param _prev_staked_to Staked balance of recipient before transfer\n    @param _amount Amount of tokens to transfer\n    \"\"\"\n    assert msg.sender == upstream\n    assert not self.blacklist[_from]\n\n    extcall downstream.on_transfer(_caller, _from, _to, _supply, _prev_staked_from, _prev_staked_to, _amount)\n    extcall aggregator.on_transfer(_caller, _from, _to, _supply, _prev_staked_from, _prev_staked_to, _amount)\n\n@external\ndef on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon staking of tokens\n    @param _caller Originator of the tokens\n    @param _account Recipient of the staked tokens\n    @param _prev_supply Total token supply before stake\n    @param _prev_staked Staked balance of recipient before stake\n    @param _amount Amount of tokens to stake\n    \"\"\"\n    assert msg.sender == upstream\n\n    extcall downstream.on_stake(_caller, _account, _prev_supply, _prev_staked, _amount)\n    extcall aggregator.on_stake(_caller, _account, _prev_supply, _prev_staked, _amount)\n\n@external\ndef on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon unstaking of tokens\n    @param _account Originator of the staked tokens\n    @param _prev_supply Total token supply before unstake\n    @param _prev_staked Staked balance of originator before unstake\n    @param _amount Amount of tokens to unstake\n    \"\"\"\n    assert msg.sender == upstream\n\n    extcall downstream.on_unstake(_account, _prev_supply, _prev_staked, _amount)\n    extcall aggregator.on_unstake(_account, _prev_supply, _prev_staked, _amount)\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_instant_withdrawal(_account: address, _instant: bool):\n    \"\"\"\n    @notice Set the instant withdrawal status for a specific account\n    @param _account Account to set instant withdrawal status for\n    @param _instant True: allow instant withdrawals, False: disallow instant withdrawals\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.instant_withdrawal[_account] = _instant\n    log SetInstantWithdrawal(account=_account, instant=_instant)\n\n@external\ndef set_blacklist(_account: address, _blacklist: bool):\n    \"\"\"\n    @notice Set the transfer blacklist status for a specific account\n    @param _account Account to set transfer blacklist status for\n    @param _blacklist True: add to blacklist, False: remove from blacklist\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.blacklist[_account] = _blacklist\n    log SetBlacklist(account=_account, blacklist=_blacklist)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)"
+    }
+  }
+}

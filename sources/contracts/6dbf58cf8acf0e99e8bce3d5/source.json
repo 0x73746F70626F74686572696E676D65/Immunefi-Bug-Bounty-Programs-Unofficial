@@ -1,0 +1,447 @@
+{
+  "file_path": "YearnVaultFactory.vy",
+  "creation_status": "success",
+  "source_code": "# @version 0.3.10\n#pragma evm-version paris\n\n\"\"\"\n@title Yearn Vault Factory\n@license GNU AGPLv3\n@author yearn.finance\n@notice\n    This vault Factory can be used by anyone wishing to deploy their own\n    ERC4626 compliant Yearn V3 Vault of the same API version.\n\n    The factory clones new vaults from its specific `VAULT_ORIGINAL`\n    immutable address set on creation of the factory.\n    \n    The deployments are done through create2 with a specific `salt` \n    that is derived from a combination of the deployer's address,\n    the underlying asset used, as well as the name and symbol specified.\n    Meaning a deployer will not be able to deploy the exact same vault\n    twice and will need to use different name and or symbols for vaults\n    that use the same other parameters such as `asset`.\n\n    The factory also holds the protocol fee configs for each vault and strategy\n    of its specific `API_VERSION` that determine how much of the fees\n    charged are designated \"protocol fees\" and sent to the designated\n    `fee_recipient`. The protocol fees work through a revenue share system,\n    where if the vault or strategy decides to charge X amount of total\n    fees during a `report` the protocol fees are a percent of X.\n    The protocol fees will be sent to the designated fee_recipient and\n    then (X - protocol_fees) will be sent to the vault/strategy specific\n    fee recipient.\n\"\"\"\n\ninterface IVault:\n    def initialize(\n        asset: address, \n        name: String[64], \n        symbol: String[32], \n        role_manager: address, \n        profit_max_unlock_time: uint256\n    ): nonpayable\n\nevent NewVault:\n    vault_address: indexed(address)\n    asset: indexed(address)\n\nevent UpdateProtocolFeeBps:\n    old_fee_bps: uint16\n    new_fee_bps: uint16\n\nevent UpdateProtocolFeeRecipient:\n    old_fee_recipient: indexed(address)\n    new_fee_recipient: indexed(address)\n\nevent UpdateCustomProtocolFee:\n    vault: indexed(address)\n    new_custom_protocol_fee: uint16\n\nevent RemovedCustomProtocolFee:\n    vault: indexed(address)\n\nevent FactoryShutdown:\n    pass\n\nevent GovernanceTransferred:\n    previousGovernance: indexed(address)\n    newGovernance: indexed(address)\n\nevent UpdatePendingGovernance:\n    newPendingGovernance: indexed(address)\n\n\n# Identifier for this version of the vault.\nAPI_VERSION: constant(String[28]) = \"3.1.0\"\n\n# The max amount the protocol fee can be set to.\nMAX_FEE_BPS: constant(uint16) = 5_000 # 50%\n\n# Mask used to unpack the protocol fee bps.\nFEE_BPS_MASK: constant(uint256) = 2**16-1\n\n# The address that all newly deployed vaults are based from.\nVAULT_ORIGINAL: immutable(address)\n\n# State of the Factory. If True no new vaults can be deployed.\nshutdown: public(bool)\n\n# Address that can set or change the fee configs.\ngovernance: public(address)\n# Pending governance waiting to be accepted.\npendingGovernance: public(address)\n\n# Name for identification.\nname: public(String[64])\n\n# Protocol Fee Data is packed into a single uint256 slot\n# 72 bits Empty | 160 bits fee recipient | 16 bits fee bps | 8 bits custom flag\n\n# The default config for assessing protocol fees.\ndefault_protocol_fee_data: uint256\n# Custom fee to charge for a specific vault or strategy.\ncustom_protocol_fee_data: HashMap[address, uint256]\n\n@external\ndef __init__(name: String[64], vault_original: address, governance: address):\n    self.name = name\n    VAULT_ORIGINAL = vault_original\n    self.governance = governance\n\n@external\ndef deploy_new_vault(\n    asset: address, \n    name: String[64], \n    symbol: String[32], \n    role_manager: address, \n    profit_max_unlock_time: uint256\n) -> address:\n    \"\"\"\n    @notice Deploys a new clone of the original vault.\n    @param asset The asset to be used for the vault.\n    @param name The name of the new vault.\n    @param symbol The symbol of the new vault.\n    @param role_manager The address of the role manager.\n    @param profit_max_unlock_time The time over which the profits will unlock.\n    @return The address of the new vault.\n    \"\"\"\n    # Make sure the factory is not shutdown.\n    assert not self.shutdown, \"shutdown\"\n\n    # Clone a new version of the vault using create2.\n    vault_address: address = create_minimal_proxy_to(\n            VAULT_ORIGINAL, \n            value=0,\n            salt=keccak256(_abi_encode(msg.sender, asset, name, symbol))\n        )\n\n    IVault(vault_address).initialize(\n        asset, \n        name, \n        symbol, \n        role_manager, \n        profit_max_unlock_time, \n    )\n        \n    log NewVault(vault_address, asset)\n    return vault_address\n\n@view\n@external\ndef vault_original()-> address:\n    \"\"\"\n    @notice Get the address of the vault to clone from\n    @return The address of the original vault.\n    \"\"\"\n    return VAULT_ORIGINAL\n\n@view\n@external\ndef apiVersion() -> String[28]:\n    \"\"\"\n    @notice Get the API version of the factory.\n    @return The API version of the factory.\n    \"\"\"\n    return API_VERSION\n\n@view\n@external\ndef protocol_fee_config(vault: address = msg.sender) -> (uint16, address):\n    \"\"\"\n    @notice Called during vault and strategy reports \n    to retrieve the protocol fee to charge and address\n    to receive the fees.\n    @param vault Address of the vault that would be reporting.\n    @return Fee in bps\n    @return Address of fee recipient\n    \"\"\"\n    # If there is a custom protocol fee set we return it.\n    config_data: uint256 = self.custom_protocol_fee_data[vault]\n    if self._unpack_custom_flag(config_data):\n        # Always use the default fee recipient even with custom fees.\n        return (\n            self._unpack_protocol_fee(config_data),\n            self._unpack_fee_recipient(self.default_protocol_fee_data)\n        )\n    else:\n        # Otherwise return the default config.\n        config_data = self.default_protocol_fee_data\n        return (\n            self._unpack_protocol_fee(config_data), \n            self._unpack_fee_recipient(config_data)\n        )\n\n@view\n@external\ndef use_custom_protocol_fee(vault: address) -> bool:\n    \"\"\"\n    @notice If a custom protocol fee is used for a vault.\n    @param vault Address of the vault to check.\n    @return If a custom protocol fee is used.\n    \"\"\"\n    return self._unpack_custom_flag(self.custom_protocol_fee_data[vault])\n\n@view\n@internal\ndef _unpack_protocol_fee(config_data: uint256) -> uint16:\n    \"\"\"\n    Unpacks the protocol fee from the packed data uint.\n    \"\"\"\n    return convert(shift(config_data, -8) & FEE_BPS_MASK, uint16)\n    \n@view\n@internal\ndef _unpack_fee_recipient(config_data: uint256) -> address:\n    \"\"\"\n    Unpacks the fee recipient from the packed data uint.\n    \"\"\"\n    return convert(shift(config_data, -24), address)\n\n@view\n@internal\ndef _unpack_custom_flag(config_data: uint256) -> bool:\n    \"\"\"\n    Unpacks the custom fee flag from the packed data uint.\n    \"\"\"\n    return config_data & 1 == 1\n\n@view\n@internal\ndef _pack_protocol_fee_data(recipient: address, fee: uint16, custom: bool) -> uint256:\n    \"\"\"\n    Packs the full protocol fee data into a single uint256 slot.\n    This is used for both the default fee storage as well as for custom fees.\n    72 bits Empty | 160 bits fee recipient | 16 bits fee bps | 8 bits custom flag\n    \"\"\"\n    return shift(convert(recipient, uint256), 24) | shift(convert(fee, uint256), 8) | convert(custom, uint256)\n\n@external\ndef set_protocol_fee_bps(new_protocol_fee_bps: uint16):\n    \"\"\"\n    @notice Set the protocol fee in basis points\n    @dev Must be below the max allowed fee, and a default\n    fee_recipient must be set so we don't issue fees to the 0 address.\n    @param new_protocol_fee_bps The new protocol fee in basis points\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    assert new_protocol_fee_bps <= MAX_FEE_BPS, \"fee too high\"\n\n    # Cache the current default protocol fee.\n    default_fee_data: uint256 = self.default_protocol_fee_data\n    recipient: address = self._unpack_fee_recipient(default_fee_data)\n    \n    assert recipient != empty(address), \"no recipient\"\n\n    # Set the new fee\n    self.default_protocol_fee_data = self._pack_protocol_fee_data(\n        recipient, \n        new_protocol_fee_bps, \n        False\n    )\n\n    log UpdateProtocolFeeBps(\n        self._unpack_protocol_fee(default_fee_data), \n        new_protocol_fee_bps\n    )\n\n\n@external\ndef set_protocol_fee_recipient(new_protocol_fee_recipient: address):\n    \"\"\"\n    @notice Set the protocol fee recipient\n    @dev Can never be set to 0 to avoid issuing fees to the 0 address.\n    @param new_protocol_fee_recipient The new protocol fee recipient\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    assert new_protocol_fee_recipient != empty(address), \"zero address\"\n\n    default_fee_data: uint256 = self.default_protocol_fee_data\n\n    self.default_protocol_fee_data = self._pack_protocol_fee_data(\n        new_protocol_fee_recipient, \n        self._unpack_protocol_fee(default_fee_data), \n        False\n    )\n    \n    log UpdateProtocolFeeRecipient(\n        self._unpack_fee_recipient(default_fee_data),\n        new_protocol_fee_recipient\n    )\n    \n\n@external\ndef set_custom_protocol_fee_bps(vault: address, new_custom_protocol_fee: uint16):\n    \"\"\"\n    @notice Allows Governance to set custom protocol fees\n    for a specific vault or strategy.\n    @dev Must be below the max allowed fee, and a default\n    fee_recipient must be set so we don't issue fees to the 0 address.\n    @param vault The address of the vault or strategy to customize.\n    @param new_custom_protocol_fee The custom protocol fee in BPS.\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    assert new_custom_protocol_fee <= MAX_FEE_BPS, \"fee too high\"\n    assert self._unpack_fee_recipient(self.default_protocol_fee_data) != empty(address), \"no recipient\"\n\n    self.custom_protocol_fee_data[vault] = self._pack_protocol_fee_data(\n        empty(address), \n        new_custom_protocol_fee, \n        True\n    )\n\n    log UpdateCustomProtocolFee(vault, new_custom_protocol_fee)\n\n@external \ndef remove_custom_protocol_fee(vault: address):\n    \"\"\"\n    @notice Allows governance to remove a previously set\n    custom protocol fee.\n    @param vault The address of the vault or strategy to\n    remove the custom fee for.\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n\n    # Reset the custom fee to 0 and flag to False.\n    self.custom_protocol_fee_data[vault] = self._pack_protocol_fee_data(empty(address), 0, False)\n\n    log RemovedCustomProtocolFee(vault)\n\n@external\ndef shutdown_factory():\n    \"\"\"\n    @notice To stop new deployments through this factory.\n    @dev A one time switch available for governance to stop\n    new vaults from being deployed through the factory.\n    NOTE: This will have no effect on any previously deployed\n    vaults that deployed from this factory.\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    assert self.shutdown == False, \"shutdown\"\n\n    self.shutdown = True\n    \n    log FactoryShutdown()\n\n@external\ndef transferGovernance(new_governance: address):\n    \"\"\"\n    @notice Set the governance address\n    @param new_governance The new governance address\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    self.pendingGovernance = new_governance\n\n    log UpdatePendingGovernance(new_governance)\n\n@external\ndef acceptGovernance():\n    \"\"\"\n    @notice Accept the governance address\n    \"\"\"\n    assert msg.sender == self.pendingGovernance, \"not pending governance\"\n\n    old_governance: address = self.governance\n\n    self.governance = msg.sender\n    self.pendingGovernance = empty(address)\n\n    log GovernanceTransferred(old_governance, msg.sender)",
+  "deployed_bytecode": "0x60003560e01c6002600f821660011b610eb201601e39600051565b63fc0e74d18118610e4d5734610ead5760005460405260206040f3610e4d565b635aa6e6758118610e4d5734610ead5760015460405260206040f3610e4d565b63f39c38a081186100765734610ead5760025460405260206040f35b63258294108118610e4d5734610ead5760208060805260056040527f332e312e3000000000000000000000000000000000000000000000000000000060605260408160800181518152602082015160208201528051806020830101601f82600003163682375050601f19601f8251602001011690509050810190506080f3610e4d565b6306fdde0381186101765734610ead5760208060405280604001602060035401600081601f0160051c60038111610ead57801561014957905b80600301548160051b850152600101818118610132575b5050508051806020830101601f82600003163682375050601f19601f825160200101169050810190506040f35b6362fbf6038118610e4d57602436103417610ead576004358060101c610ead5760a05260015433181561020057600e60c0527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b61138860a051131561026957600c60c0527f66656520746f6f2068696768000000000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b60065460c05260c051604052610280610100610e6d565b6101005160e05260e0516102f157600c610100527f6e6f20726563697069656e7400000000000000000000000000000000000000006101205261010050610100518061012001601f826000031636823750506308c379a060c052602060e052601f19601f61010051011660440160dcfd5b60e05160405260a051606052600060805261030d610100610e91565b610100516006557f678d2b2fe79c193f6c2c18d7515e339afcbd73fcfb360b1d0fbadae07342e05160c051604052610346610100610e53565b610100516101205260a051610140526040610120a100610e4d565b63b4aeee77811861063f5760e436103417610ead576004358060a01c610ead576040526024356004016040813511610ead576020813501808260603750506044356004016020813511610ead576020813501808260c03750506064358060a01c610ead576101005260005415610435576008610120527f73687574646f776e0000000000000000000000000000000000000000000000006101405261012050610120518061014001601f826000031636823750506308c379a060e052602061010052601f19601f61012051011660440160fcfd5b7f602d3d8160093d39f3363d3d373d3d3d363d7300000000000000000000000000610280526020610ed260003960005160601b610293527f5af43d82803e903d91602b57fd5bf300000000000000000000000000000000006102a7526080336101605260405161018052806101a0528061016001602060605101808282606060045afa50508051806020830101601f82600003163682375050601f19601f82516020010116905081019050806101c052806101600160c051815260e05160208201528051806020830101601f82600003163682375050601f19601f825160200101169050810190506101405261014080516020820120905060366102806000f58015610ead5761012052610120516375b30be66101405260a06040516101605280610180528061016001602060605101808282606060045afa50508051806020830101601f82600003163682375050601f19601f82516020010116905081019050806101a052806101600160c051815260e05160208201528051806020830101601f82600003163682375050601f19601f82516020010116905081019050610100516101c0526084356101e05250803b15610ead57600061014061014461015c6000855af1610609573d600060003e3d6000fd5b50604051610120517f4241302c393c713e690702c4a45a57e93cef59aa8c6e2358495853b3420551d86000610140a36020610120f35b63b5a71e078118610e4d57604436103417610ead576004358060a01c610ead5760a0526024358060101c610ead5760c0526001543318156106d957600e60e0527f6e6f7420676f7665726e616e63650000000000000000000000000000000000006101005260e05060e0518061010001601f826000031636823750506308c379a060a052602060c052601f19601f60e051011660440160bcfd5b61138860c051131561074457600c60e0527f66656520746f6f206869676800000000000000000000000000000000000000006101005260e05060e0518061010001601f826000031636823750506308c379a060a052602060c052601f19601f60e051011660440160bcfd5b60065460405261075460e0610e6d565b60e0516107be57600c610100527f6e6f20726563697069656e7400000000000000000000000000000000000000006101205261010050610100518061012001601f826000031636823750506308c379a060c052602060e052601f19601f61010051011660440160dcfd5b600060405260c05160605260016080526107d860e0610e91565b60e051600760a05160205260005260406000205560a0517f96d6cc624354ffe5a7207dc2dcc152e58e23ac8df9c96943f3cfb10ea4c140ac60c05160e052602060e0a200610e4d565b63f71bf70d8118610e4d5734610ead576020610ed260403960206040f3610e4d565b635153b1998118610e4d5734610ead573360605261088456610e4d565b636556424b8118610e4d57602436103417610ead576004358060a01c610ead576060525b60076060516020526000526040600020546080526080516040526108a860a0610e83565b60a0516108ef576006546080526080516040526108c560a0610e53565b60a05160e0526080516040526108db60c0610e6d565b60c05161010052604060e061092356610923565b6080516040526108ff60c0610e53565b60c0516101005260065460405261091660e0610e6d565b60e0516101205260406101005bf3610e4d565b63e94860d88118610e4d57602436103417610ead576004358060a01c610ead576060526020600760605160205260005260406000205460405261096c6080610e83565b6080f3610e4d565b63f8ebccea8118610e4d57602436103417610ead576004358060a01c610ead5760a0526001543318156109fe57600e60c0527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b60a051610a6257600c60c0527f7a65726f2061646472657373000000000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b60065460c05260a0516101205260c051604052610a7f60e0610e53565b60e05161014052600061016052610120516040526101405160605261016051608052610aac610100610e91565b6101005160065560a05160c051604052610ac660e0610e6d565b60e0517f6af4e38beb02e4b110090dd85c5adfb341e2278b905068773762fe4666e5db7a6000610100a300610e4d565b6311a3a4348118610bcf57602436103417610ead576004358060a01c610ead5760a052600154331815610b8057600e60c0527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b606036604037610b9060c0610e91565b60c051600760a05160205260005260406000205560a0517f39612c4f13d7a058dece05cf6730e3322fd9a11d6f055a5eacdde49191f45f1f600060c0a2005b63d38bfff48118610e4d57602436103417610ead576004358060a01c610ead57604052600154331815610c5957600e6060527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060805260605060605180608001601f826000031636823750506308c379a06020526020604052601f19601f6060510116604401603cfd5b6040516002556040517fa443b483867b0f9db5b03913474dd21935ac5ba70fa6c94e3423ba9be157c44b60006060a200610e4d565b63365adba68118610e4d5734610ead57600154331815610d0557600e6040527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060605260405060405180606001601f826000031636823750506308c379a06000526020602052601f19601f6040510116604401601cfd5b60005415610d6a5760086040527f73687574646f776e00000000000000000000000000000000000000000000000060605260405060405180606001601f826000031636823750506308c379a06000526020602052601f19601f6040510116604401601cfd5b60016000557fc643193a97fc0e18d69c95e1c034b91f51fa164ba8ea68dfb6dd98568b9bc96b60006040a100610e4d565b63238efcbc8118610e4d5734610ead57600254331815610e125760166040527f6e6f742070656e64696e6720676f7665726e616e63650000000000000000000060605260405060405180606001601f826000031636823750506308c379a06000526020602052601f19601f6040510116604401601cfd5b600154604052336001556000600255336040517f5f56bee8cffbe9a78652a74a60705edede02af10b0bbb888ca44b79a0d42ce8060006060a3005b60006000fd5b61ffff6040518060081c9050168060101c610ead57815250565b6040518060181c90508060a01c610ead57815250565b600160016040511614815250565b6080516060518060081b90506040518060181b90501717815250565b600080fd005a001a0e4d00f90af6003a0c8e036109290843097408600d9b08210e4d0e4d000000000000000000000000dd3fa86409658d207a9be0141ee560c8db557824",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "*": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "Yearn v3.1.0 Vault Factory",
+      {
+        "name": "name",
+        "type": "string"
+      }
+    ],
+    [
+      "0xdD3FA86409658d207A9BE0141eE560C8db557824",
+      {
+        "name": "vault_original",
+        "type": "address"
+      }
+    ],
+    [
+      "0x6f3cBE2ab3483EC4BA7B672fbdCa0E9B33F88db8",
+      {
+        "name": "governance",
+        "type": "address"
+      }
+    ]
+  ],
+  "compiler_version": "v0.3.10+commit.91361694",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-06-19T19:31:31.117227Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x610ed25150346100c8576020610fb56000396000516040602082610fb501600039600051116100c8576020602082610fb501600039600051018082610fb50160403950506020610fd56000396000518060a01c6100c85760a0526020610ff56000396000518060a01c6100c85760c052602060405101600081601f0160051c600381116100c85780156100a657905b8060051b60400151816003015560010181811861008e575b50505060a051610ed25260c051600155610ed26100cd61000039610ef2610000f35b600080fd60003560e01c6002600f821660011b610eb201601e39600051565b63fc0e74d18118610e4d5734610ead5760005460405260206040f3610e4d565b635aa6e6758118610e4d5734610ead5760015460405260206040f3610e4d565b63f39c38a081186100765734610ead5760025460405260206040f35b63258294108118610e4d5734610ead5760208060805260056040527f332e312e3000000000000000000000000000000000000000000000000000000060605260408160800181518152602082015160208201528051806020830101601f82600003163682375050601f19601f8251602001011690509050810190506080f3610e4d565b6306fdde0381186101765734610ead5760208060405280604001602060035401600081601f0160051c60038111610ead57801561014957905b80600301548160051b850152600101818118610132575b5050508051806020830101601f82600003163682375050601f19601f825160200101169050810190506040f35b6362fbf6038118610e4d57602436103417610ead576004358060101c610ead5760a05260015433181561020057600e60c0527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b61138860a051131561026957600c60c0527f66656520746f6f2068696768000000000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b60065460c05260c051604052610280610100610e6d565b6101005160e05260e0516102f157600c610100527f6e6f20726563697069656e7400000000000000000000000000000000000000006101205261010050610100518061012001601f826000031636823750506308c379a060c052602060e052601f19601f61010051011660440160dcfd5b60e05160405260a051606052600060805261030d610100610e91565b610100516006557f678d2b2fe79c193f6c2c18d7515e339afcbd73fcfb360b1d0fbadae07342e05160c051604052610346610100610e53565b610100516101205260a051610140526040610120a100610e4d565b63b4aeee77811861063f5760e436103417610ead576004358060a01c610ead576040526024356004016040813511610ead576020813501808260603750506044356004016020813511610ead576020813501808260c03750506064358060a01c610ead576101005260005415610435576008610120527f73687574646f776e0000000000000000000000000000000000000000000000006101405261012050610120518061014001601f826000031636823750506308c379a060e052602061010052601f19601f61012051011660440160fcfd5b7f602d3d8160093d39f3363d3d373d3d3d363d7300000000000000000000000000610280526020610ed260003960005160601b610293527f5af43d82803e903d91602b57fd5bf300000000000000000000000000000000006102a7526080336101605260405161018052806101a0528061016001602060605101808282606060045afa50508051806020830101601f82600003163682375050601f19601f82516020010116905081019050806101c052806101600160c051815260e05160208201528051806020830101601f82600003163682375050601f19601f825160200101169050810190506101405261014080516020820120905060366102806000f58015610ead5761012052610120516375b30be66101405260a06040516101605280610180528061016001602060605101808282606060045afa50508051806020830101601f82600003163682375050601f19601f82516020010116905081019050806101a052806101600160c051815260e05160208201528051806020830101601f82600003163682375050601f19601f82516020010116905081019050610100516101c0526084356101e05250803b15610ead57600061014061014461015c6000855af1610609573d600060003e3d6000fd5b50604051610120517f4241302c393c713e690702c4a45a57e93cef59aa8c6e2358495853b3420551d86000610140a36020610120f35b63b5a71e078118610e4d57604436103417610ead576004358060a01c610ead5760a0526024358060101c610ead5760c0526001543318156106d957600e60e0527f6e6f7420676f7665726e616e63650000000000000000000000000000000000006101005260e05060e0518061010001601f826000031636823750506308c379a060a052602060c052601f19601f60e051011660440160bcfd5b61138860c051131561074457600c60e0527f66656520746f6f206869676800000000000000000000000000000000000000006101005260e05060e0518061010001601f826000031636823750506308c379a060a052602060c052601f19601f60e051011660440160bcfd5b60065460405261075460e0610e6d565b60e0516107be57600c610100527f6e6f20726563697069656e7400000000000000000000000000000000000000006101205261010050610100518061012001601f826000031636823750506308c379a060c052602060e052601f19601f61010051011660440160dcfd5b600060405260c05160605260016080526107d860e0610e91565b60e051600760a05160205260005260406000205560a0517f96d6cc624354ffe5a7207dc2dcc152e58e23ac8df9c96943f3cfb10ea4c140ac60c05160e052602060e0a200610e4d565b63f71bf70d8118610e4d5734610ead576020610ed260403960206040f3610e4d565b635153b1998118610e4d5734610ead573360605261088456610e4d565b636556424b8118610e4d57602436103417610ead576004358060a01c610ead576060525b60076060516020526000526040600020546080526080516040526108a860a0610e83565b60a0516108ef576006546080526080516040526108c560a0610e53565b60a05160e0526080516040526108db60c0610e6d565b60c05161010052604060e061092356610923565b6080516040526108ff60c0610e53565b60c0516101005260065460405261091660e0610e6d565b60e0516101205260406101005bf3610e4d565b63e94860d88118610e4d57602436103417610ead576004358060a01c610ead576060526020600760605160205260005260406000205460405261096c6080610e83565b6080f3610e4d565b63f8ebccea8118610e4d57602436103417610ead576004358060a01c610ead5760a0526001543318156109fe57600e60c0527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b60a051610a6257600c60c0527f7a65726f2061646472657373000000000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b60065460c05260a0516101205260c051604052610a7f60e0610e53565b60e05161014052600061016052610120516040526101405160605261016051608052610aac610100610e91565b6101005160065560a05160c051604052610ac660e0610e6d565b60e0517f6af4e38beb02e4b110090dd85c5adfb341e2278b905068773762fe4666e5db7a6000610100a300610e4d565b6311a3a4348118610bcf57602436103417610ead576004358060a01c610ead5760a052600154331815610b8057600e60c0527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060e05260c05060c0518060e001601f826000031636823750506308c379a0608052602060a052601f19601f60c0510116604401609cfd5b606036604037610b9060c0610e91565b60c051600760a05160205260005260406000205560a0517f39612c4f13d7a058dece05cf6730e3322fd9a11d6f055a5eacdde49191f45f1f600060c0a2005b63d38bfff48118610e4d57602436103417610ead576004358060a01c610ead57604052600154331815610c5957600e6060527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060805260605060605180608001601f826000031636823750506308c379a06020526020604052601f19601f6060510116604401603cfd5b6040516002556040517fa443b483867b0f9db5b03913474dd21935ac5ba70fa6c94e3423ba9be157c44b60006060a200610e4d565b63365adba68118610e4d5734610ead57600154331815610d0557600e6040527f6e6f7420676f7665726e616e636500000000000000000000000000000000000060605260405060405180606001601f826000031636823750506308c379a06000526020602052601f19601f6040510116604401601cfd5b60005415610d6a5760086040527f73687574646f776e00000000000000000000000000000000000000000000000060605260405060405180606001601f826000031636823750506308c379a06000526020602052601f19601f6040510116604401601cfd5b60016000557fc643193a97fc0e18d69c95e1c034b91f51fa164ba8ea68dfb6dd98568b9bc96b60006040a100610e4d565b63238efcbc8118610e4d5734610ead57600254331815610e125760166040527f6e6f742070656e64696e6720676f7665726e616e63650000000000000000000060605260405060405180606001601f826000031636823750506308c379a06000526020602052601f19601f6040510116604401601cfd5b600154604052336001556000600255336040517f5f56bee8cffbe9a78652a74a60705edede02af10b0bbb888ca44b79a0d42ce8060006060a3005b60006000fd5b61ffff6040518060081c9050168060101c610ead57815250565b6040518060181c90508060a01c610ead57815250565b600160016040511614815250565b6080516060518060081b90506040518060181b90501717815250565b600080fd005a001a0e4d00f90af6003a0c8e036109290843097408600d9b08210e4d0e4d84190ed28118201820a16576797065728300030a00160000000000000000000000000000000000000000000000000000000000000060000000000000000000000000dd3fa86409658d207a9be0141ee560c8db5578240000000000000000000000006f3cbe2ab3483ec4ba7b672fbdca0e9b33f88db8000000000000000000000000000000000000000000000000000000000000001a596561726e2076332e312e30205661756c7420466163746f7279000000000000",
+  "name": "YearnVaultFactory",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "vault_address",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "asset",
+          "type": "address"
+        }
+      ],
+      "name": "NewVault",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "name": "old_fee_bps",
+          "type": "uint16"
+        },
+        {
+          "indexed": false,
+          "name": "new_fee_bps",
+          "type": "uint16"
+        }
+      ],
+      "name": "UpdateProtocolFeeBps",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "old_fee_recipient",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "new_fee_recipient",
+          "type": "address"
+        }
+      ],
+      "name": "UpdateProtocolFeeRecipient",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "vault",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "new_custom_protocol_fee",
+          "type": "uint16"
+        }
+      ],
+      "name": "UpdateCustomProtocolFee",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "vault",
+          "type": "address"
+        }
+      ],
+      "name": "RemovedCustomProtocolFee",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [],
+      "name": "FactoryShutdown",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "previousGovernance",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "newGovernance",
+          "type": "address"
+        }
+      ],
+      "name": "GovernanceTransferred",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "newPendingGovernance",
+          "type": "address"
+        }
+      ],
+      "name": "UpdatePendingGovernance",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "vault_original",
+          "type": "address"
+        },
+        {
+          "name": "governance",
+          "type": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [
+        {
+          "name": "asset",
+          "type": "address"
+        },
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "symbol",
+          "type": "string"
+        },
+        {
+          "name": "role_manager",
+          "type": "address"
+        },
+        {
+          "name": "profit_max_unlock_time",
+          "type": "uint256"
+        }
+      ],
+      "name": "deploy_new_vault",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "vault_original",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "apiVersion",
+      "outputs": [
+        {
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "protocol_fee_config",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint16"
+        },
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "vault",
+          "type": "address"
+        }
+      ],
+      "name": "protocol_fee_config",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint16"
+        },
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "vault",
+          "type": "address"
+        }
+      ],
+      "name": "use_custom_protocol_fee",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "new_protocol_fee_bps",
+          "type": "uint16"
+        }
+      ],
+      "name": "set_protocol_fee_bps",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "new_protocol_fee_recipient",
+          "type": "address"
+        }
+      ],
+      "name": "set_protocol_fee_recipient",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "vault",
+          "type": "address"
+        },
+        {
+          "name": "new_custom_protocol_fee",
+          "type": "uint16"
+        }
+      ],
+      "name": "set_custom_protocol_fee_bps",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "vault",
+          "type": "address"
+        }
+      ],
+      "name": "remove_custom_protocol_fee",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "shutdown_factory",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "new_governance",
+          "type": "address"
+        }
+      ],
+      "name": "transferGovernance",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "acceptGovernance",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "shutdown",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "governance",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pendingGovernance",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "name",
+      "outputs": [
+        {
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": "0x0000000000000000000000000000000000000000000000000000000000000060000000000000000000000000dd3fa86409658d207a9be0141ee560c8db5578240000000000000000000000006f3cbe2ab3483ec4ba7b672fbdca0e9b33f88db8000000000000000000000000000000000000000000000000000000000000001a596561726e2076332e312e30205661756c7420466163746f7279000000000000",
+  "sources": {
+    "YearnVaultFactory.vy": {
+      "content": "# @version 0.3.10\n#pragma evm-version paris\n\n\"\"\"\n@title Yearn Vault Factory\n@license GNU AGPLv3\n@author yearn.finance\n@notice\n    This vault Factory can be used by anyone wishing to deploy their own\n    ERC4626 compliant Yearn V3 Vault of the same API version.\n\n    The factory clones new vaults from its specific `VAULT_ORIGINAL`\n    immutable address set on creation of the factory.\n    \n    The deployments are done through create2 with a specific `salt` \n    that is derived from a combination of the deployer's address,\n    the underlying asset used, as well as the name and symbol specified.\n    Meaning a deployer will not be able to deploy the exact same vault\n    twice and will need to use different name and or symbols for vaults\n    that use the same other parameters such as `asset`.\n\n    The factory also holds the protocol fee configs for each vault and strategy\n    of its specific `API_VERSION` that determine how much of the fees\n    charged are designated \"protocol fees\" and sent to the designated\n    `fee_recipient`. The protocol fees work through a revenue share system,\n    where if the vault or strategy decides to charge X amount of total\n    fees during a `report` the protocol fees are a percent of X.\n    The protocol fees will be sent to the designated fee_recipient and\n    then (X - protocol_fees) will be sent to the vault/strategy specific\n    fee recipient.\n\"\"\"\n\ninterface IVault:\n    def initialize(\n        asset: address, \n        name: String[64], \n        symbol: String[32], \n        role_manager: address, \n        profit_max_unlock_time: uint256\n    ): nonpayable\n\nevent NewVault:\n    vault_address: indexed(address)\n    asset: indexed(address)\n\nevent UpdateProtocolFeeBps:\n    old_fee_bps: uint16\n    new_fee_bps: uint16\n\nevent UpdateProtocolFeeRecipient:\n    old_fee_recipient: indexed(address)\n    new_fee_recipient: indexed(address)\n\nevent UpdateCustomProtocolFee:\n    vault: indexed(address)\n    new_custom_protocol_fee: uint16\n\nevent RemovedCustomProtocolFee:\n    vault: indexed(address)\n\nevent FactoryShutdown:\n    pass\n\nevent GovernanceTransferred:\n    previousGovernance: indexed(address)\n    newGovernance: indexed(address)\n\nevent UpdatePendingGovernance:\n    newPendingGovernance: indexed(address)\n\n\n# Identifier for this version of the vault.\nAPI_VERSION: constant(String[28]) = \"3.1.0\"\n\n# The max amount the protocol fee can be set to.\nMAX_FEE_BPS: constant(uint16) = 5_000 # 50%\n\n# Mask used to unpack the protocol fee bps.\nFEE_BPS_MASK: constant(uint256) = 2**16-1\n\n# The address that all newly deployed vaults are based from.\nVAULT_ORIGINAL: immutable(address)\n\n# State of the Factory. If True no new vaults can be deployed.\nshutdown: public(bool)\n\n# Address that can set or change the fee configs.\ngovernance: public(address)\n# Pending governance waiting to be accepted.\npendingGovernance: public(address)\n\n# Name for identification.\nname: public(String[64])\n\n# Protocol Fee Data is packed into a single uint256 slot\n# 72 bits Empty | 160 bits fee recipient | 16 bits fee bps | 8 bits custom flag\n\n# The default config for assessing protocol fees.\ndefault_protocol_fee_data: uint256\n# Custom fee to charge for a specific vault or strategy.\ncustom_protocol_fee_data: HashMap[address, uint256]\n\n@external\ndef __init__(name: String[64], vault_original: address, governance: address):\n    self.name = name\n    VAULT_ORIGINAL = vault_original\n    self.governance = governance\n\n@external\ndef deploy_new_vault(\n    asset: address, \n    name: String[64], \n    symbol: String[32], \n    role_manager: address, \n    profit_max_unlock_time: uint256\n) -> address:\n    \"\"\"\n    @notice Deploys a new clone of the original vault.\n    @param asset The asset to be used for the vault.\n    @param name The name of the new vault.\n    @param symbol The symbol of the new vault.\n    @param role_manager The address of the role manager.\n    @param profit_max_unlock_time The time over which the profits will unlock.\n    @return The address of the new vault.\n    \"\"\"\n    # Make sure the factory is not shutdown.\n    assert not self.shutdown, \"shutdown\"\n\n    # Clone a new version of the vault using create2.\n    vault_address: address = create_minimal_proxy_to(\n            VAULT_ORIGINAL, \n            value=0,\n            salt=keccak256(_abi_encode(msg.sender, asset, name, symbol))\n        )\n\n    IVault(vault_address).initialize(\n        asset, \n        name, \n        symbol, \n        role_manager, \n        profit_max_unlock_time, \n    )\n        \n    log NewVault(vault_address, asset)\n    return vault_address\n\n@view\n@external\ndef vault_original()-> address:\n    \"\"\"\n    @notice Get the address of the vault to clone from\n    @return The address of the original vault.\n    \"\"\"\n    return VAULT_ORIGINAL\n\n@view\n@external\ndef apiVersion() -> String[28]:\n    \"\"\"\n    @notice Get the API version of the factory.\n    @return The API version of the factory.\n    \"\"\"\n    return API_VERSION\n\n@view\n@external\ndef protocol_fee_config(vault: address = msg.sender) -> (uint16, address):\n    \"\"\"\n    @notice Called during vault and strategy reports \n    to retrieve the protocol fee to charge and address\n    to receive the fees.\n    @param vault Address of the vault that would be reporting.\n    @return Fee in bps\n    @return Address of fee recipient\n    \"\"\"\n    # If there is a custom protocol fee set we return it.\n    config_data: uint256 = self.custom_protocol_fee_data[vault]\n    if self._unpack_custom_flag(config_data):\n        # Always use the default fee recipient even with custom fees.\n        return (\n            self._unpack_protocol_fee(config_data),\n            self._unpack_fee_recipient(self.default_protocol_fee_data)\n        )\n    else:\n        # Otherwise return the default config.\n        config_data = self.default_protocol_fee_data\n        return (\n            self._unpack_protocol_fee(config_data), \n            self._unpack_fee_recipient(config_data)\n        )\n\n@view\n@external\ndef use_custom_protocol_fee(vault: address) -> bool:\n    \"\"\"\n    @notice If a custom protocol fee is used for a vault.\n    @param vault Address of the vault to check.\n    @return If a custom protocol fee is used.\n    \"\"\"\n    return self._unpack_custom_flag(self.custom_protocol_fee_data[vault])\n\n@view\n@internal\ndef _unpack_protocol_fee(config_data: uint256) -> uint16:\n    \"\"\"\n    Unpacks the protocol fee from the packed data uint.\n    \"\"\"\n    return convert(shift(config_data, -8) & FEE_BPS_MASK, uint16)\n    \n@view\n@internal\ndef _unpack_fee_recipient(config_data: uint256) -> address:\n    \"\"\"\n    Unpacks the fee recipient from the packed data uint.\n    \"\"\"\n    return convert(shift(config_data, -24), address)\n\n@view\n@internal\ndef _unpack_custom_flag(config_data: uint256) -> bool:\n    \"\"\"\n    Unpacks the custom fee flag from the packed data uint.\n    \"\"\"\n    return config_data & 1 == 1\n\n@view\n@internal\ndef _pack_protocol_fee_data(recipient: address, fee: uint16, custom: bool) -> uint256:\n    \"\"\"\n    Packs the full protocol fee data into a single uint256 slot.\n    This is used for both the default fee storage as well as for custom fees.\n    72 bits Empty | 160 bits fee recipient | 16 bits fee bps | 8 bits custom flag\n    \"\"\"\n    return shift(convert(recipient, uint256), 24) | shift(convert(fee, uint256), 8) | convert(custom, uint256)\n\n@external\ndef set_protocol_fee_bps(new_protocol_fee_bps: uint16):\n    \"\"\"\n    @notice Set the protocol fee in basis points\n    @dev Must be below the max allowed fee, and a default\n    fee_recipient must be set so we don't issue fees to the 0 address.\n    @param new_protocol_fee_bps The new protocol fee in basis points\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    assert new_protocol_fee_bps <= MAX_FEE_BPS, \"fee too high\"\n\n    # Cache the current default protocol fee.\n    default_fee_data: uint256 = self.default_protocol_fee_data\n    recipient: address = self._unpack_fee_recipient(default_fee_data)\n    \n    assert recipient != empty(address), \"no recipient\"\n\n    # Set the new fee\n    self.default_protocol_fee_data = self._pack_protocol_fee_data(\n        recipient, \n        new_protocol_fee_bps, \n        False\n    )\n\n    log UpdateProtocolFeeBps(\n        self._unpack_protocol_fee(default_fee_data), \n        new_protocol_fee_bps\n    )\n\n\n@external\ndef set_protocol_fee_recipient(new_protocol_fee_recipient: address):\n    \"\"\"\n    @notice Set the protocol fee recipient\n    @dev Can never be set to 0 to avoid issuing fees to the 0 address.\n    @param new_protocol_fee_recipient The new protocol fee recipient\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    assert new_protocol_fee_recipient != empty(address), \"zero address\"\n\n    default_fee_data: uint256 = self.default_protocol_fee_data\n\n    self.default_protocol_fee_data = self._pack_protocol_fee_data(\n        new_protocol_fee_recipient, \n        self._unpack_protocol_fee(default_fee_data), \n        False\n    )\n    \n    log UpdateProtocolFeeRecipient(\n        self._unpack_fee_recipient(default_fee_data),\n        new_protocol_fee_recipient\n    )\n    \n\n@external\ndef set_custom_protocol_fee_bps(vault: address, new_custom_protocol_fee: uint16):\n    \"\"\"\n    @notice Allows Governance to set custom protocol fees\n    for a specific vault or strategy.\n    @dev Must be below the max allowed fee, and a default\n    fee_recipient must be set so we don't issue fees to the 0 address.\n    @param vault The address of the vault or strategy to customize.\n    @param new_custom_protocol_fee The custom protocol fee in BPS.\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    assert new_custom_protocol_fee <= MAX_FEE_BPS, \"fee too high\"\n    assert self._unpack_fee_recipient(self.default_protocol_fee_data) != empty(address), \"no recipient\"\n\n    self.custom_protocol_fee_data[vault] = self._pack_protocol_fee_data(\n        empty(address), \n        new_custom_protocol_fee, \n        True\n    )\n\n    log UpdateCustomProtocolFee(vault, new_custom_protocol_fee)\n\n@external \ndef remove_custom_protocol_fee(vault: address):\n    \"\"\"\n    @notice Allows governance to remove a previously set\n    custom protocol fee.\n    @param vault The address of the vault or strategy to\n    remove the custom fee for.\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n\n    # Reset the custom fee to 0 and flag to False.\n    self.custom_protocol_fee_data[vault] = self._pack_protocol_fee_data(empty(address), 0, False)\n\n    log RemovedCustomProtocolFee(vault)\n\n@external\ndef shutdown_factory():\n    \"\"\"\n    @notice To stop new deployments through this factory.\n    @dev A one time switch available for governance to stop\n    new vaults from being deployed through the factory.\n    NOTE: This will have no effect on any previously deployed\n    vaults that deployed from this factory.\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    assert self.shutdown == False, \"shutdown\"\n\n    self.shutdown = True\n    \n    log FactoryShutdown()\n\n@external\ndef transferGovernance(new_governance: address):\n    \"\"\"\n    @notice Set the governance address\n    @param new_governance The new governance address\n    \"\"\"\n    assert msg.sender == self.governance, \"not governance\"\n    self.pendingGovernance = new_governance\n\n    log UpdatePendingGovernance(new_governance)\n\n@external\ndef acceptGovernance():\n    \"\"\"\n    @notice Accept the governance address\n    \"\"\"\n    assert msg.sender == self.pendingGovernance, \"not pending governance\"\n\n    old_governance: address = self.governance\n\n    self.governance = msg.sender\n    self.pendingGovernance = empty(address)\n\n    log GovernanceTransferred(old_governance, msg.sender)"
+    }
+  }
+}

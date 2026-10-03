@@ -1,0 +1,658 @@
+{
+  "file_path": "BonusDistributor.vy",
+  "creation_status": "success",
+  "source_code": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Bonus Distributor\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Awards bonus tokens to teams based on their profit. The bonus token is priced by an oracle \n        and is adjusted by the growth of revenue of all teams combined, meaning growth is rewarded \n        by a lowering of the effective bonus token price, resulting in more bonus tokens being awarded.\n        The awarded tokens are split between the teams and the YBC, with a configurable ratio.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\nstruct Parameters:\n    bonus_factor: uint256\n    ybc_split: uint256\n    bonus_price: uint256\n\ninterface IAccountant:\n    def global_revenues(_period: uint256) -> uint256: view\n    def team_profits(_team: address, _period: uint256) -> uint256: view\n\ninterface ITeam:\n    def owner() -> address: view\n\ninterface IBonusPriceOracle:\n    def price(_period: uint256) -> uint256: nonpayable\n\ninterface IYBCRecipient:\n    def deposit_bonus(_amount: uint256): nonpayable\n\ngenesis: public(immutable(uint256))\nbonus_token: public(immutable(IERC20))\nmanagement: public(address)\npending_management: public(address)\noperator: public(address)\naccountant: public(IAccountant)\nbonus_price_oracle: public(IBonusPriceOracle)\nybc_recipient: public(IYBCRecipient)\n\nsmoothing_factor: public(uint256)\ngrowth_rate_cap: public(uint256)\nbonus_factor: public(uint256)\nybc_split: public(uint256)\n\npending_period: public(uint256)\npending_claims: public(HashMap[address, uint256]) # team => pending claim period\nema_revenue: public(uint256)\nparameters: public(HashMap[uint256, Parameters])\n\nevent ClaimBonus:\n    team: indexed(address)\n    period: indexed(uint256)\n    amount: uint256\n    ybc_amount: uint256\n    recipient: address\n\nevent SetOperator:\n    operator: indexed(address)\n\nevent SetAccountant:\n    accountant: indexed(address)\n\nevent SetBonusPriceOracle:\n    oracle: indexed(address)\n\nevent SetYBC:\n    recipient: indexed(address)\n    split: uint256\n\nevent SetSmoothingFactor:\n    factor: uint256\n\nevent SetGrowthRateCap:\n    cap: uint256\n\nevent SetBonusFactor:\n    factor: uint256\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPRECISION: constant(uint256) = 10**18\nBPS_PRECISION: constant(uint256) = 10000\nPERIOD_LENGTH: constant(uint256) = 6 * 14 * 24 * 60 * 60\n\n@deploy\ndef __init__(_genesis: uint256, _token: address):\n    \"\"\"\n    @notice Constructor\n    @param _genesis Budget period genesis timestamp\n    @param _token Bonus token address\n    \"\"\"\n    genesis = _genesis\n    bonus_token = IERC20(_token)\n\n    self.management = msg.sender\n    self.operator = msg.sender\n    self.smoothing_factor = PRECISION\n    self.growth_rate_cap = BPS_PRECISION * 4 // 5\n    self.bonus_factor = BPS_PRECISION\n\n@external\n@view\ndef period() -> uint256:\n    \"\"\"\n    @notice Query the current budget period number\n    @return The current budget period number\n    \"\"\"\n    return self._period()\n\n@external\ndef finalize_period() -> (uint256, uint256, uint256):\n    \"\"\"\n    @notice Finalize bonus accounting for a budget period\n    @return Tuple with: budget period number, spot token price, growth factor\n    @dev Can only be called by the operator, if set\n    \"\"\"\n    assert self.operator in [msg.sender, empty(address)]\n    period: uint256 = self.pending_period\n    assert self._period() > period\n    self.pending_period = period + 1\n\n    # compute EMA smoothed revenue\n    global_revenue: uint256 = staticcall self.accountant.global_revenues(period)\n    prev_ema_revenue: uint256 = self.ema_revenue\n    ema_revenue: uint256 = 0\n    if period == 0:\n        prev_ema_revenue = global_revenue\n        ema_revenue = global_revenue\n    else:\n        smoothing_factor: uint256 = self.smoothing_factor\n        ema_revenue = (smoothing_factor * global_revenue + (PRECISION - smoothing_factor) * prev_ema_revenue) // PRECISION\n    self.ema_revenue = ema_revenue\n\n    if prev_ema_revenue == 0:\n        # prevent division by zero - the cap will keep the growth factor in check\n        prev_ema_revenue = 1\n\n    # compute global growth and cap in either direction\n    growth_rate_cap: uint256 = self.growth_rate_cap * PRECISION // BPS_PRECISION\n    growth_factor: uint256 = ema_revenue * PRECISION // prev_ema_revenue\n    growth_factor = min(growth_factor, PRECISION + growth_rate_cap)\n    growth_factor = max(growth_factor, PRECISION - growth_rate_cap)\n\n    # calculate adjusted bonus token price\n    price: uint256 = extcall self.bonus_price_oracle.price(period)\n    adjusted_price: uint256 = price * (2 * PRECISION - growth_factor) // PRECISION\n\n    self.parameters[period] = Parameters(bonus_factor=self.bonus_factor, ybc_split=self.ybc_split, bonus_price=adjusted_price)\n    return period, price, growth_factor\n\n@external\ndef claim(_team: address, _recipient: address = msg.sender) -> (uint256, uint256):\n    \"\"\"\n    @notice Claim a team's bonus tokens\n    @param _team Team address\n    @param _recipient Receiver of the bonus tokens. Defaults to caller\n    @return Tuple with: bonus tokens to team, bonus tokens to YBC\n    @dev Can only be called by the team owner\n    \"\"\"\n    assert msg.sender == staticcall ITeam(_team).owner()\n\n    total_amount: uint256 = 0\n    ybc_amount: uint256 = 0\n\n    pending: uint256 = self.pending_period\n    period: uint256 = self.pending_claims[_team]\n    for i: uint256 in range(16):\n        if period == pending:\n            break\n\n        par: Parameters = self.parameters[period]\n        profit: uint256 = staticcall self.accountant.team_profits(_team, period)\n        amount: uint256 = profit * par.bonus_factor * PRECISION // par.bonus_price // BPS_PRECISION\n        total_amount += amount\n        \n        loop_ybc_amount: uint256 = amount * par.ybc_split // BPS_PRECISION\n        ybc_amount += loop_ybc_amount\n\n        log ClaimBonus(team=_team, period=period, amount=amount, ybc_amount=loop_ybc_amount, recipient=_recipient)\n        period += 1\n\n    self.pending_claims[_team] = period\n\n    team_amount: uint256 = total_amount - ybc_amount\n    if team_amount > 0:\n        assert extcall bonus_token.transfer(_recipient, team_amount, default_return_value=True)\n\n    if ybc_amount > 0:\n        recipient: IYBCRecipient = self.ybc_recipient\n        assert extcall bonus_token.approve(recipient.address, ybc_amount, default_return_value=True)\n        extcall recipient.deposit_bonus(ybc_amount)\n\n    return team_amount, ybc_amount\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_operator(_operator: address):\n    \"\"\"\n    @notice Set a new operator\n    @param _operator New operator address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.operator = _operator\n    log SetOperator(operator=_operator)\n\n@external\ndef set_accountant(_accountant: address):\n    \"\"\"\n    @notice Set a new accountant\n    @param _accountant New accountant address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.accountant = IAccountant(_accountant)\n    log SetAccountant(accountant=_accountant)\n\n@external\ndef set_bonus_price_oracle(_oracle: address):\n    \"\"\"\n    @notice Set a new bonus price oracle\n    @param _oracle New bonus price oracle address\n    @dev The oracle should return the value of 1 wad of bonus tokens in USD (18 decimals)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.bonus_price_oracle = IBonusPriceOracle(_oracle)\n    log SetBonusPriceOracle(oracle=_oracle)\n\n@external\ndef set_ybc(_recipient: address, _split: uint256):\n    \"\"\"\n    @notice Set the YBC parameters\n    @param _recipient YBC recipient\n    @param _split Split of bonus tokens to the YBC (bps)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _recipient != empty(address)\n    assert _split <= BPS_PRECISION\n\n    self.ybc_recipient = IYBCRecipient(_recipient)\n    self.ybc_split = _split\n    log SetYBC(recipient=_recipient, split=_split)\n\n@external\ndef set_smoothing_factor(_factor: uint256):\n    \"\"\"\n    @notice Set the revenue smoothing factor\n    @param _factor Revenue soothing factor (18 decimals)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _factor <= PRECISION\n\n    self.smoothing_factor = _factor\n    log SetSmoothingFactor(factor=_factor)\n\n@external\ndef set_growth_rate_cap(_cap: uint256):\n    \"\"\"\n    @notice Set the cap on the growth rate\n    @param _cap Growth rate cap (bps)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _cap <= BPS_PRECISION * 4 // 5\n\n    self.growth_rate_cap = _cap\n    log SetGrowthRateCap(cap=_cap)\n\n@external\ndef set_bonus_factor(_factor: uint256):\n    \"\"\"\n    @notice Set the bonus factor\n    @param _factor Bonus factor (bps)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _factor <= 2 * BPS_PRECISION\n\n    self.bonus_factor = _factor\n    log SetBonusFactor(factor=_factor)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _period() -> uint256:\n    return unsafe_div(block.timestamp - genesis, PERIOD_LENGTH)",
+  "deployed_bytecode": "0x5f3560e01c60026024820660011b610d8c01601e395f51565b63ef78d4fd81186100385734610d885760206100346040610d66565b6040f35b632a4a9dd18118610d6257602436103417610d8857600d6004356020525f5260405f208054604052600181015460605260028101546080525060606040f35b63b2d255798118610d625734610d885760025433811861009857600161009b565b80155b905015610d8857600a546040526040516100b56060610d66565b6060511115610d885760405160018101818110610d88579050600a5560035463f915293a60805260405160a052602060806024609c845afa6100f9573d5f5f3e3d5ffd5b60203d10610d88576080905051606052600c546080525f60a05260405161012b5760605160805260605160a0526101a0565b60065460c05260c051606051808202811583838304141715610d88579050905060c05180670de0b6b3a764000003670de0b6b3a76400008111610d88579050608051808202811583838304141715610d885790509050808201828110610d885790509050670de0b6b3a76400008104905060a0525b60a051600c556080516101b35760016080525b600754670de0b6b3a7640000810281670de0b6b3a7640000820418610d885790506127108104905060c05260a051670de0b6b3a7640000810281670de0b6b3a7640000820418610d885790506080518015610d88578082049050905060e05260e05160c05180670de0b6b3a764000001670de0b6b3a76400008110610d885790508082811882841002189050905060e05260e05160c05180670de0b6b3a764000003670de0b6b3a76400008111610d885790508082811882841102189050905060e0526004546326a49e3761012052604051610140526020610120602461013c5f855af16102a3573d5f5f3e3d5ffd5b60203d10610d8857610120905051610100526101005160e05180671bc16d674ec8000003671bc16d674ec800008111610d88579050808202811583838304141715610d885790509050670de0b6b3a76400008104905061012052600d6040516020525f5260405f20600854815560095460018201556101205160028201555060405161014052610100516101605260e051610180526060610140f35b631e83409a811861035d57602436103417610d8857336060526103bc565b63a550057e8118610d6257602436103417610d88576004358060a01c610d8857604052600b6040516020525f5260405f205460605260206060f35b6321c0b3428118610d6257604436103417610d88576024358060a01c610d88576060525b6004358060a01c610d8857604052604051638da5cb5b608052602060806004609c845afa6103ec573d5f5f3e3d5ffd5b3d602081183d60201002188060800160a011610d88576080518060a01c610d885760c0525060c09050513318610d8857604036608037600a5460c052600b6040516020525f5260405f205460e0525f6010905b806101005260c05160e05118156105c457600d60e0516020525f5260405f2080546101205260018101546101405260028101546101605250600354638bbb9d056101a0526040516101c05260e0516101e05260206101a060446101bc845afa6104aa573d5f5f3e3d5ffd5b60203d10610d88576101a0905051610180526101805161012051808202811583838304141715610d885790509050670de0b6b3a7640000810281670de0b6b3a7640000820418610d88579050610160518015610d885780820490509050612710810490506101a0526080516101a051808201828110610d8857905090506080526101a05161014051808202811583838304141715610d885790509050612710810490506101c05260a0516101c051808201828110610d88579050905060a05260e0516040517fd4514a861380841acaf92be4fa4555a1ee8b52788dbc7d231e8786b50c771ca560406101a06101e05e6060516102205260606101e0a360e05160018101818110610d8857905060e05260010181811861043f575b505060e051600b6040516020525f5260405f205560805160a051808203828111610d885790509050610100526101005115610681576020610df45f395f5163a9059cbb610120526060516101405261010051610160526020610120604461013c5f855af1610634573d5f5f3e3d5ffd5b3d61064b57803b15610d8857600161018052610675565b3d602081183d6020100218806101200161014011610d8857610120518060011c610d885761018052505b61018090505115610d88575b60a0511561074d57600554610120526020610df45f395f5163095ea7b361014052610120516101605260a051610180526020610140604461015c5f855af16106cb573d5f5f3e3d5ffd5b3d6106e257803b15610d885760016101a05261070c565b3d602081183d6020100218806101400161016011610d8857610140518060011c610d88576101a052505b6101a090505115610d885761012051633ac9448e6101405260a05161016052803b15610d88575f610140602461015c5f855af161074b573d5f5f3e3d5ffd5b505b610100516101205260a051610140526040610120f35b6301681a6281186107a157602436103417610d88577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526107db565b63a7f0b3de8118610d625734610d88576020610dd460403960206040f35b636ea056a98118610d6257604436103417610d88576024356060525b6004358060a01c610d88576040525f543318610d885760605160805260605119610836576040516370a0823160a0523060c052602060a0602460bc845afa610825573d5f5f3e3d5ffd5b60203d10610d885760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af1610863573d5f5f3e3d5ffd5b3d61087a57803b15610d88576001610100526108a1565b3d602081183d60201002188060a00160c011610d885760a0518060011c610d885761010052505b61010090505115610d8857005b6330c7be728118610d6257602436103417610d88576004358060a01c610d88576040525f543318610d88576040516002556040517fdbebfba65bd6398fb722063efc10c99f624f9cd8ba657201056af918a676d5ee5f6060a2005b6371da8a8d811861096457602436103417610d88576004358060a01c610d88576040525f543318610d88576040516003556040517f0272efc86eeb452c32134d3a55db5b3f3a9f3a8f426422cd285c688b97b303df5f6060a2005b63570ca7358118610d625734610d885760025460405260206040f35b62cccec88118610d6257602436103417610d88576004358060a01c610d88576040525f543318610d88576040516004556040517e876a9468f367df1afaf02e27a95cdb4afe2715fa6d7d553372679a52c0a53a5f6060a2005b630ac702948118610d6257604436103417610d88576004358060a01c610d88576040525f543318610d885760405115610d885761271060243511610d88576040516005556024356009556040517f12e60979f673de6b3d304e6536c768c1a594b07d6dd6811e1895524b9484c98860243560605260206060a2005b63a0f2ce558118610d6257602436103417610d88575f543318610d8857670de0b6b3a764000060043511610d88576004356006557ffaf52b639046bb3e963663f9bbaabf1d770ba94de786bd0023a106f636d7240560043560405260206040a1005b6343efc5748118610b1257602436103417610d88575f543318610d8857611f4060043511610d88576004356007557f8ed46fa9460ea3d7af19f9578d971a60b644ec0f4a483bd33d05d28c7e01c9c560043560405260206040a1005b63ef989fc08118610d625734610d885760085460405260206040f35b63b7b790178118610d6257602436103417610d88575f543318610d8857614e2060043511610d88576004356008557f950cd1719c20776884c2c44c0f3eb060e304575f0718a370cbf06df4620e00f260043560405260206040a1005b63fd066ecc8118610d6257602436103417610d88576004358060a01c610d88576040525f543318610d88576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c8118610c2d5734610d88576001543318610d88575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63770817ec8118610d625734610d885760015460405260206040f35b63f3173cd08118610d625734610d88576020610df460403960206040f35b6388a8d6028118610d625734610d88575f5460405260206040f35b634fb3ccc58118610d625734610d885760035460405260206040f35b63426a1d2b8118610d625734610d885760045460405260206040f35b635f37ee078118610d625734610d885760055460405260206040f35b63b41908428118610d625734610d885760065460405260206040f35b6333df577c8118610d625734610d885760075460405260206040f35b6325089e138118610d625734610d885760095460405260206040f35b63c5486f8d8118610d625734610d8857600a5460405260206040f35b6308006fd78118610d625734610d8857600c5460405260206040f35b5f5ffd5b626ebe00426020610dd45f395f51808203828111610d88579050905004815250565b5f80fd0d62090908ae0d6209800c820d620d620be50a540c670b2e0b8a0d620d620d0e0ab60d2a0d620d4609d9007707630d620c490d6203980d620d6200180cd60c9e0cf207bf033f0cba0000000000000000000000000000000000000000000000000000000069151f800000000000000000000000000bc529c00c6401aef6d220be8c6ea1667f6ad93e",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "BonusDistributor.vy": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "1762992000",
+      {
+        "name": "_genesis",
+        "type": "uint256"
+      }
+    ],
+    [
+      "0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e",
+      {
+        "name": "_token",
+        "type": "address"
+      }
+    ]
+  ],
+  "compiler_version": "v0.4.2+commit.c216787f",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-07-01T20:48:41.791887Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x610df4515034610062576020610e925f395f518060a01c610062576040526020610e725f395f51610dd452604051610df452335f5533600255670de0b6b3a7640000600655611f40600755612710600855610dd461006661000039610e14610000f35b5f80fd5f3560e01c60026024820660011b610d8c01601e395f51565b63ef78d4fd81186100385734610d885760206100346040610d66565b6040f35b632a4a9dd18118610d6257602436103417610d8857600d6004356020525f5260405f208054604052600181015460605260028101546080525060606040f35b63b2d255798118610d625734610d885760025433811861009857600161009b565b80155b905015610d8857600a546040526040516100b56060610d66565b6060511115610d885760405160018101818110610d88579050600a5560035463f915293a60805260405160a052602060806024609c845afa6100f9573d5f5f3e3d5ffd5b60203d10610d88576080905051606052600c546080525f60a05260405161012b5760605160805260605160a0526101a0565b60065460c05260c051606051808202811583838304141715610d88579050905060c05180670de0b6b3a764000003670de0b6b3a76400008111610d88579050608051808202811583838304141715610d885790509050808201828110610d885790509050670de0b6b3a76400008104905060a0525b60a051600c556080516101b35760016080525b600754670de0b6b3a7640000810281670de0b6b3a7640000820418610d885790506127108104905060c05260a051670de0b6b3a7640000810281670de0b6b3a7640000820418610d885790506080518015610d88578082049050905060e05260e05160c05180670de0b6b3a764000001670de0b6b3a76400008110610d885790508082811882841002189050905060e05260e05160c05180670de0b6b3a764000003670de0b6b3a76400008111610d885790508082811882841102189050905060e0526004546326a49e3761012052604051610140526020610120602461013c5f855af16102a3573d5f5f3e3d5ffd5b60203d10610d8857610120905051610100526101005160e05180671bc16d674ec8000003671bc16d674ec800008111610d88579050808202811583838304141715610d885790509050670de0b6b3a76400008104905061012052600d6040516020525f5260405f20600854815560095460018201556101205160028201555060405161014052610100516101605260e051610180526060610140f35b631e83409a811861035d57602436103417610d8857336060526103bc565b63a550057e8118610d6257602436103417610d88576004358060a01c610d8857604052600b6040516020525f5260405f205460605260206060f35b6321c0b3428118610d6257604436103417610d88576024358060a01c610d88576060525b6004358060a01c610d8857604052604051638da5cb5b608052602060806004609c845afa6103ec573d5f5f3e3d5ffd5b3d602081183d60201002188060800160a011610d88576080518060a01c610d885760c0525060c09050513318610d8857604036608037600a5460c052600b6040516020525f5260405f205460e0525f6010905b806101005260c05160e05118156105c457600d60e0516020525f5260405f2080546101205260018101546101405260028101546101605250600354638bbb9d056101a0526040516101c05260e0516101e05260206101a060446101bc845afa6104aa573d5f5f3e3d5ffd5b60203d10610d88576101a0905051610180526101805161012051808202811583838304141715610d885790509050670de0b6b3a7640000810281670de0b6b3a7640000820418610d88579050610160518015610d885780820490509050612710810490506101a0526080516101a051808201828110610d8857905090506080526101a05161014051808202811583838304141715610d885790509050612710810490506101c05260a0516101c051808201828110610d88579050905060a05260e0516040517fd4514a861380841acaf92be4fa4555a1ee8b52788dbc7d231e8786b50c771ca560406101a06101e05e6060516102205260606101e0a360e05160018101818110610d8857905060e05260010181811861043f575b505060e051600b6040516020525f5260405f205560805160a051808203828111610d885790509050610100526101005115610681576020610df45f395f5163a9059cbb610120526060516101405261010051610160526020610120604461013c5f855af1610634573d5f5f3e3d5ffd5b3d61064b57803b15610d8857600161018052610675565b3d602081183d6020100218806101200161014011610d8857610120518060011c610d885761018052505b61018090505115610d88575b60a0511561074d57600554610120526020610df45f395f5163095ea7b361014052610120516101605260a051610180526020610140604461015c5f855af16106cb573d5f5f3e3d5ffd5b3d6106e257803b15610d885760016101a05261070c565b3d602081183d6020100218806101400161016011610d8857610140518060011c610d88576101a052505b6101a090505115610d885761012051633ac9448e6101405260a05161016052803b15610d88575f610140602461015c5f855af161074b573d5f5f3e3d5ffd5b505b610100516101205260a051610140526040610120f35b6301681a6281186107a157602436103417610d88577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526107db565b63a7f0b3de8118610d625734610d88576020610dd460403960206040f35b636ea056a98118610d6257604436103417610d88576024356060525b6004358060a01c610d88576040525f543318610d885760605160805260605119610836576040516370a0823160a0523060c052602060a0602460bc845afa610825573d5f5f3e3d5ffd5b60203d10610d885760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af1610863573d5f5f3e3d5ffd5b3d61087a57803b15610d88576001610100526108a1565b3d602081183d60201002188060a00160c011610d885760a0518060011c610d885761010052505b61010090505115610d8857005b6330c7be728118610d6257602436103417610d88576004358060a01c610d88576040525f543318610d88576040516002556040517fdbebfba65bd6398fb722063efc10c99f624f9cd8ba657201056af918a676d5ee5f6060a2005b6371da8a8d811861096457602436103417610d88576004358060a01c610d88576040525f543318610d88576040516003556040517f0272efc86eeb452c32134d3a55db5b3f3a9f3a8f426422cd285c688b97b303df5f6060a2005b63570ca7358118610d625734610d885760025460405260206040f35b62cccec88118610d6257602436103417610d88576004358060a01c610d88576040525f543318610d88576040516004556040517e876a9468f367df1afaf02e27a95cdb4afe2715fa6d7d553372679a52c0a53a5f6060a2005b630ac702948118610d6257604436103417610d88576004358060a01c610d88576040525f543318610d885760405115610d885761271060243511610d88576040516005556024356009556040517f12e60979f673de6b3d304e6536c768c1a594b07d6dd6811e1895524b9484c98860243560605260206060a2005b63a0f2ce558118610d6257602436103417610d88575f543318610d8857670de0b6b3a764000060043511610d88576004356006557ffaf52b639046bb3e963663f9bbaabf1d770ba94de786bd0023a106f636d7240560043560405260206040a1005b6343efc5748118610b1257602436103417610d88575f543318610d8857611f4060043511610d88576004356007557f8ed46fa9460ea3d7af19f9578d971a60b644ec0f4a483bd33d05d28c7e01c9c560043560405260206040a1005b63ef989fc08118610d625734610d885760085460405260206040f35b63b7b790178118610d6257602436103417610d88575f543318610d8857614e2060043511610d88576004356008557f950cd1719c20776884c2c44c0f3eb060e304575f0718a370cbf06df4620e00f260043560405260206040a1005b63fd066ecc8118610d6257602436103417610d88576004358060a01c610d88576040525f543318610d88576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c8118610c2d5734610d88576001543318610d88575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63770817ec8118610d625734610d885760015460405260206040f35b63f3173cd08118610d625734610d88576020610df460403960206040f35b6388a8d6028118610d625734610d88575f5460405260206040f35b634fb3ccc58118610d625734610d885760035460405260206040f35b63426a1d2b8118610d625734610d885760045460405260206040f35b635f37ee078118610d625734610d885760055460405260206040f35b63b41908428118610d625734610d885760065460405260206040f35b6333df577c8118610d625734610d885760075460405260206040f35b6325089e138118610d625734610d885760095460405260206040f35b63c5486f8d8118610d625734610d8857600a5460405260206040f35b6308006fd78118610d625734610d8857600c5460405260206040f35b5f5ffd5b626ebe00426020610dd45f395f51808203828111610d88579050905004815250565b5f80fd0d62090908ae0d6209800c820d620d620be50a540c670b2e0b8a0d620d620d0e0ab60d2a0d620d4609d9007707630d620c490d6203980d620d6200180cd60c9e0cf207bf033f0cba855820eb34721d833c1db7d71ecf093fd4b4c2b2f26d36c2e57c499eff823e9db5deda190dd48118481840a16576797065728300040200380000000000000000000000000000000000000000000000000000000069151f800000000000000000000000000bc529c00c6401aef6d220be8c6ea1667f6ad93e",
+  "name": "BonusDistributor",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "team",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "period",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "ybc_amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "recipient",
+          "type": "address"
+        }
+      ],
+      "name": "ClaimBonus",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "operator",
+          "type": "address"
+        }
+      ],
+      "name": "SetOperator",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "accountant",
+          "type": "address"
+        }
+      ],
+      "name": "SetAccountant",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "oracle",
+          "type": "address"
+        }
+      ],
+      "name": "SetBonusPriceOracle",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "recipient",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "split",
+          "type": "uint256"
+        }
+      ],
+      "name": "SetYBC",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "name": "factor",
+          "type": "uint256"
+        }
+      ],
+      "name": "SetSmoothingFactor",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "name": "cap",
+          "type": "uint256"
+        }
+      ],
+      "name": "SetGrowthRateCap",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "name": "factor",
+          "type": "uint256"
+        }
+      ],
+      "name": "SetBonusFactor",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "PendingManagement",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "SetManagement",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "period",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "finalize_period",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_team",
+          "type": "address"
+        }
+      ],
+      "name": "claim",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_team",
+          "type": "address"
+        },
+        {
+          "name": "_recipient",
+          "type": "address"
+        }
+      ],
+      "name": "claim",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_operator",
+          "type": "address"
+        }
+      ],
+      "name": "set_operator",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_accountant",
+          "type": "address"
+        }
+      ],
+      "name": "set_accountant",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_oracle",
+          "type": "address"
+        }
+      ],
+      "name": "set_bonus_price_oracle",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_recipient",
+          "type": "address"
+        },
+        {
+          "name": "_split",
+          "type": "uint256"
+        }
+      ],
+      "name": "set_ybc",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_factor",
+          "type": "uint256"
+        }
+      ],
+      "name": "set_smoothing_factor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_cap",
+          "type": "uint256"
+        }
+      ],
+      "name": "set_growth_rate_cap",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_factor",
+          "type": "uint256"
+        }
+      ],
+      "name": "set_bonus_factor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_management",
+          "type": "address"
+        }
+      ],
+      "name": "set_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accept_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "genesis",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "bonus_token",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "operator",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accountant",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "bonus_price_oracle",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "ybc_recipient",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "smoothing_factor",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "growth_rate_cap",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "bonus_factor",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "ybc_split",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_period",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "pending_claims",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "ema_revenue",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "uint256"
+        }
+      ],
+      "name": "parameters",
+      "outputs": [
+        {
+          "components": [
+            {
+              "name": "bonus_factor",
+              "type": "uint256"
+            },
+            {
+              "name": "ybc_split",
+              "type": "uint256"
+            },
+            {
+              "name": "bonus_price",
+              "type": "uint256"
+            }
+          ],
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_genesis",
+          "type": "uint256"
+        },
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": "0x0000000000000000000000000000000000000000000000000000000069151f800000000000000000000000000bc529c00c6401aef6d220be8c6ea1667f6ad93e",
+  "sources": {
+    "BonusDistributor.vy": {
+      "content": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Bonus Distributor\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Awards bonus tokens to teams based on their profit. The bonus token is priced by an oracle \n        and is adjusted by the growth of revenue of all teams combined, meaning growth is rewarded \n        by a lowering of the effective bonus token price, resulting in more bonus tokens being awarded.\n        The awarded tokens are split between the teams and the YBC, with a configurable ratio.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\nstruct Parameters:\n    bonus_factor: uint256\n    ybc_split: uint256\n    bonus_price: uint256\n\ninterface IAccountant:\n    def global_revenues(_period: uint256) -> uint256: view\n    def team_profits(_team: address, _period: uint256) -> uint256: view\n\ninterface ITeam:\n    def owner() -> address: view\n\ninterface IBonusPriceOracle:\n    def price(_period: uint256) -> uint256: nonpayable\n\ninterface IYBCRecipient:\n    def deposit_bonus(_amount: uint256): nonpayable\n\ngenesis: public(immutable(uint256))\nbonus_token: public(immutable(IERC20))\nmanagement: public(address)\npending_management: public(address)\noperator: public(address)\naccountant: public(IAccountant)\nbonus_price_oracle: public(IBonusPriceOracle)\nybc_recipient: public(IYBCRecipient)\n\nsmoothing_factor: public(uint256)\ngrowth_rate_cap: public(uint256)\nbonus_factor: public(uint256)\nybc_split: public(uint256)\n\npending_period: public(uint256)\npending_claims: public(HashMap[address, uint256]) # team => pending claim period\nema_revenue: public(uint256)\nparameters: public(HashMap[uint256, Parameters])\n\nevent ClaimBonus:\n    team: indexed(address)\n    period: indexed(uint256)\n    amount: uint256\n    ybc_amount: uint256\n    recipient: address\n\nevent SetOperator:\n    operator: indexed(address)\n\nevent SetAccountant:\n    accountant: indexed(address)\n\nevent SetBonusPriceOracle:\n    oracle: indexed(address)\n\nevent SetYBC:\n    recipient: indexed(address)\n    split: uint256\n\nevent SetSmoothingFactor:\n    factor: uint256\n\nevent SetGrowthRateCap:\n    cap: uint256\n\nevent SetBonusFactor:\n    factor: uint256\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPRECISION: constant(uint256) = 10**18\nBPS_PRECISION: constant(uint256) = 10000\nPERIOD_LENGTH: constant(uint256) = 6 * 14 * 24 * 60 * 60\n\n@deploy\ndef __init__(_genesis: uint256, _token: address):\n    \"\"\"\n    @notice Constructor\n    @param _genesis Budget period genesis timestamp\n    @param _token Bonus token address\n    \"\"\"\n    genesis = _genesis\n    bonus_token = IERC20(_token)\n\n    self.management = msg.sender\n    self.operator = msg.sender\n    self.smoothing_factor = PRECISION\n    self.growth_rate_cap = BPS_PRECISION * 4 // 5\n    self.bonus_factor = BPS_PRECISION\n\n@external\n@view\ndef period() -> uint256:\n    \"\"\"\n    @notice Query the current budget period number\n    @return The current budget period number\n    \"\"\"\n    return self._period()\n\n@external\ndef finalize_period() -> (uint256, uint256, uint256):\n    \"\"\"\n    @notice Finalize bonus accounting for a budget period\n    @return Tuple with: budget period number, spot token price, growth factor\n    @dev Can only be called by the operator, if set\n    \"\"\"\n    assert self.operator in [msg.sender, empty(address)]\n    period: uint256 = self.pending_period\n    assert self._period() > period\n    self.pending_period = period + 1\n\n    # compute EMA smoothed revenue\n    global_revenue: uint256 = staticcall self.accountant.global_revenues(period)\n    prev_ema_revenue: uint256 = self.ema_revenue\n    ema_revenue: uint256 = 0\n    if period == 0:\n        prev_ema_revenue = global_revenue\n        ema_revenue = global_revenue\n    else:\n        smoothing_factor: uint256 = self.smoothing_factor\n        ema_revenue = (smoothing_factor * global_revenue + (PRECISION - smoothing_factor) * prev_ema_revenue) // PRECISION\n    self.ema_revenue = ema_revenue\n\n    if prev_ema_revenue == 0:\n        # prevent division by zero - the cap will keep the growth factor in check\n        prev_ema_revenue = 1\n\n    # compute global growth and cap in either direction\n    growth_rate_cap: uint256 = self.growth_rate_cap * PRECISION // BPS_PRECISION\n    growth_factor: uint256 = ema_revenue * PRECISION // prev_ema_revenue\n    growth_factor = min(growth_factor, PRECISION + growth_rate_cap)\n    growth_factor = max(growth_factor, PRECISION - growth_rate_cap)\n\n    # calculate adjusted bonus token price\n    price: uint256 = extcall self.bonus_price_oracle.price(period)\n    adjusted_price: uint256 = price * (2 * PRECISION - growth_factor) // PRECISION\n\n    self.parameters[period] = Parameters(bonus_factor=self.bonus_factor, ybc_split=self.ybc_split, bonus_price=adjusted_price)\n    return period, price, growth_factor\n\n@external\ndef claim(_team: address, _recipient: address = msg.sender) -> (uint256, uint256):\n    \"\"\"\n    @notice Claim a team's bonus tokens\n    @param _team Team address\n    @param _recipient Receiver of the bonus tokens. Defaults to caller\n    @return Tuple with: bonus tokens to team, bonus tokens to YBC\n    @dev Can only be called by the team owner\n    \"\"\"\n    assert msg.sender == staticcall ITeam(_team).owner()\n\n    total_amount: uint256 = 0\n    ybc_amount: uint256 = 0\n\n    pending: uint256 = self.pending_period\n    period: uint256 = self.pending_claims[_team]\n    for i: uint256 in range(16):\n        if period == pending:\n            break\n\n        par: Parameters = self.parameters[period]\n        profit: uint256 = staticcall self.accountant.team_profits(_team, period)\n        amount: uint256 = profit * par.bonus_factor * PRECISION // par.bonus_price // BPS_PRECISION\n        total_amount += amount\n        \n        loop_ybc_amount: uint256 = amount * par.ybc_split // BPS_PRECISION\n        ybc_amount += loop_ybc_amount\n\n        log ClaimBonus(team=_team, period=period, amount=amount, ybc_amount=loop_ybc_amount, recipient=_recipient)\n        period += 1\n\n    self.pending_claims[_team] = period\n\n    team_amount: uint256 = total_amount - ybc_amount\n    if team_amount > 0:\n        assert extcall bonus_token.transfer(_recipient, team_amount, default_return_value=True)\n\n    if ybc_amount > 0:\n        recipient: IYBCRecipient = self.ybc_recipient\n        assert extcall bonus_token.approve(recipient.address, ybc_amount, default_return_value=True)\n        extcall recipient.deposit_bonus(ybc_amount)\n\n    return team_amount, ybc_amount\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_operator(_operator: address):\n    \"\"\"\n    @notice Set a new operator\n    @param _operator New operator address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.operator = _operator\n    log SetOperator(operator=_operator)\n\n@external\ndef set_accountant(_accountant: address):\n    \"\"\"\n    @notice Set a new accountant\n    @param _accountant New accountant address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.accountant = IAccountant(_accountant)\n    log SetAccountant(accountant=_accountant)\n\n@external\ndef set_bonus_price_oracle(_oracle: address):\n    \"\"\"\n    @notice Set a new bonus price oracle\n    @param _oracle New bonus price oracle address\n    @dev The oracle should return the value of 1 wad of bonus tokens in USD (18 decimals)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.bonus_price_oracle = IBonusPriceOracle(_oracle)\n    log SetBonusPriceOracle(oracle=_oracle)\n\n@external\ndef set_ybc(_recipient: address, _split: uint256):\n    \"\"\"\n    @notice Set the YBC parameters\n    @param _recipient YBC recipient\n    @param _split Split of bonus tokens to the YBC (bps)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _recipient != empty(address)\n    assert _split <= BPS_PRECISION\n\n    self.ybc_recipient = IYBCRecipient(_recipient)\n    self.ybc_split = _split\n    log SetYBC(recipient=_recipient, split=_split)\n\n@external\ndef set_smoothing_factor(_factor: uint256):\n    \"\"\"\n    @notice Set the revenue smoothing factor\n    @param _factor Revenue soothing factor (18 decimals)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _factor <= PRECISION\n\n    self.smoothing_factor = _factor\n    log SetSmoothingFactor(factor=_factor)\n\n@external\ndef set_growth_rate_cap(_cap: uint256):\n    \"\"\"\n    @notice Set the cap on the growth rate\n    @param _cap Growth rate cap (bps)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _cap <= BPS_PRECISION * 4 // 5\n\n    self.growth_rate_cap = _cap\n    log SetGrowthRateCap(cap=_cap)\n\n@external\ndef set_bonus_factor(_factor: uint256):\n    \"\"\"\n    @notice Set the bonus factor\n    @param _factor Bonus factor (bps)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _factor <= 2 * BPS_PRECISION\n\n    self.bonus_factor = _factor\n    log SetBonusFactor(factor=_factor)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _period() -> uint256:\n    return unsafe_div(block.timestamp - genesis, PERIOD_LENGTH)"
+    }
+  }
+}

@@ -1,0 +1,951 @@
+{
+  "file_path": "StakingRewardDistributor.vy",
+  "creation_status": "success",
+  "source_code": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Staking Reward Distributor\n@author Yearn Finance\n@license GNU AGPLv3\n@notice A component to the RewardDistributor. It tracks staking balances through the stYFI hook\n        and snapshots the total staked balance each epoch to report as its reward weight.\n        Rewards are claimed from the distributor as they become available and streamed over the\n        following epoch to all stakers, proportional to their current balance.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IHooks:\n    def on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _value: uint256): nonpayable\n    def on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def instant_withdrawal(_account: address) -> bool: view\n\ninterface IComponent:\n    def sync_total_weight(_epoch: uint256) -> uint256: nonpayable\n\ninterface IDistributor:\n    def genesis() -> uint256: view\n    def claim() -> (uint256, uint256, uint256): nonpayable\n\nimplements: IHooks\nimplements: IComponent\n\nstruct Weight:\n    epoch: uint256\n    time: uint256\n    weight: uint256\n\nstruct TotalWeight:\n    epoch: uint256\n    weight: uint256\n\nstruct Cursor:\n    count: uint256\n    last: uint256\n\nstruct Rewards:\n    timestamp: uint256\n    rewards: uint256\n\nstruct Accrued:\n    count: uint256\n    claimed: uint256\n\nstruct AccruedEntry:\n    epoch: uint256\n    accrued: uint256\n\ngenesis: public(immutable(uint256))\ntoken: public(immutable(IERC20))\nmanagement: public(address)\npending_management: public(address)\n\ndepositor: public(address)\nstaking: public(IERC20)\ndistributor: public(IDistributor)\nclaimers: public(HashMap[address, bool])\nreward_expiration: public(uint256)\nreclaim_bounty: public(uint256)\nreclaim_recipient: public(address)\nreclaim_disabled: public(HashMap[address, bool])\n\ntotal_weight_cursor: public(Cursor)\ntotal_weight_entries: public(HashMap[uint256, TotalWeight])\n\nepoch_rewards: public(Rewards)\nreward_integral: public(uint256)\nreward_integral_snapshot: public(HashMap[uint256, uint256])\naccount_reward_integral: public(HashMap[address, uint256])\naccrued_rewards: public(HashMap[address, Accrued])\naccrued_reward_entries: public(HashMap[address, HashMap[uint256, AccruedEntry]]) # account => idx => entry\n\nevent Claim:\n    account: indexed(address)\n    rewards: uint256\n\nevent Reclaim:\n    caller: indexed(address)\n    account: indexed(address)\n    rewards: uint256\n    bounty: uint256\n\nevent SetDepositor:\n    depositor: indexed(address)\n\nevent SetStaking:\n    staking: indexed(address)\n\nevent SetDistributor:\n    distributor: indexed(address)\n\nevent SetClaimer:\n    account: indexed(address)\n    claimer: bool\n\nevent SetRewardExpiration:\n    expiration: uint256\n    bounty: uint256\n    recipient: address\n\nevent SetReclaimDisabled:\n    account: indexed(address)\n    disabled: bool\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nEPOCH_LENGTH: constant(uint256) = 14 * 24 * 60 * 60\nRAMP_LENGTH: constant(uint256) = 4 * EPOCH_LENGTH\nINCREMENT: constant(bool) = True\nDECREMENT: constant(bool) = False\nPRECISION: constant(uint256) = 10**30\nBOUNTY_PRECISION: constant(uint256) = 10_000\n\n@deploy\ndef __init__(_distributor: address, _token: address):\n    \"\"\"\n    @notice Constructor\n    @param _distributor The distributor address\n    @param _token The address of the reward token\n    \"\"\"\n    genesis = staticcall IDistributor(_distributor).genesis()\n    token = IERC20(_token)\n\n    self.management = msg.sender\n    self.distributor = IDistributor(_distributor)\n    self.total_weight_cursor = Cursor(count=1, last=0)\n    self.total_weight_entries[0] = TotalWeight(epoch=0, weight=10**12)\n    self.reward_expiration = 26\n    self.reclaim_recipient = msg.sender\n\n@external\n@view\ndef epoch() -> uint256:\n    \"\"\"\n    @notice Query the current epoch number\n    @return The current epoch number\n    \"\"\"\n    return self._epoch()\n\n@external\ndef sync_total_weight(_epoch: uint256) -> uint256:\n    \"\"\"\n    @notice Compute and finalize the total weight for reward distribution purposes\n    @param _epoch The epoch to compute the total weight for\n    @return The total weight for this epoch\n    @dev Can only be called by the distributor\n    \"\"\"\n    assert msg.sender == self.distributor.address\n    cursor: Cursor = self.total_weight_cursor\n    \n    weight: uint256 = 0\n    next_idx: uint256 = cursor.last + 1\n    if next_idx == cursor.count:\n        # already at last entry\n        weight = self.total_weight_entries[cursor.last].weight\n    else:\n        # peek into next entry\n        next: TotalWeight = self.total_weight_entries[next_idx]\n        if _epoch < next.epoch:\n            # next entry is for a future epoch, keep using current entry\n            weight = self.total_weight_entries[cursor.last].weight\n        else:\n            # update cursor\n            self.total_weight_cursor.last = next_idx\n\n            weight = next.weight\n    return weight\n\n@external\ndef sync_rewards(_account: address = empty(address)) -> bool:\n    \"\"\"\n    @notice Synchronize global rewards up until now\n    @param _account Also update rewards for this specific account (optional)\n    @return True: rewards are fully synced, False: not fully synced\n    \"\"\"\n    synced: bool = self._sync_integral()\n    if _account != empty(address):\n        staked: uint256 = staticcall self.staking.balanceOf(_account)\n        self._sync_account_integral(_account, staked)\n    return synced\n\n@external\ndef on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon transfer of tokens\n    @param _caller Originator of the transfer\n    @param _from Sender of the token\n    @param _to Recipient of the tokens\n    @param _supply Total token supply\n    @param _prev_staked_from Staked balance of sender before transfer\n    @param _prev_staked_to Staked balance of recipient before transfer\n    @param _amount Amount of tokens to transfer\n    \"\"\"\n    assert msg.sender == self.depositor\n    assert self._sync_integral()\n    self._sync_account_integral(_from, _prev_staked_from)\n    self._sync_account_integral(_to, _prev_staked_to)\n\n@external\ndef on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon staking of tokens\n    @param _caller Originator of the tokens\n    @param _account Recipient of the staked tokens\n    @param _prev_supply Total token supply before stake\n    @param _prev_staked Staked balance of recipient before stake\n    @param _amount Amount of tokens to stake\n    \"\"\"\n    assert msg.sender == self.depositor\n    assert self._sync_integral()\n    self._update_total_weight(_amount, INCREMENT)\n    self._sync_account_integral(_account, _prev_staked)\n\n@external\ndef on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon unstaking of tokens\n    @param _account Originator of the staked tokens\n    @param _prev_supply Total token supply before unstake\n    @param _prev_staked Staked balance of originator before unstake\n    @param _amount Amount of tokens to unstake\n    \"\"\"\n    assert msg.sender == self.depositor\n    assert self._sync_integral()\n    self._update_total_weight(_amount, DECREMENT)\n    self._sync_account_integral(_account, _prev_staked)\n\n@external\n@view\ndef instant_withdrawal(_account: address) -> bool:\n    \"\"\"\n    @notice Query instant withdrawal status of an account\n    @param _account Account to query withdrawal status for\n    @return Always False\n    \"\"\"\n    return False\n\n@external\ndef claim(_account: address) -> uint256:\n    \"\"\"\n    @notice Claim rewards on behalf of an account\n    @param _account Account to claim rewards for\n    @return Amount of rewards tokens claimed\n    \"\"\"\n    if self.accrued_rewards[_account].count == 0:\n        # shortcut accounts that are guaranteed to have no rewards\n        return 0\n\n    assert self.claimers[msg.sender]\n    assert self._sync_integral()\n    staked: uint256 = staticcall self.staking.balanceOf(_account)\n    accrued: uint256 = self._sync_account_integral(_account, staked)\n    pending: uint256 = accrued - self.accrued_rewards[_account].claimed\n\n    if pending > 0:\n        self.accrued_rewards[_account].claimed = accrued\n        assert extcall token.transfer(msg.sender, pending, default_return_value=True)\n        log Claim(account=_account, rewards=pending)\n\n    return pending\n\n@external\n@view\ndef pending_rewards(_account: address) -> uint256:\n    \"\"\"\n    @notice Query pending rewards\n    @param _account Account to query pending rewards for\n    @return Amount of pending rewards tokens\n    @dev Does not include earned rewards since last account state change\n    \"\"\"\n    idx: uint256 = self.accrued_rewards[_account].count\n    if idx == 0:\n        return 0\n    idx -= 1\n    accrued: uint256 = self.accrued_reward_entries[_account][idx].accrued\n    return accrued - self.accrued_rewards[_account].claimed\n\n@external\ndef reclaim(_account: address, _idx: uint256 = max_value(uint256)) -> (uint256, uint256):\n    \"\"\"\n    @notice Reclaim expired rewards\n    @param _account Account to reclaim rewards for\n    @param _idx Index of accrued rewards to reclaim from (optional)\n    @return Tuple with amount of rewards reclaimed and bounty amount received\n    \"\"\"\n    assert not self.reclaim_disabled[_account]\n    assert self._sync_integral()\n    count: uint256 = self.accrued_rewards[_account].count\n    assert count > 0\n    assert _idx == max_value(uint256) or _idx < count\n\n    expiration: uint256 = self.reward_expiration\n    epoch: uint256 = self._epoch()\n    if epoch < expiration:\n        return 0, 0\n    epoch -= expiration\n\n    # reclaim based on snapshotted accrued rewards\n    rewards: uint256 = 0\n    if _idx < max_value(uint256):\n        assert self.accrued_reward_entries[_account][_idx].epoch <= epoch\n        accrued: uint256 = self.accrued_reward_entries[_account][_idx].accrued\n        claimed: uint256 = self.accrued_rewards[_account].claimed\n        if claimed < accrued:\n            rewards = accrued - claimed\n            self.accrued_rewards[_account].claimed = accrued\n\n    # reclaim from rewards since last state change\n    integral: uint256 = self.reward_integral_snapshot[epoch]\n    account_integral: uint256 = self.account_reward_integral[_account]\n    if account_integral < integral:\n        staked: uint256 = staticcall self.staking.balanceOf(_account)\n        rewards += (integral - account_integral) * staked // PRECISION\n        self.account_reward_integral[_account] = integral\n\n    if rewards == 0:\n        return 0, 0\n\n    bounty: uint256 = rewards * self.reclaim_bounty // BOUNTY_PRECISION\n    log Reclaim(caller=msg.sender, account=_account, rewards=rewards, bounty=bounty)\n\n    if bounty > 0:\n        rewards -= bounty\n        assert extcall token.transfer(msg.sender, bounty, default_return_value=True)\n\n    if rewards > 0:\n        assert extcall token.transfer(self.reclaim_recipient, rewards, default_return_value=True)\n\n    return rewards, bounty\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_depositor(_depositor: address):\n    \"\"\"\n    @notice Set the depositor\n    @param _depositor Depositor address\n    @dev Can only be called by management\n    @dev Caller is responsible for ensuring consistency between the old and new depositor\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.depositor = _depositor\n    log SetDepositor(depositor=_depositor)\n\n@external\ndef set_staking(_staking: address):\n    \"\"\"\n    @notice Set the staking address\n    @param _staking Staking address\n    @dev Can only be called by management\n    @dev Caller is responsible for ensuring consistency between the depositor and staking contract\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.staking = IERC20(_staking)\n    log SetStaking(staking=_staking)\n\n@external\ndef set_distributor(_distributor: address):\n    \"\"\"\n    @notice Set upstream reward distributor\n    @param _distributor Distributor address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.distributor = IDistributor(_distributor)\n    log SetDistributor(distributor=_distributor)\n\n@external\ndef set_claimer(_account: address, _claimer: bool):\n    \"\"\"\n    @notice Whitelist account as reward claimer\n    @param _account Account\n    @param _claimer True: add to whitelist, False: remove from whitelist\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.claimers[_account] = _claimer\n    log SetClaimer(account=_account, claimer=_claimer)\n\n@external\ndef set_reward_expiration(_expiration: uint256, _bounty: uint256, _recipient: address):\n    \"\"\"\n    @notice Set reward expiration parameters\n    @param _expiration Number of epochs after which rewards can be reclaimed\n    @param _bounty Bounty (in bps) to give to the caller\n    @param _recipient Recipient of the reclaimed rewards\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _expiration > 1\n    assert _bounty <= BOUNTY_PRECISION\n    assert _recipient != empty(address) or _bounty == BOUNTY_PRECISION\n\n    self.reward_expiration = _expiration\n    self.reclaim_bounty = _bounty\n    self.reclaim_recipient = _recipient\n    log SetRewardExpiration(expiration=_expiration, bounty=_bounty, recipient=_recipient)\n\n@external\ndef set_reclaim_disabled(_account: address, _disabled: bool):\n    \"\"\"\n    @notice Set reclaim disable flag\n    @param _account Address to set the flag for\n    @param _disabled True: disable reclaims for account, False: enable reclaims\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    self.reclaim_disabled[_account] = _disabled\n    log SetReclaimDisabled(account=_account, disabled=_disabled)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _epoch() -> uint256:\n    return unsafe_div(block.timestamp - genesis, EPOCH_LENGTH)\n\n@internal\ndef _update_total_weight(_amount: uint256, _increment: bool):\n    \"\"\"\n    @notice Increase or decrease the total weight.\n            Global integral must be synced before calling\n    \"\"\"\n    current_epoch: uint256 = self._epoch()\n\n    # load latest total weight\n    count: uint256 = self.total_weight_cursor.count\n    idx: uint256 = count - 1\n    weight: TotalWeight = self.total_weight_entries[idx]\n\n    if current_epoch > weight.epoch:\n        # new epoch, add entry to list\n        idx = count\n        weight.epoch = current_epoch\n        self.total_weight_cursor.count = count + 1\n\n    if _increment == INCREMENT:\n        weight.weight += _amount\n    else:\n        weight.weight -= _amount\n\n    self.total_weight_entries[idx] = weight\n\n@internal\ndef _sync_integral() -> bool:\n    \"\"\"\n    @notice Sync global integral to the latest value\n    \"\"\"\n    current_epoch: uint256 = self._epoch()\n\n    unlocked: uint256 = 0\n    ew: Rewards = self.epoch_rewards\n    epoch: uint256 = unsafe_div(ew.timestamp, EPOCH_LENGTH)\n    synced: bool = epoch == current_epoch\n    last_streamed: uint256 = (ew.timestamp % EPOCH_LENGTH) * ew.rewards // EPOCH_LENGTH\n    ew.timestamp = block.timestamp - genesis\n    total_weight: uint256 = self.total_weight_entries[self.total_weight_cursor.count - 1].weight\n    integral: uint256 = self.reward_integral\n\n    if not synced:\n        # rollover to new epoch. first finalize the last one\n        unlocked = ew.rewards - last_streamed\n        last_streamed = 0\n\n        # save integral snapshot\n        self.reward_integral_snapshot[epoch] = integral + unlocked * PRECISION // total_weight\n\n        # fast forward through any other completed epochs\n        distributor: IDistributor = self.distributor\n        epoch_rewards: uint256 = 0\n        for i: uint256 in range(32):\n            epoch += 1\n            epoch_rewards = (extcall distributor.claim())[2]\n            synced = epoch == current_epoch\n            if synced:\n                break\n            else:\n                unlocked += epoch_rewards\n                self.reward_integral_snapshot[epoch] = integral + unlocked * PRECISION // total_weight\n\n        if synced:\n            # fully caught up\n            ew.rewards = epoch_rewards\n        else:\n            # not fully caught up. we already added the full amount to `unlocked`, so we \n            # zero out the epoch rewards to not double count it in the next call\n            ew.timestamp = epoch * EPOCH_LENGTH\n            ew.rewards = 0\n\n    self.epoch_rewards = ew\n\n    streamed: uint256 = (ew.timestamp % EPOCH_LENGTH) * ew.rewards // EPOCH_LENGTH\n    unlocked += streamed - last_streamed\n    if unlocked == 0:\n        return synced\n\n    # update integral\n    self.reward_integral = integral + unlocked * PRECISION // total_weight\n\n    return synced\n\n@internal\ndef _sync_account_integral(_account: address, _staked: uint256) -> uint256:\n    \"\"\"\n    @notice Sync integral of a specific account to the latest value\n    \"\"\"\n    epoch: uint256 = self._epoch()\n    integral: uint256 = self.reward_integral\n\n    idx: uint256 = self.accrued_rewards[_account].count\n    if idx == 0:\n        # no entries yet\n        idx = 1\n        self.accrued_rewards[_account].count = 1\n        self.accrued_reward_entries[_account][0].epoch = epoch\n    idx -= 1\n\n    accrued: uint256 = self.accrued_reward_entries[_account][idx].accrued\n    if _staked > 0:\n        if epoch > self.accrued_reward_entries[_account][idx].epoch:\n            # new epoch, new entry\n            idx += 1\n            self.accrued_rewards[_account].count = idx + 1\n            self.accrued_reward_entries[_account][idx].epoch = epoch\n\n        accrued += (integral - self.account_reward_integral[_account]) * _staked // PRECISION\n        self.accrued_reward_entries[_account][idx].accrued = accrued\n\n    self.account_reward_integral[_account] = integral\n    return accrued",
+  "deployed_bytecode": "0x5f3560e01c6002602a820660011b61183401601e395f51565b63900cf0cf811861003857346118305760206100346040611251565b6040f35b636ea056a9811861124d57604436103417611830576024356060525b6004358060a01c611830576040525f54331861183057606051608052606051196100af576040516370a0823160a0523060c052602060a0602460bc845afa61009e573d5f5f3e3d5ffd5b60203d106118305760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af16100dc573d5f5f3e3d5ffd5b3d6100f357803b156118305760016101005261011a565b3d602081183d60201002188060a00160c0116118305760a0518060011c6118305761010052505b6101009050511561183057005b63c135ebf9811861124d5760243610341761183057600454331861183057600a54604052600b546060525f6080526060516001810181811061183057905060a05260405160a0511861019057600c6060516020525f5260405f20600181019050546080526101e1565b600c60a0516020525f5260405f20805460c052600181015460e0525060c051600435106101c85760a051600b5560e0516080526101e1565b600c6060516020525f5260405f20600181019050546080525b60206080f35b63476232ad811861124d5734611830575f61024052610226565b639ed826cd811861124d57602436103417611830576004358060a01c61183057610240525b610231610280611273565b6102805161026052610240511561029f576003546370a082316102a052610240516102c05260206102a060246102bc845afa61026f573d5f5f3e3d5ffd5b60203d10611830576102a090505161028052610240516040526102805160605261029a6102a061159c565b6102a0505b6020610260f35b63a92d8b52811861033f5760e436103417611830576004358060a01c61183057610240526024358060a01c61183057610260526044358060a01c61183057610280526002543318611830576102fc6102a0611273565b6102a05115611830576102605160405260843560605261031d6102a061159c565b6102a0506102805160405260a4356060526103396102a061159c565b6102a050005b63c7c4ff46811861124d57346118305760025460405260206040f35b63311c744f81186103dc5760a436103417611830576004358060a01c61183057610240526024358060a01c61183057610260526002543318611830576103a2610280611273565b61028051156118305760843560405260016060526103be61175d565b610260516040526064356060526103d661028061159c565b61028050005b632d79b803811861124d573461183057600d54604052600e5460605260406040f35b63abdf4884811861124d57608436103417611830576004358060a01c6118305761024052600254331861183057610436610260611273565b6102605115611830576064356040525f60605261045161175d565b6102405160405260443560605261046961026061159c565b61026050005b63f26c71ba811861049c57602436103417611830576004358060a01c611830576040525f60605260206060f35b63fc0c546a811861124d57346118305760206118a860403960206040f35b631e83409a811861069157602436103417611830576004358060a01c61183057610240526012610240516020525f5260405f2054610501575f61026052602061026061068f565b6005336020525f5260405f2054156118305761051e610260611273565b6102605115611830576003546370a0823161028052610240516102a0526020610280602461029c845afa610554573d5f5f3e3d5ffd5b60203d106118305761028090505161026052604061024060405e6105796102a061159c565b6102a05161028052610280516012610240516020525f5260405f206001810190505480820382811161183057905090506102a0526102a0511561068957610280516012610240516020525f5260405f206001810190505560206118a85f395f5163a9059cbb6102c052336102e0526102a0516103005260206102c060446102dc5f855af1610609573d5f5f3e3d5ffd5b3d61062057803b156118305760016103205261064a565b3d602081183d6020100218806102c0016102e011611830576102c0518060011c6118305761032052505b6103209050511561183057610240517f47cee97cb7acd717b3c0aa1435d004cd5b3c8c57d70dbceb4e4458bbd60e39d46102a0516102c05260206102c0a25b60206102a05bf35b637fde7140811861124d57602436103417611830576004358060a01c6118305760405260126040516020525f5260405f20805460605260018101546080525060406060f35b632975e99a811861124d57602436103417611830576004358060a01c6118305760405260126040516020525f5260405f205460605260605161071f575f60805260206080610787565b6060516001810381811161183057905060605260136040516020525f5260405f20806060516020525f5260405f2090506001810190505460805260805160126040516020525f5260405f2060018101905054808203828111611830579050905060a052602060a05bf35b63fc772c8b811861124d57602436103417611830577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff610260526107e5565b638bd317eb8118610c375760443610341761183057602435610260525b6004358060a01c61183057610240526009610240516020525f5260405f205461183057610813610280611273565b6102805115611830576012610240516020525f5260405f2054610280526102805115611830576102605119610849576001610853565b6102805161026051105b15611830576006546102a05261086a6102e0611251565b6102e0516102c0526102a0516102c0511015610891576040366102e03760406102e0610c35565b6102c0516102a05180820382811161183057905090506102c0525f6102e0527fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff610260511461098a576102c0516013610240516020525f5260405f2080610260516020525f5260405f2090505411611830576013610240516020525f5260405f2080610260516020525f5260405f20905060018101905054610300526012610240516020525f5260405f2060018101905054610320526103005161032051101561098a57610300516103205180820382811161183057905090506102e052610300516012610240516020525f5260405f20600181019050555b60106102c0516020525f5260405f2054610300526011610240516020525f5260405f20546103205261030051610320511015610a6a576003546370a082316103605261024051610380526020610360602461037c845afa6109ed573d5f5f3e3d5ffd5b60203d1061183057610360905051610340526102e051610300516103205180820382811161183057905090506103405180820281158383830414171561183057905090506c0c9f2c9cd04674edea400000008104905080820182811061183057905090506102e052610300516011610240516020525f5260405f20555b6102e051610a8357604036610340376040610340610c35565b6102e0516007548082028115838383041417156118305790509050612710810490506103405261024051337f920ef6135eaabb1cfa705dc5bf0bedd49c095fad9fb23f2d579b92e662114a7e6102e0516103605261034051610380526040610360a36103405115610b8e576102e0516103405180820382811161183057905090506102e05260206118a85f395f5163a9059cbb610360523361038052610340516103a0526020610360604461037c5f855af1610b41573d5f5f3e3d5ffd5b3d610b5857803b156118305760016103c052610b82565b3d602081183d602010021880610360016103801161183057610360518060011c611830576103c052505b6103c090505115611830575b6102e05115610c1f5760206118a85f395f5163a9059cbb61036052600854610380526102e0516103a0526020610360604461037c5f855af1610bd2573d5f5f3e3d5ffd5b3d610be957803b156118305760016103c052610c13565b3d602081183d602010021880610360016103801161183057610360518060011c611830576103c052505b6103c090505115611830575b6102e05161036052610340516103805260406103605bf35b634cbc5513811861124d573461183057600a54604052600b5460605260406040f35b6301681a62811861124d57602436103417611830577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff606052610054565b63562915a0811861124d57602436103417611830576004358060a01c611830576040525f543318611830576040516002556040517fe5845022cf6cbbb6597b6e3a99005dd423016c1e7ac69c6e621cd47c38a3f3925f6060a2005b6322008d56811861124d57602436103417611830576004358060a01c611830576040525f543318611830576040516003556040517f58fd5d9c33114e6edf8ea5d30956f8d1a4ab112b004f99928b4bcf1b87d666625f6060a2005b634202c6f9811861124d57602436103417611830576004358060a01c611830576040525f543318611830576040516004556040517ff52f1295a5bd82818185311d8284477532c0eba12fd2ba17314486d3a8f6810d5f6060a2005b63bbc223f58118610e2457604436103417611830576004358060a01c611830576040526024358060011c611830576060525f5433186118305760605160056040516020525f5260405f20556040517f4dc837210548516568378153706718ba26db8d3f26eb60b45084ce5194c2872860605160805260206080a2005b63fdc0e499811861124d57346118305760065460405260206040f35b63b4f70521811861124d57606436103417611830576044358060a01c611830576040525f5433186118305760026004351061183057612710602435116118305760405115610e8f576001610e98565b61271060243518155b15611830576004356006556024356007556040516008557f2d9c411a91be84428f9644fbb5e1e9a29d64f2e196aba27deef87cbd43e6e3a46040600460603760405160a05260606060a1005b6388e3f7dd8118610f6057604436103417611830576004358060a01c611830576040526024358060011c611830576060525f5433186118305760605160096040516020525f5260405f20556040517fc91b1dcbb90b046eac83f7ff46ca2baa261a580efaaf93b72e73f7a5beb0cdef60605160805260206080a2005b6380f4a8bd811861124d576024361034176118305760106004356020525f5260405f205460405260206040f35b63fd066ecc811861124d57602436103417611830576004358060a01c611830576040525f543318611830576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c811861124d5734611830576001543318611830575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63a7f0b3de811861104e573461183057602061188860403960206040f35b63aaa626b6811861124d573461183057600f5460405260206040f35b6388a8d60281186110855734611830575f5460405260206040f35b63dca6e492811861124d57346118305760085460405260206040f35b63770817ec81186110bd57346118305760015460405260206040f35b63b02a19ec811861124d57602436103417611830576004358060a01c6118305760405260096040516020525f5260405f205460605260206060f35b634cf088d9811861111457346118305760035460405260206040f35b633abf1a49811861124d57346118305760075460405260206040f35b63bfe10928811861114c57346118305760045460405260206040f35b632ac7183e811861124d57602436103417611830576004358060a01c6118305760405260116040516020525f5260405f205460605260206060f35b63da62fba9811861124d57602436103417611830576004358060a01c6118305760405260056040516020525f5260405f205460605260206060f35b6319497b83811861124d5760243610341761183057600c6004356020525f5260405f20805460405260018101546060525060406040f35b632193fac1811861124d57604436103417611830576004358060a01c6118305760405260136040516020525f5260405f20806024356020525f5260405f209050805460605260018101546080525060406060f35b5f5ffd5b621275004260206118885f395f51808203828111611830579050905004815250565b61127d6060611251565b6060516040525f606052600d54608052600e5460a052621275006080510460c05260405160c0511460e052608051621275008106905060a05180820281158383830414171561183057905090506212750081049050610100524260206118885f395f518082038281116118305790509050608052600c600a54600181038181116118305790506020525f5260405f206001810190505461012052600f546101405260e0516114cc5760a0516101005180820382811161183057905090506060525f61010052610140516060516c0c9f2c9cd04674edea400000008102816c0c9f2c9cd04674edea4000000082041861183057905061012051801561183057808204905090508082018281106118305790509050601060c0516020525f5260405f2055600454610160525f610180525f6020905b806101a05260c0516001810181811061183057905060c05261016051634e71d92d6101c05260606101c060046101dc5f855af16113ef573d5f5f3e3d5ffd5b60603d10611830576101c09050604081019050516101805260405160c0511460e05260e05161149857606051610180518082018281106118305790509050606052610140516060516c0c9f2c9cd04674edea400000008102816c0c9f2c9cd04674edea4000000082041861183057905061012051801561183057808204905090508082018281106118305790509050601060c0516020525f5260405f20556001018181186113b0575b505060e0516114c45760c05162127500810281621275008204186118305790506080525f60a0526114cc565b6101805160a0525b608051600d5560a051600e55608051621275008106905060a05180820281158383830414171561183057905090506212750081049050610160526060516101605161010051808203828111611830579050905080820182811061183057905090506060526060516115425760e05181525061159a565b610140516060516c0c9f2c9cd04674edea400000008102816c0c9f2c9cd04674edea4000000082041861183057905061012051801561183057808204905090508082018281106118305790509050600f5560e0518152505b565b6115a660a0611251565b60a051608052600f5460a05260126040516020525f5260405f205460c05260c05161160157600160c052600160126040516020525f5260405f205560805160136040516020525f5260405f20805f6020525f5260405f209050555b60c0516001810381811161183057905060c05260136040516020525f5260405f208060c0516020525f5260405f2090506001810190505460e052606051156117435760136040516020525f5260405f208060c0516020525f5260405f2090505460805111156116be5760c0516001810181811061183057905060c05260c0516001810181811061183057905060126040516020525f5260405f205560805160136040516020525f5260405f208060c0516020525f5260405f209050555b60e05160a05160116040516020525f5260405f2054808203828111611830579050905060605180820281158383830414171561183057905090506c0c9f2c9cd04674edea4000000081049050808201828110611830579050905060e05260e05160136040516020525f5260405f208060c0516020525f5260405f209050600181019050555b60a05160116040516020525f5260405f205560e051815250565b61176760a0611251565b60a051608052600a5460a05260a0516001810381811161183057905060c052600c60c0516020525f5260405f20805460e0526001810154610100525060e05160805111156117cf5760a05160c05260805160e05260a05160018101818110611830579050600a555b6001606051186117f75761010051604051808201828110611830579050905061010052611811565b610100516040518082038281116118305790509050610100525b600c60c0516020525f5260405f2060e051815561010051600182015550565b5f80fd124d0da80fe8124d046f0d4d0f8d124d10a1124d1030035b0cf2124d124d10f804ba01e7124d11870c970ee403fe020111300127124d0e40106a11f9124d11c2124d0018124d078902a6124d06d6124d0c5907c8000000000000000000000000000000000000000000000000000000006983dd80000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf6204",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "StakingRewardDistributor.vy": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "0xd31911a33a5577Be233Dc096F6F5a7e496fF5934",
+      {
+        "name": "_distributor",
+        "type": "address"
+      }
+    ],
+    [
+      "0xBe53A109B494E5c9f97b9Cd39Fe969BE68BF6204",
+      {
+        "name": "_token",
+        "type": "address"
+      }
+    ]
+  ],
+  "compiler_version": "v0.4.2+commit.c216787f",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-02-18T12:28:58.492165Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x6118a85150346100b35760206119775f395f518060a01c6100b35760405260206119975f395f518060a01c6100b35760605260405163a7f0b3de608052602060806004609c845afa610053573d5f5f3e3d5ffd5b60203d106100b3576080905051611888526060516118a852335f556040516004556001600a555f600b55600c5f6020525f5260405f205f815564e8d4a51000600182015550601a600655336008556118886100b7610000396118c8610000f35b5f80fd5f3560e01c6002602a820660011b61183401601e395f51565b63900cf0cf811861003857346118305760206100346040611251565b6040f35b636ea056a9811861124d57604436103417611830576024356060525b6004358060a01c611830576040525f54331861183057606051608052606051196100af576040516370a0823160a0523060c052602060a0602460bc845afa61009e573d5f5f3e3d5ffd5b60203d106118305760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af16100dc573d5f5f3e3d5ffd5b3d6100f357803b156118305760016101005261011a565b3d602081183d60201002188060a00160c0116118305760a0518060011c6118305761010052505b6101009050511561183057005b63c135ebf9811861124d5760243610341761183057600454331861183057600a54604052600b546060525f6080526060516001810181811061183057905060a05260405160a0511861019057600c6060516020525f5260405f20600181019050546080526101e1565b600c60a0516020525f5260405f20805460c052600181015460e0525060c051600435106101c85760a051600b5560e0516080526101e1565b600c6060516020525f5260405f20600181019050546080525b60206080f35b63476232ad811861124d5734611830575f61024052610226565b639ed826cd811861124d57602436103417611830576004358060a01c61183057610240525b610231610280611273565b6102805161026052610240511561029f576003546370a082316102a052610240516102c05260206102a060246102bc845afa61026f573d5f5f3e3d5ffd5b60203d10611830576102a090505161028052610240516040526102805160605261029a6102a061159c565b6102a0505b6020610260f35b63a92d8b52811861033f5760e436103417611830576004358060a01c61183057610240526024358060a01c61183057610260526044358060a01c61183057610280526002543318611830576102fc6102a0611273565b6102a05115611830576102605160405260843560605261031d6102a061159c565b6102a0506102805160405260a4356060526103396102a061159c565b6102a050005b63c7c4ff46811861124d57346118305760025460405260206040f35b63311c744f81186103dc5760a436103417611830576004358060a01c61183057610240526024358060a01c61183057610260526002543318611830576103a2610280611273565b61028051156118305760843560405260016060526103be61175d565b610260516040526064356060526103d661028061159c565b61028050005b632d79b803811861124d573461183057600d54604052600e5460605260406040f35b63abdf4884811861124d57608436103417611830576004358060a01c6118305761024052600254331861183057610436610260611273565b6102605115611830576064356040525f60605261045161175d565b6102405160405260443560605261046961026061159c565b61026050005b63f26c71ba811861049c57602436103417611830576004358060a01c611830576040525f60605260206060f35b63fc0c546a811861124d57346118305760206118a860403960206040f35b631e83409a811861069157602436103417611830576004358060a01c61183057610240526012610240516020525f5260405f2054610501575f61026052602061026061068f565b6005336020525f5260405f2054156118305761051e610260611273565b6102605115611830576003546370a0823161028052610240516102a0526020610280602461029c845afa610554573d5f5f3e3d5ffd5b60203d106118305761028090505161026052604061024060405e6105796102a061159c565b6102a05161028052610280516012610240516020525f5260405f206001810190505480820382811161183057905090506102a0526102a0511561068957610280516012610240516020525f5260405f206001810190505560206118a85f395f5163a9059cbb6102c052336102e0526102a0516103005260206102c060446102dc5f855af1610609573d5f5f3e3d5ffd5b3d61062057803b156118305760016103205261064a565b3d602081183d6020100218806102c0016102e011611830576102c0518060011c6118305761032052505b6103209050511561183057610240517f47cee97cb7acd717b3c0aa1435d004cd5b3c8c57d70dbceb4e4458bbd60e39d46102a0516102c05260206102c0a25b60206102a05bf35b637fde7140811861124d57602436103417611830576004358060a01c6118305760405260126040516020525f5260405f20805460605260018101546080525060406060f35b632975e99a811861124d57602436103417611830576004358060a01c6118305760405260126040516020525f5260405f205460605260605161071f575f60805260206080610787565b6060516001810381811161183057905060605260136040516020525f5260405f20806060516020525f5260405f2090506001810190505460805260805160126040516020525f5260405f2060018101905054808203828111611830579050905060a052602060a05bf35b63fc772c8b811861124d57602436103417611830577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff610260526107e5565b638bd317eb8118610c375760443610341761183057602435610260525b6004358060a01c61183057610240526009610240516020525f5260405f205461183057610813610280611273565b6102805115611830576012610240516020525f5260405f2054610280526102805115611830576102605119610849576001610853565b6102805161026051105b15611830576006546102a05261086a6102e0611251565b6102e0516102c0526102a0516102c0511015610891576040366102e03760406102e0610c35565b6102c0516102a05180820382811161183057905090506102c0525f6102e0527fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff610260511461098a576102c0516013610240516020525f5260405f2080610260516020525f5260405f2090505411611830576013610240516020525f5260405f2080610260516020525f5260405f20905060018101905054610300526012610240516020525f5260405f2060018101905054610320526103005161032051101561098a57610300516103205180820382811161183057905090506102e052610300516012610240516020525f5260405f20600181019050555b60106102c0516020525f5260405f2054610300526011610240516020525f5260405f20546103205261030051610320511015610a6a576003546370a082316103605261024051610380526020610360602461037c845afa6109ed573d5f5f3e3d5ffd5b60203d1061183057610360905051610340526102e051610300516103205180820382811161183057905090506103405180820281158383830414171561183057905090506c0c9f2c9cd04674edea400000008104905080820182811061183057905090506102e052610300516011610240516020525f5260405f20555b6102e051610a8357604036610340376040610340610c35565b6102e0516007548082028115838383041417156118305790509050612710810490506103405261024051337f920ef6135eaabb1cfa705dc5bf0bedd49c095fad9fb23f2d579b92e662114a7e6102e0516103605261034051610380526040610360a36103405115610b8e576102e0516103405180820382811161183057905090506102e05260206118a85f395f5163a9059cbb610360523361038052610340516103a0526020610360604461037c5f855af1610b41573d5f5f3e3d5ffd5b3d610b5857803b156118305760016103c052610b82565b3d602081183d602010021880610360016103801161183057610360518060011c611830576103c052505b6103c090505115611830575b6102e05115610c1f5760206118a85f395f5163a9059cbb61036052600854610380526102e0516103a0526020610360604461037c5f855af1610bd2573d5f5f3e3d5ffd5b3d610be957803b156118305760016103c052610c13565b3d602081183d602010021880610360016103801161183057610360518060011c611830576103c052505b6103c090505115611830575b6102e05161036052610340516103805260406103605bf35b634cbc5513811861124d573461183057600a54604052600b5460605260406040f35b6301681a62811861124d57602436103417611830577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff606052610054565b63562915a0811861124d57602436103417611830576004358060a01c611830576040525f543318611830576040516002556040517fe5845022cf6cbbb6597b6e3a99005dd423016c1e7ac69c6e621cd47c38a3f3925f6060a2005b6322008d56811861124d57602436103417611830576004358060a01c611830576040525f543318611830576040516003556040517f58fd5d9c33114e6edf8ea5d30956f8d1a4ab112b004f99928b4bcf1b87d666625f6060a2005b634202c6f9811861124d57602436103417611830576004358060a01c611830576040525f543318611830576040516004556040517ff52f1295a5bd82818185311d8284477532c0eba12fd2ba17314486d3a8f6810d5f6060a2005b63bbc223f58118610e2457604436103417611830576004358060a01c611830576040526024358060011c611830576060525f5433186118305760605160056040516020525f5260405f20556040517f4dc837210548516568378153706718ba26db8d3f26eb60b45084ce5194c2872860605160805260206080a2005b63fdc0e499811861124d57346118305760065460405260206040f35b63b4f70521811861124d57606436103417611830576044358060a01c611830576040525f5433186118305760026004351061183057612710602435116118305760405115610e8f576001610e98565b61271060243518155b15611830576004356006556024356007556040516008557f2d9c411a91be84428f9644fbb5e1e9a29d64f2e196aba27deef87cbd43e6e3a46040600460603760405160a05260606060a1005b6388e3f7dd8118610f6057604436103417611830576004358060a01c611830576040526024358060011c611830576060525f5433186118305760605160096040516020525f5260405f20556040517fc91b1dcbb90b046eac83f7ff46ca2baa261a580efaaf93b72e73f7a5beb0cdef60605160805260206080a2005b6380f4a8bd811861124d576024361034176118305760106004356020525f5260405f205460405260206040f35b63fd066ecc811861124d57602436103417611830576004358060a01c611830576040525f543318611830576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c811861124d5734611830576001543318611830575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63a7f0b3de811861104e573461183057602061188860403960206040f35b63aaa626b6811861124d573461183057600f5460405260206040f35b6388a8d60281186110855734611830575f5460405260206040f35b63dca6e492811861124d57346118305760085460405260206040f35b63770817ec81186110bd57346118305760015460405260206040f35b63b02a19ec811861124d57602436103417611830576004358060a01c6118305760405260096040516020525f5260405f205460605260206060f35b634cf088d9811861111457346118305760035460405260206040f35b633abf1a49811861124d57346118305760075460405260206040f35b63bfe10928811861114c57346118305760045460405260206040f35b632ac7183e811861124d57602436103417611830576004358060a01c6118305760405260116040516020525f5260405f205460605260206060f35b63da62fba9811861124d57602436103417611830576004358060a01c6118305760405260056040516020525f5260405f205460605260206060f35b6319497b83811861124d5760243610341761183057600c6004356020525f5260405f20805460405260018101546060525060406040f35b632193fac1811861124d57604436103417611830576004358060a01c6118305760405260136040516020525f5260405f20806024356020525f5260405f209050805460605260018101546080525060406060f35b5f5ffd5b621275004260206118885f395f51808203828111611830579050905004815250565b61127d6060611251565b6060516040525f606052600d54608052600e5460a052621275006080510460c05260405160c0511460e052608051621275008106905060a05180820281158383830414171561183057905090506212750081049050610100524260206118885f395f518082038281116118305790509050608052600c600a54600181038181116118305790506020525f5260405f206001810190505461012052600f546101405260e0516114cc5760a0516101005180820382811161183057905090506060525f61010052610140516060516c0c9f2c9cd04674edea400000008102816c0c9f2c9cd04674edea4000000082041861183057905061012051801561183057808204905090508082018281106118305790509050601060c0516020525f5260405f2055600454610160525f610180525f6020905b806101a05260c0516001810181811061183057905060c05261016051634e71d92d6101c05260606101c060046101dc5f855af16113ef573d5f5f3e3d5ffd5b60603d10611830576101c09050604081019050516101805260405160c0511460e05260e05161149857606051610180518082018281106118305790509050606052610140516060516c0c9f2c9cd04674edea400000008102816c0c9f2c9cd04674edea4000000082041861183057905061012051801561183057808204905090508082018281106118305790509050601060c0516020525f5260405f20556001018181186113b0575b505060e0516114c45760c05162127500810281621275008204186118305790506080525f60a0526114cc565b6101805160a0525b608051600d5560a051600e55608051621275008106905060a05180820281158383830414171561183057905090506212750081049050610160526060516101605161010051808203828111611830579050905080820182811061183057905090506060526060516115425760e05181525061159a565b610140516060516c0c9f2c9cd04674edea400000008102816c0c9f2c9cd04674edea4000000082041861183057905061012051801561183057808204905090508082018281106118305790509050600f5560e0518152505b565b6115a660a0611251565b60a051608052600f5460a05260126040516020525f5260405f205460c05260c05161160157600160c052600160126040516020525f5260405f205560805160136040516020525f5260405f20805f6020525f5260405f209050555b60c0516001810381811161183057905060c05260136040516020525f5260405f208060c0516020525f5260405f2090506001810190505460e052606051156117435760136040516020525f5260405f208060c0516020525f5260405f2090505460805111156116be5760c0516001810181811061183057905060c05260c0516001810181811061183057905060126040516020525f5260405f205560805160136040516020525f5260405f208060c0516020525f5260405f209050555b60e05160a05160116040516020525f5260405f2054808203828111611830579050905060605180820281158383830414171561183057905090506c0c9f2c9cd04674edea4000000081049050808201828110611830579050905060e05260e05160136040516020525f5260405f208060c0516020525f5260405f209050600181019050555b60a05160116040516020525f5260405f205560e051815250565b61176760a0611251565b60a051608052600a5460a05260a0516001810381811161183057905060c052600c60c0516020525f5260405f20805460e0526001810154610100525060e05160805111156117cf5760a05160c05260805160e05260a05160018101818110611830579050600a555b6001606051186117f75761010051604051808201828110611830579050905061010052611811565b610100516040518082038281116118305790509050610100525b600c60c0516020525f5260405f2060e051815561010051600182015550565b5f80fd124d0da80fe8124d046f0d4d0f8d124d10a1124d1030035b0cf2124d124d10f804ba01e7124d11870c970ee403fe020111300127124d0e40106a11f9124d11c2124d0018124d078902a6124d06d6124d0c5907c885582018974d41f203a92b52b3277bffa411d30d0a92d148f40683dd062c7b7b971fd01918888118541840a1657679706572830004020038000000000000000000000000d31911a33a5577be233dc096f6f5a7e496ff5934000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf6204",
+  "name": "StakingRewardDistributor",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "rewards",
+          "type": "uint256"
+        }
+      ],
+      "name": "Claim",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "caller",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "rewards",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "bounty",
+          "type": "uint256"
+        }
+      ],
+      "name": "Reclaim",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "depositor",
+          "type": "address"
+        }
+      ],
+      "name": "SetDepositor",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "staking",
+          "type": "address"
+        }
+      ],
+      "name": "SetStaking",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "distributor",
+          "type": "address"
+        }
+      ],
+      "name": "SetDistributor",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "claimer",
+          "type": "bool"
+        }
+      ],
+      "name": "SetClaimer",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "name": "expiration",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "bounty",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "recipient",
+          "type": "address"
+        }
+      ],
+      "name": "SetRewardExpiration",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "account",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "disabled",
+          "type": "bool"
+        }
+      ],
+      "name": "SetReclaimDisabled",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "PendingManagement",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "SetManagement",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "epoch",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_epoch",
+          "type": "uint256"
+        }
+      ],
+      "name": "sync_total_weight",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "sync_rewards",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        }
+      ],
+      "name": "sync_rewards",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_caller",
+          "type": "address"
+        },
+        {
+          "name": "_from",
+          "type": "address"
+        },
+        {
+          "name": "_to",
+          "type": "address"
+        },
+        {
+          "name": "_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked_from",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked_to",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_transfer",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_caller",
+          "type": "address"
+        },
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_prev_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_stake",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_prev_supply",
+          "type": "uint256"
+        },
+        {
+          "name": "_prev_staked",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "on_unstake",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        }
+      ],
+      "name": "instant_withdrawal",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        }
+      ],
+      "name": "claim",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        }
+      ],
+      "name": "pending_rewards",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        }
+      ],
+      "name": "reclaim",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_idx",
+          "type": "uint256"
+        }
+      ],
+      "name": "reclaim",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_depositor",
+          "type": "address"
+        }
+      ],
+      "name": "set_depositor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_staking",
+          "type": "address"
+        }
+      ],
+      "name": "set_staking",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_distributor",
+          "type": "address"
+        }
+      ],
+      "name": "set_distributor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_claimer",
+          "type": "bool"
+        }
+      ],
+      "name": "set_claimer",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_expiration",
+          "type": "uint256"
+        },
+        {
+          "name": "_bounty",
+          "type": "uint256"
+        },
+        {
+          "name": "_recipient",
+          "type": "address"
+        }
+      ],
+      "name": "set_reward_expiration",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_account",
+          "type": "address"
+        },
+        {
+          "name": "_disabled",
+          "type": "bool"
+        }
+      ],
+      "name": "set_reclaim_disabled",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_management",
+          "type": "address"
+        }
+      ],
+      "name": "set_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accept_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "genesis",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "token",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "depositor",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "staking",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "distributor",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "claimers",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "reward_expiration",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "reclaim_bounty",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "reclaim_recipient",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "reclaim_disabled",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "total_weight_cursor",
+      "outputs": [
+        {
+          "components": [
+            {
+              "name": "count",
+              "type": "uint256"
+            },
+            {
+              "name": "last",
+              "type": "uint256"
+            }
+          ],
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "uint256"
+        }
+      ],
+      "name": "total_weight_entries",
+      "outputs": [
+        {
+          "components": [
+            {
+              "name": "epoch",
+              "type": "uint256"
+            },
+            {
+              "name": "weight",
+              "type": "uint256"
+            }
+          ],
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "epoch_rewards",
+      "outputs": [
+        {
+          "components": [
+            {
+              "name": "timestamp",
+              "type": "uint256"
+            },
+            {
+              "name": "rewards",
+              "type": "uint256"
+            }
+          ],
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "reward_integral",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "uint256"
+        }
+      ],
+      "name": "reward_integral_snapshot",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "account_reward_integral",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "accrued_rewards",
+      "outputs": [
+        {
+          "components": [
+            {
+              "name": "count",
+              "type": "uint256"
+            },
+            {
+              "name": "claimed",
+              "type": "uint256"
+            }
+          ],
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        },
+        {
+          "name": "arg1",
+          "type": "uint256"
+        }
+      ],
+      "name": "accrued_reward_entries",
+      "outputs": [
+        {
+          "components": [
+            {
+              "name": "epoch",
+              "type": "uint256"
+            },
+            {
+              "name": "accrued",
+              "type": "uint256"
+            }
+          ],
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_distributor",
+          "type": "address"
+        },
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": "0x000000000000000000000000d31911a33a5577be233dc096f6f5a7e496ff5934000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf6204",
+  "sources": {
+    "StakingRewardDistributor.vy": {
+      "content": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Staking Reward Distributor\n@author Yearn Finance\n@license GNU AGPLv3\n@notice A component to the RewardDistributor. It tracks staking balances through the stYFI hook\n        and snapshots the total staked balance each epoch to report as its reward weight.\n        Rewards are claimed from the distributor as they become available and streamed over the\n        following epoch to all stakers, proportional to their current balance.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IHooks:\n    def on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _value: uint256): nonpayable\n    def on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _value: uint256): nonpayable\n    def instant_withdrawal(_account: address) -> bool: view\n\ninterface IComponent:\n    def sync_total_weight(_epoch: uint256) -> uint256: nonpayable\n\ninterface IDistributor:\n    def genesis() -> uint256: view\n    def claim() -> (uint256, uint256, uint256): nonpayable\n\nimplements: IHooks\nimplements: IComponent\n\nstruct Weight:\n    epoch: uint256\n    time: uint256\n    weight: uint256\n\nstruct TotalWeight:\n    epoch: uint256\n    weight: uint256\n\nstruct Cursor:\n    count: uint256\n    last: uint256\n\nstruct Rewards:\n    timestamp: uint256\n    rewards: uint256\n\nstruct Accrued:\n    count: uint256\n    claimed: uint256\n\nstruct AccruedEntry:\n    epoch: uint256\n    accrued: uint256\n\ngenesis: public(immutable(uint256))\ntoken: public(immutable(IERC20))\nmanagement: public(address)\npending_management: public(address)\n\ndepositor: public(address)\nstaking: public(IERC20)\ndistributor: public(IDistributor)\nclaimers: public(HashMap[address, bool])\nreward_expiration: public(uint256)\nreclaim_bounty: public(uint256)\nreclaim_recipient: public(address)\nreclaim_disabled: public(HashMap[address, bool])\n\ntotal_weight_cursor: public(Cursor)\ntotal_weight_entries: public(HashMap[uint256, TotalWeight])\n\nepoch_rewards: public(Rewards)\nreward_integral: public(uint256)\nreward_integral_snapshot: public(HashMap[uint256, uint256])\naccount_reward_integral: public(HashMap[address, uint256])\naccrued_rewards: public(HashMap[address, Accrued])\naccrued_reward_entries: public(HashMap[address, HashMap[uint256, AccruedEntry]]) # account => idx => entry\n\nevent Claim:\n    account: indexed(address)\n    rewards: uint256\n\nevent Reclaim:\n    caller: indexed(address)\n    account: indexed(address)\n    rewards: uint256\n    bounty: uint256\n\nevent SetDepositor:\n    depositor: indexed(address)\n\nevent SetStaking:\n    staking: indexed(address)\n\nevent SetDistributor:\n    distributor: indexed(address)\n\nevent SetClaimer:\n    account: indexed(address)\n    claimer: bool\n\nevent SetRewardExpiration:\n    expiration: uint256\n    bounty: uint256\n    recipient: address\n\nevent SetReclaimDisabled:\n    account: indexed(address)\n    disabled: bool\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nEPOCH_LENGTH: constant(uint256) = 14 * 24 * 60 * 60\nRAMP_LENGTH: constant(uint256) = 4 * EPOCH_LENGTH\nINCREMENT: constant(bool) = True\nDECREMENT: constant(bool) = False\nPRECISION: constant(uint256) = 10**30\nBOUNTY_PRECISION: constant(uint256) = 10_000\n\n@deploy\ndef __init__(_distributor: address, _token: address):\n    \"\"\"\n    @notice Constructor\n    @param _distributor The distributor address\n    @param _token The address of the reward token\n    \"\"\"\n    genesis = staticcall IDistributor(_distributor).genesis()\n    token = IERC20(_token)\n\n    self.management = msg.sender\n    self.distributor = IDistributor(_distributor)\n    self.total_weight_cursor = Cursor(count=1, last=0)\n    self.total_weight_entries[0] = TotalWeight(epoch=0, weight=10**12)\n    self.reward_expiration = 26\n    self.reclaim_recipient = msg.sender\n\n@external\n@view\ndef epoch() -> uint256:\n    \"\"\"\n    @notice Query the current epoch number\n    @return The current epoch number\n    \"\"\"\n    return self._epoch()\n\n@external\ndef sync_total_weight(_epoch: uint256) -> uint256:\n    \"\"\"\n    @notice Compute and finalize the total weight for reward distribution purposes\n    @param _epoch The epoch to compute the total weight for\n    @return The total weight for this epoch\n    @dev Can only be called by the distributor\n    \"\"\"\n    assert msg.sender == self.distributor.address\n    cursor: Cursor = self.total_weight_cursor\n    \n    weight: uint256 = 0\n    next_idx: uint256 = cursor.last + 1\n    if next_idx == cursor.count:\n        # already at last entry\n        weight = self.total_weight_entries[cursor.last].weight\n    else:\n        # peek into next entry\n        next: TotalWeight = self.total_weight_entries[next_idx]\n        if _epoch < next.epoch:\n            # next entry is for a future epoch, keep using current entry\n            weight = self.total_weight_entries[cursor.last].weight\n        else:\n            # update cursor\n            self.total_weight_cursor.last = next_idx\n\n            weight = next.weight\n    return weight\n\n@external\ndef sync_rewards(_account: address = empty(address)) -> bool:\n    \"\"\"\n    @notice Synchronize global rewards up until now\n    @param _account Also update rewards for this specific account (optional)\n    @return True: rewards are fully synced, False: not fully synced\n    \"\"\"\n    synced: bool = self._sync_integral()\n    if _account != empty(address):\n        staked: uint256 = staticcall self.staking.balanceOf(_account)\n        self._sync_account_integral(_account, staked)\n    return synced\n\n@external\ndef on_transfer(_caller: address, _from: address, _to: address, _supply: uint256, _prev_staked_from: uint256, _prev_staked_to: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon transfer of tokens\n    @param _caller Originator of the transfer\n    @param _from Sender of the token\n    @param _to Recipient of the tokens\n    @param _supply Total token supply\n    @param _prev_staked_from Staked balance of sender before transfer\n    @param _prev_staked_to Staked balance of recipient before transfer\n    @param _amount Amount of tokens to transfer\n    \"\"\"\n    assert msg.sender == self.depositor\n    assert self._sync_integral()\n    self._sync_account_integral(_from, _prev_staked_from)\n    self._sync_account_integral(_to, _prev_staked_to)\n\n@external\ndef on_stake(_caller: address, _account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon staking of tokens\n    @param _caller Originator of the tokens\n    @param _account Recipient of the staked tokens\n    @param _prev_supply Total token supply before stake\n    @param _prev_staked Staked balance of recipient before stake\n    @param _amount Amount of tokens to stake\n    \"\"\"\n    assert msg.sender == self.depositor\n    assert self._sync_integral()\n    self._update_total_weight(_amount, INCREMENT)\n    self._sync_account_integral(_account, _prev_staked)\n\n@external\ndef on_unstake(_account: address, _prev_supply: uint256, _prev_staked: uint256, _amount: uint256):\n    \"\"\"\n    @notice Triggered by the hook upon unstaking of tokens\n    @param _account Originator of the staked tokens\n    @param _prev_supply Total token supply before unstake\n    @param _prev_staked Staked balance of originator before unstake\n    @param _amount Amount of tokens to unstake\n    \"\"\"\n    assert msg.sender == self.depositor\n    assert self._sync_integral()\n    self._update_total_weight(_amount, DECREMENT)\n    self._sync_account_integral(_account, _prev_staked)\n\n@external\n@view\ndef instant_withdrawal(_account: address) -> bool:\n    \"\"\"\n    @notice Query instant withdrawal status of an account\n    @param _account Account to query withdrawal status for\n    @return Always False\n    \"\"\"\n    return False\n\n@external\ndef claim(_account: address) -> uint256:\n    \"\"\"\n    @notice Claim rewards on behalf of an account\n    @param _account Account to claim rewards for\n    @return Amount of rewards tokens claimed\n    \"\"\"\n    if self.accrued_rewards[_account].count == 0:\n        # shortcut accounts that are guaranteed to have no rewards\n        return 0\n\n    assert self.claimers[msg.sender]\n    assert self._sync_integral()\n    staked: uint256 = staticcall self.staking.balanceOf(_account)\n    accrued: uint256 = self._sync_account_integral(_account, staked)\n    pending: uint256 = accrued - self.accrued_rewards[_account].claimed\n\n    if pending > 0:\n        self.accrued_rewards[_account].claimed = accrued\n        assert extcall token.transfer(msg.sender, pending, default_return_value=True)\n        log Claim(account=_account, rewards=pending)\n\n    return pending\n\n@external\n@view\ndef pending_rewards(_account: address) -> uint256:\n    \"\"\"\n    @notice Query pending rewards\n    @param _account Account to query pending rewards for\n    @return Amount of pending rewards tokens\n    @dev Does not include earned rewards since last account state change\n    \"\"\"\n    idx: uint256 = self.accrued_rewards[_account].count\n    if idx == 0:\n        return 0\n    idx -= 1\n    accrued: uint256 = self.accrued_reward_entries[_account][idx].accrued\n    return accrued - self.accrued_rewards[_account].claimed\n\n@external\ndef reclaim(_account: address, _idx: uint256 = max_value(uint256)) -> (uint256, uint256):\n    \"\"\"\n    @notice Reclaim expired rewards\n    @param _account Account to reclaim rewards for\n    @param _idx Index of accrued rewards to reclaim from (optional)\n    @return Tuple with amount of rewards reclaimed and bounty amount received\n    \"\"\"\n    assert not self.reclaim_disabled[_account]\n    assert self._sync_integral()\n    count: uint256 = self.accrued_rewards[_account].count\n    assert count > 0\n    assert _idx == max_value(uint256) or _idx < count\n\n    expiration: uint256 = self.reward_expiration\n    epoch: uint256 = self._epoch()\n    if epoch < expiration:\n        return 0, 0\n    epoch -= expiration\n\n    # reclaim based on snapshotted accrued rewards\n    rewards: uint256 = 0\n    if _idx < max_value(uint256):\n        assert self.accrued_reward_entries[_account][_idx].epoch <= epoch\n        accrued: uint256 = self.accrued_reward_entries[_account][_idx].accrued\n        claimed: uint256 = self.accrued_rewards[_account].claimed\n        if claimed < accrued:\n            rewards = accrued - claimed\n            self.accrued_rewards[_account].claimed = accrued\n\n    # reclaim from rewards since last state change\n    integral: uint256 = self.reward_integral_snapshot[epoch]\n    account_integral: uint256 = self.account_reward_integral[_account]\n    if account_integral < integral:\n        staked: uint256 = staticcall self.staking.balanceOf(_account)\n        rewards += (integral - account_integral) * staked // PRECISION\n        self.account_reward_integral[_account] = integral\n\n    if rewards == 0:\n        return 0, 0\n\n    bounty: uint256 = rewards * self.reclaim_bounty // BOUNTY_PRECISION\n    log Reclaim(caller=msg.sender, account=_account, rewards=rewards, bounty=bounty)\n\n    if bounty > 0:\n        rewards -= bounty\n        assert extcall token.transfer(msg.sender, bounty, default_return_value=True)\n\n    if rewards > 0:\n        assert extcall token.transfer(self.reclaim_recipient, rewards, default_return_value=True)\n\n    return rewards, bounty\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_depositor(_depositor: address):\n    \"\"\"\n    @notice Set the depositor\n    @param _depositor Depositor address\n    @dev Can only be called by management\n    @dev Caller is responsible for ensuring consistency between the old and new depositor\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.depositor = _depositor\n    log SetDepositor(depositor=_depositor)\n\n@external\ndef set_staking(_staking: address):\n    \"\"\"\n    @notice Set the staking address\n    @param _staking Staking address\n    @dev Can only be called by management\n    @dev Caller is responsible for ensuring consistency between the depositor and staking contract\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.staking = IERC20(_staking)\n    log SetStaking(staking=_staking)\n\n@external\ndef set_distributor(_distributor: address):\n    \"\"\"\n    @notice Set upstream reward distributor\n    @param _distributor Distributor address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.distributor = IDistributor(_distributor)\n    log SetDistributor(distributor=_distributor)\n\n@external\ndef set_claimer(_account: address, _claimer: bool):\n    \"\"\"\n    @notice Whitelist account as reward claimer\n    @param _account Account\n    @param _claimer True: add to whitelist, False: remove from whitelist\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.claimers[_account] = _claimer\n    log SetClaimer(account=_account, claimer=_claimer)\n\n@external\ndef set_reward_expiration(_expiration: uint256, _bounty: uint256, _recipient: address):\n    \"\"\"\n    @notice Set reward expiration parameters\n    @param _expiration Number of epochs after which rewards can be reclaimed\n    @param _bounty Bounty (in bps) to give to the caller\n    @param _recipient Recipient of the reclaimed rewards\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _expiration > 1\n    assert _bounty <= BOUNTY_PRECISION\n    assert _recipient != empty(address) or _bounty == BOUNTY_PRECISION\n\n    self.reward_expiration = _expiration\n    self.reclaim_bounty = _bounty\n    self.reclaim_recipient = _recipient\n    log SetRewardExpiration(expiration=_expiration, bounty=_bounty, recipient=_recipient)\n\n@external\ndef set_reclaim_disabled(_account: address, _disabled: bool):\n    \"\"\"\n    @notice Set reclaim disable flag\n    @param _account Address to set the flag for\n    @param _disabled True: disable reclaims for account, False: enable reclaims\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    self.reclaim_disabled[_account] = _disabled\n    log SetReclaimDisabled(account=_account, disabled=_disabled)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _epoch() -> uint256:\n    return unsafe_div(block.timestamp - genesis, EPOCH_LENGTH)\n\n@internal\ndef _update_total_weight(_amount: uint256, _increment: bool):\n    \"\"\"\n    @notice Increase or decrease the total weight.\n            Global integral must be synced before calling\n    \"\"\"\n    current_epoch: uint256 = self._epoch()\n\n    # load latest total weight\n    count: uint256 = self.total_weight_cursor.count\n    idx: uint256 = count - 1\n    weight: TotalWeight = self.total_weight_entries[idx]\n\n    if current_epoch > weight.epoch:\n        # new epoch, add entry to list\n        idx = count\n        weight.epoch = current_epoch\n        self.total_weight_cursor.count = count + 1\n\n    if _increment == INCREMENT:\n        weight.weight += _amount\n    else:\n        weight.weight -= _amount\n\n    self.total_weight_entries[idx] = weight\n\n@internal\ndef _sync_integral() -> bool:\n    \"\"\"\n    @notice Sync global integral to the latest value\n    \"\"\"\n    current_epoch: uint256 = self._epoch()\n\n    unlocked: uint256 = 0\n    ew: Rewards = self.epoch_rewards\n    epoch: uint256 = unsafe_div(ew.timestamp, EPOCH_LENGTH)\n    synced: bool = epoch == current_epoch\n    last_streamed: uint256 = (ew.timestamp % EPOCH_LENGTH) * ew.rewards // EPOCH_LENGTH\n    ew.timestamp = block.timestamp - genesis\n    total_weight: uint256 = self.total_weight_entries[self.total_weight_cursor.count - 1].weight\n    integral: uint256 = self.reward_integral\n\n    if not synced:\n        # rollover to new epoch. first finalize the last one\n        unlocked = ew.rewards - last_streamed\n        last_streamed = 0\n\n        # save integral snapshot\n        self.reward_integral_snapshot[epoch] = integral + unlocked * PRECISION // total_weight\n\n        # fast forward through any other completed epochs\n        distributor: IDistributor = self.distributor\n        epoch_rewards: uint256 = 0\n        for i: uint256 in range(32):\n            epoch += 1\n            epoch_rewards = (extcall distributor.claim())[2]\n            synced = epoch == current_epoch\n            if synced:\n                break\n            else:\n                unlocked += epoch_rewards\n                self.reward_integral_snapshot[epoch] = integral + unlocked * PRECISION // total_weight\n\n        if synced:\n            # fully caught up\n            ew.rewards = epoch_rewards\n        else:\n            # not fully caught up. we already added the full amount to `unlocked`, so we \n            # zero out the epoch rewards to not double count it in the next call\n            ew.timestamp = epoch * EPOCH_LENGTH\n            ew.rewards = 0\n\n    self.epoch_rewards = ew\n\n    streamed: uint256 = (ew.timestamp % EPOCH_LENGTH) * ew.rewards // EPOCH_LENGTH\n    unlocked += streamed - last_streamed\n    if unlocked == 0:\n        return synced\n\n    # update integral\n    self.reward_integral = integral + unlocked * PRECISION // total_weight\n\n    return synced\n\n@internal\ndef _sync_account_integral(_account: address, _staked: uint256) -> uint256:\n    \"\"\"\n    @notice Sync integral of a specific account to the latest value\n    \"\"\"\n    epoch: uint256 = self._epoch()\n    integral: uint256 = self.reward_integral\n\n    idx: uint256 = self.accrued_rewards[_account].count\n    if idx == 0:\n        # no entries yet\n        idx = 1\n        self.accrued_rewards[_account].count = 1\n        self.accrued_reward_entries[_account][0].epoch = epoch\n    idx -= 1\n\n    accrued: uint256 = self.accrued_reward_entries[_account][idx].accrued\n    if _staked > 0:\n        if epoch > self.accrued_reward_entries[_account][idx].epoch:\n            # new epoch, new entry\n            idx += 1\n            self.accrued_rewards[_account].count = idx + 1\n            self.accrued_reward_entries[_account][idx].epoch = epoch\n\n        accrued += (integral - self.account_reward_integral[_account]) * _staked // PRECISION\n        self.accrued_reward_entries[_account][idx].accrued = accrued\n\n    self.account_reward_integral[_account] = integral\n    return accrued"
+    }
+  }
+}

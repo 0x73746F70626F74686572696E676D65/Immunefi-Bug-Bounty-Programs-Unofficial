@@ -1,0 +1,727 @@
+{
+  "file_path": "FundingDistributor.vy",
+  "creation_status": "success",
+  "source_code": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Funding Distributor\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Maintains a list of approved funding and distributes the funding to the team upon request. \n        Funding is either sent directly or in a vesting contract, depending on the duration specified\n        in the approval as well as the time of claim.\n        Supports returning of unused funding, which reduces the team's cost by the average price of \n        the tokens during all the claims.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\nstruct Approval:\n    team: address\n    period: uint256\n    token: address\n    amount: uint256\n    duration: uint256\n    used: uint256\n\nstruct Cost:\n    amount: uint256\n    price: uint256\n\ninterface IFundingDistributor:\n    def token(_idx: uint256) -> address: view\n    def claimable(_idx: uint256) -> uint256: view\n    def claim(_idx: uint256, _amount: uint256, _recipient: address) -> (uint256, uint256, address): nonpayable\n    def refund(_idx: uint256, _amount: uint256) -> (uint256, uint256): nonpayable\nimplements: IFundingDistributor\n\ninterface IRegistry:\n    def is_team(_team: address) -> bool: view\n\ninterface IAccountant:\n    def adjust_cost(_team: address, _period: uint256, _amount: uint256, _increment: bool): nonpayable\n\ninterface IOracle:\n    def price(_asset: address) -> uint256: nonpayable\n\ninterface IVestingFactory:\n    def deploy_vesting_contract(\n        _token: address, _recipient: address, _amount: uint256, _duration: uint256, _start: uint256, \n        _cliff: uint256, _open: bool, _donation: uint256, _owner: address\n    ) -> address: nonpayable\n\ngenesis: public(immutable(uint256))\nmanagement: public(address)\npending_management: public(address)\nregistry: public(IRegistry)\naccountant: public(IAccountant)\nvesting_factory: public(IVestingFactory)\nvesting_owner: public(address)\noracles: public(HashMap[address, address])\nnum_approvals: public(uint256)\napprovals: public(HashMap[uint256, Approval])\ncosts: public(HashMap[address, HashMap[uint256, HashMap[address, Cost]]]) # team => period => token => cost\n\nevent ApproveFunding:\n    idx: indexed(uint256)\n    team: indexed(address)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    duration: uint256\n\nevent ClaimFunding:\n    idx: indexed(uint256)\n    team: indexed(address)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    cost: uint256\n    vest: address\n    recipient: address\n\nevent ReturnFunding:\n    idx: indexed(uint256)\n    team: indexed(address)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    refund: uint256\n    sender: address\n\nevent SetRegistry:\n    registry: indexed(address)\n\nevent SetAccountant:\n    accountant: indexed(address)\n\nevent SetVestingFactory:\n    factory: indexed(address)\n\nevent SetVestingOwner:\n    owner: indexed(address)\n\nevent SetPriceOracle:\n    token: indexed(address)\n    oracle: address\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPRECISION: constant(uint256) = 10**18\nPERIOD_LENGTH: constant(uint256) = 6 * 14 * 24 * 60 * 60\nINCREMENT: constant(bool) = True\nDECREMENT: constant(bool) = False\n\n@deploy\ndef __init__(_genesis: uint256):\n    \"\"\"\n    @notice Constructor\n    @param _genesis Budget period genesis timestamp\n    \"\"\"\n    genesis = _genesis\n    self.management = msg.sender\n    self.vesting_owner = msg.sender\n\n@external\n@view\ndef period() -> uint256:\n    \"\"\"\n    @notice Query the current budget period number\n    @return The current budget period number\n    \"\"\"\n    return self._period()\n\n@external\n@view\ndef token(_idx: uint256) -> address:\n    \"\"\"\n    @notice Query the token associated with a specific approval\n    @param _idx Approval index\n    @return The token address\n    \"\"\"\n    token: address = self.approvals[_idx].token\n    assert token != empty(address)\n    return token\n\n@external\ndef approve(_team: address, _period: uint256, _token: address, _amount: uint256, _duration: uint256) -> uint256:\n    \"\"\"\n    @notice Approve funding\n    @param _team Team address\n    @param _period Budget period number. Cant be in the past\n    @param _token Token address\n    @param _amount Token amount\n    @param _duration Vest duration from start of the budget period\n    @return Approval index\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _team != empty(address)\n    assert _period >= self._period()\n    assert _token != empty(address)\n    assert _amount > 0\n\n    oracle: address = self.oracles[_token]\n    assert oracle != empty(address)\n    price: uint256 = extcall IOracle(oracle).price(_token)\n    assert price > 0\n\n    idx: uint256 = self.num_approvals\n    self.num_approvals = idx + 1\n    self.approvals[idx] = Approval(team=_team, period=_period, token=_token, amount=_amount, duration=_duration, used=0)\n\n    log ApproveFunding(idx=idx, team=_team, period=_period, token=_token, amount=_amount, duration=_duration)\n    return idx\n\n@external\n@view\ndef claimable(_idx: uint256) -> uint256:\n    team: address = self.approvals[_idx].team\n    if not staticcall self.registry.is_team(team):\n        return 0\n\n    period: uint256 = self._period()\n    if period != self.approvals[_idx].period:\n        return 0\n\n    return self.approvals[_idx].amount - self.approvals[_idx].used\n\n@external\ndef claim(_idx: uint256, _amount: uint256, _recipient: address) -> (uint256, uint256, address):\n    \"\"\"\n    @notice Claim funding\n    @param _idx Approval index\n    @param _amount Token amount\n    @param _recipient Funding recipient\n    @return Tuple with: current budget period number, USD value of claim (18 decimals), vesting contract (if applicable)\n    @dev Can only be called by the team associated with the approval\n    \"\"\"\n    assert msg.sender == self.approvals[_idx].team\n    assert staticcall self.registry.is_team(msg.sender)\n    assert _amount > 0\n    assert _recipient != empty(address)\n\n    period: uint256 = self._period()\n    assert period == self.approvals[_idx].period\n\n    # update approval usage\n    used: uint256 = self.approvals[_idx].used + _amount\n    assert used <= self.approvals[_idx].amount\n    self.approvals[_idx].used = used\n\n    # get price from oracle\n    token: address = self.approvals[_idx].token\n    oracle: address = self.oracles[token]\n    assert oracle != empty(address)\n    price: uint256 = extcall IOracle(oracle).price(token)\n    assert price > 0\n\n    # update cost and average price\n    cost: Cost = self.costs[msg.sender][period][token]\n    new_cost: uint256 = cost.amount + _amount\n    cost.price = (cost.amount * cost.price + _amount * price) // new_cost\n    cost.amount = new_cost\n    self.costs[msg.sender][period][token] = cost\n\n    # report to accountant\n    value: uint256 = _amount * price // PRECISION\n    extcall self.accountant.adjust_cost(msg.sender, period, value, INCREMENT)\n\n    duration: uint256 = self.approvals[_idx].duration\n    start: uint256 = genesis + period * PERIOD_LENGTH\n    vest: address = empty(address)\n    if block.timestamp >= start + duration:\n        # tokens unlock immediately\n        assert extcall IERC20(token).transfer(_recipient, _amount, default_return_value=True)\n    else:\n        # tokens vest over time\n        factory: IVestingFactory = self.vesting_factory\n        assert extcall IERC20(token).approve(factory.address, _amount, default_return_value=True)\n        vest = extcall factory.deploy_vesting_contract(token, _recipient, _amount, duration, start, 0, True, 0, self.vesting_owner)\n\n    log ClaimFunding(idx=_idx, team=msg.sender, period=period, token=token, amount=_amount, cost=value, vest=vest, recipient=_recipient)\n    return (period, value, vest)\n\n@external\ndef refund(_idx: uint256, _amount: uint256) -> (uint256, uint256):\n    \"\"\"\n    @notice Refund previously claimed funding\n    @param _idx Approval index\n    @param _amount Token amount\n    @return Tuple with: current budget period number, USD value of refund (18 decimals)\n    @dev Reduces the team's cost using the average price of all claims in this approval\n    \"\"\"\n    assert msg.sender == self.approvals[_idx].team\n    period: uint256 = self._period()\n    assert period == self.approvals[_idx].period\n\n    # update cost\n    token: address = self.approvals[_idx].token\n    cost: Cost = self.costs[msg.sender][period][token]\n    self.costs[msg.sender][period][token].amount = cost.amount - _amount\n\n    # report to accountant using the average price\n    value: uint256 = _amount * cost.price // PRECISION\n    extcall self.accountant.adjust_cost(msg.sender, period, value, DECREMENT)\n\n    assert extcall IERC20(token).transferFrom(msg.sender, self, _amount, default_return_value=True)\n\n    log ReturnFunding(idx=_idx, team=msg.sender, period=period, token=token, amount=_amount, refund=value, sender=msg.sender)\n    return (period, value)\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_registry(_registry: address):\n    \"\"\"\n    @notice Set a new registry\n    @param _registry New registry address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.registry = IRegistry(_registry)\n    log SetRegistry(registry=_registry)\n\n@external\ndef set_accountant(_accountant: address):\n    \"\"\"\n    @notice Set a new accountant\n    @param _accountant New accountant address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.accountant = IAccountant(_accountant)\n    log SetAccountant(accountant=_accountant)\n\n@external\ndef set_vesting_factory(_factory: address):\n    \"\"\"\n    @notice Set a new vesting factory\n    @param _factory New vesting factory address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.vesting_factory = IVestingFactory(_factory)\n    log SetVestingFactory(factory=_factory)\n\n@external\ndef set_vesting_owner(_owner: address):\n    \"\"\"\n    @notice Set a new vesting owner\n    @param _owner New vesting owner address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.vesting_owner = _owner\n    log SetVestingOwner(owner=_owner)\n\n@external\ndef set_price_oracle(_token: address, _oracle: address):\n    \"\"\"\n    @notice Set a token price oracle\n    @param _token Token address\n    @param _oracle Oracle address\n    @dev The oracle should return the value of 1 wad of tokens in USD (18 decimals)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _token != empty(address)\n    if _oracle != empty(address):\n        assert extcall IOracle(_oracle).price(_token) > 0\n\n    self.oracles[_token] = _oracle\n    log SetPriceOracle(token=_token, oracle=_oracle)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _period() -> uint256:\n    return unsafe_div(block.timestamp - genesis, PERIOD_LENGTH)",
+  "deployed_bytecode": "0x5f3560e01c60026016820660011b61108701601e395f51565b63ef78d4fd811861003857346110835760206100346040611061565b6040f35b638af2b687811861105d57346110835760055460405260206040f35b63044215c6811861008f576024361034176110835760086004356020525f5260405f2060028101905054604052604051156110835760206040f35b6301681a62811861105d57602436103417611083577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff606052610b07565b63f7e290a481186102245760a436103417611083576004358060a01c611083576040526044358060a01c611083576060525f5433186110835760405115611083576101186080611061565b60805160243510611083576060511561108357606435156110835760066060516020525f5260405f2054608052608051156110835760805163aea9107860c05260605160e052602060c0602460dc5f855af1610176573d5f5f3e3d5ffd5b60203d106110835760c090505160a05260a051156110835760075460c05260c05160018101818110611083579050600755600860c0516020525f5260405f20604051815560243560018201556060516002820155606435600382015560843560048201555f60058201555060243560405160c0517fae5b2886be95e8a25dc091dfc796aefa037b25c5dde2172364abec8d9e3e8cc960605160e0526040606461010037606060e0a4602060c0f35b635af36e3e811861044d576044361034176110835760086004356020525f5260405f20543318611083576102586060611061565b60605160405260086004356020525f5260405f2060018101905054604051186110835760086004356020525f5260405f20600281019050546060526009336020525f5260405f20806040516020525f5260405f209050806060516020525f5260405f2090508054608052600181015460a0525060805160243580820382811161108357905090506009336020525f5260405f20806040516020525f5260405f209050806060516020525f5260405f2090505560243560a0518082028115838383041417156110835790509050670de0b6b3a76400008104905060c05260035463a3a5af4560e05233610100526040516101205260c051610140525f61016052803b15611083575f60e0608460fc5f855af1610375573d5f5f3e3d5ffd5b506060516323b872dd60e0523361010052306101205260243561014052602060e0606460fc5f855af16103aa573d5f5f3e3d5ffd5b3d6103c157803b15611083576001610160526103e9565b3d602081183d60201002188060e001610100116110835760e0518060011c6110835761016052505b6101609050511561108357604051336004357f800f62113300de06d14775d04da9874f69ff9b70ba3ecfe4debae056f5ef89b660605160e0526024356101005260c051610120523361014052608060e0a460405160e05260c05161010052604060e0f35b63770817ec811861105d57346110835760015460405260206040f35b63d1d58b25811861105d576024361034176110835760086004356020525f5260405f205460405260025463d4486c93606052604051608052602060606024607c845afa6104b8573d5f5f3e3d5ffd5b3d602081183d602010021880606001608011611083576060518060011c6110835760a0525060a09050516104f3575f60c052602060c061056d565b6104fd6080611061565b60805160605260086004356020525f5260405f20600181019050546060511461052d575f6080526020608061056d565b60086004356020525f5260405f206003810190505460086004356020525f5260405f20600581019050548082038281116110835790509050608052602060805bf35b63ac44ff31811861105d57606436103417611083576044358060a01c6110835760405260086004356020525f5260405f205433186110835760025463d4486c9360605233608052602060606024607c845afa6105cd573d5f5f3e3d5ffd5b3d602081183d602010021880606001608011611083576060518060011c6110835760a0525060a09050511561108357602435156110835760405115611083576106166080611061565b60805160605260086004356020525f5260405f2060018101905054606051186110835760086004356020525f5260405f2060058101905054602435808201828110611083579050905060805260086004356020525f5260405f2060038101905054608051116110835760805160086004356020525f5260405f206005810190505560086004356020525f5260405f206002810190505460a052600660a0516020525f5260405f205460c05260c051156110835760c05163aea910786101005260a051610120526020610100602461011c5f855af16106f6573d5f5f3e3d5ffd5b60203d106110835761010090505160e05260e05115611083576009336020525f5260405f20806060516020525f5260405f2090508060a0516020525f5260405f20905080546101005260018101546101205250610100516024358082018281106110835790509050610140526101005161012051808202811583838304141715611083579050905060243560e0518082028115838383041417156110835790509050808201828110611083579050905061014051801561108357808204905090506101205261014051610100526009336020525f5260405f20806060516020525f5260405f2090508060a0516020525f5260405f2090506101005181556101205160018201555060243560e0518082028115838383041417156110835790509050670de0b6b3a7640000810490506101605260035463a3a5af4561018052336101a0526060516101c052610160516101e052600161020052803b15611083575f610180608461019c5f855af161086e573d5f5f3e3d5ffd5b5060086004356020525f5260405f20600481019050546101805260206110b35f395f51606051626ebe00810281626ebe0082041861108357905080820182811061108357905090506101a0525f6101c0526101a0516101805180820182811061108357905090504210156109f9576004546101e05260a05163095ea7b3610200526101e05161022052602435610240526020610200604461021c5f855af1610918573d5f5f3e3d5ffd5b3d61092f57803b1561108357600161026052610959565b3d602081183d602010021880610200016102201161108357610200518060011c6110835761026052505b61026090505115611083576101e05163babce1b96102005260a05161022052604051610240526024356102605260406101806102805e5f6102c05260016102e0525f6103005260055461032052602061020061012461021c5f855af16109c1573d5f5f3e3d5ffd5b3d602081183d602010021880610200016102201161108357610200518060a01c6110835761034052506103409050516101c052610a7a565b60a05163a9059cbb6101e052604051610200526024356102205260206101e060446101fc5f855af1610a2d573d5f5f3e3d5ffd5b3d610a4457803b1561108357600161024052610a6e565b3d602081183d6020100218806101e00161020011611083576101e0518060011c6110835761024052505b61024090505115611083575b606051336004357fe40e3fad998ed4a0741f5c8887d16742f34623e998cf9bf3cdcffefb004c825b60a0516101e0526024356102005261016051610220526101c051610240526040516102605260a06101e0a46060516101e05261016051610200526101c0516102205260606101e0f35b636ea056a98118610bda57604436103417611083576024356060525b6004358060a01c611083576040525f5433186110835760605160805260605119610b62576040516370a0823160a0523060c052602060a0602460bc845afa610b51573d5f5f3e3d5ffd5b60203d106110835760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af1610b8f573d5f5f3e3d5ffd5b3d610ba657803b1561108357600161010052610bcd565b3d602081183d60201002188060a00160c0116110835760a0518060011c6110835761010052505b6101009050511561108357005b635b95c56b811861105d57606436103417611083576004358060a01c611083576040526044358060a01c6110835760605260096040516020525f5260405f20806024356020525f5260405f209050806060516020525f5260405f2090508054608052600181015460a0525060406080f35b63f1e300bb8118610ca657602436103417611083576004358060a01c611083576040525f543318611083576040516002556040517f278c70ced5f3e0e5eeb385b5ff9cb735748ba00a625147e66065ed48fc1562cd5f6060a2005b63755ca367811861105d57604436103417611083576004358060a01c611083576040526024358060a01c611083576060525f54331861108357604051156110835760605115610d2b5760605163aea9107860805260405160a052602060806024609c5f855af1610d18573d5f5f3e3d5ffd5b60203d1061108357608090505115611083575b60605160066040516020525f5260405f20556040517f944f260fa5475db9151efe54fc9fb6df2b40f73533d9483011e94522398cb3c160605160805260206080a2005b6371da8a8d8118610dc957602436103417611083576004358060a01c611083576040525f543318611083576040516003556040517f0272efc86eeb452c32134d3a55db5b3f3a9f3a8f426422cd285c688b97b303df5f6060a2005b63addd5099811861105d57602436103417611083576004358060a01c6110835760405260066040516020525f5260405f205460605260206060f35b633b93c6a38118610e5f57602436103417611083576004358060a01c611083576040525f543318611083576040516004556040517fc21fff1e896708bc6de4c31d162069d1a69e7eb9f67b1f87a1e2e8cc58615fe45f6060a2005b634fb3ccc5811861105d57346110835760035460405260206040f35b635642f8bc8118610ed657602436103417611083576004358060a01c611083576040525f543318611083576040516005556040517fb4ad8b9ad362e260fbcc0103952384e972e0b769d18c18e3049e1bdeaab62a935f6060a2005b6388a8d602811861105d5734611083575f5460405260206040f35b63fd066ecc8118610f4c57602436103417611083576004358060a01c611083576040525f543318611083576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c8118610f945734611083576001543318611083575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63f7a12740811861105d57346110835760045460405260206040f35b63a7f0b3de811861105d57346110835760206110b360403960206040f35b637b103999811861105d57346110835760025460405260206040f35b63d3b39baa811861105d57346110835760075460405260206040f35b6363035f66811861105d576024361034176110835760086004356020525f5260405f20805460405260018101546060526002810154608052600381015460a052600481015460c052600581015460e0525060c06040f35b5f5ffd5b626ebe004260206110b35f395f51808203828111611083579050905004815250565b5f80fd105d105d105d0c4b00cd0fce00540018105d056f105d105d0fea0d6e0fb0105d0ef1046910060aeb0e7b0e040000000000000000000000000000000000000000000000000000000069151f80",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "FundingDistributor.vy": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "1762992000",
+      {
+        "name": "_genesis",
+        "type": "uint256"
+      }
+    ]
+  ],
+  "compiler_version": "v0.4.2+commit.c216787f",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-07-01T20:48:36.952657Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x6110b351503461002f57602061111e5f395f516110b352335f55336005556110b3610033610000396110d3610000f35b5f80fd5f3560e01c60026016820660011b61108701601e395f51565b63ef78d4fd811861003857346110835760206100346040611061565b6040f35b638af2b687811861105d57346110835760055460405260206040f35b63044215c6811861008f576024361034176110835760086004356020525f5260405f2060028101905054604052604051156110835760206040f35b6301681a62811861105d57602436103417611083577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff606052610b07565b63f7e290a481186102245760a436103417611083576004358060a01c611083576040526044358060a01c611083576060525f5433186110835760405115611083576101186080611061565b60805160243510611083576060511561108357606435156110835760066060516020525f5260405f2054608052608051156110835760805163aea9107860c05260605160e052602060c0602460dc5f855af1610176573d5f5f3e3d5ffd5b60203d106110835760c090505160a05260a051156110835760075460c05260c05160018101818110611083579050600755600860c0516020525f5260405f20604051815560243560018201556060516002820155606435600382015560843560048201555f60058201555060243560405160c0517fae5b2886be95e8a25dc091dfc796aefa037b25c5dde2172364abec8d9e3e8cc960605160e0526040606461010037606060e0a4602060c0f35b635af36e3e811861044d576044361034176110835760086004356020525f5260405f20543318611083576102586060611061565b60605160405260086004356020525f5260405f2060018101905054604051186110835760086004356020525f5260405f20600281019050546060526009336020525f5260405f20806040516020525f5260405f209050806060516020525f5260405f2090508054608052600181015460a0525060805160243580820382811161108357905090506009336020525f5260405f20806040516020525f5260405f209050806060516020525f5260405f2090505560243560a0518082028115838383041417156110835790509050670de0b6b3a76400008104905060c05260035463a3a5af4560e05233610100526040516101205260c051610140525f61016052803b15611083575f60e0608460fc5f855af1610375573d5f5f3e3d5ffd5b506060516323b872dd60e0523361010052306101205260243561014052602060e0606460fc5f855af16103aa573d5f5f3e3d5ffd5b3d6103c157803b15611083576001610160526103e9565b3d602081183d60201002188060e001610100116110835760e0518060011c6110835761016052505b6101609050511561108357604051336004357f800f62113300de06d14775d04da9874f69ff9b70ba3ecfe4debae056f5ef89b660605160e0526024356101005260c051610120523361014052608060e0a460405160e05260c05161010052604060e0f35b63770817ec811861105d57346110835760015460405260206040f35b63d1d58b25811861105d576024361034176110835760086004356020525f5260405f205460405260025463d4486c93606052604051608052602060606024607c845afa6104b8573d5f5f3e3d5ffd5b3d602081183d602010021880606001608011611083576060518060011c6110835760a0525060a09050516104f3575f60c052602060c061056d565b6104fd6080611061565b60805160605260086004356020525f5260405f20600181019050546060511461052d575f6080526020608061056d565b60086004356020525f5260405f206003810190505460086004356020525f5260405f20600581019050548082038281116110835790509050608052602060805bf35b63ac44ff31811861105d57606436103417611083576044358060a01c6110835760405260086004356020525f5260405f205433186110835760025463d4486c9360605233608052602060606024607c845afa6105cd573d5f5f3e3d5ffd5b3d602081183d602010021880606001608011611083576060518060011c6110835760a0525060a09050511561108357602435156110835760405115611083576106166080611061565b60805160605260086004356020525f5260405f2060018101905054606051186110835760086004356020525f5260405f2060058101905054602435808201828110611083579050905060805260086004356020525f5260405f2060038101905054608051116110835760805160086004356020525f5260405f206005810190505560086004356020525f5260405f206002810190505460a052600660a0516020525f5260405f205460c05260c051156110835760c05163aea910786101005260a051610120526020610100602461011c5f855af16106f6573d5f5f3e3d5ffd5b60203d106110835761010090505160e05260e05115611083576009336020525f5260405f20806060516020525f5260405f2090508060a0516020525f5260405f20905080546101005260018101546101205250610100516024358082018281106110835790509050610140526101005161012051808202811583838304141715611083579050905060243560e0518082028115838383041417156110835790509050808201828110611083579050905061014051801561108357808204905090506101205261014051610100526009336020525f5260405f20806060516020525f5260405f2090508060a0516020525f5260405f2090506101005181556101205160018201555060243560e0518082028115838383041417156110835790509050670de0b6b3a7640000810490506101605260035463a3a5af4561018052336101a0526060516101c052610160516101e052600161020052803b15611083575f610180608461019c5f855af161086e573d5f5f3e3d5ffd5b5060086004356020525f5260405f20600481019050546101805260206110b35f395f51606051626ebe00810281626ebe0082041861108357905080820182811061108357905090506101a0525f6101c0526101a0516101805180820182811061108357905090504210156109f9576004546101e05260a05163095ea7b3610200526101e05161022052602435610240526020610200604461021c5f855af1610918573d5f5f3e3d5ffd5b3d61092f57803b1561108357600161026052610959565b3d602081183d602010021880610200016102201161108357610200518060011c6110835761026052505b61026090505115611083576101e05163babce1b96102005260a05161022052604051610240526024356102605260406101806102805e5f6102c05260016102e0525f6103005260055461032052602061020061012461021c5f855af16109c1573d5f5f3e3d5ffd5b3d602081183d602010021880610200016102201161108357610200518060a01c6110835761034052506103409050516101c052610a7a565b60a05163a9059cbb6101e052604051610200526024356102205260206101e060446101fc5f855af1610a2d573d5f5f3e3d5ffd5b3d610a4457803b1561108357600161024052610a6e565b3d602081183d6020100218806101e00161020011611083576101e0518060011c6110835761024052505b61024090505115611083575b606051336004357fe40e3fad998ed4a0741f5c8887d16742f34623e998cf9bf3cdcffefb004c825b60a0516101e0526024356102005261016051610220526101c051610240526040516102605260a06101e0a46060516101e05261016051610200526101c0516102205260606101e0f35b636ea056a98118610bda57604436103417611083576024356060525b6004358060a01c611083576040525f5433186110835760605160805260605119610b62576040516370a0823160a0523060c052602060a0602460bc845afa610b51573d5f5f3e3d5ffd5b60203d106110835760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af1610b8f573d5f5f3e3d5ffd5b3d610ba657803b1561108357600161010052610bcd565b3d602081183d60201002188060a00160c0116110835760a0518060011c6110835761010052505b6101009050511561108357005b635b95c56b811861105d57606436103417611083576004358060a01c611083576040526044358060a01c6110835760605260096040516020525f5260405f20806024356020525f5260405f209050806060516020525f5260405f2090508054608052600181015460a0525060406080f35b63f1e300bb8118610ca657602436103417611083576004358060a01c611083576040525f543318611083576040516002556040517f278c70ced5f3e0e5eeb385b5ff9cb735748ba00a625147e66065ed48fc1562cd5f6060a2005b63755ca367811861105d57604436103417611083576004358060a01c611083576040526024358060a01c611083576060525f54331861108357604051156110835760605115610d2b5760605163aea9107860805260405160a052602060806024609c5f855af1610d18573d5f5f3e3d5ffd5b60203d1061108357608090505115611083575b60605160066040516020525f5260405f20556040517f944f260fa5475db9151efe54fc9fb6df2b40f73533d9483011e94522398cb3c160605160805260206080a2005b6371da8a8d8118610dc957602436103417611083576004358060a01c611083576040525f543318611083576040516003556040517f0272efc86eeb452c32134d3a55db5b3f3a9f3a8f426422cd285c688b97b303df5f6060a2005b63addd5099811861105d57602436103417611083576004358060a01c6110835760405260066040516020525f5260405f205460605260206060f35b633b93c6a38118610e5f57602436103417611083576004358060a01c611083576040525f543318611083576040516004556040517fc21fff1e896708bc6de4c31d162069d1a69e7eb9f67b1f87a1e2e8cc58615fe45f6060a2005b634fb3ccc5811861105d57346110835760035460405260206040f35b635642f8bc8118610ed657602436103417611083576004358060a01c611083576040525f543318611083576040516005556040517fb4ad8b9ad362e260fbcc0103952384e972e0b769d18c18e3049e1bdeaab62a935f6060a2005b6388a8d602811861105d5734611083575f5460405260206040f35b63fd066ecc8118610f4c57602436103417611083576004358060a01c611083576040525f543318611083576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c8118610f945734611083576001543318611083575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63f7a12740811861105d57346110835760045460405260206040f35b63a7f0b3de811861105d57346110835760206110b360403960206040f35b637b103999811861105d57346110835760025460405260206040f35b63d3b39baa811861105d57346110835760075460405260206040f35b6363035f66811861105d576024361034176110835760086004356020525f5260405f20805460405260018101546060526002810154608052600381015460a052600481015460c052600581015460e0525060c06040f35b5f5ffd5b626ebe004260206110b35f395f51808203828111611083579050905004815250565b5f80fd105d105d105d0c4b00cd0fce00540018105d056f105d105d0fea0d6e0fb0105d0ef1046910060aeb0e7b0e04855820a9b8529ff66cf26e0193c1d3ddb1e7522f0db7060a004e757e36c6985c5b046d1910b381182c1820a16576797065728300040200380000000000000000000000000000000000000000000000000000000069151f80",
+  "name": "FundingDistributor",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "idx",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "name": "team",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "period",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "duration",
+          "type": "uint256"
+        }
+      ],
+      "name": "ApproveFunding",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "idx",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "name": "team",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "period",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "cost",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "vest",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "recipient",
+          "type": "address"
+        }
+      ],
+      "name": "ClaimFunding",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "idx",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "name": "team",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "period",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "refund",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "sender",
+          "type": "address"
+        }
+      ],
+      "name": "ReturnFunding",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "registry",
+          "type": "address"
+        }
+      ],
+      "name": "SetRegistry",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "accountant",
+          "type": "address"
+        }
+      ],
+      "name": "SetAccountant",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "factory",
+          "type": "address"
+        }
+      ],
+      "name": "SetVestingFactory",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "owner",
+          "type": "address"
+        }
+      ],
+      "name": "SetVestingOwner",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "oracle",
+          "type": "address"
+        }
+      ],
+      "name": "SetPriceOracle",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "PendingManagement",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "SetManagement",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "period",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_idx",
+          "type": "uint256"
+        }
+      ],
+      "name": "token",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_team",
+          "type": "address"
+        },
+        {
+          "name": "_period",
+          "type": "uint256"
+        },
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        },
+        {
+          "name": "_duration",
+          "type": "uint256"
+        }
+      ],
+      "name": "approve",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_idx",
+          "type": "uint256"
+        }
+      ],
+      "name": "claimable",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_idx",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        },
+        {
+          "name": "_recipient",
+          "type": "address"
+        }
+      ],
+      "name": "claim",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_idx",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "refund",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_registry",
+          "type": "address"
+        }
+      ],
+      "name": "set_registry",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_accountant",
+          "type": "address"
+        }
+      ],
+      "name": "set_accountant",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_factory",
+          "type": "address"
+        }
+      ],
+      "name": "set_vesting_factory",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_owner",
+          "type": "address"
+        }
+      ],
+      "name": "set_vesting_owner",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_oracle",
+          "type": "address"
+        }
+      ],
+      "name": "set_price_oracle",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_management",
+          "type": "address"
+        }
+      ],
+      "name": "set_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accept_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "genesis",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "registry",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accountant",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "vesting_factory",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "vesting_owner",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "oracles",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "num_approvals",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "uint256"
+        }
+      ],
+      "name": "approvals",
+      "outputs": [
+        {
+          "components": [
+            {
+              "name": "team",
+              "type": "address"
+            },
+            {
+              "name": "period",
+              "type": "uint256"
+            },
+            {
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "name": "duration",
+              "type": "uint256"
+            },
+            {
+              "name": "used",
+              "type": "uint256"
+            }
+          ],
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        },
+        {
+          "name": "arg1",
+          "type": "uint256"
+        },
+        {
+          "name": "arg2",
+          "type": "address"
+        }
+      ],
+      "name": "costs",
+      "outputs": [
+        {
+          "components": [
+            {
+              "name": "amount",
+              "type": "uint256"
+            },
+            {
+              "name": "price",
+              "type": "uint256"
+            }
+          ],
+          "name": "",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_genesis",
+          "type": "uint256"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": "0x0000000000000000000000000000000000000000000000000000000069151f80",
+  "sources": {
+    "FundingDistributor.vy": {
+      "content": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Funding Distributor\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Maintains a list of approved funding and distributes the funding to the team upon request. \n        Funding is either sent directly or in a vesting contract, depending on the duration specified\n        in the approval as well as the time of claim.\n        Supports returning of unused funding, which reduces the team's cost by the average price of \n        the tokens during all the claims.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\nstruct Approval:\n    team: address\n    period: uint256\n    token: address\n    amount: uint256\n    duration: uint256\n    used: uint256\n\nstruct Cost:\n    amount: uint256\n    price: uint256\n\ninterface IFundingDistributor:\n    def token(_idx: uint256) -> address: view\n    def claimable(_idx: uint256) -> uint256: view\n    def claim(_idx: uint256, _amount: uint256, _recipient: address) -> (uint256, uint256, address): nonpayable\n    def refund(_idx: uint256, _amount: uint256) -> (uint256, uint256): nonpayable\nimplements: IFundingDistributor\n\ninterface IRegistry:\n    def is_team(_team: address) -> bool: view\n\ninterface IAccountant:\n    def adjust_cost(_team: address, _period: uint256, _amount: uint256, _increment: bool): nonpayable\n\ninterface IOracle:\n    def price(_asset: address) -> uint256: nonpayable\n\ninterface IVestingFactory:\n    def deploy_vesting_contract(\n        _token: address, _recipient: address, _amount: uint256, _duration: uint256, _start: uint256, \n        _cliff: uint256, _open: bool, _donation: uint256, _owner: address\n    ) -> address: nonpayable\n\ngenesis: public(immutable(uint256))\nmanagement: public(address)\npending_management: public(address)\nregistry: public(IRegistry)\naccountant: public(IAccountant)\nvesting_factory: public(IVestingFactory)\nvesting_owner: public(address)\noracles: public(HashMap[address, address])\nnum_approvals: public(uint256)\napprovals: public(HashMap[uint256, Approval])\ncosts: public(HashMap[address, HashMap[uint256, HashMap[address, Cost]]]) # team => period => token => cost\n\nevent ApproveFunding:\n    idx: indexed(uint256)\n    team: indexed(address)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    duration: uint256\n\nevent ClaimFunding:\n    idx: indexed(uint256)\n    team: indexed(address)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    cost: uint256\n    vest: address\n    recipient: address\n\nevent ReturnFunding:\n    idx: indexed(uint256)\n    team: indexed(address)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    refund: uint256\n    sender: address\n\nevent SetRegistry:\n    registry: indexed(address)\n\nevent SetAccountant:\n    accountant: indexed(address)\n\nevent SetVestingFactory:\n    factory: indexed(address)\n\nevent SetVestingOwner:\n    owner: indexed(address)\n\nevent SetPriceOracle:\n    token: indexed(address)\n    oracle: address\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPRECISION: constant(uint256) = 10**18\nPERIOD_LENGTH: constant(uint256) = 6 * 14 * 24 * 60 * 60\nINCREMENT: constant(bool) = True\nDECREMENT: constant(bool) = False\n\n@deploy\ndef __init__(_genesis: uint256):\n    \"\"\"\n    @notice Constructor\n    @param _genesis Budget period genesis timestamp\n    \"\"\"\n    genesis = _genesis\n    self.management = msg.sender\n    self.vesting_owner = msg.sender\n\n@external\n@view\ndef period() -> uint256:\n    \"\"\"\n    @notice Query the current budget period number\n    @return The current budget period number\n    \"\"\"\n    return self._period()\n\n@external\n@view\ndef token(_idx: uint256) -> address:\n    \"\"\"\n    @notice Query the token associated with a specific approval\n    @param _idx Approval index\n    @return The token address\n    \"\"\"\n    token: address = self.approvals[_idx].token\n    assert token != empty(address)\n    return token\n\n@external\ndef approve(_team: address, _period: uint256, _token: address, _amount: uint256, _duration: uint256) -> uint256:\n    \"\"\"\n    @notice Approve funding\n    @param _team Team address\n    @param _period Budget period number. Cant be in the past\n    @param _token Token address\n    @param _amount Token amount\n    @param _duration Vest duration from start of the budget period\n    @return Approval index\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _team != empty(address)\n    assert _period >= self._period()\n    assert _token != empty(address)\n    assert _amount > 0\n\n    oracle: address = self.oracles[_token]\n    assert oracle != empty(address)\n    price: uint256 = extcall IOracle(oracle).price(_token)\n    assert price > 0\n\n    idx: uint256 = self.num_approvals\n    self.num_approvals = idx + 1\n    self.approvals[idx] = Approval(team=_team, period=_period, token=_token, amount=_amount, duration=_duration, used=0)\n\n    log ApproveFunding(idx=idx, team=_team, period=_period, token=_token, amount=_amount, duration=_duration)\n    return idx\n\n@external\n@view\ndef claimable(_idx: uint256) -> uint256:\n    team: address = self.approvals[_idx].team\n    if not staticcall self.registry.is_team(team):\n        return 0\n\n    period: uint256 = self._period()\n    if period != self.approvals[_idx].period:\n        return 0\n\n    return self.approvals[_idx].amount - self.approvals[_idx].used\n\n@external\ndef claim(_idx: uint256, _amount: uint256, _recipient: address) -> (uint256, uint256, address):\n    \"\"\"\n    @notice Claim funding\n    @param _idx Approval index\n    @param _amount Token amount\n    @param _recipient Funding recipient\n    @return Tuple with: current budget period number, USD value of claim (18 decimals), vesting contract (if applicable)\n    @dev Can only be called by the team associated with the approval\n    \"\"\"\n    assert msg.sender == self.approvals[_idx].team\n    assert staticcall self.registry.is_team(msg.sender)\n    assert _amount > 0\n    assert _recipient != empty(address)\n\n    period: uint256 = self._period()\n    assert period == self.approvals[_idx].period\n\n    # update approval usage\n    used: uint256 = self.approvals[_idx].used + _amount\n    assert used <= self.approvals[_idx].amount\n    self.approvals[_idx].used = used\n\n    # get price from oracle\n    token: address = self.approvals[_idx].token\n    oracle: address = self.oracles[token]\n    assert oracle != empty(address)\n    price: uint256 = extcall IOracle(oracle).price(token)\n    assert price > 0\n\n    # update cost and average price\n    cost: Cost = self.costs[msg.sender][period][token]\n    new_cost: uint256 = cost.amount + _amount\n    cost.price = (cost.amount * cost.price + _amount * price) // new_cost\n    cost.amount = new_cost\n    self.costs[msg.sender][period][token] = cost\n\n    # report to accountant\n    value: uint256 = _amount * price // PRECISION\n    extcall self.accountant.adjust_cost(msg.sender, period, value, INCREMENT)\n\n    duration: uint256 = self.approvals[_idx].duration\n    start: uint256 = genesis + period * PERIOD_LENGTH\n    vest: address = empty(address)\n    if block.timestamp >= start + duration:\n        # tokens unlock immediately\n        assert extcall IERC20(token).transfer(_recipient, _amount, default_return_value=True)\n    else:\n        # tokens vest over time\n        factory: IVestingFactory = self.vesting_factory\n        assert extcall IERC20(token).approve(factory.address, _amount, default_return_value=True)\n        vest = extcall factory.deploy_vesting_contract(token, _recipient, _amount, duration, start, 0, True, 0, self.vesting_owner)\n\n    log ClaimFunding(idx=_idx, team=msg.sender, period=period, token=token, amount=_amount, cost=value, vest=vest, recipient=_recipient)\n    return (period, value, vest)\n\n@external\ndef refund(_idx: uint256, _amount: uint256) -> (uint256, uint256):\n    \"\"\"\n    @notice Refund previously claimed funding\n    @param _idx Approval index\n    @param _amount Token amount\n    @return Tuple with: current budget period number, USD value of refund (18 decimals)\n    @dev Reduces the team's cost using the average price of all claims in this approval\n    \"\"\"\n    assert msg.sender == self.approvals[_idx].team\n    period: uint256 = self._period()\n    assert period == self.approvals[_idx].period\n\n    # update cost\n    token: address = self.approvals[_idx].token\n    cost: Cost = self.costs[msg.sender][period][token]\n    self.costs[msg.sender][period][token].amount = cost.amount - _amount\n\n    # report to accountant using the average price\n    value: uint256 = _amount * cost.price // PRECISION\n    extcall self.accountant.adjust_cost(msg.sender, period, value, DECREMENT)\n\n    assert extcall IERC20(token).transferFrom(msg.sender, self, _amount, default_return_value=True)\n\n    log ReturnFunding(idx=_idx, team=msg.sender, period=period, token=token, amount=_amount, refund=value, sender=msg.sender)\n    return (period, value)\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_registry(_registry: address):\n    \"\"\"\n    @notice Set a new registry\n    @param _registry New registry address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.registry = IRegistry(_registry)\n    log SetRegistry(registry=_registry)\n\n@external\ndef set_accountant(_accountant: address):\n    \"\"\"\n    @notice Set a new accountant\n    @param _accountant New accountant address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.accountant = IAccountant(_accountant)\n    log SetAccountant(accountant=_accountant)\n\n@external\ndef set_vesting_factory(_factory: address):\n    \"\"\"\n    @notice Set a new vesting factory\n    @param _factory New vesting factory address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.vesting_factory = IVestingFactory(_factory)\n    log SetVestingFactory(factory=_factory)\n\n@external\ndef set_vesting_owner(_owner: address):\n    \"\"\"\n    @notice Set a new vesting owner\n    @param _owner New vesting owner address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.vesting_owner = _owner\n    log SetVestingOwner(owner=_owner)\n\n@external\ndef set_price_oracle(_token: address, _oracle: address):\n    \"\"\"\n    @notice Set a token price oracle\n    @param _token Token address\n    @param _oracle Oracle address\n    @dev The oracle should return the value of 1 wad of tokens in USD (18 decimals)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _token != empty(address)\n    if _oracle != empty(address):\n        assert extcall IOracle(_oracle).price(_token) > 0\n\n    self.oracles[_token] = _oracle\n    log SetPriceOracle(token=_token, oracle=_oracle)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _period() -> uint256:\n    return unsafe_div(block.timestamp - genesis, PERIOD_LENGTH)"
+    }
+  }
+}

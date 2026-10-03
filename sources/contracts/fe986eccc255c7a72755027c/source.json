@@ -1,0 +1,463 @@
+{
+  "file_path": "Team.vy",
+  "creation_status": "success",
+  "source_code": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Team\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Implementation contract for proxies deployed by the team registry. Used to deposit\n        revenue and claim funding by the owner.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface ITeam:\n    def migrate(_registry: address): nonpayable\nimplements: ITeam\n\ninterface IRegistry:\n    def revenue_recipient() -> address: view\n    def funding_distributor() -> address: view\n\ninterface IRevenueRecipient:\n    def deposit(_token: address, _amount: uint256) -> (uint256, uint256): nonpayable\n\ninterface IFundingDistributor:\n    def token(_idx: uint256) -> address: view\n    def claimable(_idx: uint256) -> uint256: view\n    def claim(_idx: uint256, _amount: uint256, _recipient: address) -> (uint256, uint256, address): nonpayable\n    def refund(_idx: uint256, _amount: uint256) -> (uint256, uint256): nonpayable\n\nname: public(String[100])\nregistry: public(IRegistry)\nowner: public(address)\npending_owner: public(address)\n\nevent DepositRevenue:\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    revenue: uint256\n    depositor: address\n\nevent ClaimFunding:\n    idx: indexed(uint256)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    cost: uint256\n    vest: address\n    recipient: address\n\nevent ReturnFunding:\n    idx: indexed(uint256)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    refund: uint256\n    sender: address\n\nevent PendingOwner:\n    owner: indexed(address)\n\nevent SetOwner:\n    owner: indexed(address)\n\nevent Migrate:\n    registry: indexed(address)\n\n@deploy\ndef __init__():\n    \"\"\"\n    @notice Constructor\n    \"\"\"\n    self.registry = IRegistry(0x1111111111111111111111111111111111111111)\n\n@external\ndef setup(_name: String[100], _owner: address):\n    \"\"\"\n    @notice Set up team parameters\n    @param _name Team name\n    @param _owner Owner address\n    \"\"\"\n    assert self.registry.address == empty(address)\n    self.name = _name\n    self.registry = IRegistry(msg.sender)\n    self.owner = _owner\n\n@external\ndef deposit_revenue(_token: address, _amount: uint256) -> uint256:\n    \"\"\"\n    @notice Deposit earned revenue\n    @param _token Token address\n    @param _amount Token amount\n    @return USD value of revenue (18 decimals)\n    \"\"\"\n    recipient: address = staticcall self.registry.revenue_recipient()\n    assert extcall IERC20(_token).transferFrom(msg.sender, self, _amount, default_return_value=True)\n    assert extcall IERC20(_token).approve(recipient, _amount, default_return_value=True)\n    period: uint256 = 0\n    revenue: uint256 = 0\n    period, revenue = extcall IRevenueRecipient(recipient).deposit(_token, _amount)\n\n    log DepositRevenue(period=period, token=_token, amount=_amount, revenue=revenue, depositor=msg.sender)\n    return revenue\n\n@external\ndef claim_funding(_idx: uint256, _amount: uint256 = max_value(uint256), _recipient: address = msg.sender) -> (address, uint256, address):\n    \"\"\"\n    @notice Claim funding\n    @param _idx Approval index\n    @param _amount Token amount. Defaults to all available\n    @param _recipient Receiver of the funding\n    @return Tuple with: token address, USD value of funding (18 decimals), vesting contract (if applicable)\n    \"\"\"\n    assert msg.sender == self.owner\n\n    distributor: address = staticcall self.registry.funding_distributor()\n    token: address = staticcall IFundingDistributor(distributor).token(_idx)\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IFundingDistributor(distributor).claimable(_idx)\n\n    period: uint256 = 0\n    cost: uint256 = 0\n    vest: address = empty(address)\n    period, cost, vest = extcall IFundingDistributor(distributor).claim(_idx, amount, _recipient)\n\n    log ClaimFunding(idx=_idx, period=period, token=token, amount=amount, cost=cost, vest=vest, recipient=_recipient)\n    return token, cost, vest\n\n@external\ndef return_funding(_idx: uint256, _amount: uint256) -> (address, uint256):\n    \"\"\"\n    @notice Return previously claimed funding\n    @param _idx Approval index\n    @param _amount Token amount\n    @return Tuple with: token address, USD value of refund (18 decimals)\n    \"\"\"\n    assert _amount > 0\n\n    distributor: address = staticcall self.registry.funding_distributor()\n    token: address = staticcall IFundingDistributor(distributor).token(_idx)\n\n    assert extcall IERC20(token).transferFrom(msg.sender, self, _amount, default_return_value=True)\n    assert extcall IERC20(token).approve(distributor, _amount, default_return_value=True)\n\n    period: uint256 = 0\n    refund: uint256 = 0\n    period, refund = extcall IFundingDistributor(distributor).refund(_idx, _amount)\n\n    log ReturnFunding(idx=_idx, period=period, token=token, amount=_amount, refund=refund, sender=msg.sender)\n    return token, refund\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by the owner\n    \"\"\"\n    assert msg.sender == self.owner\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_owner(_owner: address):\n    \"\"\"\n    @notice Set the pending owner address.\n            Needs to be accepted by that account separately to transfer ownership over\n    @param _owner New pending owner address\n    \"\"\"\n    assert msg.sender == self.owner\n\n    self.pending_owner = _owner\n    log PendingOwner(owner=_owner)\n\n@external\ndef accept_owner():\n    \"\"\"\n    @notice Accept ownership role.\n            Can only be called by account previously marked as pending by current owner\n    \"\"\"\n    assert msg.sender == self.pending_owner\n\n    self.pending_owner = empty(address)\n    self.owner = msg.sender\n    log SetOwner(owner=msg.sender)\n\n@external\ndef migrate(_registry: address):\n    \"\"\"\n    @notice Migrate to a new registry\n    @param _registry New registry address\n    @dev Can only be called by the current registry\n    \"\"\"\n    assert msg.sender == self.registry.address\n    assert _registry != empty(address)\n\n    self.registry = IRegistry(_registry)\n    log Migrate(registry=_registry)",
+  "deployed_bytecode": "0x5f3560e01c6002600e820660011b610a6901601e395f51565b63ae34ebb081186100a157604436103417610a6557600435600401803560648111610a6557506020813501808260403750506024358060a01c610a655760e052600554610a65576020604051015f81601f0160051c60058111610a6557801561009257905b8060051b60400151815560010181811861007d575b5050503360055560e051600655005b6332680ed48118610a6157604436103417610a65576024356040523360605261047f565b63c57475a581186102bf57604436103417610a65576004358060a01c610a6557604052600554636e671435608052602060806004609c845afa61010a573d5f5f3e3d5ffd5b3d602081183d60201002188060800160a011610a65576080518060a01c610a655760c0525060c09050516060526040516323b872dd6080523360a0523060c05260243560e052602060806064609c5f855af1610168573d5f5f3e3d5ffd5b3d61017f57803b15610a65576001610100526101a6565b3d602081183d60201002188060800160a011610a65576080518060011c610a655761010052505b61010090505115610a655760405163095ea7b360805260605160a05260243560c052602060806044609c5f855af16101e0573d5f5f3e3d5ffd5b3d6101f657803b15610a6557600160e05261021c565b3d602081183d60201002188060800160a011610a65576080518060011c610a655760e052505b60e090505115610a65576040366080376060516347e7ef2460c05260405160e05260243561010052604060c0604460dc5f855af161025c573d5f5f3e3d5ffd5b60403d10610a655760c090506040816101205e50604061012060805e6080517f11a71968b6edb53a34159c81472c1bf04be1308f7643ff16967dd49fb27fc41260405160c05260243560e05260a051610100523361012052608060c0a2602060a0f35b636ea056a981186103af57604436103417610a65576024356060525b6004358060a01c610a65576040526006543318610a655760605160805260605119610337576040516370a0823160a0523060c052602060a0602460bc845afa610326573d5f5f3e3d5ffd5b60203d10610a655760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af1610364573d5f5f3e3d5ffd5b3d61037b57803b15610a65576001610100526103a2565b3d602081183d60201002188060a00160c011610a655760a0518060011c610a655761010052505b61010090505115610a6557005b63ce5494bb8118610a6157602436103417610a65576004358060a01c610a65576040526005543318610a655760405115610a65576040516005556040517fd58a618a39de682696ea37dd9a6bf9c793afa426fa1438e75c3966e3b541e45a5f6060a2005b63b109c3538118610a6157602436103417610a65577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6040523360605261047f565b6377c8e17b811861066157606436103417610a65576024356040526044358060a01c610a65576060525b6006543318610a65576005546317afccdf60a052602060a0600460bc845afa6104aa573d5f5f3e3d5ffd5b3d602081183d60201002188060a00160c011610a655760a0518060a01c610a655760e0525060e090505160805260805163044215c660c05260043560e052602060c0602460dc845afa6104ff573d5f5f3e3d5ffd5b3d602081183d60201002188060c00160e011610a655760c0518060a01c610a6557610100525061010090505160a05260405160c052604051196105765760805163d1d58b2560e05260043561010052602060e0602460fc845afa610565573d5f5f3e3d5ffd5b60203d10610a655760e090505160c0525b60603660e03760805163ac44ff31610140526004356101605260c051610180526060516101a0526060610140606461015c5f855af16105b7573d5f5f3e3d5ffd5b3d606081183d606010021880610140016101a011610a655760406101406101c05e610180518060a01c610a655761020052506101c090506060816102205e50606061022060e05e60e0516004357fe03c3e08324d72c11904af692e8f5d21e5952336cd467918aae0094f018a1afe604060a06101405e60406101006101805e6060516101c05260a0610140a360a05161014052610100516101605261012051610180526060610140f35b638da5cb5b811861067d5734610a655760065460405260206040f35b637f4ec4c38118610a615734610a655760075460405260206040f35b63bbcd557681186108eb57604436103417610a655760243515610a65576005546317afccdf606052602060606004607c845afa6106d8573d5f5f3e3d5ffd5b3d602081183d602010021880606001608011610a65576060518060a01c610a655760a0525060a090505160405260405163044215c660805260043560a052602060806024609c845afa61072d573d5f5f3e3d5ffd5b3d602081183d60201002188060800160a011610a65576080518060a01c610a655760c0525060c09050516060526060516323b872dd6080523360a0523060c05260243560e052602060806064609c5f855af161078b573d5f5f3e3d5ffd5b3d6107a257803b15610a65576001610100526107c9565b3d602081183d60201002188060800160a011610a65576080518060011c610a655761010052505b61010090505115610a655760605163095ea7b360805260405160a05260243560c052602060806044609c5f855af1610803573d5f5f3e3d5ffd5b3d61081957803b15610a6557600160e05261083f565b3d602081183d60201002188060800160a011610a65576080518060011c610a655760e052505b60e090505115610a6557604036608037604051635af36e3e60c0526040600460e037604060c0604460dc5f855af1610879573d5f5f3e3d5ffd5b60403d10610a655760c090506040816101205e50604061012060805e6080516004357f52bf2c7e0538fc4478a89b6b54a29279e3953e0654d57eba5b98c5558712c13060605160c05260243560e05260a051610100523361012052608060c0a360605160c05260a05160e052604060c0f35b6301681a628118610a6157602436103417610a65577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526102db565b637cb97b2b8118610a6157602436103417610a65576004358060a01c610a65576040526006543318610a65576040516007556040517f4306745d208e8707535ce9418abeb2b0a7136ecb794c23956c829fff4fc18f895f6060a2005b63b2c1e1de8118610a615734610a65576007543318610a65575f60075533600655337f167d3e9c1016ab80e58802ca9da10ce5c6a0f4debc46a2e7a2cd9e56899a4fb55f6040a2005b6306fdde038118610a615734610a65576020806040528060400160205f54015f81601f0160051c60058111610a65578015610a1957905b80548160051b850152600101818118610a05575b5050508051806020830101601f825f03163682375050601f19601f825160200101169050810190506040f35b637b1039998118610a615734610a655760055460405260206040f35b5f5ffd5b5f80fd0a6104130a6109ce0a6100c509850929001804550a610a4506990a61",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "Team.vy": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": null,
+  "compiler_version": "v0.4.2+commit.c216787f",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-07-01T20:47:37.563757Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x3461002e57731111111111111111111111111111111111111111600555610a8561003261000039610a85610000f35b5f80fd5f3560e01c6002600e820660011b610a6901601e395f51565b63ae34ebb081186100a157604436103417610a6557600435600401803560648111610a6557506020813501808260403750506024358060a01c610a655760e052600554610a65576020604051015f81601f0160051c60058111610a6557801561009257905b8060051b60400151815560010181811861007d575b5050503360055560e051600655005b6332680ed48118610a6157604436103417610a65576024356040523360605261047f565b63c57475a581186102bf57604436103417610a65576004358060a01c610a6557604052600554636e671435608052602060806004609c845afa61010a573d5f5f3e3d5ffd5b3d602081183d60201002188060800160a011610a65576080518060a01c610a655760c0525060c09050516060526040516323b872dd6080523360a0523060c05260243560e052602060806064609c5f855af1610168573d5f5f3e3d5ffd5b3d61017f57803b15610a65576001610100526101a6565b3d602081183d60201002188060800160a011610a65576080518060011c610a655761010052505b61010090505115610a655760405163095ea7b360805260605160a05260243560c052602060806044609c5f855af16101e0573d5f5f3e3d5ffd5b3d6101f657803b15610a6557600160e05261021c565b3d602081183d60201002188060800160a011610a65576080518060011c610a655760e052505b60e090505115610a65576040366080376060516347e7ef2460c05260405160e05260243561010052604060c0604460dc5f855af161025c573d5f5f3e3d5ffd5b60403d10610a655760c090506040816101205e50604061012060805e6080517f11a71968b6edb53a34159c81472c1bf04be1308f7643ff16967dd49fb27fc41260405160c05260243560e05260a051610100523361012052608060c0a2602060a0f35b636ea056a981186103af57604436103417610a65576024356060525b6004358060a01c610a65576040526006543318610a655760605160805260605119610337576040516370a0823160a0523060c052602060a0602460bc845afa610326573d5f5f3e3d5ffd5b60203d10610a655760a09050516080525b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af1610364573d5f5f3e3d5ffd5b3d61037b57803b15610a65576001610100526103a2565b3d602081183d60201002188060a00160c011610a655760a0518060011c610a655761010052505b61010090505115610a6557005b63ce5494bb8118610a6157602436103417610a65576004358060a01c610a65576040526005543318610a655760405115610a65576040516005556040517fd58a618a39de682696ea37dd9a6bf9c793afa426fa1438e75c3966e3b541e45a5f6060a2005b63b109c3538118610a6157602436103417610a65577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6040523360605261047f565b6377c8e17b811861066157606436103417610a65576024356040526044358060a01c610a65576060525b6006543318610a65576005546317afccdf60a052602060a0600460bc845afa6104aa573d5f5f3e3d5ffd5b3d602081183d60201002188060a00160c011610a655760a0518060a01c610a655760e0525060e090505160805260805163044215c660c05260043560e052602060c0602460dc845afa6104ff573d5f5f3e3d5ffd5b3d602081183d60201002188060c00160e011610a655760c0518060a01c610a6557610100525061010090505160a05260405160c052604051196105765760805163d1d58b2560e05260043561010052602060e0602460fc845afa610565573d5f5f3e3d5ffd5b60203d10610a655760e090505160c0525b60603660e03760805163ac44ff31610140526004356101605260c051610180526060516101a0526060610140606461015c5f855af16105b7573d5f5f3e3d5ffd5b3d606081183d606010021880610140016101a011610a655760406101406101c05e610180518060a01c610a655761020052506101c090506060816102205e50606061022060e05e60e0516004357fe03c3e08324d72c11904af692e8f5d21e5952336cd467918aae0094f018a1afe604060a06101405e60406101006101805e6060516101c05260a0610140a360a05161014052610100516101605261012051610180526060610140f35b638da5cb5b811861067d5734610a655760065460405260206040f35b637f4ec4c38118610a615734610a655760075460405260206040f35b63bbcd557681186108eb57604436103417610a655760243515610a65576005546317afccdf606052602060606004607c845afa6106d8573d5f5f3e3d5ffd5b3d602081183d602010021880606001608011610a65576060518060a01c610a655760a0525060a090505160405260405163044215c660805260043560a052602060806024609c845afa61072d573d5f5f3e3d5ffd5b3d602081183d60201002188060800160a011610a65576080518060a01c610a655760c0525060c09050516060526060516323b872dd6080523360a0523060c05260243560e052602060806064609c5f855af161078b573d5f5f3e3d5ffd5b3d6107a257803b15610a65576001610100526107c9565b3d602081183d60201002188060800160a011610a65576080518060011c610a655761010052505b61010090505115610a655760605163095ea7b360805260405160a05260243560c052602060806044609c5f855af1610803573d5f5f3e3d5ffd5b3d61081957803b15610a6557600160e05261083f565b3d602081183d60201002188060800160a011610a65576080518060011c610a655760e052505b60e090505115610a6557604036608037604051635af36e3e60c0526040600460e037604060c0604460dc5f855af1610879573d5f5f3e3d5ffd5b60403d10610a655760c090506040816101205e50604061012060805e6080516004357f52bf2c7e0538fc4478a89b6b54a29279e3953e0654d57eba5b98c5558712c13060605160c05260243560e05260a051610100523361012052608060c0a360605160c05260a05160e052604060c0f35b6301681a628118610a6157602436103417610a65577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff6060526102db565b637cb97b2b8118610a6157602436103417610a65576004358060a01c610a65576040526006543318610a65576040516007556040517f4306745d208e8707535ce9418abeb2b0a7136ecb794c23956c829fff4fc18f895f6060a2005b63b2c1e1de8118610a615734610a65576007543318610a65575f60075533600655337f167d3e9c1016ab80e58802ca9da10ce5c6a0f4debc46a2e7a2cd9e56899a4fb55f6040a2005b6306fdde038118610a615734610a65576020806040528060400160205f54015f81601f0160051c60058111610a65578015610a1957905b80548160051b850152600101818118610a05575b5050508051806020830101601f825f03163682375050601f19601f825160200101169050810190506040f35b637b1039998118610a615734610a655760055460405260206040f35b5f5ffd5b5f80fd0a6104130a6109ce0a6100c509850929001804550a610a4506990a618558209aafd4ca980ee40bf9845f62901244cbe1b110f8b1801b479bdf0915b0ee1ddc190a8581181c00a1657679706572830004020037",
+  "name": "Team",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "period",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "revenue",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "depositor",
+          "type": "address"
+        }
+      ],
+      "name": "DepositRevenue",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "idx",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "name": "period",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "cost",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "vest",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "recipient",
+          "type": "address"
+        }
+      ],
+      "name": "ClaimFunding",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "idx",
+          "type": "uint256"
+        },
+        {
+          "indexed": true,
+          "name": "period",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "refund",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "sender",
+          "type": "address"
+        }
+      ],
+      "name": "ReturnFunding",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "owner",
+          "type": "address"
+        }
+      ],
+      "name": "PendingOwner",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "owner",
+          "type": "address"
+        }
+      ],
+      "name": "SetOwner",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "registry",
+          "type": "address"
+        }
+      ],
+      "name": "Migrate",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_name",
+          "type": "string"
+        },
+        {
+          "name": "_owner",
+          "type": "address"
+        }
+      ],
+      "name": "setup",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "deposit_revenue",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_idx",
+          "type": "uint256"
+        }
+      ],
+      "name": "claim_funding",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_idx",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "claim_funding",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_idx",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        },
+        {
+          "name": "_recipient",
+          "type": "address"
+        }
+      ],
+      "name": "claim_funding",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_idx",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "return_funding",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_owner",
+          "type": "address"
+        }
+      ],
+      "name": "set_owner",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accept_owner",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_registry",
+          "type": "address"
+        }
+      ],
+      "name": "migrate",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "name",
+      "outputs": [
+        {
+          "name": "",
+          "type": "string"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "registry",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "owner",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_owner",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": null,
+  "sources": {
+    "Team.vy": {
+      "content": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Team\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Implementation contract for proxies deployed by the team registry. Used to deposit\n        revenue and claim funding by the owner.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface ITeam:\n    def migrate(_registry: address): nonpayable\nimplements: ITeam\n\ninterface IRegistry:\n    def revenue_recipient() -> address: view\n    def funding_distributor() -> address: view\n\ninterface IRevenueRecipient:\n    def deposit(_token: address, _amount: uint256) -> (uint256, uint256): nonpayable\n\ninterface IFundingDistributor:\n    def token(_idx: uint256) -> address: view\n    def claimable(_idx: uint256) -> uint256: view\n    def claim(_idx: uint256, _amount: uint256, _recipient: address) -> (uint256, uint256, address): nonpayable\n    def refund(_idx: uint256, _amount: uint256) -> (uint256, uint256): nonpayable\n\nname: public(String[100])\nregistry: public(IRegistry)\nowner: public(address)\npending_owner: public(address)\n\nevent DepositRevenue:\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    revenue: uint256\n    depositor: address\n\nevent ClaimFunding:\n    idx: indexed(uint256)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    cost: uint256\n    vest: address\n    recipient: address\n\nevent ReturnFunding:\n    idx: indexed(uint256)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    refund: uint256\n    sender: address\n\nevent PendingOwner:\n    owner: indexed(address)\n\nevent SetOwner:\n    owner: indexed(address)\n\nevent Migrate:\n    registry: indexed(address)\n\n@deploy\ndef __init__():\n    \"\"\"\n    @notice Constructor\n    \"\"\"\n    self.registry = IRegistry(0x1111111111111111111111111111111111111111)\n\n@external\ndef setup(_name: String[100], _owner: address):\n    \"\"\"\n    @notice Set up team parameters\n    @param _name Team name\n    @param _owner Owner address\n    \"\"\"\n    assert self.registry.address == empty(address)\n    self.name = _name\n    self.registry = IRegistry(msg.sender)\n    self.owner = _owner\n\n@external\ndef deposit_revenue(_token: address, _amount: uint256) -> uint256:\n    \"\"\"\n    @notice Deposit earned revenue\n    @param _token Token address\n    @param _amount Token amount\n    @return USD value of revenue (18 decimals)\n    \"\"\"\n    recipient: address = staticcall self.registry.revenue_recipient()\n    assert extcall IERC20(_token).transferFrom(msg.sender, self, _amount, default_return_value=True)\n    assert extcall IERC20(_token).approve(recipient, _amount, default_return_value=True)\n    period: uint256 = 0\n    revenue: uint256 = 0\n    period, revenue = extcall IRevenueRecipient(recipient).deposit(_token, _amount)\n\n    log DepositRevenue(period=period, token=_token, amount=_amount, revenue=revenue, depositor=msg.sender)\n    return revenue\n\n@external\ndef claim_funding(_idx: uint256, _amount: uint256 = max_value(uint256), _recipient: address = msg.sender) -> (address, uint256, address):\n    \"\"\"\n    @notice Claim funding\n    @param _idx Approval index\n    @param _amount Token amount. Defaults to all available\n    @param _recipient Receiver of the funding\n    @return Tuple with: token address, USD value of funding (18 decimals), vesting contract (if applicable)\n    \"\"\"\n    assert msg.sender == self.owner\n\n    distributor: address = staticcall self.registry.funding_distributor()\n    token: address = staticcall IFundingDistributor(distributor).token(_idx)\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IFundingDistributor(distributor).claimable(_idx)\n\n    period: uint256 = 0\n    cost: uint256 = 0\n    vest: address = empty(address)\n    period, cost, vest = extcall IFundingDistributor(distributor).claim(_idx, amount, _recipient)\n\n    log ClaimFunding(idx=_idx, period=period, token=token, amount=amount, cost=cost, vest=vest, recipient=_recipient)\n    return token, cost, vest\n\n@external\ndef return_funding(_idx: uint256, _amount: uint256) -> (address, uint256):\n    \"\"\"\n    @notice Return previously claimed funding\n    @param _idx Approval index\n    @param _amount Token amount\n    @return Tuple with: token address, USD value of refund (18 decimals)\n    \"\"\"\n    assert _amount > 0\n\n    distributor: address = staticcall self.registry.funding_distributor()\n    token: address = staticcall IFundingDistributor(distributor).token(_idx)\n\n    assert extcall IERC20(token).transferFrom(msg.sender, self, _amount, default_return_value=True)\n    assert extcall IERC20(token).approve(distributor, _amount, default_return_value=True)\n\n    period: uint256 = 0\n    refund: uint256 = 0\n    period, refund = extcall IFundingDistributor(distributor).refund(_idx, _amount)\n\n    log ReturnFunding(idx=_idx, period=period, token=token, amount=_amount, refund=refund, sender=msg.sender)\n    return token, refund\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by the owner\n    \"\"\"\n    assert msg.sender == self.owner\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef set_owner(_owner: address):\n    \"\"\"\n    @notice Set the pending owner address.\n            Needs to be accepted by that account separately to transfer ownership over\n    @param _owner New pending owner address\n    \"\"\"\n    assert msg.sender == self.owner\n\n    self.pending_owner = _owner\n    log PendingOwner(owner=_owner)\n\n@external\ndef accept_owner():\n    \"\"\"\n    @notice Accept ownership role.\n            Can only be called by account previously marked as pending by current owner\n    \"\"\"\n    assert msg.sender == self.pending_owner\n\n    self.pending_owner = empty(address)\n    self.owner = msg.sender\n    log SetOwner(owner=msg.sender)\n\n@external\ndef migrate(_registry: address):\n    \"\"\"\n    @notice Migrate to a new registry\n    @param _registry New registry address\n    @dev Can only be called by the current registry\n    \"\"\"\n    assert msg.sender == self.registry.address\n    assert _registry != empty(address)\n\n    self.registry = IRegistry(_registry)\n    log Migrate(registry=_registry)"
+    }
+  }
+}

@@ -1,0 +1,805 @@
+{
+  "file_path": "RevenueRecipient.vy",
+  "creation_status": "success",
+  "source_code": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Revenue Recipient\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Temporary contract designed to take in team revenues as they are submitted, before\n        they are redistributed to stYFI + treasury + yETH recovery by the operator.\n        Will eventually be replaced by a contract that automatically spreads incoming revenues\n        over the appropriate stYFI epochs.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IRevenueRecipient:\n    def deposit(_token: address, _amount: uint256) -> (uint256, uint256): nonpayable\nimplements: IRevenueRecipient\n\ninterface IAccountant:\n    def adjust_revenue(_team: address, _period: uint256, _amount: uint256, _increment: bool): nonpayable\n\ninterface IOracle:\n    def price(_asset: address) -> uint256: nonpayable\n\ninterface IConverter:\n    def convert(_token: address, _amount: uint256): nonpayable\n\ninterface IRegistry:\n    def is_team(_team: address) -> bool: view\n\ninterface IRewardDistributor:\n    def token() -> address: view\n    def deposit(_epoch: uint256, _amount: uint256): nonpayable\n\ninterface IAuction:\n    def auctions(_token: address) -> (uint64, uint64, uint128): view\n    def kick(_token: address): nonpayable\n\ngenesis: public(immutable(uint256))\ntoken: public(immutable(IERC20))\ntoken_split: public(immutable(uint256[3])) # stYFI, treasury, yETH\nmanagement: public(address)\npending_management: public(address)\nkilled: public(bool)\noperator: public(address)\nregistry: public(IRegistry)\naccountant: public(IAccountant)\ntreasury: public(address)\nreward_distributor: public(IRewardDistributor)\nrecovery_auction: public(IAuction)\noracles: public(HashMap[address, address])\nconverters: public(HashMap[address, address])\n\nlast_balance: public(uint256)\nsum_balance: public(uint256)\nused: public(uint256[3])\n\nevent DepositRevenue:\n    team: indexed(address)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    revenue: uint256\n\nevent ConvertToken:\n    token: indexed(address)\n    converter: address\n    amount: uint256\n\nevent ToTreasury:\n    amount: uint256\n\nevent ToRewards:\n    epoch: indexed(uint256)\n    amount: uint256\n\nevent ToRecovery:\n    amount: uint256\n\nevent Kill: pass\n\nevent SetOperator:\n    operator: indexed(address)\n\nevent SetRegistry:\n    registry: indexed(address)\n\nevent SetAccountant:\n    accountant: indexed(address)\n\nevent SetTreasury:\n    treasury: indexed(address)\n\nevent SetRewardDistributor:\n    distributor: indexed(address)\n\nevent SetRecoveryAuction:\n    auction: indexed(address)\n\nevent SetPriceOracle:\n    token: indexed(address)\n    oracle: address\n\nevent SetTokenConverter:\n    token: indexed(address)\n    converter: address\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPRECISION: constant(uint256) = 10**18\nBPS_PRECISION: constant(uint256) = 10000\nPERIOD_LENGTH: constant(uint256) = 6 * 14 * 24 * 60 * 60\nAUCTION_LENGTH: constant(uint256) = 24 * 60 * 60\nINCREMENT: constant(bool) = True\n\n@deploy\ndef __init__(_genesis: uint256, _token: address, _split: uint256[3]):\n    \"\"\"\n    @notice Constructor\n    @param _genesis Budget period genesis timestamp\n    @param _token Main revenue token\n    @param _split Token split between stYFI, treasury and yETH (in that order, bps)\n    \"\"\"\n    assert _split[0] + _split[1] + _split[2] == BPS_PRECISION\n\n    genesis = _genesis\n    token = IERC20(_token)\n    token_split = _split\n\n    self.management = msg.sender\n    self.operator = msg.sender\n    self.treasury = msg.sender\n\n@external\n@view\ndef period() -> uint256:\n    \"\"\"\n    @notice Query the current budget period number\n    @return The current budget period number\n    \"\"\"\n    return self._period()\n\n@external\ndef deposit(_token: address, _amount: uint256) -> (uint256, uint256):\n    \"\"\"\n    @notice Deposit revenue\n    @param _token Token address\n    @param _amount Token amount\n    @return Tuple with: current budget period number, USD value of revenue (18 decimals)\n    @dev Can only be called by a registered team\n    @dev Only accepts tokens that are whitelisted by having a price oracle assigned\n    \"\"\"\n    assert staticcall self.registry.is_team(msg.sender)\n    assert not self.killed\n\n    oracle: address = self.oracles[_token]\n    assert oracle != empty(address)\n    price: uint256 = extcall IOracle(oracle).price(_token)\n    assert price > 0\n\n    assert extcall IERC20(_token).transferFrom(msg.sender, self, _amount, default_return_value=True)\n    converter: address = self.converters[_token]\n    if converter != empty(address):\n        assert extcall IERC20(_token).approve(converter, _amount, default_return_value=True)\n        extcall IConverter(converter).convert(_token, _amount)\n\n    period: uint256 = self._period()\n    value: uint256 = _amount * price // PRECISION\n    extcall self.accountant.adjust_revenue(msg.sender, period, value, INCREMENT)\n\n    log DepositRevenue(team=msg.sender, period=period, token=_token, amount=_amount, revenue=value)\n    return period, value\n\n@external\ndef convert(_token: address, _amount: uint256):\n    \"\"\"\n    @notice Convert a token\n    @param _token Token address\n    @param _amount Token amount\n    @dev Can only be called by the operator\n    @dev Only accepts tokens that are whitelisted by having a converter assigned\n    \"\"\"\n    assert msg.sender == self.operator\n    assert not self.killed\n    converter: address = self.converters[_token]\n    assert converter != empty(address)\n    assert extcall IERC20(_token).approve(converter, _amount, default_return_value=True)\n    extcall IConverter(converter).convert(_token, _amount)\n    log ConvertToken(token=_token, converter=converter, amount=_amount)\n\n@external\ndef to_styfi_rewards(_epoch: uint256, _amount: uint256):\n    \"\"\"\n    @notice Queue the rewards token for future distribution to stYFI\n    @param _epoch Epoch number to queue rewards for\n    @param _amount Token amount\n    @dev Can only be called by the operator\n    \"\"\"\n    assert msg.sender == self.operator\n\n    self._use_balance(0, _amount)\n    distributor: IRewardDistributor = self.reward_distributor\n    assert staticcall distributor.token() == token.address\n    assert extcall token.approve(distributor.address, _amount, default_return_value=True)\n    extcall distributor.deposit(_epoch, _amount)\n    log ToRewards(epoch=_epoch, amount=_amount)\n\n@external\ndef to_treasury(_amount: uint256):\n    \"\"\"\n    @notice Send tokens to treasury\n    @param _amount Token amount\n    @dev Can only be called by the operator\n    \"\"\"\n    assert msg.sender == self.operator\n\n    self._use_balance(1, _amount)\n    assert extcall token.transfer(self.treasury, _amount, default_return_value=True)\n    log ToTreasury(amount=_amount)\n\n@external\ndef to_yeth_recovery(_amount: uint256):\n    \"\"\"\n    @notice Auction token for yETH recovery\n    @param _amount Token amount\n    @dev Can only be called by the operator\n    \"\"\"\n    assert msg.sender == self.operator\n\n    self._use_balance(2, _amount)\n\n    # check token is enabled inside the auction\n    auction: IAuction = self.recovery_auction\n    kicked: uint64 = 0\n    scaler: uint64 = 0\n    available: uint128 = 0\n    kicked, scaler, available = staticcall auction.auctions(token.address)\n    assert scaler > 0\n    assert block.timestamp >= convert(kicked, uint256) + AUCTION_LENGTH\n\n    assert extcall token.transfer(auction.address, _amount, default_return_value=True)\n    extcall auction.kick(token.address)\n    log ToRecovery(amount=_amount)\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    if _token == token.address:\n        assert self.killed\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef kill():\n    \"\"\"\n    @notice Kill the revenue recipient, making it unable to accept or redistribute revenue\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.killed = True\n    log Kill()\n\n@external\ndef set_operator(_operator: address):\n    \"\"\"\n    @notice Set a new operator\n    @param _operator New operator address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.operator = _operator\n    log SetOperator(operator=_operator)\n\n@external\ndef set_registry(_registry: address):\n    \"\"\"\n    @notice Set a new registry\n    @param _registry New registry address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.registry = IRegistry(_registry)\n    log SetRegistry(registry=_registry)\n\n@external\ndef set_accountant(_accountant: address):\n    \"\"\"\n    @notice Set a new accountant\n    @param _accountant New accountant address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.accountant = IAccountant(_accountant)\n    log SetAccountant(accountant=_accountant)\n\n@external\ndef set_treasury(_treasury: address):\n    \"\"\"\n    @notice Set a new treasury\n    @param _treasury New treasury address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.treasury = _treasury\n    log SetTreasury(treasury=_treasury)\n\n@external\ndef set_reward_distributor(_distributor: address):\n    \"\"\"\n    @notice Set a new stYFI reward distributor\n    @param _distributor New stYFI reward distributor address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.reward_distributor = IRewardDistributor(_distributor)\n    log SetRewardDistributor(distributor=_distributor)\n\n@external\ndef set_recovery_auction(_auction: address):\n    \"\"\"\n    @notice Set a yETH recovery auction\n    @param _auction New yETH recovery auction address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.recovery_auction = IAuction(_auction)\n    log SetRecoveryAuction(auction=_auction)\n\n@external\ndef set_price_oracle(_token: address, _oracle: address):\n    \"\"\"\n    @notice Set a token price oracle\n    @param _token Token address\n    @param _oracle Oracle address\n    @dev The oracle should return the value of 1 wad of tokens in USD (18 decimals)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _token != empty(address)\n    if _oracle != empty(address):\n        assert extcall IOracle(_oracle).price(_token) > 0\n\n    self.oracles[_token] = _oracle\n    log SetPriceOracle(token=_token, oracle=_oracle)\n\n@external\ndef set_token_converter(_token: address, _converter: address):\n    \"\"\"\n    @notice Set a token converter\n    @param _token Token address\n    @param _converter Converter address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.converters[_token] = _converter\n    log SetTokenConverter(token=_token, converter=_converter)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _period() -> uint256:\n    return unsafe_div(block.timestamp - genesis, PERIOD_LENGTH)\n\n@internal\ndef _use_balance(_i: uint256, _amount: uint256):\n    assert not self.killed\n    current: uint256 = staticcall token.balanceOf(self)\n    increase: uint256 = current - self.last_balance\n    self.last_balance = current\n    sum_balance: uint256 = self.sum_balance + increase\n    self.sum_balance = sum_balance\n\n    budget: uint256 = sum_balance * token_split[_i] // BPS_PRECISION\n    used: uint256 = self.used[_i] + _amount\n    assert used <= budget\n\n    self.last_balance -= _amount\n    self.used[_i] = used",
+  "deployed_bytecode": "0x5f3560e01c6002601e820660011b6111bf01601e395f51565b63ef78d4fd811861003857346111bb5760206100346040611081565b6040f35b634fb3ccc5811861107d57346111bb5760055460405260206040f35b6347e7ef24811861107d576044361034176111bb576004358060a01c6111bb5760405260045463d4486c9360605233608052602060606024607c845afa61009d573d5f5f3e3d5ffd5b3d602081183d6020100218806060016080116111bb576060518060011c6111bb5760a0525060a0905051156111bb576002546111bb5760096040516020525f5260405f2054606052606051156111bb5760605163aea9107860a05260405160c052602060a0602460bc5f855af1610116573d5f5f3e3d5ffd5b60203d106111bb5760a0905051608052608051156111bb576040516323b872dd60a0523360c0523060e05260243561010052602060a0606460bc5f855af1610160573d5f5f3e3d5ffd5b3d61017757803b156111bb5760016101205261019e565b3d602081183d60201002188060a00160c0116111bb5760a0518060011c6111bb5761012052505b610120905051156111bb57600a6040516020525f5260405f205460a05260a051156102745760405163095ea7b360c05260a05160e05260243561010052602060c0604460dc5f855af16101f3573d5f5f3e3d5ffd5b3d61020a57803b156111bb57600161012052610231565b3d602081183d60201002188060c00160e0116111bb5760c0518060011c6111bb5761012052505b610120905051156111bb5760a0516367c6e39c60c05260405160e05260243561010052803b156111bb575f60c0604460dc5f855af1610272573d5f5f3e3d5ffd5b505b61027e60e0611081565b60e05160c0526024356080518082028115838383041417156111bb5790509050670de0b6b3a76400008104905060e05260055463b106710c610100523361012052604060c06101405e600161018052803b156111bb575f610100608461011c5f855af16102ed573d5f5f3e3d5ffd5b5060c051337f81d571e960b4c5de5925eacc62e1a57b498175af677f2d496140839c50381c5b604051610100526024356101205260e051610140526060610100a3604060c06101005e6040610100f35b6367c6e39c811861107d576044361034176111bb576004358060a01c6111bb5760405260035433186111bb576002546111bb57600a6040516020525f5260405f2054606052606051156111bb5760405163095ea7b360805260605160a05260243560c052602060806044609c5f855af16103b9573d5f5f3e3d5ffd5b3d6103cf57803b156111bb57600160e0526103f5565b3d602081183d60201002188060800160a0116111bb576080518060011c6111bb5760e052505b60e0905051156111bb576060516367c6e39c60805260405160a05260243560c052803b156111bb575f60806044609c5f855af1610434573d5f5f3e3d5ffd5b506040517f36f9833998cac7cab28d168cdb2ef1e91cffc5d01656a53f935c0e13880b3e9460605160805260243560a05260406080a2005b630f1dbea4811861107d576044361034176111bb5760035433186111bb575f60405260243560605261049c6110a3565b60075461012052602061121b5f395f516101205163fc0c546a610140526020610140600461015c845afa6104d2573d5f5f3e3d5ffd5b3d602081183d60201002188061014001610160116111bb57610140518060a01c6111bb576101805250610180905051186111bb57602061121b5f395f5163095ea7b3610140526101205161016052602435610180526020610140604461015c5f855af1610541573d5f5f3e3d5ffd5b3d61055857803b156111bb5760016101a052610582565b3d602081183d60201002188061014001610160116111bb57610140518060011c6111bb576101a052505b6101a0905051156111bb576101205163e2bbb158610140526040600461016037803b156111bb575f610140604461015c5f855af16105c2573d5f5f3e3d5ffd5b506004357fb7c2ed88c336ee10ec956cb50efd68f4ee960e3b05df70aa65f16414752252cf602435610140526020610140a2005b637b973a2c811861107d576024361034176111bb5760035433186111bb5760016040526004356060526106276110a3565b602061121b5f395f5163a9059cbb6101205260065461014052600435610160526020610120604461013c5f855af1610661573d5f5f3e3d5ffd5b3d61067857803b156111bb576001610180526106a2565b3d602081183d60201002188061012001610140116111bb57610120518060011c6111bb5761018052505b610180905051156111bb577fdae71ca522b043bfc50fb187c9f45468771cd8822be932c7c4820ed13026d964600435610120526020610120a1005b63bea3058f81186108bc576024361034176111bb5760035433186111bb57600260405260043560605261070e6110a3565b600854610120526060366101403761012051631d59410a6101a052602061121b6101c03960606101a060246101bc845afa61074b573d5f5f3e3d5ffd5b3d606081183d6060100218806101a001610200116111bb576101a0518060401c6111bb57610220526101c0518060401c6111bb57610240526101e0518060801c6111bb57610260525061022090506060816102805e5060606102806101405e600161016051126111bb57610140516201518081018181106111bb57905042106111bb57602061121b5f395f5163a9059cbb6101a052610120516101c0526004356101e05260206101a060446101bc5f855af1610809573d5f5f3e3d5ffd5b3d61082057803b156111bb5760016102005261084a565b3d602081183d6020100218806101a0016101c0116111bb576101a0518060011c6111bb5761020052505b610200905051156111bb57610120516396c551756101a052602061121b6101c039803b156111bb575f6101a060246101bc5f855af161088b573d5f5f3e3d5ffd5b507f0e3b9ed4da3ecb541e8f72b0a66c90799b5a85edc2345353619d3d2ce97c28546004356101a05260206101a0a1005b63092ad359811861107d57346111bb5760075460405260206040f35b6301681a628118610916576024361034176111bb577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff606052610950565b63fc0c546a811861107d57346111bb57602061121b60403960206040f35b636ea056a9811861107d576044361034176111bb576024356060525b6004358060a01c6111bb576040525f5433186111bb57606051608052606051196109ab576040516370a0823160a0523060c052602060a0602460bc845afa61099a573d5f5f3e3d5ffd5b60203d106111bb5760a09050516080525b602061121b5f395f51604051186109c557600254156111bb575b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af16109f2573d5f5f3e3d5ffd5b3d610a0957803b156111bb57600161010052610a30565b3d602081183d60201002188060a00160c0116111bb5760a0518060011c6111bb5761010052505b610100905051156111bb57005b6341c0e1b58118610a8157346111bb575f5433186111bb5760016002557fbe26733c2bf6ff3ea5ba8cfe744422bd49052ff9ed5685c9e81e6f9321dbaddd5f6040a1005b6330bcd67b8118610adc576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516006556040517fcb7ef3e545f5cdb893f5c568ba710fe08f336375a2d9fd66e161033f8fc09ef35f6060a2005b631f3a0e41811861107d57346111bb5760025460405260206040f35b6330c7be728118610b53576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516003556040517fdbebfba65bd6398fb722063efc10c99f624f9cd8ba657201056af918a676d5ee5f6060a2005b63770817ec811861107d57346111bb5760015460405260206040f35b63f1e300bb8118610bca576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516004556040517f278c70ced5f3e0e5eeb385b5ff9cb735748ba00a625147e66065ed48fc1562cd5f6060a2005b6371da8a8d8118610c25576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516005556040517f0272efc86eeb452c32134d3a55db5b3f3a9f3a8f426422cd285c688b97b303df5f6060a2005b63755ca367811861107d576044361034176111bb576004358060a01c6111bb576040526024358060a01c6111bb576060525f5433186111bb57604051156111bb5760605115610caa5760605163aea9107860805260405160a052602060806024609c5f855af1610c97573d5f5f3e3d5ffd5b60203d106111bb576080905051156111bb575b60605160096040516020525f5260405f20556040517f944f260fa5475db9151efe54fc9fb6df2b40f73533d9483011e94522398cb3c160605160805260206080a2005b63fee42d77811861107d576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516007556040517f07011b0b15512f533140457fca55819676a0497d4afe5c3d7a3524d951a0c4c85f6060a2005b635eebafff811861107d576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516008556040517fcf0b49d30058a7b2c4abcba1621ed8144ef1621f9a2c0112bd237fecd6b623415f6060a2005b63168d2ffd8118610e1f576044361034176111bb576004358060a01c6111bb576040526024358060a01c6111bb576060525f5433186111bb57606051600a6040516020525f5260405f20556040517fc5b6ae9e3b4a82a521a68fb2b106185044d464ab524ececb4c9682f6714cdbfa60605160805260206080a2005b6361d027b3811861107d57346111bb5760065460405260206040f35b63fd066ecc811861107d576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c811861107d57346111bb5760015433186111bb575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63a7f0b3de811861107d57346111bb5760206111fb60403960206040f35b639d48dc718118610f32576024361034176111bb57602060043560038110156111bb5760051b6040016111fb0160403960206040f35b6340a05acb811861107d576024361034176111bb576004358060a01c6111bb57604052600a6040516020525f5260405f205460605260206060f35b6388a8d6028118610f8857346111bb575f5460405260206040f35b63fa4b0ec48118610fa457346111bb5760085460405260206040f35b6361b9c4a2811861107d57346111bb57600c5460405260206040f35b63570ca7358118610fdc57346111bb5760035460405260206040f35b637b103999811861107d57346111bb5760045460405260206040f35b63addd5099811861107d576024361034176111bb576004358060a01c6111bb5760405260096040516020525f5260405f205460605260206060f35b630727adb3811861107d57346111bb57600b5460405260206040f35b63020fe6e5811861107d576024361034176111bb5760043560038110156111bb57600d015460405260206040f35b5f5ffd5b626ebe004260206111fb5f395f518082038281116111bb579050905004815250565b6002546111bb57602061121b5f395f516370a0823160a0523060c052602060a0602460bc845afa6110d6573d5f5f3e3d5ffd5b60203d106111bb5760a0905051608052608051600b548082038281116111bb579050905060a052608051600b55600c5460a0518082018281106111bb579050905060c05260c051600c5560c051602060405160038110156111bb5760051b6040016111fb015f395f518082028115838383041417156111bb57905090506127108104905060e05260405160038110156111bb57600d01546060518082018281106111bb57905090506101005260e05161010051116111bb57600b546060518082038281116111bb5790509050600b556101005160405160038110156111bb57600d0155565b5f80fd107d0ced107d0a3d08d8107d107d0efc046c0d480f6d104f107d0da30e96093405f6107d0e3b0fc0107d06dd00541033033d0b6f0af80ff80ede00180000000000000000000000000000000000000000000000000000000069151f80000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf62040000000000000000000000000000000000000000000000000000000000001f4000000000000000000000000000000000000000000000000000000000000003e800000000000000000000000000000000000000000000000000000000000003e8",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "outputSelection": {
+      "RevenueRecipient.vy": [
+        "abi",
+        "evm.bytecode",
+        "evm.deployedBytecode",
+        "evm.methodIdentifiers"
+      ]
+    },
+    "search_paths": [
+      "."
+    ]
+  },
+  "optimization_runs": null,
+  "sourcify_repo_url": null,
+  "decoded_constructor_args": [
+    [
+      "1762992000",
+      {
+        "name": "_genesis",
+        "type": "uint256"
+      }
+    ],
+    [
+      "0xBe53A109B494E5c9f97b9Cd39Fe969BE68BF6204",
+      {
+        "name": "_token",
+        "type": "address"
+      }
+    ],
+    [
+      [
+        "8000",
+        "1000",
+        "1000"
+      ],
+      {
+        "name": "_split",
+        "type": "uint256[3]"
+      }
+    ]
+  ],
+  "compiler_version": "v0.4.2+commit.c216787f",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-07-01T20:48:33.064062Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x61127b5150346100b457602061130b5f395f518060a01c6100b457604052612710602061132b5f395f51602061134b5f395f518082018281106100b45790509050602061136b5f395f518082018281106100b45790509050186100b45760206112eb5f395f516111fb5260405161121b52602061132b5f395f5161123b52602061134b5f395f5161125b52602061136b5f395f5161127b52335f5533600355336006556111fb6100b86100003961129b610000f35b5f80fd5f3560e01c6002601e820660011b6111bf01601e395f51565b63ef78d4fd811861003857346111bb5760206100346040611081565b6040f35b634fb3ccc5811861107d57346111bb5760055460405260206040f35b6347e7ef24811861107d576044361034176111bb576004358060a01c6111bb5760405260045463d4486c9360605233608052602060606024607c845afa61009d573d5f5f3e3d5ffd5b3d602081183d6020100218806060016080116111bb576060518060011c6111bb5760a0525060a0905051156111bb576002546111bb5760096040516020525f5260405f2054606052606051156111bb5760605163aea9107860a05260405160c052602060a0602460bc5f855af1610116573d5f5f3e3d5ffd5b60203d106111bb5760a0905051608052608051156111bb576040516323b872dd60a0523360c0523060e05260243561010052602060a0606460bc5f855af1610160573d5f5f3e3d5ffd5b3d61017757803b156111bb5760016101205261019e565b3d602081183d60201002188060a00160c0116111bb5760a0518060011c6111bb5761012052505b610120905051156111bb57600a6040516020525f5260405f205460a05260a051156102745760405163095ea7b360c05260a05160e05260243561010052602060c0604460dc5f855af16101f3573d5f5f3e3d5ffd5b3d61020a57803b156111bb57600161012052610231565b3d602081183d60201002188060c00160e0116111bb5760c0518060011c6111bb5761012052505b610120905051156111bb5760a0516367c6e39c60c05260405160e05260243561010052803b156111bb575f60c0604460dc5f855af1610272573d5f5f3e3d5ffd5b505b61027e60e0611081565b60e05160c0526024356080518082028115838383041417156111bb5790509050670de0b6b3a76400008104905060e05260055463b106710c610100523361012052604060c06101405e600161018052803b156111bb575f610100608461011c5f855af16102ed573d5f5f3e3d5ffd5b5060c051337f81d571e960b4c5de5925eacc62e1a57b498175af677f2d496140839c50381c5b604051610100526024356101205260e051610140526060610100a3604060c06101005e6040610100f35b6367c6e39c811861107d576044361034176111bb576004358060a01c6111bb5760405260035433186111bb576002546111bb57600a6040516020525f5260405f2054606052606051156111bb5760405163095ea7b360805260605160a05260243560c052602060806044609c5f855af16103b9573d5f5f3e3d5ffd5b3d6103cf57803b156111bb57600160e0526103f5565b3d602081183d60201002188060800160a0116111bb576080518060011c6111bb5760e052505b60e0905051156111bb576060516367c6e39c60805260405160a05260243560c052803b156111bb575f60806044609c5f855af1610434573d5f5f3e3d5ffd5b506040517f36f9833998cac7cab28d168cdb2ef1e91cffc5d01656a53f935c0e13880b3e9460605160805260243560a05260406080a2005b630f1dbea4811861107d576044361034176111bb5760035433186111bb575f60405260243560605261049c6110a3565b60075461012052602061121b5f395f516101205163fc0c546a610140526020610140600461015c845afa6104d2573d5f5f3e3d5ffd5b3d602081183d60201002188061014001610160116111bb57610140518060a01c6111bb576101805250610180905051186111bb57602061121b5f395f5163095ea7b3610140526101205161016052602435610180526020610140604461015c5f855af1610541573d5f5f3e3d5ffd5b3d61055857803b156111bb5760016101a052610582565b3d602081183d60201002188061014001610160116111bb57610140518060011c6111bb576101a052505b6101a0905051156111bb576101205163e2bbb158610140526040600461016037803b156111bb575f610140604461015c5f855af16105c2573d5f5f3e3d5ffd5b506004357fb7c2ed88c336ee10ec956cb50efd68f4ee960e3b05df70aa65f16414752252cf602435610140526020610140a2005b637b973a2c811861107d576024361034176111bb5760035433186111bb5760016040526004356060526106276110a3565b602061121b5f395f5163a9059cbb6101205260065461014052600435610160526020610120604461013c5f855af1610661573d5f5f3e3d5ffd5b3d61067857803b156111bb576001610180526106a2565b3d602081183d60201002188061012001610140116111bb57610120518060011c6111bb5761018052505b610180905051156111bb577fdae71ca522b043bfc50fb187c9f45468771cd8822be932c7c4820ed13026d964600435610120526020610120a1005b63bea3058f81186108bc576024361034176111bb5760035433186111bb57600260405260043560605261070e6110a3565b600854610120526060366101403761012051631d59410a6101a052602061121b6101c03960606101a060246101bc845afa61074b573d5f5f3e3d5ffd5b3d606081183d6060100218806101a001610200116111bb576101a0518060401c6111bb57610220526101c0518060401c6111bb57610240526101e0518060801c6111bb57610260525061022090506060816102805e5060606102806101405e600161016051126111bb57610140516201518081018181106111bb57905042106111bb57602061121b5f395f5163a9059cbb6101a052610120516101c0526004356101e05260206101a060446101bc5f855af1610809573d5f5f3e3d5ffd5b3d61082057803b156111bb5760016102005261084a565b3d602081183d6020100218806101a0016101c0116111bb576101a0518060011c6111bb5761020052505b610200905051156111bb57610120516396c551756101a052602061121b6101c039803b156111bb575f6101a060246101bc5f855af161088b573d5f5f3e3d5ffd5b507f0e3b9ed4da3ecb541e8f72b0a66c90799b5a85edc2345353619d3d2ce97c28546004356101a05260206101a0a1005b63092ad359811861107d57346111bb5760075460405260206040f35b6301681a628118610916576024361034176111bb577fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff606052610950565b63fc0c546a811861107d57346111bb57602061121b60403960206040f35b636ea056a9811861107d576044361034176111bb576024356060525b6004358060a01c6111bb576040525f5433186111bb57606051608052606051196109ab576040516370a0823160a0523060c052602060a0602460bc845afa61099a573d5f5f3e3d5ffd5b60203d106111bb5760a09050516080525b602061121b5f395f51604051186109c557600254156111bb575b60405163a9059cbb60a0523360c05260805160e052602060a0604460bc5f855af16109f2573d5f5f3e3d5ffd5b3d610a0957803b156111bb57600161010052610a30565b3d602081183d60201002188060a00160c0116111bb5760a0518060011c6111bb5761010052505b610100905051156111bb57005b6341c0e1b58118610a8157346111bb575f5433186111bb5760016002557fbe26733c2bf6ff3ea5ba8cfe744422bd49052ff9ed5685c9e81e6f9321dbaddd5f6040a1005b6330bcd67b8118610adc576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516006556040517fcb7ef3e545f5cdb893f5c568ba710fe08f336375a2d9fd66e161033f8fc09ef35f6060a2005b631f3a0e41811861107d57346111bb5760025460405260206040f35b6330c7be728118610b53576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516003556040517fdbebfba65bd6398fb722063efc10c99f624f9cd8ba657201056af918a676d5ee5f6060a2005b63770817ec811861107d57346111bb5760015460405260206040f35b63f1e300bb8118610bca576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516004556040517f278c70ced5f3e0e5eeb385b5ff9cb735748ba00a625147e66065ed48fc1562cd5f6060a2005b6371da8a8d8118610c25576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516005556040517f0272efc86eeb452c32134d3a55db5b3f3a9f3a8f426422cd285c688b97b303df5f6060a2005b63755ca367811861107d576044361034176111bb576004358060a01c6111bb576040526024358060a01c6111bb576060525f5433186111bb57604051156111bb5760605115610caa5760605163aea9107860805260405160a052602060806024609c5f855af1610c97573d5f5f3e3d5ffd5b60203d106111bb576080905051156111bb575b60605160096040516020525f5260405f20556040517f944f260fa5475db9151efe54fc9fb6df2b40f73533d9483011e94522398cb3c160605160805260206080a2005b63fee42d77811861107d576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516007556040517f07011b0b15512f533140457fca55819676a0497d4afe5c3d7a3524d951a0c4c85f6060a2005b635eebafff811861107d576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516008556040517fcf0b49d30058a7b2c4abcba1621ed8144ef1621f9a2c0112bd237fecd6b623415f6060a2005b63168d2ffd8118610e1f576044361034176111bb576004358060a01c6111bb576040526024358060a01c6111bb576060525f5433186111bb57606051600a6040516020525f5260405f20556040517fc5b6ae9e3b4a82a521a68fb2b106185044d464ab524ececb4c9682f6714cdbfa60605160805260206080a2005b6361d027b3811861107d57346111bb5760065460405260206040f35b63fd066ecc811861107d576024361034176111bb576004358060a01c6111bb576040525f5433186111bb576040516001556040517fe7b5cc087e6e47e33e86bdfe4720b7e849891938b18ff6e0c3f92299de79e60c5f6060a2005b63759be10c811861107d57346111bb5760015433186111bb575f600155335f55337fafe23f9e1f603b288748a507d5a993957e9f14313a5889d5a070851299939d595f6040a2005b63a7f0b3de811861107d57346111bb5760206111fb60403960206040f35b639d48dc718118610f32576024361034176111bb57602060043560038110156111bb5760051b6040016111fb0160403960206040f35b6340a05acb811861107d576024361034176111bb576004358060a01c6111bb57604052600a6040516020525f5260405f205460605260206060f35b6388a8d6028118610f8857346111bb575f5460405260206040f35b63fa4b0ec48118610fa457346111bb5760085460405260206040f35b6361b9c4a2811861107d57346111bb57600c5460405260206040f35b63570ca7358118610fdc57346111bb5760035460405260206040f35b637b103999811861107d57346111bb5760045460405260206040f35b63addd5099811861107d576024361034176111bb576004358060a01c6111bb5760405260096040516020525f5260405f205460605260206060f35b630727adb3811861107d57346111bb57600b5460405260206040f35b63020fe6e5811861107d576024361034176111bb5760043560038110156111bb57600d015460405260206040f35b5f5ffd5b626ebe004260206111fb5f395f518082038281116111bb579050905004815250565b6002546111bb57602061121b5f395f516370a0823160a0523060c052602060a0602460bc845afa6110d6573d5f5f3e3d5ffd5b60203d106111bb5760a0905051608052608051600b548082038281116111bb579050905060a052608051600b55600c5460a0518082018281106111bb579050905060c05260c051600c5560c051602060405160038110156111bb5760051b6040016111fb015f395f518082028115838383041417156111bb57905090506127108104905060e05260405160038110156111bb57600d01546060518082018281106111bb57905090506101005260e05161010051116111bb57600b546060518082038281116111bb5790509050600b556101005160405160038110156111bb57600d0155565b5f80fd107d0ced107d0a3d08d8107d107d0efc046c0d480f6d104f107d0da30e96093405f6107d0e3b0fc0107d06dd00541033033d0b6f0af80ff80ede0018855820a48e8b2adb3e8ef6affca0a83abe3213673e7902c9c33ed1cba1ab6def5636231911fb81183c18a0a16576797065728300040200380000000000000000000000000000000000000000000000000000000069151f80000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf62040000000000000000000000000000000000000000000000000000000000001f4000000000000000000000000000000000000000000000000000000000000003e800000000000000000000000000000000000000000000000000000000000003e8",
+  "name": "RevenueRecipient",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": false,
+  "is_verified_via_eth_bytecode_db": false,
+  "language": "vyper",
+  "evm_version": null,
+  "can_be_visualized_via_sol2uml": false,
+  "is_verified_via_sourcify": false,
+  "additional_sources": [],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "team",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "name": "period",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "revenue",
+          "type": "uint256"
+        }
+      ],
+      "name": "DepositRevenue",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "converter",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ConvertToken",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ToTreasury",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "epoch",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ToRewards",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "name": "amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "ToRecovery",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [],
+      "name": "Kill",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "operator",
+          "type": "address"
+        }
+      ],
+      "name": "SetOperator",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "registry",
+          "type": "address"
+        }
+      ],
+      "name": "SetRegistry",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "accountant",
+          "type": "address"
+        }
+      ],
+      "name": "SetAccountant",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "treasury",
+          "type": "address"
+        }
+      ],
+      "name": "SetTreasury",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "distributor",
+          "type": "address"
+        }
+      ],
+      "name": "SetRewardDistributor",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "auction",
+          "type": "address"
+        }
+      ],
+      "name": "SetRecoveryAuction",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "oracle",
+          "type": "address"
+        }
+      ],
+      "name": "SetPriceOracle",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "token",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "name": "converter",
+          "type": "address"
+        }
+      ],
+      "name": "SetTokenConverter",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "PendingManagement",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "name": "management",
+          "type": "address"
+        }
+      ],
+      "name": "SetManagement",
+      "type": "event"
+    },
+    {
+      "inputs": [],
+      "name": "period",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "deposit",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        },
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "convert",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_epoch",
+          "type": "uint256"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "to_styfi_rewards",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "to_treasury",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "to_yeth_recovery",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_amount",
+          "type": "uint256"
+        }
+      ],
+      "name": "sweep",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "kill",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_operator",
+          "type": "address"
+        }
+      ],
+      "name": "set_operator",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_registry",
+          "type": "address"
+        }
+      ],
+      "name": "set_registry",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_accountant",
+          "type": "address"
+        }
+      ],
+      "name": "set_accountant",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_treasury",
+          "type": "address"
+        }
+      ],
+      "name": "set_treasury",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_distributor",
+          "type": "address"
+        }
+      ],
+      "name": "set_reward_distributor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_auction",
+          "type": "address"
+        }
+      ],
+      "name": "set_recovery_auction",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_oracle",
+          "type": "address"
+        }
+      ],
+      "name": "set_price_oracle",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_converter",
+          "type": "address"
+        }
+      ],
+      "name": "set_token_converter",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_management",
+          "type": "address"
+        }
+      ],
+      "name": "set_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accept_management",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "genesis",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "token",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "uint256"
+        }
+      ],
+      "name": "token_split",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pending_management",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "killed",
+      "outputs": [
+        {
+          "name": "",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "operator",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "registry",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "accountant",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "treasury",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "reward_distributor",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "recovery_auction",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "oracles",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "address"
+        }
+      ],
+      "name": "converters",
+      "outputs": [
+        {
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "last_balance",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "sum_balance",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "arg0",
+          "type": "uint256"
+        }
+      ],
+      "name": "used",
+      "outputs": [
+        {
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "name": "_genesis",
+          "type": "uint256"
+        },
+        {
+          "name": "_token",
+          "type": "address"
+        },
+        {
+          "name": "_split",
+          "type": "uint256[3]"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": true,
+  "constructor_args": "0x0000000000000000000000000000000000000000000000000000000069151f80000000000000000000000000be53a109b494e5c9f97b9cd39fe969be68bf62040000000000000000000000000000000000000000000000000000000000001f4000000000000000000000000000000000000000000000000000000000000003e800000000000000000000000000000000000000000000000000000000000003e8",
+  "sources": {
+    "RevenueRecipient.vy": {
+      "content": "# pragma version 0.4.2\n# pragma optimize gas\n# pragma evm-version cancun\n\"\"\"\n@title Revenue Recipient\n@author Yearn Finance\n@license GNU AGPLv3\n@notice Temporary contract designed to take in team revenues as they are submitted, before\n        they are redistributed to stYFI + treasury + yETH recovery by the operator.\n        Will eventually be replaced by a contract that automatically spreads incoming revenues\n        over the appropriate stYFI epochs.\n\"\"\"\n\nfrom ethereum.ercs import IERC20\n\ninterface IRevenueRecipient:\n    def deposit(_token: address, _amount: uint256) -> (uint256, uint256): nonpayable\nimplements: IRevenueRecipient\n\ninterface IAccountant:\n    def adjust_revenue(_team: address, _period: uint256, _amount: uint256, _increment: bool): nonpayable\n\ninterface IOracle:\n    def price(_asset: address) -> uint256: nonpayable\n\ninterface IConverter:\n    def convert(_token: address, _amount: uint256): nonpayable\n\ninterface IRegistry:\n    def is_team(_team: address) -> bool: view\n\ninterface IRewardDistributor:\n    def token() -> address: view\n    def deposit(_epoch: uint256, _amount: uint256): nonpayable\n\ninterface IAuction:\n    def auctions(_token: address) -> (uint64, uint64, uint128): view\n    def kick(_token: address): nonpayable\n\ngenesis: public(immutable(uint256))\ntoken: public(immutable(IERC20))\ntoken_split: public(immutable(uint256[3])) # stYFI, treasury, yETH\nmanagement: public(address)\npending_management: public(address)\nkilled: public(bool)\noperator: public(address)\nregistry: public(IRegistry)\naccountant: public(IAccountant)\ntreasury: public(address)\nreward_distributor: public(IRewardDistributor)\nrecovery_auction: public(IAuction)\noracles: public(HashMap[address, address])\nconverters: public(HashMap[address, address])\n\nlast_balance: public(uint256)\nsum_balance: public(uint256)\nused: public(uint256[3])\n\nevent DepositRevenue:\n    team: indexed(address)\n    period: indexed(uint256)\n    token: address\n    amount: uint256\n    revenue: uint256\n\nevent ConvertToken:\n    token: indexed(address)\n    converter: address\n    amount: uint256\n\nevent ToTreasury:\n    amount: uint256\n\nevent ToRewards:\n    epoch: indexed(uint256)\n    amount: uint256\n\nevent ToRecovery:\n    amount: uint256\n\nevent Kill: pass\n\nevent SetOperator:\n    operator: indexed(address)\n\nevent SetRegistry:\n    registry: indexed(address)\n\nevent SetAccountant:\n    accountant: indexed(address)\n\nevent SetTreasury:\n    treasury: indexed(address)\n\nevent SetRewardDistributor:\n    distributor: indexed(address)\n\nevent SetRecoveryAuction:\n    auction: indexed(address)\n\nevent SetPriceOracle:\n    token: indexed(address)\n    oracle: address\n\nevent SetTokenConverter:\n    token: indexed(address)\n    converter: address\n\nevent PendingManagement:\n    management: indexed(address)\n\nevent SetManagement:\n    management: indexed(address)\n\nPRECISION: constant(uint256) = 10**18\nBPS_PRECISION: constant(uint256) = 10000\nPERIOD_LENGTH: constant(uint256) = 6 * 14 * 24 * 60 * 60\nAUCTION_LENGTH: constant(uint256) = 24 * 60 * 60\nINCREMENT: constant(bool) = True\n\n@deploy\ndef __init__(_genesis: uint256, _token: address, _split: uint256[3]):\n    \"\"\"\n    @notice Constructor\n    @param _genesis Budget period genesis timestamp\n    @param _token Main revenue token\n    @param _split Token split between stYFI, treasury and yETH (in that order, bps)\n    \"\"\"\n    assert _split[0] + _split[1] + _split[2] == BPS_PRECISION\n\n    genesis = _genesis\n    token = IERC20(_token)\n    token_split = _split\n\n    self.management = msg.sender\n    self.operator = msg.sender\n    self.treasury = msg.sender\n\n@external\n@view\ndef period() -> uint256:\n    \"\"\"\n    @notice Query the current budget period number\n    @return The current budget period number\n    \"\"\"\n    return self._period()\n\n@external\ndef deposit(_token: address, _amount: uint256) -> (uint256, uint256):\n    \"\"\"\n    @notice Deposit revenue\n    @param _token Token address\n    @param _amount Token amount\n    @return Tuple with: current budget period number, USD value of revenue (18 decimals)\n    @dev Can only be called by a registered team\n    @dev Only accepts tokens that are whitelisted by having a price oracle assigned\n    \"\"\"\n    assert staticcall self.registry.is_team(msg.sender)\n    assert not self.killed\n\n    oracle: address = self.oracles[_token]\n    assert oracle != empty(address)\n    price: uint256 = extcall IOracle(oracle).price(_token)\n    assert price > 0\n\n    assert extcall IERC20(_token).transferFrom(msg.sender, self, _amount, default_return_value=True)\n    converter: address = self.converters[_token]\n    if converter != empty(address):\n        assert extcall IERC20(_token).approve(converter, _amount, default_return_value=True)\n        extcall IConverter(converter).convert(_token, _amount)\n\n    period: uint256 = self._period()\n    value: uint256 = _amount * price // PRECISION\n    extcall self.accountant.adjust_revenue(msg.sender, period, value, INCREMENT)\n\n    log DepositRevenue(team=msg.sender, period=period, token=_token, amount=_amount, revenue=value)\n    return period, value\n\n@external\ndef convert(_token: address, _amount: uint256):\n    \"\"\"\n    @notice Convert a token\n    @param _token Token address\n    @param _amount Token amount\n    @dev Can only be called by the operator\n    @dev Only accepts tokens that are whitelisted by having a converter assigned\n    \"\"\"\n    assert msg.sender == self.operator\n    assert not self.killed\n    converter: address = self.converters[_token]\n    assert converter != empty(address)\n    assert extcall IERC20(_token).approve(converter, _amount, default_return_value=True)\n    extcall IConverter(converter).convert(_token, _amount)\n    log ConvertToken(token=_token, converter=converter, amount=_amount)\n\n@external\ndef to_styfi_rewards(_epoch: uint256, _amount: uint256):\n    \"\"\"\n    @notice Queue the rewards token for future distribution to stYFI\n    @param _epoch Epoch number to queue rewards for\n    @param _amount Token amount\n    @dev Can only be called by the operator\n    \"\"\"\n    assert msg.sender == self.operator\n\n    self._use_balance(0, _amount)\n    distributor: IRewardDistributor = self.reward_distributor\n    assert staticcall distributor.token() == token.address\n    assert extcall token.approve(distributor.address, _amount, default_return_value=True)\n    extcall distributor.deposit(_epoch, _amount)\n    log ToRewards(epoch=_epoch, amount=_amount)\n\n@external\ndef to_treasury(_amount: uint256):\n    \"\"\"\n    @notice Send tokens to treasury\n    @param _amount Token amount\n    @dev Can only be called by the operator\n    \"\"\"\n    assert msg.sender == self.operator\n\n    self._use_balance(1, _amount)\n    assert extcall token.transfer(self.treasury, _amount, default_return_value=True)\n    log ToTreasury(amount=_amount)\n\n@external\ndef to_yeth_recovery(_amount: uint256):\n    \"\"\"\n    @notice Auction token for yETH recovery\n    @param _amount Token amount\n    @dev Can only be called by the operator\n    \"\"\"\n    assert msg.sender == self.operator\n\n    self._use_balance(2, _amount)\n\n    # check token is enabled inside the auction\n    auction: IAuction = self.recovery_auction\n    kicked: uint64 = 0\n    scaler: uint64 = 0\n    available: uint128 = 0\n    kicked, scaler, available = staticcall auction.auctions(token.address)\n    assert scaler > 0\n    assert block.timestamp >= convert(kicked, uint256) + AUCTION_LENGTH\n\n    assert extcall token.transfer(auction.address, _amount, default_return_value=True)\n    extcall auction.kick(token.address)\n    log ToRecovery(amount=_amount)\n\n@external\ndef sweep(_token: address, _amount: uint256 = max_value(uint256)):\n    \"\"\"\n    @notice Transfer out a token\n    @param _token The token address\n    @param _amount The amount of tokens. Defaults to all\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    amount: uint256 = _amount\n    if _amount == max_value(uint256):\n        amount = staticcall IERC20(_token).balanceOf(self)\n\n    if _token == token.address:\n        assert self.killed\n\n    assert extcall IERC20(_token).transfer(msg.sender, amount, default_return_value=True)\n\n@external\ndef kill():\n    \"\"\"\n    @notice Kill the revenue recipient, making it unable to accept or redistribute revenue\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.killed = True\n    log Kill()\n\n@external\ndef set_operator(_operator: address):\n    \"\"\"\n    @notice Set a new operator\n    @param _operator New operator address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.operator = _operator\n    log SetOperator(operator=_operator)\n\n@external\ndef set_registry(_registry: address):\n    \"\"\"\n    @notice Set a new registry\n    @param _registry New registry address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.registry = IRegistry(_registry)\n    log SetRegistry(registry=_registry)\n\n@external\ndef set_accountant(_accountant: address):\n    \"\"\"\n    @notice Set a new accountant\n    @param _accountant New accountant address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.accountant = IAccountant(_accountant)\n    log SetAccountant(accountant=_accountant)\n\n@external\ndef set_treasury(_treasury: address):\n    \"\"\"\n    @notice Set a new treasury\n    @param _treasury New treasury address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.treasury = _treasury\n    log SetTreasury(treasury=_treasury)\n\n@external\ndef set_reward_distributor(_distributor: address):\n    \"\"\"\n    @notice Set a new stYFI reward distributor\n    @param _distributor New stYFI reward distributor address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.reward_distributor = IRewardDistributor(_distributor)\n    log SetRewardDistributor(distributor=_distributor)\n\n@external\ndef set_recovery_auction(_auction: address):\n    \"\"\"\n    @notice Set a yETH recovery auction\n    @param _auction New yETH recovery auction address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.recovery_auction = IAuction(_auction)\n    log SetRecoveryAuction(auction=_auction)\n\n@external\ndef set_price_oracle(_token: address, _oracle: address):\n    \"\"\"\n    @notice Set a token price oracle\n    @param _token Token address\n    @param _oracle Oracle address\n    @dev The oracle should return the value of 1 wad of tokens in USD (18 decimals)\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n    assert _token != empty(address)\n    if _oracle != empty(address):\n        assert extcall IOracle(_oracle).price(_token) > 0\n\n    self.oracles[_token] = _oracle\n    log SetPriceOracle(token=_token, oracle=_oracle)\n\n@external\ndef set_token_converter(_token: address, _converter: address):\n    \"\"\"\n    @notice Set a token converter\n    @param _token Token address\n    @param _converter Converter address\n    @dev Can only be called by management\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.converters[_token] = _converter\n    log SetTokenConverter(token=_token, converter=_converter)\n\n@external\ndef set_management(_management: address):\n    \"\"\"\n    @notice Set the pending management address.\n            Needs to be accepted by that account separately to transfer management over\n    @param _management New pending management address\n    \"\"\"\n    assert msg.sender == self.management\n\n    self.pending_management = _management\n    log PendingManagement(management=_management)\n\n@external\ndef accept_management():\n    \"\"\"\n    @notice Accept management role.\n            Can only be called by account previously marked as pending by current management\n    \"\"\"\n    assert msg.sender == self.pending_management\n\n    self.pending_management = empty(address)\n    self.management = msg.sender\n    log SetManagement(management=msg.sender)\n\n@internal\n@view\ndef _period() -> uint256:\n    return unsafe_div(block.timestamp - genesis, PERIOD_LENGTH)\n\n@internal\ndef _use_balance(_i: uint256, _amount: uint256):\n    assert not self.killed\n    current: uint256 = staticcall token.balanceOf(self)\n    increase: uint256 = current - self.last_balance\n    self.last_balance = current\n    sum_balance: uint256 = self.sum_balance + increase\n    self.sum_balance = sum_balance\n\n    budget: uint256 = sum_balance * token_split[_i] // BPS_PRECISION\n    used: uint256 = self.used[_i] + _amount\n    assert used <= budget\n\n    self.last_balance -= _amount\n    self.used[_i] = used"
+    }
+  }
+}
