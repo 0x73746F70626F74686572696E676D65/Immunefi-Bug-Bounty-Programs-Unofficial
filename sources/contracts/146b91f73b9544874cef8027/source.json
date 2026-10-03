@@ -1,0 +1,305 @@
+{
+  "sources": {
+    "src/contracts/ZapperARM.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity ^0.8.23;\n\n// Contracts\nimport {Ownable} from \"./Ownable.sol\";\n\n// Interfaces\nimport {IWETH} from \"./Interfaces.sol\";\nimport {IERC20} from \"./Interfaces.sol\";\nimport {ILiquidityProviderARM} from \"./Interfaces.sol\";\n\n/**\n * @title Zapper contract for Automated Redemption Managers (ARMs)\n * Converts native currency to wrapped currency, deposits it to an ARM and receives ARM LP shares.\n * @author Origin Protocol Inc\n */\ncontract ZapperARM is Ownable {\n    /// @notice The address of the wrapped token. eg WETH or wS\n    IWETH public immutable wrappedCurrency;\n\n    event Zap(address indexed arm, address indexed sender, uint256 assets, uint256 shares);\n\n    constructor(address _wrappedCurrency) {\n        wrappedCurrency = IWETH(_wrappedCurrency);\n    }\n\n    /// @notice Convert native currency to wrapped currency, deposit it to an ARM and receive ARM shares\n    /// @param arm The address of the ARM contract to deposit to\n    /// @return shares The amount of ARM LP shares sent to the depositor\n    function deposit(address arm) public payable returns (uint256 shares) {\n        // Wrap all native currency sent\n        uint256 balance = address(this).balance;\n        wrappedCurrency.deposit{value: balance}();\n\n        // Deposit all wrapped currency to the ARM\n        wrappedCurrency.approve(arm, balance);\n        shares = ILiquidityProviderARM(arm).deposit(balance, msg.sender);\n\n        // Emit event\n        emit Zap(arm, msg.sender, balance, shares);\n    }\n\n    /// @notice Rescue ERC20 tokens\n    /// @param token The address of the ERC20 token\n    /// @param amount The amount of tokens to rescue\n    function rescueERC20(address token, uint256 amount) external onlyOwner {\n        IERC20(token).transfer(msg.sender, amount);\n    }\n}\n"
+    },
+    "src/contracts/Ownable.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\n/**\n * @title Base contract that provides ownership control\n * @author Origin Protocol Inc\n */\ncontract Ownable {\n    /// @notice The slot used to store the owner of the contract.\n    /// This is also used as the proxy admin.\n    /// keccak256(“eip1967.proxy.admin”) - 1 per EIP 1967\n    bytes32 internal constant OWNER_SLOT = 0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103;\n\n    event AdminChanged(address previousAdmin, address newAdmin);\n\n    constructor() {\n        assert(OWNER_SLOT == bytes32(uint256(keccak256(\"eip1967.proxy.admin\")) - 1));\n        _setOwner(msg.sender);\n    }\n\n    /// @notice The contract owner and proxy admin.\n    function owner() public view returns (address) {\n        return _owner();\n    }\n\n    /// @notice Set the owner and proxy admin of the contract.\n    /// @param newOwner The address of the new owner.\n    function setOwner(address newOwner) external onlyOwner {\n        _setOwner(newOwner);\n    }\n\n    function _owner() internal view returns (address ownerOut) {\n        bytes32 position = OWNER_SLOT;\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            ownerOut := sload(position)\n        }\n    }\n\n    function _setOwner(address newOwner) internal {\n        emit AdminChanged(_owner(), newOwner);\n        bytes32 position = OWNER_SLOT;\n        // solhint-disable-next-line no-inline-assembly\n        assembly {\n            sstore(position, newOwner)\n        }\n    }\n\n    function _onlyOwner() internal view {\n        require(msg.sender == _owner(), \"ARM: Only owner can call this function.\");\n    }\n\n    modifier onlyOwner() {\n        _onlyOwner();\n        _;\n    }\n}\n"
+    },
+    "src/contracts/Interfaces.sol": {
+      "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.23;\n\ninterface IERC20 {\n    function totalSupply() external view returns (uint256);\n    function balanceOf(address account) external view returns (uint256);\n    function transfer(address to, uint256 value) external returns (bool);\n    function allowance(address owner, address spender) external view returns (uint256);\n    function approve(address spender, uint256 value) external returns (bool);\n    function transferFrom(address from, address to, uint256 value) external returns (bool);\n    function decimals() external view returns (uint8);\n\n    event Transfer(address indexed from, address indexed to, uint256 value);\n}\n\ninterface IOethARM {\n    function token0() external returns (address);\n    function token1() external returns (address);\n    function owner() external returns (address);\n\n    /**\n     * @notice Swaps an exact amount of input tokens for as many output tokens as possible.\n     * msg.sender should have already given the ARM contract an allowance of\n     * at least amountIn on the input token.\n     *\n     * @param inToken Input token.\n     * @param outToken Output token.\n     * @param amountIn The amount of input tokens to send.\n     * @param amountOutMin The minimum amount of output tokens that must be received for the transaction not to revert.\n     * @param to Recipient of the output tokens.\n     */\n    function swapExactTokensForTokens(\n        IERC20 inToken,\n        IERC20 outToken,\n        uint256 amountIn,\n        uint256 amountOutMin,\n        address to\n    ) external;\n\n    /**\n     * @notice Uniswap V2 Router compatible interface. Swaps an exact amount of\n     * input tokens for as many output tokens as possible.\n     * msg.sender should have already given the ARM contract an allowance of\n     * at least amountIn on the input token.\n     *\n     * @param amountIn The amount of input tokens to send.\n     * @param amountOutMin The minimum amount of output tokens that must be received for the transaction not to revert.\n     * @param path The input and output token addresses.\n     * @param to Recipient of the output tokens.\n     * @param deadline Unix timestamp after which the transaction will revert.\n     * @return amounts The input and output token amounts.\n     */\n    function swapExactTokensForTokens(\n        uint256 amountIn,\n        uint256 amountOutMin,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external returns (uint256[] memory amounts);\n\n    /**\n     * @notice Receive an exact amount of output tokens for as few input tokens as possible.\n     * msg.sender should have already given the router an allowance of\n     * at least amountInMax on the input token.\n     *\n     * @param inToken Input token.\n     * @param outToken Output token.\n     * @param amountOut The amount of output tokens to receive.\n     * @param amountInMax The maximum amount of input tokens that can be required before the transaction reverts.\n     * @param to Recipient of the output tokens.\n     */\n    function swapTokensForExactTokens(\n        IERC20 inToken,\n        IERC20 outToken,\n        uint256 amountOut,\n        uint256 amountInMax,\n        address to\n    ) external;\n\n    /**\n     * @notice Uniswap V2 Router compatible interface. Receive an exact amount of\n     * output tokens for as few input tokens as possible.\n     * msg.sender should have already given the router an allowance of\n     * at least amountInMax on the input token.\n     *\n     * @param amountOut The amount of output tokens to receive.\n     * @param amountInMax The maximum amount of input tokens that can be required before the transaction reverts.\n     * @param path The input and output token addresses.\n     * @param to Recipient of the output tokens.\n     * @param deadline Unix timestamp after which the transaction will revert.\n     * @return amounts The input and output token amounts.\n     */\n    function swapTokensForExactTokens(\n        uint256 amountOut,\n        uint256 amountInMax,\n        address[] calldata path,\n        address to,\n        uint256 deadline\n    ) external returns (uint256[] memory amounts);\n\n    function setOwner(address newOwner) external;\n    function transferToken(address token, address to, uint256 amount) external;\n\n    // From OethLiquidityManager\n    function requestWithdrawal(uint256 amount) external returns (uint256 requestId, uint256 queued);\n    function claimWithdrawal(uint256 requestId) external;\n    function claimWithdrawals(uint256[] calldata requestIds) external;\n}\n\ninterface ILiquidityProviderARM is IERC20 {\n    function previewDeposit(uint256 assets) external returns (uint256 shares);\n    function deposit(uint256 assets) external returns (uint256 shares);\n    function deposit(uint256 assets, address liquidityProvider) external returns (uint256 shares);\n\n    function previewRedeem(uint256 shares) external returns (uint256 assets);\n    function requestRedeem(uint256 shares) external returns (uint256 requestId, uint256 assets);\n    function claimRedeem(uint256 requestId) external returns (uint256 assets);\n\n    function totalAssets() external returns (uint256 assets);\n    function convertToShares(uint256 assets) external returns (uint256 shares);\n    function convertToAssets(uint256 shares) external returns (uint256 assets);\n    function lastTotalAssets() external returns (uint256 assets);\n}\n\ninterface ICapManager {\n    function postDepositHook(address liquidityProvider, uint256 assets) external;\n}\n\ninterface LegacyAMM {\n    function transferToken(address tokenOut, address to, uint256 amount) external;\n}\n\ninterface IOriginVault {\n    function mint(address _asset, uint256 _amount, uint256 _minimumOusdAmount) external;\n\n    function redeem(uint256 _amount, uint256 _minimumUnitAmount) external;\n\n    function requestWithdrawal(uint256 amount) external returns (uint256 requestId, uint256 queued);\n\n    function claimWithdrawal(uint256 requestId) external returns (uint256 amount);\n\n    function claimWithdrawals(uint256[] memory requestIds)\n        external\n        returns (uint256[] memory amounts, uint256 totalAmount);\n\n    function addWithdrawalQueueLiquidity() external;\n\n    function setMaxSupplyDiff(uint256 _maxSupplyDiff) external;\n\n    function governor() external view returns (address);\n\n    function dripper() external view returns (address);\n\n    function withdrawalQueueMetadata()\n        external\n        view\n        returns (uint128 queued, uint128 claimable, uint128 claimed, uint128 nextWithdrawalIndex);\n\n    function withdrawalRequests(uint256 requestId)\n        external\n        view\n        returns (address withdrawer, bool claimed, uint40 timestamp, uint128 amount, uint128 queued);\n\n    function withdrawalClaimDelay() external view returns (uint256);\n}\n\ninterface IGovernance {\n    enum ProposalState {\n        Pending,\n        Active,\n        Canceled,\n        Defeated,\n        Succeeded,\n        Queued,\n        Expired,\n        Executed\n    }\n\n    function state(uint256 proposalId) external view returns (ProposalState);\n\n    function proposalSnapshot(uint256 proposalId) external view returns (uint256);\n\n    function proposalDeadline(uint256 proposalId) external view returns (uint256);\n\n    function proposalEta(uint256 proposalId) external view returns (uint256);\n\n    function votingDelay() external view returns (uint256);\n\n    function castVote(uint256 proposalId, uint8 support) external returns (uint256 balance);\n\n    function queue(uint256 proposalId) external;\n\n    function execute(uint256 proposalId) external;\n}\n\ninterface IWETH is IERC20 {\n    event Deposit(address indexed dst, uint256 wad);\n    event Withdrawal(address indexed src, uint256 wad);\n\n    function deposit() external payable;\n    function withdraw(uint256 wad) external;\n}\n\ninterface ISTETH is IERC20 {\n    event Submitted(address indexed sender, uint256 amount, address referral);\n\n    // function() external payable;\n    function submit(address _referral) external payable returns (uint256);\n}\n\ninterface IStETHWithdrawal {\n    event WithdrawalRequested(\n        uint256 indexed requestId,\n        address indexed requestor,\n        address indexed owner,\n        uint256 amountOfStETH,\n        uint256 amountOfShares\n    );\n    event WithdrawalsFinalized(\n        uint256 indexed from, uint256 indexed to, uint256 amountOfETHLocked, uint256 sharesToBurn, uint256 timestamp\n    );\n    event WithdrawalClaimed(\n        uint256 indexed requestId, address indexed owner, address indexed receiver, uint256 amountOfETH\n    );\n\n    struct WithdrawalRequestStatus {\n        /// @notice stETH token amount that was locked on withdrawal queue for this request\n        uint256 amountOfStETH;\n        /// @notice amount of stETH shares locked on withdrawal queue for this request\n        uint256 amountOfShares;\n        /// @notice address that can claim or transfer this request\n        address owner;\n        /// @notice timestamp of when the request was created, in seconds\n        uint256 timestamp;\n        /// @notice true, if request is finalized\n        bool isFinalized;\n        /// @notice true, if request is claimed. Request is claimable if (isFinalized && !isClaimed)\n        bool isClaimed;\n    }\n\n    function transferFrom(address _from, address _to, uint256 _requestId) external;\n    function ownerOf(uint256 _requestId) external returns (address);\n    function requestWithdrawals(uint256[] calldata _amounts, address _owner)\n        external\n        returns (uint256[] memory requestIds);\n    function getLastCheckpointIndex() external view returns (uint256);\n    function findCheckpointHints(uint256[] calldata _requestIds, uint256 _firstIndex, uint256 _lastIndex)\n        external\n        view\n        returns (uint256[] memory hintIds);\n    function claimWithdrawals(uint256[] calldata _requestIds, uint256[] calldata _hints) external;\n    function getWithdrawalStatus(uint256[] calldata _requestIds)\n        external\n        view\n        returns (WithdrawalRequestStatus[] memory statuses);\n    function getWithdrawalRequests(address _owner) external view returns (uint256[] memory requestsIds);\n    function getLastRequestId() external view returns (uint256);\n}\n\ninterface IOracle {\n    function price(address asset) external view returns (uint256 price);\n}\n\ninterface IHarvestable {\n    function collectRewards() external returns (address[] memory tokens, uint256[] memory rewards);\n}\n\ninterface IMagpieRouter {\n    function swapWithMagpieSignature(bytes calldata) external payable returns (uint256 amountOut);\n}\n\nlibrary DistributionTypes {\n    struct IncentivesProgramCreationInput {\n        string name;\n        address rewardToken;\n        uint104 emissionPerSecond;\n        uint40 distributionEnd;\n    }\n}\n\nlibrary IDistributionManager {\n    struct AccruedRewards {\n        uint256 amount;\n        bytes32 programId;\n        address rewardToken;\n    }\n}\n\ninterface SiloIncentivesControllerGaugeLike {\n    function claimRewards(address _to) external returns (IDistributionManager.AccruedRewards[] memory accruedRewards);\n    function createIncentivesProgram(DistributionTypes.IncentivesProgramCreationInput memory _incentivesProgramInput)\n        external;\n    function getAllProgramsNames() external view returns (string[] memory programsNames);\n    function getRewardsBalance(address _user, string memory _programName)\n        external\n        view\n        returns (uint256 unclaimedRewards);\n    function incentivesPrograms(bytes32)\n        external\n        view\n        returns (\n            uint256 index,\n            address rewardToken,\n            uint104 emissionPerSecond,\n            uint40 lastUpdateTimestamp,\n            uint40 distributionEnd\n        );\n    function owner() external view returns (address);\n}\n\ninterface IEETHWithdrawal {\n    function requestWithdraw(address receipient, uint256 amount) external returns (uint256 requestId);\n}\n\ninterface IEETHWithdrawalNFT {\n    function finalizeRequests(uint256 requestId) external;\n    function claimWithdraw(uint256 requestId) external;\n    function batchClaimWithdraw(uint256[] calldata requestIds) external;\n}\n\ninterface IEETHRedemptionManager {\n    function redeemWeEth(uint256 amount, address receiver) external;\n    function canRedeem(uint256 amount) external view returns (bool);\n}\n\ninterface IDistributor {\n    function claim(\n        address[] calldata users,\n        address[] calldata tokens,\n        uint256[] calldata amounts,\n        bytes32[][] calldata proofs\n    ) external;\n}\n"
+    }
+  },
+  "metadata": {
+    "compiler": {
+      "version": "0.8.23+commit.f704f362"
+    },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "_wrappedCurrency",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "constructor"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "previousAdmin",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "address",
+              "name": "newAdmin",
+              "type": "address"
+            }
+          ],
+          "name": "AdminChanged",
+          "type": "event"
+        },
+        {
+          "anonymous": false,
+          "inputs": [
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "arm",
+              "type": "address"
+            },
+            {
+              "indexed": true,
+              "internalType": "address",
+              "name": "sender",
+              "type": "address"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "assets",
+              "type": "uint256"
+            },
+            {
+              "indexed": false,
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "name": "Zap",
+          "type": "event"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "arm",
+              "type": "address"
+            }
+          ],
+          "name": "deposit",
+          "outputs": [
+            {
+              "internalType": "uint256",
+              "name": "shares",
+              "type": "uint256"
+            }
+          ],
+          "stateMutability": "payable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "owner",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "token",
+              "type": "address"
+            },
+            {
+              "internalType": "uint256",
+              "name": "amount",
+              "type": "uint256"
+            }
+          ],
+          "name": "rescueERC20",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newOwner",
+              "type": "address"
+            }
+          ],
+          "name": "setOwner",
+          "outputs": [],
+          "stateMutability": "nonpayable",
+          "type": "function"
+        },
+        {
+          "inputs": [],
+          "name": "wrappedCurrency",
+          "outputs": [
+            {
+              "internalType": "contract IWETH",
+              "name": "",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "view",
+          "type": "function"
+        }
+      ],
+      "devdoc": {
+        "author": "Origin Protocol Inc",
+        "kind": "dev",
+        "methods": {
+          "deposit(address)": {
+            "params": {
+              "arm": "The address of the ARM contract to deposit to"
+            },
+            "returns": {
+              "shares": "The amount of ARM LP shares sent to the depositor"
+            }
+          },
+          "rescueERC20(address,uint256)": {
+            "params": {
+              "amount": "The amount of tokens to rescue",
+              "token": "The address of the ERC20 token"
+            }
+          },
+          "setOwner(address)": {
+            "params": {
+              "newOwner": "The address of the new owner."
+            }
+          }
+        },
+        "title": "Zapper contract for Automated Redemption Managers (ARMs) Converts native currency to wrapped currency, deposits it to an ARM and receives ARM LP shares.",
+        "version": 1
+      },
+      "userdoc": {
+        "kind": "user",
+        "methods": {
+          "deposit(address)": {
+            "notice": "Convert native currency to wrapped currency, deposit it to an ARM and receive ARM shares"
+          },
+          "owner()": {
+            "notice": "The contract owner and proxy admin."
+          },
+          "rescueERC20(address,uint256)": {
+            "notice": "Rescue ERC20 tokens"
+          },
+          "setOwner(address)": {
+            "notice": "Set the owner and proxy admin of the contract."
+          },
+          "wrappedCurrency()": {
+            "notice": "The address of the wrapped token. eg WETH or wS"
+          }
+        },
+        "version": 1
+      }
+    },
+    "settings": {
+      "compilationTarget": {
+        "src/contracts/ZapperARM.sol": "ZapperARM"
+      },
+      "evmVersion": "shanghai",
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "ipfs"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "remappings": [
+        ":@openzeppelin/contracts-upgradeable/=dependencies/@openzeppelin-contracts-upgradeable-5.0.2-5.0.2/contracts/",
+        ":@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/",
+        ":@pendle-sy/=dependencies/@pendle-sy-1.0.0-1.0.0/contracts/",
+        ":@solmate/=dependencies/solmate-6.7.0/src/",
+        ":contracts/=src/contracts/",
+        ":forge-std/=dependencies/forge-std-1.9.7/src/",
+        ":script/=script/",
+        ":test/=test/",
+        ":utils/=src/contracts/utils/",
+        "dependencies/@pendle-sy-1.0.0-1.0.0/:@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-4.9.3-4.9.3/contracts/"
+      ]
+    },
+    "sources": {
+      "src/contracts/Interfaces.sol": {
+        "keccak256": "0xac056276ddec69be50de21fa808be4a38e1213fd0bcdd6a894e2821accf3f72f",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://24d9254b516a6beccb582501b4e59b7be030df0219db204e5cfabd07bbb1a053",
+          "dweb:/ipfs/QmVb1TWQ8HGvs3PUmhedTXsHLUBMgfnSwRShnWeAKBYNCu"
+        ]
+      },
+      "src/contracts/Ownable.sol": {
+        "keccak256": "0x85510a0212935f8a79b0ea6d2d87f8f1c297e6f6915e0e4c2a07f284a4081b61",
+        "license": "MIT",
+        "urls": [
+          "bzz-raw://2692470938e2be05180ad9d5debba7ba17cbb5be795a4d901eb715762f1cc33f",
+          "dweb:/ipfs/QmTnXB5PCHLf5SRBmTJdHUvGqK5x61n3M7FxvALr64GjJi"
+        ]
+      },
+      "src/contracts/ZapperARM.sol": {
+        "keccak256": "0xbe32e7364d8c6386be9da894671e5760c5edd9b0f852d5256c51e427b8b64a14",
+        "license": "BUSL-1.1",
+        "urls": [
+          "bzz-raw://b06d188893ef78ea2f1d897c9b813d1bac9eae8bcdb6ca84ffdf70bfce5d7119",
+          "dweb:/ipfs/QmaZEnxZfnbb4M4JebwzfEYSz5X13GHNqsq4tGot8KHAKs"
+        ]
+      }
+    },
+    "version": 1
+  },
+  "compilation": {
+    "language": "Solidity",
+    "compiler": "solc",
+    "compilerVersion": "0.8.23+commit.f704f362",
+    "compilerSettings": {
+      "viaIR": false,
+      "metadata": {
+        "appendCBOR": true,
+        "bytecodeHash": "ipfs",
+        "useLiteralContent": false
+      },
+      "optimizer": {
+        "runs": 200,
+        "enabled": true
+      },
+      "evmVersion": "shanghai",
+      "remappings": [
+        "dependencies/@pendle-sy-1.0.0-1.0.0/:@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-4.9.3-4.9.3/contracts/",
+        "contracts/=src/contracts/",
+        "script/=script/",
+        "test/=test/",
+        "utils/=src/contracts/utils/",
+        "@solmate/=dependencies/solmate-6.7.0/src/",
+        "forge-std/=dependencies/forge-std-1.9.7/src/",
+        "@pendle-sy/=dependencies/@pendle-sy-1.0.0-1.0.0/contracts/",
+        "@openzeppelin/contracts/=dependencies/@openzeppelin-contracts-5.0.2-5.0.2/contracts/",
+        "@openzeppelin/contracts-upgradeable/=dependencies/@openzeppelin-contracts-upgradeable-5.0.2-5.0.2/contracts/"
+      ]
+    },
+    "name": "ZapperARM",
+    "fullyQualifiedName": "src/contracts/ZapperARM.sol:ZapperARM"
+  },
+  "proxyResolution": {
+    "isProxy": false,
+    "proxyType": null,
+    "implementations": []
+  },
+  "matchId": "19586771",
+  "creationMatch": "match",
+  "runtimeMatch": "match",
+  "verifiedAt": "2026-02-19T23:39:04Z",
+  "match": "match",
+  "chainId": "1",
+  "address": "0xE11EDbd5AE4Fa434Af7f8D7F03Da1742996e7Ab2"
+}
