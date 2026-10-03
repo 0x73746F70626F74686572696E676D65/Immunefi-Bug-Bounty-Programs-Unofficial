@@ -137,10 +137,13 @@ def archive_repo(owner, repo, ref):
         save_json(index,result);return result
 
 def github(entry):
-    url=entry['url']
+    url=entry['url'];repair_reason=None
+    if url.startswith('https://github.com/sky-ecosystem/mip21-toolkit'):
+        url=url.replace('/sky-ecosystem/mip21-toolkit','/sky-ecosystem/rwa-toolkit',1);repair_reason='The current canonical RWA Toolkit repository identifies itself as the MakerDAO MIP21 Toolkit.'
     if url=='https://github.com/has...edera-transaction-tool':
-        url='https://github.com/hashgraph/hedera-transaction-tool'
+        url='https://github.com/hashgraph/hedera-transaction-tool';repair_reason='The upstream metadata truncates the hashgraph/hedera-transaction-tool URL.'
     parts=urllib.parse.unquote(urllib.parse.urlsplit(url).path).strip('/').split('/')
+    if len(parts)>2 and parts[0]=='orgs' and parts[2]=='repositories':parts=[parts[1]]
     if len(parts)<2 or not parts[1]:
         owner=parts[0]
         if '...' in owner:raise RuntimeError('Truncated upstream GitHub URL in metadata')
@@ -150,13 +153,15 @@ def github(entry):
             repos.extend(batch)
             if len(batch)<100:break
             page+=1
-        snapshots=[];failures=[]
+        snapshots=[];failures=[];empty=[]
         save_json(OUT/'organizations'/(safe(owner)+'.json'),{'organization':owner,'listed_at':stamp(),'repositories':[{'full_name':r['full_name'],'default_branch':r['default_branch'],'size':r.get('size',0)} for r in repos]})
         for r in repos:
             if r.get('size',0)==0:continue
             try:snapshots.append(archive_repo(*r['full_name'].split('/'),r['default_branch']))
-            except Exception as e:failures.append({'repository':r['full_name'],'error':str(e)})
-        return {'status':'partial' if failures else 'fetched','kind':'github_organization','repositories':snapshots,'failures':failures}
+            except Exception as e:
+                if str(e) in ('Empty repository archive','Repository has no Git refs'):empty.append({'repository':r['full_name'],'reason':str(e)})
+                else:failures.append({'repository':r['full_name'],'error':str(e)})
+        return {'status':'partial' if failures else 'fetched','kind':'github_organization','repositories':snapshots,'empty_repositories':empty,'failures':failures}
     owner,repo=parts[:2];repo=repo.removesuffix('.git');info=repo_info(owner,repo);ref=info['default_branch'];path='';ref_fallback=None
     if len(parts)>3 and parts[2] in ('blob','tree'):
         tail=parts[3:];resolved=None
@@ -181,7 +186,7 @@ def github(entry):
     historical=None
     if not exists and path:
         try:
-            history=get_json(f'https://api.github.com/repos/{owner}/{repo}/commits?path={urllib.parse.quote(path,safe="")}&per_page=1')
+            history=get_json(f'https://api.github.com/repos/{owner}/{repo}/commits?path={urllib.parse.quote(path,safe="")}&per_page=1&sha={snapshot["commit"]}')
             if history:
                 event=history[0]
                 for candidate in [event['sha']]+[v['sha'] for v in event.get('parents',[])]:
@@ -190,7 +195,7 @@ def github(entry):
                     if any(x['path']==path or x['path'].startswith(path.rstrip('/')+'/') for x in old_files):
                         historical={'current_snapshot':snapshot['snapshot'],'recovery_commit':candidate,'reason':'The scoped path is missing at the currently advertised ref; archive the last available source from Git history.'};snapshot=old;exists=True;break
         except Exception:pass
-    return {'status':'fetched' if exists else 'missing_scoped_path','kind':'github','scope_ref_fallback':ref_fallback,'historical_scope_recovery':historical,'scope_path':path,'scope_path_present':exists,'resolved_repository_url':info['html_url'],**({'metadata_url_repair':{'original_url':entry['url'],'resolved_url':url,'reason':'The upstream metadata truncates the hashgraph/hedera-transaction-tool URL.'}} if url!=entry['url'] else {}),**snapshot}
+    return {'status':'fetched' if exists else 'missing_scoped_path','kind':'github','scope_ref_fallback':ref_fallback,'historical_scope_recovery':historical,'scope_path':path,'scope_path_present':exists,'resolved_repository_url':info['html_url'],**({'metadata_url_repair':{'original_url':entry['url'],'resolved_url':url,'reason':repair_reason}} if url!=entry['url'] else {}),**snapshot}
 
 class PreParser(__import__('html.parser',fromlist=['HTMLParser']).HTMLParser):
     def __init__(self):super().__init__();self.depth=0;self.current=None;self.items=[]
