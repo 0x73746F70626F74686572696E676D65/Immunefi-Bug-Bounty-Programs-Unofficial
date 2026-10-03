@@ -1,0 +1,900 @@
+{
+  "file_path": "modules/withdrawal-manager-cyclical/contracts/MapleWithdrawalManager.sol",
+  "creation_status": "success",
+  "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { ERC20Helper }           from \"../modules/erc20-helper/src/ERC20Helper.sol\";\nimport { IMapleProxyFactory }    from \"../modules/maple-proxy-factory/contracts/interfaces/IMapleProxyFactory.sol\";\nimport { MapleProxiedInternals } from \"../modules/maple-proxy-factory/contracts/MapleProxiedInternals.sol\";\n\nimport { IERC20Like, IGlobalsLike, IPoolLike, IPoolManagerLike } from \"./interfaces/Interfaces.sol\";\n\nimport { IMapleWithdrawalManager } from \"./interfaces/IMapleWithdrawalManager.sol\";\n\nimport { MapleWithdrawalManagerStorage } from \"./MapleWithdrawalManagerStorage.sol\";\n\n/*\n\n    ███╗   ███╗ █████╗ ██████╗ ██╗     ███████╗\n    ████╗ ████║██╔══██╗██╔══██╗██║     ██╔════╝\n    ██╔████╔██║███████║██████╔╝██║     █████╗\n    ██║╚██╔╝██║██╔══██║██╔═══╝ ██║     ██╔══╝\n    ██║ ╚═╝ ██║██║  ██║██║     ███████╗███████╗\n    ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚══════╝\n\n\n    ██╗    ██╗██╗████████╗██╗  ██╗██████╗ ██████╗  █████╗ ██╗    ██╗ █████╗ ██╗\n    ██║    ██║██║╚══██╔══╝██║  ██║██╔══██╗██╔══██╗██╔══██╗██║    ██║██╔══██╗██║\n    ██║ █╗ ██║██║   ██║   ███████║██║  ██║██████╔╝███████║██║ █╗ ██║███████║██║\n    ██║███╗██║██║   ██║   ██╔══██║██║  ██║██╔══██╗██╔══██║██║███╗██║██╔══██║██║\n    ╚███╔███╔╝██║   ██║   ██║  ██║██████╔╝██║  ██║██║  ██║╚███╔███╔╝██║  ██║███████╗\n    ╚══╝╚══╝ ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝\n\n\n    ███╗   ███╗ █████╗ ███╗   ██╗ █████╗  ██████╗ ███████╗██████╗\n    ████╗ ████║██╔══██╗████╗  ██║██╔══██╗██╔════╝ ██╔════╝██╔══██╗\n    ██╔████╔██║███████║██╔██╗ ██║███████║██║  ███╗█████╗  ██████╔╝\n    ██║╚██╔╝██║██╔══██║██║╚██╗██║██╔══██║██║   ██║██╔══╝  ██╔══██╗\n    ██║ ╚═╝ ██║██║  ██║██║ ╚████║██║  ██║╚██████╔╝███████╗██║  ██║\n    ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝\n\n    * `cycleDuration` is the time of a full withdrawal cycle.\n    *\n    * |--------|--------|\n    *     C1       C2\n    *\n    * There is a withdrawal window at the beginning of each withdrawal cycle.\n    *\n    * |===-----|===-----|\n    *  WW1      WW2\n    *\n    * Once a user locks their shares, they must wait at least one full cycle from the end of the cycle they locked their shares in.\n    * Users are only able to withdraw during a withdrawal window, which starts at the beginning of each cycle.\n    *\n    * |===-.---|===-----|===-----|\n    *      ^             ^\n    *  shares locked    earliest withdrawal time\n    *\n    * When the pool delegate changes the configuration, it will take effect only on the start of the third cycle.\n    * This way all users that have already locked their shares will not have their withdrawal time affected.\n    *\n    *     C1       C2       C3             C4\n    * |===--.--|===-----|===-----|==========----------|\n    *       ^                     ^\n    * configuration change     new configuration kicks in\n    *\n    * Users that request a withdrawal during C1 will withdraw during WW3 using the old configuration.\n    * Users that lock their shares during and after C2 will withdraw in windows that use the new configuration.\n\n*/\n\ncontract MapleWithdrawalManager is IMapleWithdrawalManager, MapleWithdrawalManagerStorage, MapleProxiedInternals {\n\n    // NOTE: The following functions already check for paused state in the pool, therefore no need to check here.\n    // * addShares\n    // * removeShares\n    // * processExit\n    modifier whenProtocolNotPaused() {\n        require(!IGlobalsLike(globals()).protocolPaused(), \"WM:PROTOCOL_PAUSED\");\n        _;\n    }\n\n    modifier onlyPoolDelegateOrProtocolAdmins {\n        address globals_ = globals();\n\n        require(\n            msg.sender == IPoolManagerLike(poolManager).poolDelegate() ||\n            msg.sender == IGlobalsLike(globals_).governor() ||\n            msg.sender == IGlobalsLike(globals_).operationalAdmin(),\n            \"WM:NOT_PD_OR_GOV_OR_OA\"\n        );\n\n        _;\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Proxy Functions                                                                                                                ***/\n    /**************************************************************************************************************************************/\n\n    function migrate(address migrator_, bytes calldata arguments_) external override {\n        require(msg.sender == _factory(),        \"WM:M:NOT_FACTORY\");\n        require(_migrate(migrator_, arguments_), \"WM:M:FAILED\");\n    }\n\n    function setImplementation(address implementation_) external override {\n        require(msg.sender == _factory(), \"WM:SI:NOT_FACTORY\");\n        _setImplementation(implementation_);\n    }\n\n    function upgrade(uint256 version_, bytes calldata arguments_) external override {\n        address poolDelegate_ = poolDelegate();\n\n        IGlobalsLike mapleGlobals_ = IGlobalsLike(globals());\n\n        require(msg.sender == poolDelegate_ || msg.sender == mapleGlobals_.securityAdmin(), \"WM:U:NOT_AUTHORIZED\");\n\n        if (msg.sender == poolDelegate_) {\n            require(mapleGlobals_.isValidScheduledCall(msg.sender, address(this), \"WM:UPGRADE\", msg.data), \"WM:U:INVALID_SCHED_CALL\");\n\n            mapleGlobals_.unscheduleCall(msg.sender, \"WM:UPGRADE\", msg.data);\n        }\n\n        IMapleProxyFactory(_factory()).upgradeInstance(version_, arguments_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Administrative Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    function setExitConfig(\n        uint256 cycleDuration_,\n        uint256 windowDuration_\n    )\n        external override whenProtocolNotPaused onlyPoolDelegateOrProtocolAdmins\n    {\n        require(windowDuration_ != 0,              \"WM:SEC:ZERO_WINDOW\");\n        require(windowDuration_ <= cycleDuration_, \"WM:SEC:WINDOW_OOB\");\n\n        // The new config will take effect only after the current cycle and two additional ones elapse.\n        // This is done in order to to prevent overlaps between the current and new withdrawal cycles.\n        uint256 currentCycleId_   = getCurrentCycleId();\n        uint256 initialCycleId_   = currentCycleId_ + 3;\n        uint256 initialCycleTime_ = getWindowStart(currentCycleId_);\n        uint256 latestConfigId_   = latestConfigId;\n\n        // This isn't the most optimal way to do this, since the internal function `getConfigAt` iterates through configs.\n        // But this function should only be called by the pool delegate and not often, and, at most, we need to iterate through 3 cycles.\n        for (uint256 i = currentCycleId_; i < initialCycleId_; i++) {\n            CycleConfig memory config = getConfigAtId(i);\n\n            initialCycleTime_ += config.cycleDuration;\n        }\n\n        // If the new config takes effect on the same cycle as the latest config, overwrite it. Otherwise create a new config.\n        if (initialCycleId_ != cycleConfigs[latestConfigId_].initialCycleId) {\n            latestConfigId_ = ++latestConfigId;\n        }\n\n        cycleConfigs[latestConfigId_] = CycleConfig({\n            initialCycleId:   _uint64(initialCycleId_),\n            initialCycleTime: _uint64(initialCycleTime_),\n            cycleDuration:    _uint64(cycleDuration_),\n            windowDuration:   _uint64(windowDuration_)\n        });\n\n        emit ConfigurationUpdated({\n            configId_:         latestConfigId_,\n            initialCycleId_:   _uint64(initialCycleId_),\n            initialCycleTime_: _uint64(initialCycleTime_),\n            cycleDuration_:    _uint64(cycleDuration_),\n            windowDuration_:   _uint64(windowDuration_)\n        });\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Exit Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    function addShares(uint256 shares_, address owner_) external override {\n        require(msg.sender == poolManager, \"WM:AS:NOT_POOL_MANAGER\");\n\n        uint256 exitCycleId_  = exitCycleId[owner_];\n        uint256 lockedShares_ = lockedShares[owner_];\n\n        require(lockedShares_ == 0 || block.timestamp >= getWindowStart(exitCycleId_), \"WM:AS:WITHDRAWAL_PENDING\");\n\n        // Remove all existing shares from the current cycle.\n        totalCycleShares[exitCycleId_] -= lockedShares_;\n\n        lockedShares_ += shares_;\n\n        require(lockedShares_ != 0, \"WM:AS:NO_OP\");\n\n        // Move all shares (including any new ones) to the new cycle.\n        exitCycleId_ = getCurrentCycleId() + 2;\n        totalCycleShares[exitCycleId_] += lockedShares_;\n\n        exitCycleId[owner_]  = exitCycleId_;\n        lockedShares[owner_] = lockedShares_;\n\n        require(ERC20Helper.transferFrom(pool, msg.sender, address(this), shares_), \"WM:AS:TRANSFER_FROM_FAIL\");\n\n        _emitUpdate(owner_, lockedShares_, exitCycleId_);\n    }\n\n    function removeShares(uint256 shares_, address owner_) external override returns (uint256 sharesReturned_) {\n        require(msg.sender == poolManager, \"WM:RS:NOT_POOL_MANAGER\");\n\n        uint256 exitCycleId_  = exitCycleId[owner_];\n        uint256 lockedShares_ = lockedShares[owner_];\n\n        require(block.timestamp >= getWindowStart(exitCycleId_), \"WM:RS:WITHDRAWAL_PENDING\");\n        require(shares_ != 0 && shares_ <= lockedShares_,        \"WM:RS:SHARES_OOB\");\n\n        // Remove shares from old the cycle.\n        totalCycleShares[exitCycleId_] -= lockedShares_;\n\n        // Calculate remaining shares and new cycle (if applicable).\n        lockedShares_ -= shares_;\n        exitCycleId_   = lockedShares_ != 0 ? getCurrentCycleId() + 2 : 0;\n\n        // Add shares to new cycle (if applicable).\n        if (lockedShares_ != 0) {\n            totalCycleShares[exitCycleId_] += lockedShares_;\n        }\n\n        // Update the withdrawal request.\n        exitCycleId[owner_]  = exitCycleId_;\n        lockedShares[owner_] = lockedShares_;\n\n        sharesReturned_ = shares_;\n\n        require(ERC20Helper.transfer(pool, owner_, shares_), \"WM:RS:TRANSFER_FAIL\");\n\n        _emitUpdate(owner_, lockedShares_, exitCycleId_);\n    }\n\n    function processExit(uint256 requestedShares_, address owner_)\n        external override returns (uint256 redeemableShares_, uint256 resultingAssets_)\n    {\n        require(msg.sender == poolManager, \"WM:PE:NOT_PM\");\n\n        uint256 exitCycleId_  = exitCycleId[owner_];\n        uint256 lockedShares_ = lockedShares[owner_];\n\n        require(lockedShares_ != 0, \"WM:PE:NO_REQUEST\");\n\n        require(requestedShares_ == lockedShares_, \"WM:PE:INVALID_SHARES\");\n\n        bool partialLiquidity_;\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(exitCycleId_);\n\n        require(block.timestamp >= windowStart_ && block.timestamp <  windowEnd_, \"WM:PE:NOT_IN_WINDOW\");\n\n        ( redeemableShares_, resultingAssets_, partialLiquidity_ ) = getRedeemableAmounts(lockedShares_, owner_);\n\n        // Transfer redeemable shares to be burned in the pool, re-lock remaining shares.\n        require(ERC20Helper.transfer(pool, owner_, redeemableShares_), \"WM:PE:TRANSFER_FAIL\");\n\n        // Reduce totalCurrentShares by the shares that were used in the old cycle.\n        totalCycleShares[exitCycleId_] -= lockedShares_;\n\n        // Reduce the locked shares by the total amount transferred back to the LP.\n        lockedShares_ -= redeemableShares_;\n\n        // If there are any remaining shares, move them to the next cycle.\n        // In case of partial liquidity move shares only one cycle forward (instead of two).\n        if (lockedShares_ != 0) {\n            exitCycleId_ = getCurrentCycleId() + (partialLiquidity_ ? 1 : 2);\n            totalCycleShares[exitCycleId_] += lockedShares_;\n        } else {\n            exitCycleId_ = 0;\n        }\n\n        // Update the locked shares and cycle for the account, setting to zero if no shares are remaining.\n        lockedShares[owner_] = lockedShares_;\n        exitCycleId[owner_]  = exitCycleId_;\n\n        _emitProcess(owner_, redeemableShares_, resultingAssets_);\n        _emitUpdate(owner_, lockedShares_, exitCycleId_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** External View Utility Functions                                                                                                ***/\n    /**************************************************************************************************************************************/\n\n    function isInExitWindow(address owner_) external view override returns (bool isInExitWindow_) {\n        uint256 exitCycleId_ = exitCycleId[owner_];\n\n        if (exitCycleId_ == 0) return false; // No withdrawal request\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(exitCycleId_);\n\n        isInExitWindow_ = block.timestamp >= windowStart_ && block.timestamp <  windowEnd_;\n    }\n\n    function lockedLiquidity() external view override returns (uint256 lockedLiquidity_) {\n        uint256 currentCycleId_ = getCurrentCycleId();\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(currentCycleId_);\n\n        if (block.timestamp >= windowStart_ && block.timestamp < windowEnd_) {\n            IPoolManagerLike poolManager_ = IPoolManagerLike(poolManager);\n\n            uint256 totalAssetsWithLosses_ = poolManager_.totalAssets() - poolManager_.unrealizedLosses();\n            uint256 totalSupply_           = IPoolLike(pool).totalSupply();\n\n            lockedLiquidity_ = totalCycleShares[currentCycleId_] * totalAssetsWithLosses_ / totalSupply_;\n        }\n    }\n\n    function previewRedeem(address owner_, uint256 shares_)\n        external view override returns (uint256 redeemableShares_, uint256 resultingAssets_)\n    {\n        uint256 lockedShares_ = lockedShares[owner_];\n\n        if (shares_ != lockedShares_ || shares_ == 0) {\n            return ( redeemableShares_, resultingAssets_ );\n        }\n\n        uint256 exitCycleId_  = exitCycleId[owner_];\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(exitCycleId_);\n\n        if (block.timestamp < windowStart_ || block.timestamp >=  windowEnd_) {\n            return ( redeemableShares_, resultingAssets_ );\n        }\n\n        ( redeemableShares_, resultingAssets_, ) = getRedeemableAmounts(lockedShares_, owner_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Public View Utility Functions                                                                                                  ***/\n    /**************************************************************************************************************************************/\n\n    function getConfigAtId(uint256 cycleId_) public view override returns (CycleConfig memory config_) {\n        uint256 configId_ = latestConfigId;\n\n        if (configId_ == 0) return cycleConfigs[configId_];\n\n        while (cycleId_ < cycleConfigs[configId_].initialCycleId) {\n            --configId_;\n        }\n\n        config_ = cycleConfigs[configId_];\n    }\n\n    function getCurrentConfig() public view override returns (CycleConfig memory config_) {\n        uint256 configId_ = latestConfigId;\n\n        while (configId_ != 0 && block.timestamp < cycleConfigs[configId_].initialCycleTime) {\n            --configId_;\n        }\n\n        config_ = cycleConfigs[configId_];\n    }\n\n    // NOTE: If the first cycle has not been reached yet it will still be returned as the current one.\n    function getCurrentCycleId() public view override returns (uint256 cycleId_) {\n        CycleConfig memory config_ = getCurrentConfig();\n\n        cycleId_ = config_.initialCycleId;\n\n        if (block.timestamp > config_.initialCycleTime) {\n            cycleId_ += (block.timestamp - config_.initialCycleTime) / config_.cycleDuration;\n        }\n    }\n\n    function getRedeemableAmounts(uint256 lockedShares_, address owner_)\n        public view override returns (uint256 redeemableShares_, uint256 resultingAssets_, bool partialLiquidity_)\n    {\n        IPoolManagerLike poolManager_ = IPoolManagerLike(poolManager);\n\n        // Calculate how much liquidity is available, and how much is required to allow redemption of shares.\n        uint256 availableLiquidity_      = IERC20Like(asset()).balanceOf(pool);\n        uint256 totalAssetsWithLosses_   = poolManager_.totalAssets() - poolManager_.unrealizedLosses();\n        uint256 totalSupply_             = IPoolLike(pool).totalSupply();\n        uint256 totalRequestedLiquidity_ = totalCycleShares[exitCycleId[owner_]] * totalAssetsWithLosses_ / totalSupply_;\n\n        partialLiquidity_ = availableLiquidity_ < totalRequestedLiquidity_;\n\n        // Calculate maximum redeemable shares while maintaining a pro-rata distribution.\n        redeemableShares_ =\n            partialLiquidity_\n                ? lockedShares_ * availableLiquidity_ / totalRequestedLiquidity_\n                : lockedShares_;\n\n        resultingAssets_ = redeemableShares_ * totalAssetsWithLosses_ / totalSupply_;\n    }\n\n    function getWindowStart(uint256 cycleId_) public view override returns (uint256 windowStart_) {\n        CycleConfig memory config_ = getConfigAtId(cycleId_);\n\n        windowStart_ = config_.initialCycleTime + (cycleId_ - config_.initialCycleId) * config_.cycleDuration;\n    }\n\n    function getWindowAtId(uint256 cycleId_) public view override returns (uint256 windowStart_, uint256 windowEnd_) {\n        CycleConfig memory config_ = getConfigAtId(cycleId_);\n\n        windowStart_ = config_.initialCycleTime + (cycleId_ - config_.initialCycleId) * config_.cycleDuration;\n        windowEnd_   = windowStart_ + config_.windowDuration;\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Address View Functions                                                                                                         ***/\n    /**************************************************************************************************************************************/\n\n    function asset() public view override returns (address asset_) {\n        asset_ = IPoolLike(pool).asset();\n    }\n\n    function factory() external view override returns (address factory_) {\n        factory_ = _factory();\n    }\n\n    function globals() public view override returns (address globals_) {\n        globals_ = IMapleProxyFactory(_factory()).mapleGlobals();\n    }\n\n    function governor() public view override returns (address governor_) {\n        governor_ = IGlobalsLike(globals()).governor();\n    }\n\n    function implementation() external view override returns (address implementation_) {\n        implementation_ = _implementation();\n    }\n\n    function poolDelegate() public view override returns (address poolDelegate_) {\n        poolDelegate_ = IPoolManagerLike(poolManager).poolDelegate();\n    }\n\n    function previewWithdraw(address owner_, uint256 assets_)\n        external pure override returns (uint256 redeemableAssets_, uint256 resultingShares_)\n    {\n        owner_; assets_; redeemableAssets_; resultingShares_;  // Silence compiler warnings\n        return ( redeemableAssets_, resultingShares_ );  // NOTE: Withdrawal not implemented use redeem instead\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Helper Functions                                                                                                               ***/\n    /**************************************************************************************************************************************/\n\n    function _emitProcess(address account_, uint256 sharesToRedeem_, uint256 assetsToWithdraw_) internal {\n        if (sharesToRedeem_ == 0) {\n            return;\n        }\n\n        emit WithdrawalProcessed(account_, sharesToRedeem_, assetsToWithdraw_);\n    }\n\n    function _emitUpdate(address account_, uint256 lockedShares_, uint256 exitCycleId_) internal {\n        if (lockedShares_ == 0) {\n            emit WithdrawalCancelled(account_);\n            return;\n        }\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(exitCycleId_);\n\n        emit WithdrawalUpdated(account_, lockedShares_, _uint64(windowStart_), _uint64(windowEnd_));\n    }\n\n    function _uint64(uint256 input_) internal pure returns (uint64 output_) {\n        require(input_ <= type(uint64).max, \"WM:UINT64_CAST_OOB\");\n        output_ = uint64(input_);\n    }\n\n}\n",
+  "deployed_bytecode": "0x608060405234801561001057600080fd5b50600436106101da5760003560e01c8063a1cfc18711610104578063cbe52ae3116100a2578063dc4c90d311610071578063dc4c90d314610491578063e336ac44146104a4578063e46ceaa3146104c4578063fb940bd7146104e457600080fd5b8063cbe52ae314610445578063d326b23c14610458578063d64cda871461046b578063d784d4261461047e57600080fd5b8063c3124525116100de578063c3124525146103f2578063c3fbb6fd146103fa578063c45a01551461040d578063c5a160d11461041557600080fd5b8063a1cfc187146103b4578063b4398244146103d7578063bbc6f1dc146103df57600080fd5b80634308aec11161017c5780637a4b17891161014b5780637a4b17891461037357806385e23b32146103865780638a07bcb31461038e5780639ee43bb6146103a157600080fd5b80634308aec11461027d578063438d09c6146102c85780635c60da1b146102f0578063768bd709146102f857600080fd5b806338d52e0f116101b857806338d52e0f146102385780633b4538b8146102405780633b99bcee146102605780634046af2b1461027557600080fd5b80630c340a24146101df57806316f0115b146102045780631b8f183014610217575b600080fd5b6101e76104ed565b6040516001600160a01b0390911681526020015b60405180910390f35b6000546101e7906001600160a01b031681565b61022a6102253660046123d6565b61056c565b6040519081526020016101fb565b6101e761079b565b61022a61024e3660046123a4565b60056020526000908152604090205481565b61027361026e366004612406565b6107ea565b005b6101e7610a90565b610285610ad5565b6040516101fb919081516001600160401b039081168252602080840151821690830152604080840151821690830152606092830151169181019190915260800190565b6102db6102d63660046123a4565b610b9a565b604080519283526020830191909152016101fb565b6101e7610c16565b6103406103063660046123a4565b6006602052600090815260409020546001600160401b0380821691600160401b8104821691600160801b8204811691600160c01b90041684565b604080516001600160401b03958616815293851660208501529184169183019190915290911660608201526080016101fb565b6102856103813660046123a4565b610c20565b61022a610d35565b61027361039c366004612438565b610da9565b6102db6103af3660046123d6565b611304565b6103c76103c23660046122c8565b6115a4565b60405190151581526020016101fb565b61022a6115f3565b6102db6103ed366004612356565b6117df565b6101e76117ea565b610273610408366004612302565b61182c565b6101e76118d1565b6104286104233660046123d6565b6118db565b6040805193845260208401929092521515908201526060016101fb565b6102db610453366004612356565b611b79565b6102736104663660046123d6565b611c0a565b61022a6104793660046123a4565b611e1f565b61027361048c3660046122c8565b611e7d565b6001546101e7906001600160a01b031681565b61022a6104b23660046122c8565b60046020526000908152604090205481565b61022a6104d23660046122c8565b60036020526000908152604090205481565b61022a60025481565b60006104f76117ea565b6001600160a01b0316630c340a246040518163ffffffff1660e01b815260040160206040518083038186803b15801561052f57600080fd5b505afa158015610543573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061056791906122e5565b905090565b6001546000906001600160a01b031633146105c75760405162461bcd60e51b81526020600482015260166024820152752ba69d29299d2727aa2fa827a7a62fa6a0a720a3a2a960511b60448201526064015b60405180910390fd5b6001600160a01b0382166000908152600360209081526040808320546004909252909120546105f582611e1f565b4210156106445760405162461bcd60e51b815260206004820152601860248201527f574d3a52533a5749544844524157414c5f50454e44494e47000000000000000060448201526064016105be565b84158015906106535750808511155b6106925760405162461bcd60e51b815260206004820152601060248201526f2ba69d29299d29a420a922a9afa7a7a160811b60448201526064016105be565b600082815260056020526040812080548392906106b09084906125c3565b909155506106c0905085826125c3565b9050806106ce5760006106e1565b6106d6610d35565b6106e190600261256a565b9150801561070d576000828152600560205260408120805483929061070790849061256a565b90915550505b6001600160a01b038085166000908152600360209081526040808320869055600490915281208390555486945061074691168585611f06565b6107885760405162461bcd60e51b815260206004820152601360248201527215d34e9494ce9514905394d1915497d1905253606a1b60448201526064016105be565b610793848284611f74565b505092915050565b60008060009054906101000a90046001600160a01b03166001600160a01b03166338d52e0f6040518163ffffffff1660e01b815260040160206040518083038186803b15801561052f57600080fd5b60006107f4610a90565b905060006108006117ea565b9050336001600160a01b038316148061089a5750806001600160a01b031663be7c13f76040518163ffffffff1660e01b815260040160206040518083038186803b15801561084d57600080fd5b505afa158015610861573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061088591906122e5565b6001600160a01b0316336001600160a01b0316145b6108dc5760405162461bcd60e51b815260206004820152601360248201527215d34e954e9393d517d055551213d492569151606a1b60448201526064016105be565b336001600160a01b0383161415610a205760405163fd4c5b3760e01b81526001600160a01b0382169063fd4c5b3790610920903390309060009036906004016124ce565b60206040518083038186803b15801561093857600080fd5b505afa15801561094c573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906109709190612382565b6109bc5760405162461bcd60e51b815260206004820152601760248201527f574d3a553a494e56414c49445f53434845445f43414c4c00000000000000000060448201526064016105be565b604051635ad5b6f760e11b81526001600160a01b0382169063b5ab6dee906109ed9033906000903690600401612518565b600060405180830381600087803b158015610a0757600080fd5b505af1158015610a1b573d6000803e3d6000fd5b505050505b610a2861202f565b6001600160a01b031663fe69f7088686866040518463ffffffff1660e01b8152600401610a5793929190612550565b600060405180830381600087803b158015610a7157600080fd5b505af1158015610a85573d6000803e3d6000fd5b505050505050505050565b60015460408051634046af2b60e01b815290516000926001600160a01b031691634046af2b916004808301926020929190829003018186803b15801561052f57600080fd5b6040805160808101825260008082526020820181905291810182905260608101919091526002545b8015801590610b295750600081815260066020526040902054600160401b90046001600160401b031642105b15610b3e57610b37816125da565b9050610afd565b600090815260066020908152604091829020825160808101845290546001600160401b038082168352600160401b8204811693830193909352600160801b8104831693820193909352600160c01b909204166060820152919050565b6000806000610ba884610c20565b905080604001516001600160401b031681600001516001600160401b031685610bd191906125c3565b610bdb91906125a4565b81602001516001600160401b0316610bf3919061256a565b925080606001516001600160401b031683610c0e919061256a565b915050915091565b600061056761205e565b60408051608081018252600080825260208201819052918101829052606081019190915260025480610ca957600090815260066020908152604091829020825160808101845290546001600160401b038082168352600160401b8204811693830193909352600160801b8104831693820193909352600160c01b90920416606082015292915050565b6000818152600660205260409020546001600160401b0316831015610cd857610cd1816125da565b9050610ca9565b600090815260066020908152604091829020825160808101845290546001600160401b038082168352600160401b8204811693830193909352600160801b8104831693820193909352600160c01b90920416606082015292915050565b600080610d40610ad5565b905080600001516001600160401b0316915080602001516001600160401b0316421115610da55780604001516001600160401b031681602001516001600160401b031642610d8e91906125c3565b610d989190612582565b610da2908361256a565b91505b5090565b610db16117ea565b6001600160a01b031663425fad586040518163ffffffff1660e01b815260040160206040518083038186803b158015610de957600080fd5b505afa158015610dfd573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190610e219190612382565b15610e635760405162461bcd60e51b815260206004820152601260248201527115d34e941493d513d0d3d317d4105554d15160721b60448201526064016105be565b6000610e6d6117ea565b9050600160009054906101000a90046001600160a01b03166001600160a01b0316634046af2b6040518163ffffffff1660e01b815260040160206040518083038186803b158015610ebd57600080fd5b505afa158015610ed1573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190610ef591906122e5565b6001600160a01b0316336001600160a01b03161480610f955750806001600160a01b0316630c340a246040518163ffffffff1660e01b815260040160206040518083038186803b158015610f4857600080fd5b505afa158015610f5c573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190610f8091906122e5565b6001600160a01b0316336001600160a01b0316145b806110215750806001600160a01b0316630b52d12d6040518163ffffffff1660e01b815260040160206040518083038186803b158015610fd457600080fd5b505afa158015610fe8573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061100c91906122e5565b6001600160a01b0316336001600160a01b0316145b6110665760405162461bcd60e51b8152602060048201526016602482015275574d3a4e4f545f50445f4f525f474f565f4f525f4f4160501b60448201526064016105be565b816110a85760405162461bcd60e51b8152602060048201526012602482015271574d3a5345433a5a45524f5f57494e444f5760701b60448201526064016105be565b828211156110ec5760405162461bcd60e51b81526020600482015260116024820152702ba69d29a2a19d2ba4a72227abafa7a7a160791b60448201526064016105be565b60006110f6610d35565b9050600061110582600361256a565b9050600061111283611e1f565b600254909150835b8381101561115e57600061112d82610c20565b905080604001516001600160401b031684611148919061256a565b9350508080611156906125f1565b91505061111a565b506000818152600660205260409020546001600160401b031683146111945760026000815461118c906125f1565b918290555090505b60405180608001604052806111a885612088565b6001600160401b031681526020016111bf84612088565b6001600160401b031681526020016111d689612088565b6001600160401b031681526020016111ed88612088565b6001600160401b039081169091526000838152600660209081526040918290208451815492860151938601516060909601518516600160c01b026001600160c01b03968616600160801b02969096166fffffffffffffffffffffffffffffffff948616600160401b026fffffffffffffffffffffffffffffffff199094169190951617919091179190911691909117919091179055807fcf7af67c3593720469bbffad8e28bb40b2be1a25656541dcc03fabb648f8cf596112ad85612088565b6112b685612088565b6112bf8b612088565b6112c88b612088565b604080516001600160401b039586168152938516602085015291841683830152909216606082015290519081900360800190a250505050505050565b60015460009081906001600160a01b031633146113525760405162461bcd60e51b815260206004820152600c60248201526b574d3a50453a4e4f545f504d60a01b60448201526064016105be565b6001600160a01b038316600090815260036020908152604080832054600490925290912054806113b75760405162461bcd60e51b815260206004820152601060248201526f15d34e94114e9393d7d49154555154d560821b60448201526064016105be565b8086146113fd5760405162461bcd60e51b8152602060048201526014602482015273574d3a50453a494e56414c49445f53484152455360601b60448201526064016105be565b600080600061140b85610b9a565b9150915081421015801561141e57508042105b6114605760405162461bcd60e51b8152602060048201526013602482015272574d3a50453a4e4f545f494e5f57494e444f5760681b60448201526064016105be565b61146a84896118db565b6000549299509097509350611489906001600160a01b03168989611f06565b6114cb5760405162461bcd60e51b815260206004820152601360248201527215d34e94114e9514905394d1915497d1905253606a1b60448201526064016105be565b600085815260056020526040812080548692906114e99084906125c3565b909155506114f9905087856125c3565b93508315611555578261150d576002611510565b60015b60ff1661151b610d35565b611525919061256a565b94508360056000878152602001908152602001600020600082825461154a919061256a565b9091555061155a9050565b600094505b6001600160a01b03881660009081526004602090815260408083208790556003909152902085905561158d8888886120d6565b611598888587611f74565b50505050509250929050565b6001600160a01b038116600090815260036020526040812054806115cb5750600092915050565b6000806115d783610b9a565b915091508142101580156115ea57508042105b95945050505050565b6000806115fe610d35565b905060008061160c83610b9a565b9150915081421015801561161f57508042105b156117d957600154604080516367e2ba2360e01b815290516001600160a01b039092169160009183916367e2ba2391600480820192602092909190829003018186803b15801561166e57600080fd5b505afa158015611682573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906116a691906123bd565b826001600160a01b03166301e1d1146040518163ffffffff1660e01b815260040160206040518083038186803b1580156116df57600080fd5b505afa1580156116f3573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061171791906123bd565b61172191906125c3565b905060008060009054906101000a90046001600160a01b03166001600160a01b03166318160ddd6040518163ffffffff1660e01b815260040160206040518083038186803b15801561177257600080fd5b505afa158015611786573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906117aa91906123bd565b60008781526005602052604090205490915081906117c99084906125a4565b6117d39190612582565b96505050505b50505090565b6000805b9250929050565b60006117f461202f565b6001600160a01b0316633a60339a6040518163ffffffff1660e01b815260040160206040518083038186803b15801561052f57600080fd5b61183461202f565b6001600160a01b0316336001600160a01b0316146118875760405162461bcd60e51b815260206004820152601060248201526f574d3a4d3a4e4f545f464143544f525960801b60448201526064016105be565b611892838383612129565b6118cc5760405162461bcd60e51b815260206004820152600b60248201526a15d34e934e91905253115160aa1b60448201526064016105be565b505050565b600061056761202f565b600154600090819081906001600160a01b0316816118f761079b565b6000546040516370a0823160e01b81526001600160a01b0391821660048201529116906370a082319060240160206040518083038186803b15801561193b57600080fd5b505afa15801561194f573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061197391906123bd565b90506000826001600160a01b03166367e2ba236040518163ffffffff1660e01b815260040160206040518083038186803b1580156119b057600080fd5b505afa1580156119c4573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906119e891906123bd565b836001600160a01b03166301e1d1146040518163ffffffff1660e01b815260040160206040518083038186803b158015611a2157600080fd5b505afa158015611a35573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190611a5991906123bd565b611a6391906125c3565b905060008060009054906101000a90046001600160a01b03166001600160a01b03166318160ddd6040518163ffffffff1660e01b815260040160206040518083038186803b158015611ab457600080fd5b505afa158015611ac8573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190611aec91906123bd565b6001600160a01b03891660009081526003602090815260408083205483526005909152812054919250908290611b239085906125a4565b611b2d9190612582565b9050808410955085611b3f5789611b54565b80611b4a858c6125a4565b611b549190612582565b975081611b61848a6125a4565b611b6b9190612582565b965050505050509250925092565b6001600160a01b03821660009081526004602052604081205481908381141580611ba1575083155b15611bac57506117e3565b6001600160a01b0385166000908152600360205260408120549080611bd083610b9a565b9150915081421080611be25750804210155b15611bf057505050506117e3565b611bfa84896118db565b5090999098509650505050505050565b6001546001600160a01b03163314611c5d5760405162461bcd60e51b81526020600482015260166024820152752ba69d20a99d2727aa2fa827a7a62fa6a0a720a3a2a960511b60448201526064016105be565b6001600160a01b038116600090815260036020908152604080832054600490925290912054801580611c975750611c9382611e1f565b4210155b611ce35760405162461bcd60e51b815260206004820152601860248201527f574d3a41533a5749544844524157414c5f50454e44494e47000000000000000060448201526064016105be565b60008281526005602052604081208054839290611d019084906125c3565b90915550611d119050848261256a565b905080611d4e5760405162461bcd60e51b815260206004820152600b60248201526a0574d3a41533a4e4f5f4f560ac1b60448201526064016105be565b611d56610d35565b611d6190600261256a565b915080600560008481526020019081526020016000206000828254611d86919061256a565b90915550506001600160a01b0380841660009081526003602090815260408083208690556004909152812083905554611dc291163330876121a2565b611e0e5760405162461bcd60e51b815260206004820152601860248201527f574d3a41533a5452414e534645525f46524f4d5f4641494c000000000000000060448201526064016105be565b611e19838284611f74565b50505050565b600080611e2b83610c20565b905080604001516001600160401b031681600001516001600160401b031684611e5491906125c3565b611e5e91906125a4565b81602001516001600160401b0316611e76919061256a565b9392505050565b611e8561202f565b6001600160a01b0316336001600160a01b031614611ed95760405162461bcd60e51b8152602060048201526011602482015270574d3a53493a4e4f545f464143544f525960781b60448201526064016105be565b6001600160a01b03167f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc55565b6040516001600160a01b038316602482015260448101829052600090611f6c90859063a9059cbb60e01b906064015b60408051601f198184030181529190526020810180516001600160e01b03166001600160e01b0319909316929092179091526121dd565b949350505050565b81611fb2576040516001600160a01b038416907fc51fdb96728de385ec7859819e3997bc618362ef0dbca0ad051d856866cda3db90600090a2505050565b600080611fbe83610b9a565b91509150846001600160a01b03167fce481d825723af453e5687cafcc106004414ad24bcde1ed54f3a8db0e895e12d85611ff785612088565b61200085612088565b604080519384526001600160401b03928316602085015291169082015260600160405180910390a25050505050565b60006120597f7a45a402e4cb6e08ebc196f20f66d5d30e67285a2a8aa80503fa409e727a4af15490565b919050565b60006120597f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5490565b60006001600160401b03821115610da55760405162461bcd60e51b81526020600482015260126024820152712ba69d2aa4a72a1b1a2fa1a0a9aa2fa7a7a160711b60448201526064016105be565b816120e057505050565b60408051838152602081018390526001600160a01b038516917fddfdc995965c1fea3bbd2158d885347ad5c250f422d97342c6a3fa680600cf68910160405180910390a2505050565b6000833b8061213c576000915050611e76565b846001600160a01b03168484604051612156929190612483565b600060405180830381855af49150503d8060008114612191576040519150601f19603f3d011682016040523d82523d6000602084013e612196565b606091505b50909695505050505050565b6040516001600160a01b03808516602483015283166044820152606481018290526000906115ea9086906323b872dd60e01b90608401611f35565b60006001600160a01b0383163b6121f657506000612281565b6060836001600160a01b0316836040516122109190612493565b6000604051808303816000865af19150503d806000811461224d576040519150601f19603f3d011682016040523d82523d6000602084013e612252565b606091505b50909250905081801561227d57508051158061227d57508080602001905181019061227d9190612382565b9150505b92915050565b60008083601f84011261229957600080fd5b5081356001600160401b038111156122b057600080fd5b6020830191508360208285010111156117e357600080fd5b6000602082840312156122da57600080fd5b8135611e7681612622565b6000602082840312156122f757600080fd5b8151611e7681612622565b60008060006040848603121561231757600080fd5b833561232281612622565b925060208401356001600160401b0381111561233d57600080fd5b61234986828701612287565b9497909650939450505050565b6000806040838503121561236957600080fd5b823561237481612622565b946020939093013593505050565b60006020828403121561239457600080fd5b81518015158114611e7657600080fd5b6000602082840312156123b657600080fd5b5035919050565b6000602082840312156123cf57600080fd5b5051919050565b600080604083850312156123e957600080fd5b8235915060208301356123fb81612622565b809150509250929050565b60008060006040848603121561241b57600080fd5b8335925060208401356001600160401b0381111561233d57600080fd5b6000806040838503121561244b57600080fd5b50508035926020909101359150565b81835281816020850137506000828201602090810191909152601f909101601f19169091010190565b8183823760009101908152919050565b6000825160005b818110156124b4576020818601810151858301520161249a565b818111156124c3576000828501525b509190910192915050565b6001600160a01b0385811682528416602082015269574d3a5550475241444560b01b604082015260806060820181905260009061250e908301848661245a565b9695505050505050565b6001600160a01b038416815269574d3a5550475241444560b01b60208201526060604082018190526000906115ea908301848661245a565b8381526040602082015260006115ea60408301848661245a565b6000821982111561257d5761257d61260c565b500190565b60008261259f57634e487b7160e01b600052601260045260246000fd5b500490565b60008160001904831182151516156125be576125be61260c565b500290565b6000828210156125d5576125d561260c565b500390565b6000816125e9576125e961260c565b506000190190565b60006000198214156126055761260561260c565b5060010190565b634e487b7160e01b600052601160045260246000fd5b6001600160a01b038116811461263757600080fd5b5056fea26469706673582212208da03b9879110fcc3cef68bfc6964502583f8a85473b7b78ba0efe89f3ca421a64736f6c63430008070033",
+  "optimization_enabled": true,
+  "verified_twin_address_hash": null,
+  "is_verified": true,
+  "compiler_settings": {
+    "evmVersion": "london",
+    "libraries": {},
+    "metadata": {
+      "bytecodeHash": "ipfs"
+    },
+    "optimizer": {
+      "enabled": true,
+      "runs": 200
+    },
+    "remappings": [
+      ":address-registry/=modules/address-registry/contracts/",
+      ":contract-test-utils/=modules/erc20/modules/contract-test-utils/contracts/",
+      ":ds-test/=modules/forge-std/lib/ds-test/src/",
+      ":erc20-helper/=modules/erc20-helper/src/",
+      ":erc20/=modules/erc20/",
+      ":fixed-term-loan-manager/=modules/fixed-term-loan-manager/contracts/",
+      ":fixed-term-loan/=modules/fixed-term-loan/contracts/",
+      ":forge-std/=modules/forge-std/src/",
+      ":globals/=modules/globals/contracts/",
+      ":liquidations/=modules/liquidations/contracts/",
+      ":maple-proxy-factory/=modules/open-term-loan/modules/maple-proxy-factory/",
+      ":non-transparent-proxy/=modules/globals/modules/non-transparent-proxy/",
+      ":ntp/=modules/pool-permission-manager/modules/ntp/",
+      ":open-term-loan-manager/=modules/open-term-loan-manager/contracts/",
+      ":open-term-loan/=modules/open-term-loan/contracts/",
+      ":pool-permission-manager/=modules/pool-permission-manager/contracts/",
+      ":pool/=modules/pool/contracts/",
+      ":proxy-factory/=modules/open-term-loan/modules/maple-proxy-factory/modules/proxy-factory/",
+      ":withdrawal-manager-cyclical/=modules/withdrawal-manager-cyclical/contracts/",
+      ":withdrawal-manager-queue/=modules/withdrawal-manager-queue/contracts/"
+    ]
+  },
+  "optimization_runs": 200,
+  "sourcify_repo_url": "https://repo.sourcify.dev/contracts/full_match/1/0xCc4e684916aA7Fa0E4fAEF2359B49A755f89C75b/",
+  "decoded_constructor_args": null,
+  "compiler_version": "0.8.7+commit.e28d00a7",
+  "is_verified_via_verifier_alliance": false,
+  "verified_at": "2026-01-20T20:02:17.613328Z",
+  "implementations": [],
+  "proxy_type": null,
+  "external_libraries": [],
+  "creation_bytecode": "0x608060405234801561001057600080fd5b50612670806100206000396000f3fe608060405234801561001057600080fd5b50600436106101da5760003560e01c8063a1cfc18711610104578063cbe52ae3116100a2578063dc4c90d311610071578063dc4c90d314610491578063e336ac44146104a4578063e46ceaa3146104c4578063fb940bd7146104e457600080fd5b8063cbe52ae314610445578063d326b23c14610458578063d64cda871461046b578063d784d4261461047e57600080fd5b8063c3124525116100de578063c3124525146103f2578063c3fbb6fd146103fa578063c45a01551461040d578063c5a160d11461041557600080fd5b8063a1cfc187146103b4578063b4398244146103d7578063bbc6f1dc146103df57600080fd5b80634308aec11161017c5780637a4b17891161014b5780637a4b17891461037357806385e23b32146103865780638a07bcb31461038e5780639ee43bb6146103a157600080fd5b80634308aec11461027d578063438d09c6146102c85780635c60da1b146102f0578063768bd709146102f857600080fd5b806338d52e0f116101b857806338d52e0f146102385780633b4538b8146102405780633b99bcee146102605780634046af2b1461027557600080fd5b80630c340a24146101df57806316f0115b146102045780631b8f183014610217575b600080fd5b6101e76104ed565b6040516001600160a01b0390911681526020015b60405180910390f35b6000546101e7906001600160a01b031681565b61022a6102253660046123d6565b61056c565b6040519081526020016101fb565b6101e761079b565b61022a61024e3660046123a4565b60056020526000908152604090205481565b61027361026e366004612406565b6107ea565b005b6101e7610a90565b610285610ad5565b6040516101fb919081516001600160401b039081168252602080840151821690830152604080840151821690830152606092830151169181019190915260800190565b6102db6102d63660046123a4565b610b9a565b604080519283526020830191909152016101fb565b6101e7610c16565b6103406103063660046123a4565b6006602052600090815260409020546001600160401b0380821691600160401b8104821691600160801b8204811691600160c01b90041684565b604080516001600160401b03958616815293851660208501529184169183019190915290911660608201526080016101fb565b6102856103813660046123a4565b610c20565b61022a610d35565b61027361039c366004612438565b610da9565b6102db6103af3660046123d6565b611304565b6103c76103c23660046122c8565b6115a4565b60405190151581526020016101fb565b61022a6115f3565b6102db6103ed366004612356565b6117df565b6101e76117ea565b610273610408366004612302565b61182c565b6101e76118d1565b6104286104233660046123d6565b6118db565b6040805193845260208401929092521515908201526060016101fb565b6102db610453366004612356565b611b79565b6102736104663660046123d6565b611c0a565b61022a6104793660046123a4565b611e1f565b61027361048c3660046122c8565b611e7d565b6001546101e7906001600160a01b031681565b61022a6104b23660046122c8565b60046020526000908152604090205481565b61022a6104d23660046122c8565b60036020526000908152604090205481565b61022a60025481565b60006104f76117ea565b6001600160a01b0316630c340a246040518163ffffffff1660e01b815260040160206040518083038186803b15801561052f57600080fd5b505afa158015610543573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061056791906122e5565b905090565b6001546000906001600160a01b031633146105c75760405162461bcd60e51b81526020600482015260166024820152752ba69d29299d2727aa2fa827a7a62fa6a0a720a3a2a960511b60448201526064015b60405180910390fd5b6001600160a01b0382166000908152600360209081526040808320546004909252909120546105f582611e1f565b4210156106445760405162461bcd60e51b815260206004820152601860248201527f574d3a52533a5749544844524157414c5f50454e44494e47000000000000000060448201526064016105be565b84158015906106535750808511155b6106925760405162461bcd60e51b815260206004820152601060248201526f2ba69d29299d29a420a922a9afa7a7a160811b60448201526064016105be565b600082815260056020526040812080548392906106b09084906125c3565b909155506106c0905085826125c3565b9050806106ce5760006106e1565b6106d6610d35565b6106e190600261256a565b9150801561070d576000828152600560205260408120805483929061070790849061256a565b90915550505b6001600160a01b038085166000908152600360209081526040808320869055600490915281208390555486945061074691168585611f06565b6107885760405162461bcd60e51b815260206004820152601360248201527215d34e9494ce9514905394d1915497d1905253606a1b60448201526064016105be565b610793848284611f74565b505092915050565b60008060009054906101000a90046001600160a01b03166001600160a01b03166338d52e0f6040518163ffffffff1660e01b815260040160206040518083038186803b15801561052f57600080fd5b60006107f4610a90565b905060006108006117ea565b9050336001600160a01b038316148061089a5750806001600160a01b031663be7c13f76040518163ffffffff1660e01b815260040160206040518083038186803b15801561084d57600080fd5b505afa158015610861573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061088591906122e5565b6001600160a01b0316336001600160a01b0316145b6108dc5760405162461bcd60e51b815260206004820152601360248201527215d34e954e9393d517d055551213d492569151606a1b60448201526064016105be565b336001600160a01b0383161415610a205760405163fd4c5b3760e01b81526001600160a01b0382169063fd4c5b3790610920903390309060009036906004016124ce565b60206040518083038186803b15801561093857600080fd5b505afa15801561094c573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906109709190612382565b6109bc5760405162461bcd60e51b815260206004820152601760248201527f574d3a553a494e56414c49445f53434845445f43414c4c00000000000000000060448201526064016105be565b604051635ad5b6f760e11b81526001600160a01b0382169063b5ab6dee906109ed9033906000903690600401612518565b600060405180830381600087803b158015610a0757600080fd5b505af1158015610a1b573d6000803e3d6000fd5b505050505b610a2861202f565b6001600160a01b031663fe69f7088686866040518463ffffffff1660e01b8152600401610a5793929190612550565b600060405180830381600087803b158015610a7157600080fd5b505af1158015610a85573d6000803e3d6000fd5b505050505050505050565b60015460408051634046af2b60e01b815290516000926001600160a01b031691634046af2b916004808301926020929190829003018186803b15801561052f57600080fd5b6040805160808101825260008082526020820181905291810182905260608101919091526002545b8015801590610b295750600081815260066020526040902054600160401b90046001600160401b031642105b15610b3e57610b37816125da565b9050610afd565b600090815260066020908152604091829020825160808101845290546001600160401b038082168352600160401b8204811693830193909352600160801b8104831693820193909352600160c01b909204166060820152919050565b6000806000610ba884610c20565b905080604001516001600160401b031681600001516001600160401b031685610bd191906125c3565b610bdb91906125a4565b81602001516001600160401b0316610bf3919061256a565b925080606001516001600160401b031683610c0e919061256a565b915050915091565b600061056761205e565b60408051608081018252600080825260208201819052918101829052606081019190915260025480610ca957600090815260066020908152604091829020825160808101845290546001600160401b038082168352600160401b8204811693830193909352600160801b8104831693820193909352600160c01b90920416606082015292915050565b6000818152600660205260409020546001600160401b0316831015610cd857610cd1816125da565b9050610ca9565b600090815260066020908152604091829020825160808101845290546001600160401b038082168352600160401b8204811693830193909352600160801b8104831693820193909352600160c01b90920416606082015292915050565b600080610d40610ad5565b905080600001516001600160401b0316915080602001516001600160401b0316421115610da55780604001516001600160401b031681602001516001600160401b031642610d8e91906125c3565b610d989190612582565b610da2908361256a565b91505b5090565b610db16117ea565b6001600160a01b031663425fad586040518163ffffffff1660e01b815260040160206040518083038186803b158015610de957600080fd5b505afa158015610dfd573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190610e219190612382565b15610e635760405162461bcd60e51b815260206004820152601260248201527115d34e941493d513d0d3d317d4105554d15160721b60448201526064016105be565b6000610e6d6117ea565b9050600160009054906101000a90046001600160a01b03166001600160a01b0316634046af2b6040518163ffffffff1660e01b815260040160206040518083038186803b158015610ebd57600080fd5b505afa158015610ed1573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190610ef591906122e5565b6001600160a01b0316336001600160a01b03161480610f955750806001600160a01b0316630c340a246040518163ffffffff1660e01b815260040160206040518083038186803b158015610f4857600080fd5b505afa158015610f5c573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190610f8091906122e5565b6001600160a01b0316336001600160a01b0316145b806110215750806001600160a01b0316630b52d12d6040518163ffffffff1660e01b815260040160206040518083038186803b158015610fd457600080fd5b505afa158015610fe8573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061100c91906122e5565b6001600160a01b0316336001600160a01b0316145b6110665760405162461bcd60e51b8152602060048201526016602482015275574d3a4e4f545f50445f4f525f474f565f4f525f4f4160501b60448201526064016105be565b816110a85760405162461bcd60e51b8152602060048201526012602482015271574d3a5345433a5a45524f5f57494e444f5760701b60448201526064016105be565b828211156110ec5760405162461bcd60e51b81526020600482015260116024820152702ba69d29a2a19d2ba4a72227abafa7a7a160791b60448201526064016105be565b60006110f6610d35565b9050600061110582600361256a565b9050600061111283611e1f565b600254909150835b8381101561115e57600061112d82610c20565b905080604001516001600160401b031684611148919061256a565b9350508080611156906125f1565b91505061111a565b506000818152600660205260409020546001600160401b031683146111945760026000815461118c906125f1565b918290555090505b60405180608001604052806111a885612088565b6001600160401b031681526020016111bf84612088565b6001600160401b031681526020016111d689612088565b6001600160401b031681526020016111ed88612088565b6001600160401b039081169091526000838152600660209081526040918290208451815492860151938601516060909601518516600160c01b026001600160c01b03968616600160801b02969096166fffffffffffffffffffffffffffffffff948616600160401b026fffffffffffffffffffffffffffffffff199094169190951617919091179190911691909117919091179055807fcf7af67c3593720469bbffad8e28bb40b2be1a25656541dcc03fabb648f8cf596112ad85612088565b6112b685612088565b6112bf8b612088565b6112c88b612088565b604080516001600160401b039586168152938516602085015291841683830152909216606082015290519081900360800190a250505050505050565b60015460009081906001600160a01b031633146113525760405162461bcd60e51b815260206004820152600c60248201526b574d3a50453a4e4f545f504d60a01b60448201526064016105be565b6001600160a01b038316600090815260036020908152604080832054600490925290912054806113b75760405162461bcd60e51b815260206004820152601060248201526f15d34e94114e9393d7d49154555154d560821b60448201526064016105be565b8086146113fd5760405162461bcd60e51b8152602060048201526014602482015273574d3a50453a494e56414c49445f53484152455360601b60448201526064016105be565b600080600061140b85610b9a565b9150915081421015801561141e57508042105b6114605760405162461bcd60e51b8152602060048201526013602482015272574d3a50453a4e4f545f494e5f57494e444f5760681b60448201526064016105be565b61146a84896118db565b6000549299509097509350611489906001600160a01b03168989611f06565b6114cb5760405162461bcd60e51b815260206004820152601360248201527215d34e94114e9514905394d1915497d1905253606a1b60448201526064016105be565b600085815260056020526040812080548692906114e99084906125c3565b909155506114f9905087856125c3565b93508315611555578261150d576002611510565b60015b60ff1661151b610d35565b611525919061256a565b94508360056000878152602001908152602001600020600082825461154a919061256a565b9091555061155a9050565b600094505b6001600160a01b03881660009081526004602090815260408083208790556003909152902085905561158d8888886120d6565b611598888587611f74565b50505050509250929050565b6001600160a01b038116600090815260036020526040812054806115cb5750600092915050565b6000806115d783610b9a565b915091508142101580156115ea57508042105b95945050505050565b6000806115fe610d35565b905060008061160c83610b9a565b9150915081421015801561161f57508042105b156117d957600154604080516367e2ba2360e01b815290516001600160a01b039092169160009183916367e2ba2391600480820192602092909190829003018186803b15801561166e57600080fd5b505afa158015611682573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906116a691906123bd565b826001600160a01b03166301e1d1146040518163ffffffff1660e01b815260040160206040518083038186803b1580156116df57600080fd5b505afa1580156116f3573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061171791906123bd565b61172191906125c3565b905060008060009054906101000a90046001600160a01b03166001600160a01b03166318160ddd6040518163ffffffff1660e01b815260040160206040518083038186803b15801561177257600080fd5b505afa158015611786573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906117aa91906123bd565b60008781526005602052604090205490915081906117c99084906125a4565b6117d39190612582565b96505050505b50505090565b6000805b9250929050565b60006117f461202f565b6001600160a01b0316633a60339a6040518163ffffffff1660e01b815260040160206040518083038186803b15801561052f57600080fd5b61183461202f565b6001600160a01b0316336001600160a01b0316146118875760405162461bcd60e51b815260206004820152601060248201526f574d3a4d3a4e4f545f464143544f525960801b60448201526064016105be565b611892838383612129565b6118cc5760405162461bcd60e51b815260206004820152600b60248201526a15d34e934e91905253115160aa1b60448201526064016105be565b505050565b600061056761202f565b600154600090819081906001600160a01b0316816118f761079b565b6000546040516370a0823160e01b81526001600160a01b0391821660048201529116906370a082319060240160206040518083038186803b15801561193b57600080fd5b505afa15801561194f573d6000803e3d6000fd5b505050506040513d601f19601f8201168201806040525081019061197391906123bd565b90506000826001600160a01b03166367e2ba236040518163ffffffff1660e01b815260040160206040518083038186803b1580156119b057600080fd5b505afa1580156119c4573d6000803e3d6000fd5b505050506040513d601f19601f820116820180604052508101906119e891906123bd565b836001600160a01b03166301e1d1146040518163ffffffff1660e01b815260040160206040518083038186803b158015611a2157600080fd5b505afa158015611a35573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190611a5991906123bd565b611a6391906125c3565b905060008060009054906101000a90046001600160a01b03166001600160a01b03166318160ddd6040518163ffffffff1660e01b815260040160206040518083038186803b158015611ab457600080fd5b505afa158015611ac8573d6000803e3d6000fd5b505050506040513d601f19601f82011682018060405250810190611aec91906123bd565b6001600160a01b03891660009081526003602090815260408083205483526005909152812054919250908290611b239085906125a4565b611b2d9190612582565b9050808410955085611b3f5789611b54565b80611b4a858c6125a4565b611b549190612582565b975081611b61848a6125a4565b611b6b9190612582565b965050505050509250925092565b6001600160a01b03821660009081526004602052604081205481908381141580611ba1575083155b15611bac57506117e3565b6001600160a01b0385166000908152600360205260408120549080611bd083610b9a565b9150915081421080611be25750804210155b15611bf057505050506117e3565b611bfa84896118db565b5090999098509650505050505050565b6001546001600160a01b03163314611c5d5760405162461bcd60e51b81526020600482015260166024820152752ba69d20a99d2727aa2fa827a7a62fa6a0a720a3a2a960511b60448201526064016105be565b6001600160a01b038116600090815260036020908152604080832054600490925290912054801580611c975750611c9382611e1f565b4210155b611ce35760405162461bcd60e51b815260206004820152601860248201527f574d3a41533a5749544844524157414c5f50454e44494e47000000000000000060448201526064016105be565b60008281526005602052604081208054839290611d019084906125c3565b90915550611d119050848261256a565b905080611d4e5760405162461bcd60e51b815260206004820152600b60248201526a0574d3a41533a4e4f5f4f560ac1b60448201526064016105be565b611d56610d35565b611d6190600261256a565b915080600560008481526020019081526020016000206000828254611d86919061256a565b90915550506001600160a01b0380841660009081526003602090815260408083208690556004909152812083905554611dc291163330876121a2565b611e0e5760405162461bcd60e51b815260206004820152601860248201527f574d3a41533a5452414e534645525f46524f4d5f4641494c000000000000000060448201526064016105be565b611e19838284611f74565b50505050565b600080611e2b83610c20565b905080604001516001600160401b031681600001516001600160401b031684611e5491906125c3565b611e5e91906125a4565b81602001516001600160401b0316611e76919061256a565b9392505050565b611e8561202f565b6001600160a01b0316336001600160a01b031614611ed95760405162461bcd60e51b8152602060048201526011602482015270574d3a53493a4e4f545f464143544f525960781b60448201526064016105be565b6001600160a01b03167f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc55565b6040516001600160a01b038316602482015260448101829052600090611f6c90859063a9059cbb60e01b906064015b60408051601f198184030181529190526020810180516001600160e01b03166001600160e01b0319909316929092179091526121dd565b949350505050565b81611fb2576040516001600160a01b038416907fc51fdb96728de385ec7859819e3997bc618362ef0dbca0ad051d856866cda3db90600090a2505050565b600080611fbe83610b9a565b91509150846001600160a01b03167fce481d825723af453e5687cafcc106004414ad24bcde1ed54f3a8db0e895e12d85611ff785612088565b61200085612088565b604080519384526001600160401b03928316602085015291169082015260600160405180910390a25050505050565b60006120597f7a45a402e4cb6e08ebc196f20f66d5d30e67285a2a8aa80503fa409e727a4af15490565b919050565b60006120597f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5490565b60006001600160401b03821115610da55760405162461bcd60e51b81526020600482015260126024820152712ba69d2aa4a72a1b1a2fa1a0a9aa2fa7a7a160711b60448201526064016105be565b816120e057505050565b60408051838152602081018390526001600160a01b038516917fddfdc995965c1fea3bbd2158d885347ad5c250f422d97342c6a3fa680600cf68910160405180910390a2505050565b6000833b8061213c576000915050611e76565b846001600160a01b03168484604051612156929190612483565b600060405180830381855af49150503d8060008114612191576040519150601f19603f3d011682016040523d82523d6000602084013e612196565b606091505b50909695505050505050565b6040516001600160a01b03808516602483015283166044820152606481018290526000906115ea9086906323b872dd60e01b90608401611f35565b60006001600160a01b0383163b6121f657506000612281565b6060836001600160a01b0316836040516122109190612493565b6000604051808303816000865af19150503d806000811461224d576040519150601f19603f3d011682016040523d82523d6000602084013e612252565b606091505b50909250905081801561227d57508051158061227d57508080602001905181019061227d9190612382565b9150505b92915050565b60008083601f84011261229957600080fd5b5081356001600160401b038111156122b057600080fd5b6020830191508360208285010111156117e357600080fd5b6000602082840312156122da57600080fd5b8135611e7681612622565b6000602082840312156122f757600080fd5b8151611e7681612622565b60008060006040848603121561231757600080fd5b833561232281612622565b925060208401356001600160401b0381111561233d57600080fd5b61234986828701612287565b9497909650939450505050565b6000806040838503121561236957600080fd5b823561237481612622565b946020939093013593505050565b60006020828403121561239457600080fd5b81518015158114611e7657600080fd5b6000602082840312156123b657600080fd5b5035919050565b6000602082840312156123cf57600080fd5b5051919050565b600080604083850312156123e957600080fd5b8235915060208301356123fb81612622565b809150509250929050565b60008060006040848603121561241b57600080fd5b8335925060208401356001600160401b0381111561233d57600080fd5b6000806040838503121561244b57600080fd5b50508035926020909101359150565b81835281816020850137506000828201602090810191909152601f909101601f19169091010190565b8183823760009101908152919050565b6000825160005b818110156124b4576020818601810151858301520161249a565b818111156124c3576000828501525b509190910192915050565b6001600160a01b0385811682528416602082015269574d3a5550475241444560b01b604082015260806060820181905260009061250e908301848661245a565b9695505050505050565b6001600160a01b038416815269574d3a5550475241444560b01b60208201526060604082018190526000906115ea908301848661245a565b8381526040602082015260006115ea60408301848661245a565b6000821982111561257d5761257d61260c565b500190565b60008261259f57634e487b7160e01b600052601260045260246000fd5b500490565b60008160001904831182151516156125be576125be61260c565b500290565b6000828210156125d5576125d561260c565b500390565b6000816125e9576125e961260c565b506000190190565b60006000198214156126055761260561260c565b5060010190565b634e487b7160e01b600052601160045260246000fd5b6001600160a01b038116811461263757600080fd5b5056fea26469706673582212208da03b9879110fcc3cef68bfc6964502583f8a85473b7b78ba0efe89f3ca421a64736f6c63430008070033",
+  "name": "MapleWithdrawalManager",
+  "is_blueprint": false,
+  "license_type": "none",
+  "is_fully_verified": true,
+  "is_verified_via_eth_bytecode_db": true,
+  "language": "solidity",
+  "evm_version": "london",
+  "can_be_visualized_via_sol2uml": true,
+  "is_verified_via_sourcify": true,
+  "additional_sources": [
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/contracts/interfaces/IMapleWithdrawalManagerStorage.sol",
+      "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface IMapleWithdrawalManagerStorage {\n\n    struct CycleConfig {\n        uint64 initialCycleId;    // Identifier of the first withdrawal cycle using this configuration.\n        uint64 initialCycleTime;  // Timestamp of the first withdrawal cycle using this configuration.\n        uint64 cycleDuration;     // Duration of the withdrawal cycle.\n        uint64 windowDuration;    // Duration of the withdrawal window.\n    }\n\n    /**\n     *  @dev    Gets the configuration for a given config id.\n     *  @param  configId_        The id of the configuration to use.\n     *  @return initialCycleId   Identifier of the first withdrawal cycle using this configuration.\n     *  @return initialCycleTime Timestamp of the first withdrawal cycle using this configuration.\n     *  @return cycleDuration    Duration of the withdrawal cycle.\n     *  @return windowDuration   Duration of the withdrawal window.\n     */\n    function cycleConfigs(uint256 configId_)\n        external returns (uint64 initialCycleId, uint64 initialCycleTime, uint64 cycleDuration, uint64 windowDuration);\n\n    /**\n     *  @dev    Gets the id of the cycle that account can exit on.\n     *  @param  account_ The address to check the exit for.\n     *  @return cycleId_ The id of the cycle that account can exit on.\n     */\n    function exitCycleId(address account_) external view returns (uint256 cycleId_);\n\n    /**\n     *  @dev    Gets the most recent configuration id.\n     *  @return configId_ The id of the most recent configuration.\n     */\n    function latestConfigId() external view returns (uint256 configId_);\n\n    /**\n     *  @dev    Gets the amount of locked shares for an account.\n     *  @param  account_      The address to check the exit for.\n     *  @return lockedShares_ The amount of shares locked.\n     */\n    function lockedShares(address account_) external view returns (uint256 lockedShares_);\n\n    /**\n     *  @dev    Gets the address of the pool associated with this withdrawal manager.\n     *  @return pool_ The address of the pool.\n     */\n    function pool() external view returns (address pool_);\n\n    /**\n     *  @dev    Gets the address of the pool manager associated with this withdrawal manager.\n     *  @return poolManager_ The address of the pool manager.\n     */\n    function poolManager() external view returns (address poolManager_);\n\n    /**\n     *  @dev    Gets the amount of shares for a cycle.\n     *  @param  cycleId_          The id to cycle to check.\n     *  @return totalCycleShares_ The amount of shares in the cycle.\n     */\n    function totalCycleShares(uint256 cycleId_) external view returns (uint256 totalCycleShares_);\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/contracts/MapleWithdrawalManagerStorage.sol",
+      "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { IMapleWithdrawalManagerEvents }  from \"./interfaces/IMapleWithdrawalManagerEvents.sol\";\nimport { IMapleWithdrawalManagerStorage } from \"./interfaces/IMapleWithdrawalManagerStorage.sol\";\n\nabstract contract MapleWithdrawalManagerStorage is IMapleWithdrawalManagerStorage, IMapleWithdrawalManagerEvents {\n\n    address public override pool;\n    address public override poolManager;\n\n    uint256 public override latestConfigId;\n\n    mapping(address => uint256) public override exitCycleId;\n    mapping(address => uint256) public override lockedShares;\n\n    mapping(uint256 => uint256) public override totalCycleShares;\n\n    mapping(uint256 => CycleConfig) public override cycleConfigs;\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/contracts/interfaces/IMapleWithdrawalManager.sol",
+      "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { IMapleProxied } from \"../../modules/maple-proxy-factory/contracts/interfaces/IMapleProxied.sol\";\n\nimport { IMapleWithdrawalManagerStorage } from \"./IMapleWithdrawalManagerStorage.sol\";\n\ninterface IMapleWithdrawalManager is IMapleProxied, IMapleWithdrawalManagerStorage {\n\n    /**************************************************************************************************************************************/\n    /*** State Changing Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev   Add shares to the withdrawal manager.\n     *  @param shares_ Amount of shares to add.\n     *  @param owner_  Address of the owner of shares.\n     */\n    function addShares(uint256 shares_, address owner_) external;\n\n    /**\n     *  @dev   Process the exit of an account.\n     *  @param requestedShares_ Amount of initially requested shares.\n     *  @param owner_           Address of the account which will be processed for exit.\n     */\n    function processExit(uint256 requestedShares_, address owner_) external returns (uint256 redeemableShares_, uint256 resultingAssets_);\n\n    /**\n     *  @dev   Remove shares to the withdrawal manager.\n     *  @param shares_ Amount of shares to remove.\n     *  @param owner_  Address of the owner of shares.\n     */\n    function removeShares(uint256 shares_, address owner_) external returns (uint256 sharesReturned_);\n\n    /**\n     *  @dev   Sets up a new exit configuration.\n     *  @param cycleDuration_  The total duration, in seconds, of a withdrawal cycle.\n     *  @param windowDuration_ The duration, in seconds, of the withdrawal window.\n     */\n    function setExitConfig(uint256 cycleDuration_, uint256 windowDuration_) external;\n\n    /**************************************************************************************************************************************/\n    /*** View Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Gets the asset address used in this withdrawal manager.\n     *  @return asset_ Address of the asset.\n     */\n    function asset() external view returns (address asset_);\n\n    /**\n     *  @dev    Gets the configuration of a given cycle id.\n     *  @param  cycleId_  The id of the cycle.\n     *  @return config_ The configuration info corresponding to the cycle.\n     */\n    function getConfigAtId(uint256 cycleId_) external view returns (CycleConfig memory config_);\n\n    /**\n     *  @dev    Gets the configuration of the current cycle id.\n     *  @return config_ The configuration info corresponding to the cycle.\n     */\n    function getCurrentConfig() external view returns (CycleConfig memory config_);\n\n    /**\n     *  @dev   Gets the id of the current cycle.\n     *  @param cycleId_ The id of the current cycle.\n     */\n    function getCurrentCycleId() external view returns (uint256 cycleId_);\n\n    /**\n     *  @dev    Gets the shares and assets that are redeemable for a given user.\n     *  @param  lockedShares_     The amount of shares that are locked.\n     *  @param  owner_            The owner of the shares.\n     *  @return redeemableShares_ The amount of shares that are redeemable based on current liquidity.\n     *  @return resultingAssets_  The corresponding amount of assets that can be redeemed using the shares.\n     *  @return partialLiquidity_ Boolean indicating if there is enough liquidity to facilitate a full redemption.\n     */\n    function getRedeemableAmounts(uint256 lockedShares_, address owner_)\n        external view returns (uint256 redeemableShares_, uint256 resultingAssets_, bool partialLiquidity_);\n\n    /**\n     *  @dev    Gets the timestamp of the beginning of the withdrawal window for a given cycle.\n     *  @param  cycleId_     The id of the current cycle.\n     *  @return windowStart_ The timestamp of the beginning of the cycle, which is the same as the beginning of the withdrawal window.\n     */\n    function getWindowStart(uint256 cycleId_) external view returns (uint256 windowStart_);\n\n    /**\n     *  @dev    Gets the timestamps of the beginning and end of the withdrawal window for a given cycle.\n     *  @param  cycleId_     The id of the current cycle.\n     *  @return windowStart_ The timestamp of the beginning of the cycle, which is the same as the beginning of the withdrawal window.\n     *  @return windowEnd_   The timestamp of the end of the withdrawal window.\n     */\n    function getWindowAtId(uint256 cycleId_) external view returns (uint256 windowStart_, uint256 windowEnd_);\n\n    /**\n     *  @dev    Gets the address of globals.\n     *  @return globals_ The address of globals.\n     */\n    function globals() external view returns (address globals_);\n\n    /**\n     *  @dev    Gets the address of the governor.\n     *  @return governor_ The address of the governor.\n     */\n    function governor() external view returns (address governor_);\n\n    /**\n     *  @dev    Checks if an account is included in an exit window.\n     *  @param  owner_          The address of the share owners to check.\n     *  @return isInExitWindow_ A boolean indicating whether or not the account is in an exit window.\n     */\n    function isInExitWindow(address owner_) external view returns (bool isInExitWindow_);\n\n    /**\n     *  @dev    Gets the total amount of funds that need to be locked to fulfill exits.\n     *  @return lockedLiquidity_ The amount of locked liquidity.\n     */\n    function lockedLiquidity() external view returns (uint256 lockedLiquidity_);\n\n    /**\n     *  @dev    Gets the pool delegate address.\n     *  @return poolDelegate_ Address of the pool delegate.\n     */\n    function poolDelegate() external view returns (address poolDelegate_);\n\n    /**\n     *  @dev    Gets the amount of shares that can be redeemed.\n     *  @param  owner_            The address to check the redemption for.\n     *  @param  shares_           The amount of requested shares to redeem.\n     *  @return redeemableShares_ The amount of shares that can be redeemed.\n     *  @return resultingAssets_  The amount of assets that will be returned for `redeemableShares`.\n     */\n    function previewRedeem(address owner_, uint256 shares_) external view returns (uint256 redeemableShares_, uint256 resultingAssets_);\n\n    /**\n     *  @dev    Gets the amount of shares that can be withdrawn.\n     *  @param  owner_            The address to check the withdrawal for.\n     *  @param  assets_           The amount of requested shares to withdraw.\n     *  @return redeemableAssets_ The amount of assets that can be withdrawn.\n     *  @return resultingShares_  The amount of shares that will be burned.\n     */\n    function previewWithdraw(address owner_, uint256 assets_) external view returns (uint256 redeemableAssets_, uint256 resultingShares_);\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/contracts/interfaces/IMapleWithdrawalManagerEvents.sol",
+      "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface IMapleWithdrawalManagerEvents {\n\n    /**\n     *  @dev   Emitted when the withdrawal configuration is updated.\n     *  @param configId_         The identifier of the configuration.\n     *  @param initialCycleId_   The identifier of the withdrawal cycle when the configuration takes effect.\n     *  @param initialCycleTime_ The timestamp of the beginning of the withdrawal cycle when the configuration takes effect.\n     *  @param cycleDuration_    The new duration of the withdrawal cycle.\n     *  @param windowDuration_   The new duration of the withdrawal window.\n     */\n    event ConfigurationUpdated(\n        uint256 indexed configId_,\n        uint64 initialCycleId_,\n        uint64 initialCycleTime_,\n        uint64 cycleDuration_,\n        uint64 windowDuration_\n    );\n\n    /**\n     *  @dev   Emitted when a withdrawal request is cancelled.\n     *  @param account_ Address of the account whose withdrawal request has been cancelled.\n     */\n    event WithdrawalCancelled(address indexed account_);\n\n    /**\n     *  @dev   Emitted when a withdrawal request is processed.\n     *  @param account_          Address of the account processing their withdrawal request.\n     *  @param sharesToRedeem_   Amount of shares that the account will redeem.\n     *  @param assetsToWithdraw_ Amount of assets that will be withdrawn from the pool.\n     */\n    event WithdrawalProcessed(address indexed account_, uint256 sharesToRedeem_, uint256 assetsToWithdraw_);\n\n    /**\n     *  @dev   Emitted when a withdrawal request is updated.\n     *  @param account_      Address of the account whose request has been updated.\n     *  @param lockedShares_ Total amount of shares the account has locked.\n     *  @param windowStart_  Time when the withdrawal window for the withdrawal request will begin.\n     *  @param windowEnd_    Time when the withdrawal window for the withdrawal request will end.\n     */\n    event WithdrawalUpdated(address indexed account_, uint256 lockedShares_, uint64 windowStart_, uint64 windowEnd_);\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/contracts/interfaces/Interfaces.sol",
+      "source_code": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity ^0.8.7;\n\ninterface IERC20Like {\n\n    function balanceOf(address account_) external view returns (uint256 balance_);\n\n}\n\ninterface IGlobalsLike {\n\n    function governor() external view returns (address governor_);\n\n    function isPoolDeployer(address poolDeployer_) external view returns (bool isPoolDeployer_);\n\n    function isValidScheduledCall(\n        address caller_,\n        address contract_,\n        bytes32 functionId_,\n        bytes calldata callData_\n    ) external view returns (bool isValid_);\n\n    function operationalAdmin() external view returns (address operationalAdmin_);\n\n    function protocolPaused() external view returns (bool protocolPaused_);\n\n    function securityAdmin() external view returns (address securityAdmin_);\n\n    function unscheduleCall(address caller_, bytes32 functionId_, bytes calldata callData_) external;\n\n}\n\ninterface IPoolLike {\n\n    function asset() external view returns (address asset_);\n\n    function convertToShares(uint256 assets_) external view returns (uint256 shares_);\n\n    function manager() external view returns (address manager_);\n\n    function previewRedeem(uint256 shares_) external view returns (uint256 assets_);\n\n    function redeem(uint256 shares_, address receiver_, address owner_) external returns (uint256 assets_);\n\n    function totalSupply() external view returns (uint256 totalSupply_);\n\n    function transfer(address account_, uint256 amount_) external returns (bool success_);\n\n}\n\ninterface IPoolManagerLike {\n\n    function globals() external view returns (address globals_);\n\n    function poolDelegate() external view returns (address poolDelegate_);\n\n    function totalAssets() external view returns (uint256 totalAssets_);\n\n    function unrealizedLosses() external view returns (uint256 unrealizedLosses_);\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/erc20-helper/src/ERC20Helper.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nimport { IERC20Like } from \"./interfaces/IERC20Like.sol\";\n\n/**\n * @title Small Library to standardize erc20 token interactions.\n */\nlibrary ERC20Helper {\n\n    /**************************************************************************************************************************************/\n    /*** Internal Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function transfer(address token_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transfer.selector, to_, amount_));\n    }\n\n    function transferFrom(address token_, address from_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transferFrom.selector, from_, to_, amount_));\n    }\n\n    function approve(address token_, address spender_, uint256 amount_) internal returns (bool success_) {\n        // If setting approval to zero fails, return false.\n        if (!_call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, uint256(0)))) return false;\n\n        // If `amount_` is zero, return true as the previous step already did this.\n        if (amount_ == uint256(0)) return true;\n\n        // Return the result of setting the approval to `amount_`.\n        return _call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, amount_));\n    }\n\n    function _call(address token_, bytes memory data_) private returns (bool success_) {\n        if (token_.code.length == uint256(0)) return false;\n\n        bytes memory returnData;\n        ( success_, returnData ) = token_.call(data_);\n\n        return success_ && (returnData.length == uint256(0) || abi.decode(returnData, (bool)));\n    }\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/erc20-helper/src/interfaces/IERC20Like.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title Interface of the ERC20 standard as needed by ERC20Helper.\ninterface IERC20Like {\n\n    function approve(address spender_, uint256 amount_) external returns (bool success_);\n\n    function transfer(address recipient_, uint256 amount_) external returns (bool success_);\n\n    function transferFrom(address owner_, address recipient_, uint256 amount_) external returns (bool success_);\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/contracts/MapleProxiedInternals.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { ProxiedInternals } from \"../modules/proxy-factory/contracts/ProxiedInternals.sol\";\n\n/// @title A Maple implementation that is to be proxied, will need MapleProxiedInternals.\nabstract contract MapleProxiedInternals is ProxiedInternals { }\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/contracts/interfaces/IMapleProxied.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { IProxied } from \"../../modules/proxy-factory/contracts/interfaces/IProxied.sol\";\n\n/// @title A Maple implementation that is to be proxied, must implement IMapleProxied.\ninterface IMapleProxied is IProxied {\n\n    /**\n     *  @dev   The instance was upgraded.\n     *  @param toVersion_ The new version of the loan.\n     *  @param arguments_ The upgrade arguments, if any.\n     */\n    event Upgraded(uint256 toVersion_, bytes arguments_);\n\n    /**\n     *  @dev   Upgrades a contract implementation to a specific version.\n     *         Access control logic critical since caller can force a selfdestruct via a malicious `migrator_` which is delegatecalled.\n     *  @param toVersion_ The version to upgrade to.\n     *  @param arguments_ Some encoded arguments to use for the upgrade.\n     */\n    function upgrade(uint256 toVersion_, bytes calldata arguments_) external;\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/contracts/interfaces/IMapleProxyFactory.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { IDefaultImplementationBeacon } from \"../../modules/proxy-factory/contracts/interfaces/IDefaultImplementationBeacon.sol\";\n\n/// @title A Maple factory for Proxy contracts that proxy MapleProxied implementations.\ninterface IMapleProxyFactory is IDefaultImplementationBeacon {\n\n    /**************************************************************************************************************************************/\n    /*** Events                                                                                                                         ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev   A default version was set.\n     *  @param version_ The default version.\n     */\n    event DefaultVersionSet(uint256 indexed version_);\n\n    /**\n     *  @dev   A version of an implementation, at some address, was registered, with an optional initializer.\n     *  @param version_               The version registered.\n     *  @param implementationAddress_ The address of the implementation.\n     *  @param initializer_           The address of the initializer, if any.\n     */\n    event ImplementationRegistered(uint256 indexed version_, address indexed implementationAddress_, address indexed initializer_);\n\n    /**\n     *  @dev   A proxy contract was deployed with some initialization arguments.\n     *  @param version_                 The version of the implementation being proxied by the deployed proxy contract.\n     *  @param instance_                The address of the proxy contract deployed.\n     *  @param initializationArguments_ The arguments used to initialize the proxy contract, if any.\n     */\n    event InstanceDeployed(uint256 indexed version_, address indexed instance_, bytes initializationArguments_);\n\n    /**\n     *  @dev   A instance has upgraded by proxying to a new implementation, with some migration arguments.\n     *  @param instance_           The address of the proxy contract.\n     *  @param fromVersion_        The initial implementation version being proxied.\n     *  @param toVersion_          The new implementation version being proxied.\n     *  @param migrationArguments_ The arguments used to migrate, if any.\n     */\n    event InstanceUpgraded(address indexed instance_, uint256 indexed fromVersion_, uint256 indexed toVersion_, bytes migrationArguments_);\n\n    /**\n     *  @dev   The MapleGlobals was set.\n     *  @param mapleGlobals_ The address of a Maple Globals contract.\n     */\n    event MapleGlobalsSet(address indexed mapleGlobals_);\n\n    /**\n     *  @dev   An upgrade path was disabled, with an optional migrator contract.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     */\n    event UpgradePathDisabled(uint256 indexed fromVersion_, uint256 indexed toVersion_);\n\n    /**\n     *  @dev   An upgrade path was enabled, with an optional migrator contract.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     *  @param migrator_    The address of the migrator, if any.\n     */\n    event UpgradePathEnabled(uint256 indexed fromVersion_, uint256 indexed toVersion_, address indexed migrator_);\n\n    /**************************************************************************************************************************************/\n    /*** State Variables                                                                                                                ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev The default version.\n     */\n    function defaultVersion() external view returns (uint256 defaultVersion_);\n\n    /**\n     *  @dev The address of the MapleGlobals contract.\n     */\n    function mapleGlobals() external view returns (address mapleGlobals_);\n\n    /**\n     *  @dev    Whether the upgrade is enabled for a path from a version to another version.\n     *  @param  toVersion_   The initial version.\n     *  @param  fromVersion_ The destination version.\n     *  @return allowed_     Whether the upgrade is enabled.\n     */\n    function upgradeEnabledForPath(uint256 toVersion_, uint256 fromVersion_) external view returns (bool allowed_);\n\n    /**************************************************************************************************************************************/\n    /*** State Changing Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Deploys a new instance proxying the default implementation version, with some initialization arguments.\n     *          Uses a nonce and `msg.sender` as a salt for the CREATE2 opcode during instantiation to produce deterministic addresses.\n     *  @param  arguments_ The initialization arguments to use for the instance deployment, if any.\n     *  @param  salt_      The salt to use in the contract creation process.\n     *  @return instance_  The address of the deployed proxy contract.\n     */\n    function createInstance(bytes calldata arguments_, bytes32 salt_) external returns (address instance_);\n\n    /**\n     *  @dev   Enables upgrading from a version to a version of an implementation, with an optional migrator.\n     *         Only the Governor can call this function.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     *  @param migrator_    The address of the migrator, if any.\n     */\n    function enableUpgradePath(uint256 fromVersion_, uint256 toVersion_, address migrator_) external;\n\n    /**\n     *  @dev   Disables upgrading from a version to a version of a implementation.\n     *         Only the Governor can call this function.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     */\n    function disableUpgradePath(uint256 fromVersion_, uint256 toVersion_) external;\n\n    /**\n     *  @dev   Registers the address of an implementation contract as a version, with an optional initializer.\n     *         Only the Governor can call this function.\n     *  @param version_               The version to register.\n     *  @param implementationAddress_ The address of the implementation.\n     *  @param initializer_           The address of the initializer, if any.\n     */\n    function registerImplementation(uint256 version_, address implementationAddress_, address initializer_) external;\n\n    /**\n     *  @dev   Sets the default version.\n     *         Only the Governor can call this function.\n     *  @param version_ The implementation version to set as the default.\n     */\n    function setDefaultVersion(uint256 version_) external;\n\n    /**\n     *  @dev   Sets the Maple Globals contract.\n     *         Only the Governor can call this function.\n     *  @param mapleGlobals_ The address of a Maple Globals contract.\n     */\n    function setGlobals(address mapleGlobals_) external;\n\n    /**\n     *  @dev   Upgrades the calling proxy contract's implementation, with some migration arguments.\n     *  @param toVersion_ The implementation version to upgrade the proxy contract to.\n     *  @param arguments_ The migration arguments, if any.\n     */\n    function upgradeInstance(uint256 toVersion_, bytes calldata arguments_) external;\n\n    /**************************************************************************************************************************************/\n    /*** View Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Returns the deterministic address of a potential proxy, given some arguments and salt.\n     *  @param  arguments_       The initialization arguments to be used when deploying the proxy.\n     *  @param  salt_            The salt to be used when deploying the proxy.\n     *  @return instanceAddress_ The deterministic address of a potential proxy.\n     */\n    function getInstanceAddress(bytes calldata arguments_, bytes32 salt_) external view returns (address instanceAddress_);\n\n    /**\n     *  @dev    Returns the address of an implementation version.\n     *  @param  version_        The implementation version.\n     *  @return implementation_ The address of the implementation.\n     */\n    function implementationOf(uint256 version_) external view returns (address implementation_);\n\n    /**\n     *  @dev    Returns if a given address has been deployed by this factory/\n     *  @param  instance_   The address to check.\n     *  @return isInstance_ A boolean indication if the address has been deployed by this factory.\n     */\n    function isInstance(address instance_) external view returns (bool isInstance_);\n\n    /**\n     *  @dev    Returns the address of a migrator contract for a migration path (from version, to version).\n     *          If oldVersion_ == newVersion_, the migrator is an initializer.\n     *  @param  oldVersion_ The old version.\n     *  @param  newVersion_ The new version.\n     *  @return migrator_   The address of a migrator contract.\n     */\n    function migratorForPath(uint256 oldVersion_, uint256 newVersion_) external view returns (address migrator_);\n\n    /**\n     *  @dev    Returns the version of an implementation contract.\n     *  @param  implementation_ The address of an implementation contract.\n     *  @return version_        The version of the implementation contract.\n     */\n    function versionOf(address implementation_) external view returns (uint256 version_);\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/modules/proxy-factory/contracts/ProxiedInternals.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nimport { SlotManipulatable } from \"./SlotManipulatable.sol\";\n\n/// @title An implementation that is to be proxied, will need ProxiedInternals.\nabstract contract ProxiedInternals is SlotManipulatable {\n\n    /// @dev Storage slot with the address of the current factory. `keccak256('eip1967.proxy.factory') - 1`.\n    bytes32 private constant FACTORY_SLOT = bytes32(0x7a45a402e4cb6e08ebc196f20f66d5d30e67285a2a8aa80503fa409e727a4af1);\n\n    /// @dev Storage slot with the address of the current factory. `keccak256('eip1967.proxy.implementation') - 1`.\n    bytes32 private constant IMPLEMENTATION_SLOT = bytes32(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc);\n\n    /// @dev Delegatecalls to a migrator contract to manipulate storage during an initialization or migration.\n    function _migrate(address migrator_, bytes calldata arguments_) internal virtual returns (bool success_) {\n        uint256 size;\n\n        assembly {\n            size := extcodesize(migrator_)\n        }\n\n        if (size == uint256(0)) return false;\n\n        ( success_, ) = migrator_.delegatecall(arguments_);\n    }\n\n    /// @dev Sets the factory address in storage.\n    function _setFactory(address factory_) internal virtual returns (bool success_) {\n        _setSlotValue(FACTORY_SLOT, bytes32(uint256(uint160(factory_))));\n        return true;\n    }\n\n    /// @dev Sets the implementation address in storage.\n    function _setImplementation(address implementation_) internal virtual returns (bool success_) {\n        _setSlotValue(IMPLEMENTATION_SLOT, bytes32(uint256(uint160(implementation_))));\n        return true;\n    }\n\n    /// @dev Returns the factory address.\n    function _factory() internal view virtual returns (address factory_) {\n        return address(uint160(uint256(_getSlotValue(FACTORY_SLOT))));\n    }\n\n    /// @dev Returns the implementation address.\n    function _implementation() internal view virtual returns (address implementation_) {\n        return address(uint160(uint256(_getSlotValue(IMPLEMENTATION_SLOT))));\n    }\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/modules/proxy-factory/contracts/SlotManipulatable.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nabstract contract SlotManipulatable {\n\n    function _getReferenceTypeSlot(bytes32 slot_, bytes32 key_) internal pure returns (bytes32 value_) {\n        return keccak256(abi.encodePacked(key_, slot_));\n    }\n\n    function _getSlotValue(bytes32 slot_) internal view returns (bytes32 value_) {\n        assembly {\n            value_ := sload(slot_)\n        }\n    }\n\n    function _setSlotValue(bytes32 slot_, bytes32 value_) internal {\n        assembly {\n            sstore(slot_, value_)\n        }\n    }\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/modules/proxy-factory/contracts/interfaces/IDefaultImplementationBeacon.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title An beacon that provides a default implementation for proxies, must implement IDefaultImplementationBeacon.\ninterface IDefaultImplementationBeacon {\n\n    /// @dev The address of an implementation for proxies.\n    function defaultImplementation() external view returns (address defaultImplementation_);\n\n}\n"
+    },
+    {
+      "file_path": "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/modules/proxy-factory/contracts/interfaces/IProxied.sol",
+      "source_code": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title An implementation that is to be proxied, must implement IProxied.\ninterface IProxied {\n\n    /**\n     *  @dev The address of the proxy factory.\n     */\n    function factory() external view returns (address factory_);\n\n    /**\n     *  @dev The address of the implementation contract being proxied.\n     */\n    function implementation() external view returns (address implementation_);\n\n    /**\n     *  @dev   Modifies the proxy's implementation address.\n     *  @param newImplementation_ The address of an implementation contract.\n     */\n    function setImplementation(address newImplementation_) external;\n\n    /**\n     *  @dev   Modifies the proxy's storage by delegate-calling a migrator contract with some arguments.\n     *         Access control logic critical since caller can force a selfdestruct via a malicious `migrator_` which is delegatecalled.\n     *  @param migrator_  The address of a migrator contract.\n     *  @param arguments_ Some encoded arguments to use for the migration.\n     */\n    function migrate(address migrator_, bytes calldata arguments_) external;\n\n}\n"
+    }
+  ],
+  "certified": false,
+  "conflicting_implementations": null,
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "configId_",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "initialCycleId_",
+          "type": "uint64"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "initialCycleTime_",
+          "type": "uint64"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "cycleDuration_",
+          "type": "uint64"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "windowDuration_",
+          "type": "uint64"
+        }
+      ],
+      "name": "ConfigurationUpdated",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "toVersion_",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes",
+          "name": "arguments_",
+          "type": "bytes"
+        }
+      ],
+      "name": "Upgraded",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "account_",
+          "type": "address"
+        }
+      ],
+      "name": "WithdrawalCancelled",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "account_",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "sharesToRedeem_",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "assetsToWithdraw_",
+          "type": "uint256"
+        }
+      ],
+      "name": "WithdrawalProcessed",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "account_",
+          "type": "address"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint256",
+          "name": "lockedShares_",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "windowStart_",
+          "type": "uint64"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "windowEnd_",
+          "type": "uint64"
+        }
+      ],
+      "name": "WithdrawalUpdated",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shares_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "owner_",
+          "type": "address"
+        }
+      ],
+      "name": "addShares",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "asset",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "asset_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "cycleConfigs",
+      "outputs": [
+        {
+          "internalType": "uint64",
+          "name": "initialCycleId",
+          "type": "uint64"
+        },
+        {
+          "internalType": "uint64",
+          "name": "initialCycleTime",
+          "type": "uint64"
+        },
+        {
+          "internalType": "uint64",
+          "name": "cycleDuration",
+          "type": "uint64"
+        },
+        {
+          "internalType": "uint64",
+          "name": "windowDuration",
+          "type": "uint64"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "exitCycleId",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "factory",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "factory_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cycleId_",
+          "type": "uint256"
+        }
+      ],
+      "name": "getConfigAtId",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "uint64",
+              "name": "initialCycleId",
+              "type": "uint64"
+            },
+            {
+              "internalType": "uint64",
+              "name": "initialCycleTime",
+              "type": "uint64"
+            },
+            {
+              "internalType": "uint64",
+              "name": "cycleDuration",
+              "type": "uint64"
+            },
+            {
+              "internalType": "uint64",
+              "name": "windowDuration",
+              "type": "uint64"
+            }
+          ],
+          "internalType": "struct IMapleWithdrawalManagerStorage.CycleConfig",
+          "name": "config_",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getCurrentConfig",
+      "outputs": [
+        {
+          "components": [
+            {
+              "internalType": "uint64",
+              "name": "initialCycleId",
+              "type": "uint64"
+            },
+            {
+              "internalType": "uint64",
+              "name": "initialCycleTime",
+              "type": "uint64"
+            },
+            {
+              "internalType": "uint64",
+              "name": "cycleDuration",
+              "type": "uint64"
+            },
+            {
+              "internalType": "uint64",
+              "name": "windowDuration",
+              "type": "uint64"
+            }
+          ],
+          "internalType": "struct IMapleWithdrawalManagerStorage.CycleConfig",
+          "name": "config_",
+          "type": "tuple"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "getCurrentCycleId",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "cycleId_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "lockedShares_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "owner_",
+          "type": "address"
+        }
+      ],
+      "name": "getRedeemableAmounts",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "redeemableShares_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "resultingAssets_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bool",
+          "name": "partialLiquidity_",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cycleId_",
+          "type": "uint256"
+        }
+      ],
+      "name": "getWindowAtId",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "windowStart_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "windowEnd_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cycleId_",
+          "type": "uint256"
+        }
+      ],
+      "name": "getWindowStart",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "windowStart_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "globals",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "globals_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "governor",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "governor_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "implementation",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "implementation_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "owner_",
+          "type": "address"
+        }
+      ],
+      "name": "isInExitWindow",
+      "outputs": [
+        {
+          "internalType": "bool",
+          "name": "isInExitWindow_",
+          "type": "bool"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "latestConfigId",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "lockedLiquidity",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "lockedLiquidity_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "name": "lockedShares",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "migrator_",
+          "type": "address"
+        },
+        {
+          "internalType": "bytes",
+          "name": "arguments_",
+          "type": "bytes"
+        }
+      ],
+      "name": "migrate",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "pool",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "poolDelegate",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "poolDelegate_",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "poolManager",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "owner_",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "shares_",
+          "type": "uint256"
+        }
+      ],
+      "name": "previewRedeem",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "redeemableShares_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "resultingAssets_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "owner_",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "assets_",
+          "type": "uint256"
+        }
+      ],
+      "name": "previewWithdraw",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "redeemableAssets_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "resultingShares_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "pure",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "requestedShares_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "owner_",
+          "type": "address"
+        }
+      ],
+      "name": "processExit",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "redeemableShares_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "resultingAssets_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "shares_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "owner_",
+          "type": "address"
+        }
+      ],
+      "name": "removeShares",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "sharesReturned_",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "cycleDuration_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "windowDuration_",
+          "type": "uint256"
+        }
+      ],
+      "name": "setExitConfig",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "implementation_",
+          "type": "address"
+        }
+      ],
+      "name": "setImplementation",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "name": "totalCycleShares",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "version_",
+          "type": "uint256"
+        },
+        {
+          "internalType": "bytes",
+          "name": "arguments_",
+          "type": "bytes"
+        }
+      ],
+      "name": "upgrade",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    }
+  ],
+  "is_changed_bytecode": false,
+  "is_partially_verified": false,
+  "constructor_args": null,
+  "sources": {
+    "modules/withdrawal-manager-cyclical/contracts/MapleWithdrawalManager.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { ERC20Helper }           from \"../modules/erc20-helper/src/ERC20Helper.sol\";\nimport { IMapleProxyFactory }    from \"../modules/maple-proxy-factory/contracts/interfaces/IMapleProxyFactory.sol\";\nimport { MapleProxiedInternals } from \"../modules/maple-proxy-factory/contracts/MapleProxiedInternals.sol\";\n\nimport { IERC20Like, IGlobalsLike, IPoolLike, IPoolManagerLike } from \"./interfaces/Interfaces.sol\";\n\nimport { IMapleWithdrawalManager } from \"./interfaces/IMapleWithdrawalManager.sol\";\n\nimport { MapleWithdrawalManagerStorage } from \"./MapleWithdrawalManagerStorage.sol\";\n\n/*\n\n    ███╗   ███╗ █████╗ ██████╗ ██╗     ███████╗\n    ████╗ ████║██╔══██╗██╔══██╗██║     ██╔════╝\n    ██╔████╔██║███████║██████╔╝██║     █████╗\n    ██║╚██╔╝██║██╔══██║██╔═══╝ ██║     ██╔══╝\n    ██║ ╚═╝ ██║██║  ██║██║     ███████╗███████╗\n    ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝╚══════╝\n\n\n    ██╗    ██╗██╗████████╗██╗  ██╗██████╗ ██████╗  █████╗ ██╗    ██╗ █████╗ ██╗\n    ██║    ██║██║╚══██╔══╝██║  ██║██╔══██╗██╔══██╗██╔══██╗██║    ██║██╔══██╗██║\n    ██║ █╗ ██║██║   ██║   ███████║██║  ██║██████╔╝███████║██║ █╗ ██║███████║██║\n    ██║███╗██║██║   ██║   ██╔══██║██║  ██║██╔══██╗██╔══██║██║███╗██║██╔══██║██║\n    ╚███╔███╔╝██║   ██║   ██║  ██║██████╔╝██║  ██║██║  ██║╚███╔███╔╝██║  ██║███████╗\n    ╚══╝╚══╝ ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚══════╝\n\n\n    ███╗   ███╗ █████╗ ███╗   ██╗ █████╗  ██████╗ ███████╗██████╗\n    ████╗ ████║██╔══██╗████╗  ██║██╔══██╗██╔════╝ ██╔════╝██╔══██╗\n    ██╔████╔██║███████║██╔██╗ ██║███████║██║  ███╗█████╗  ██████╔╝\n    ██║╚██╔╝██║██╔══██║██║╚██╗██║██╔══██║██║   ██║██╔══╝  ██╔══██╗\n    ██║ ╚═╝ ██║██║  ██║██║ ╚████║██║  ██║╚██████╔╝███████╗██║  ██║\n    ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝\n\n    * `cycleDuration` is the time of a full withdrawal cycle.\n    *\n    * |--------|--------|\n    *     C1       C2\n    *\n    * There is a withdrawal window at the beginning of each withdrawal cycle.\n    *\n    * |===-----|===-----|\n    *  WW1      WW2\n    *\n    * Once a user locks their shares, they must wait at least one full cycle from the end of the cycle they locked their shares in.\n    * Users are only able to withdraw during a withdrawal window, which starts at the beginning of each cycle.\n    *\n    * |===-.---|===-----|===-----|\n    *      ^             ^\n    *  shares locked    earliest withdrawal time\n    *\n    * When the pool delegate changes the configuration, it will take effect only on the start of the third cycle.\n    * This way all users that have already locked their shares will not have their withdrawal time affected.\n    *\n    *     C1       C2       C3             C4\n    * |===--.--|===-----|===-----|==========----------|\n    *       ^                     ^\n    * configuration change     new configuration kicks in\n    *\n    * Users that request a withdrawal during C1 will withdraw during WW3 using the old configuration.\n    * Users that lock their shares during and after C2 will withdraw in windows that use the new configuration.\n\n*/\n\ncontract MapleWithdrawalManager is IMapleWithdrawalManager, MapleWithdrawalManagerStorage, MapleProxiedInternals {\n\n    // NOTE: The following functions already check for paused state in the pool, therefore no need to check here.\n    // * addShares\n    // * removeShares\n    // * processExit\n    modifier whenProtocolNotPaused() {\n        require(!IGlobalsLike(globals()).protocolPaused(), \"WM:PROTOCOL_PAUSED\");\n        _;\n    }\n\n    modifier onlyPoolDelegateOrProtocolAdmins {\n        address globals_ = globals();\n\n        require(\n            msg.sender == IPoolManagerLike(poolManager).poolDelegate() ||\n            msg.sender == IGlobalsLike(globals_).governor() ||\n            msg.sender == IGlobalsLike(globals_).operationalAdmin(),\n            \"WM:NOT_PD_OR_GOV_OR_OA\"\n        );\n\n        _;\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Proxy Functions                                                                                                                ***/\n    /**************************************************************************************************************************************/\n\n    function migrate(address migrator_, bytes calldata arguments_) external override {\n        require(msg.sender == _factory(),        \"WM:M:NOT_FACTORY\");\n        require(_migrate(migrator_, arguments_), \"WM:M:FAILED\");\n    }\n\n    function setImplementation(address implementation_) external override {\n        require(msg.sender == _factory(), \"WM:SI:NOT_FACTORY\");\n        _setImplementation(implementation_);\n    }\n\n    function upgrade(uint256 version_, bytes calldata arguments_) external override {\n        address poolDelegate_ = poolDelegate();\n\n        IGlobalsLike mapleGlobals_ = IGlobalsLike(globals());\n\n        require(msg.sender == poolDelegate_ || msg.sender == mapleGlobals_.securityAdmin(), \"WM:U:NOT_AUTHORIZED\");\n\n        if (msg.sender == poolDelegate_) {\n            require(mapleGlobals_.isValidScheduledCall(msg.sender, address(this), \"WM:UPGRADE\", msg.data), \"WM:U:INVALID_SCHED_CALL\");\n\n            mapleGlobals_.unscheduleCall(msg.sender, \"WM:UPGRADE\", msg.data);\n        }\n\n        IMapleProxyFactory(_factory()).upgradeInstance(version_, arguments_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Administrative Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    function setExitConfig(\n        uint256 cycleDuration_,\n        uint256 windowDuration_\n    )\n        external override whenProtocolNotPaused onlyPoolDelegateOrProtocolAdmins\n    {\n        require(windowDuration_ != 0,              \"WM:SEC:ZERO_WINDOW\");\n        require(windowDuration_ <= cycleDuration_, \"WM:SEC:WINDOW_OOB\");\n\n        // The new config will take effect only after the current cycle and two additional ones elapse.\n        // This is done in order to to prevent overlaps between the current and new withdrawal cycles.\n        uint256 currentCycleId_   = getCurrentCycleId();\n        uint256 initialCycleId_   = currentCycleId_ + 3;\n        uint256 initialCycleTime_ = getWindowStart(currentCycleId_);\n        uint256 latestConfigId_   = latestConfigId;\n\n        // This isn't the most optimal way to do this, since the internal function `getConfigAt` iterates through configs.\n        // But this function should only be called by the pool delegate and not often, and, at most, we need to iterate through 3 cycles.\n        for (uint256 i = currentCycleId_; i < initialCycleId_; i++) {\n            CycleConfig memory config = getConfigAtId(i);\n\n            initialCycleTime_ += config.cycleDuration;\n        }\n\n        // If the new config takes effect on the same cycle as the latest config, overwrite it. Otherwise create a new config.\n        if (initialCycleId_ != cycleConfigs[latestConfigId_].initialCycleId) {\n            latestConfigId_ = ++latestConfigId;\n        }\n\n        cycleConfigs[latestConfigId_] = CycleConfig({\n            initialCycleId:   _uint64(initialCycleId_),\n            initialCycleTime: _uint64(initialCycleTime_),\n            cycleDuration:    _uint64(cycleDuration_),\n            windowDuration:   _uint64(windowDuration_)\n        });\n\n        emit ConfigurationUpdated({\n            configId_:         latestConfigId_,\n            initialCycleId_:   _uint64(initialCycleId_),\n            initialCycleTime_: _uint64(initialCycleTime_),\n            cycleDuration_:    _uint64(cycleDuration_),\n            windowDuration_:   _uint64(windowDuration_)\n        });\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Exit Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    function addShares(uint256 shares_, address owner_) external override {\n        require(msg.sender == poolManager, \"WM:AS:NOT_POOL_MANAGER\");\n\n        uint256 exitCycleId_  = exitCycleId[owner_];\n        uint256 lockedShares_ = lockedShares[owner_];\n\n        require(lockedShares_ == 0 || block.timestamp >= getWindowStart(exitCycleId_), \"WM:AS:WITHDRAWAL_PENDING\");\n\n        // Remove all existing shares from the current cycle.\n        totalCycleShares[exitCycleId_] -= lockedShares_;\n\n        lockedShares_ += shares_;\n\n        require(lockedShares_ != 0, \"WM:AS:NO_OP\");\n\n        // Move all shares (including any new ones) to the new cycle.\n        exitCycleId_ = getCurrentCycleId() + 2;\n        totalCycleShares[exitCycleId_] += lockedShares_;\n\n        exitCycleId[owner_]  = exitCycleId_;\n        lockedShares[owner_] = lockedShares_;\n\n        require(ERC20Helper.transferFrom(pool, msg.sender, address(this), shares_), \"WM:AS:TRANSFER_FROM_FAIL\");\n\n        _emitUpdate(owner_, lockedShares_, exitCycleId_);\n    }\n\n    function removeShares(uint256 shares_, address owner_) external override returns (uint256 sharesReturned_) {\n        require(msg.sender == poolManager, \"WM:RS:NOT_POOL_MANAGER\");\n\n        uint256 exitCycleId_  = exitCycleId[owner_];\n        uint256 lockedShares_ = lockedShares[owner_];\n\n        require(block.timestamp >= getWindowStart(exitCycleId_), \"WM:RS:WITHDRAWAL_PENDING\");\n        require(shares_ != 0 && shares_ <= lockedShares_,        \"WM:RS:SHARES_OOB\");\n\n        // Remove shares from old the cycle.\n        totalCycleShares[exitCycleId_] -= lockedShares_;\n\n        // Calculate remaining shares and new cycle (if applicable).\n        lockedShares_ -= shares_;\n        exitCycleId_   = lockedShares_ != 0 ? getCurrentCycleId() + 2 : 0;\n\n        // Add shares to new cycle (if applicable).\n        if (lockedShares_ != 0) {\n            totalCycleShares[exitCycleId_] += lockedShares_;\n        }\n\n        // Update the withdrawal request.\n        exitCycleId[owner_]  = exitCycleId_;\n        lockedShares[owner_] = lockedShares_;\n\n        sharesReturned_ = shares_;\n\n        require(ERC20Helper.transfer(pool, owner_, shares_), \"WM:RS:TRANSFER_FAIL\");\n\n        _emitUpdate(owner_, lockedShares_, exitCycleId_);\n    }\n\n    function processExit(uint256 requestedShares_, address owner_)\n        external override returns (uint256 redeemableShares_, uint256 resultingAssets_)\n    {\n        require(msg.sender == poolManager, \"WM:PE:NOT_PM\");\n\n        uint256 exitCycleId_  = exitCycleId[owner_];\n        uint256 lockedShares_ = lockedShares[owner_];\n\n        require(lockedShares_ != 0, \"WM:PE:NO_REQUEST\");\n\n        require(requestedShares_ == lockedShares_, \"WM:PE:INVALID_SHARES\");\n\n        bool partialLiquidity_;\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(exitCycleId_);\n\n        require(block.timestamp >= windowStart_ && block.timestamp <  windowEnd_, \"WM:PE:NOT_IN_WINDOW\");\n\n        ( redeemableShares_, resultingAssets_, partialLiquidity_ ) = getRedeemableAmounts(lockedShares_, owner_);\n\n        // Transfer redeemable shares to be burned in the pool, re-lock remaining shares.\n        require(ERC20Helper.transfer(pool, owner_, redeemableShares_), \"WM:PE:TRANSFER_FAIL\");\n\n        // Reduce totalCurrentShares by the shares that were used in the old cycle.\n        totalCycleShares[exitCycleId_] -= lockedShares_;\n\n        // Reduce the locked shares by the total amount transferred back to the LP.\n        lockedShares_ -= redeemableShares_;\n\n        // If there are any remaining shares, move them to the next cycle.\n        // In case of partial liquidity move shares only one cycle forward (instead of two).\n        if (lockedShares_ != 0) {\n            exitCycleId_ = getCurrentCycleId() + (partialLiquidity_ ? 1 : 2);\n            totalCycleShares[exitCycleId_] += lockedShares_;\n        } else {\n            exitCycleId_ = 0;\n        }\n\n        // Update the locked shares and cycle for the account, setting to zero if no shares are remaining.\n        lockedShares[owner_] = lockedShares_;\n        exitCycleId[owner_]  = exitCycleId_;\n\n        _emitProcess(owner_, redeemableShares_, resultingAssets_);\n        _emitUpdate(owner_, lockedShares_, exitCycleId_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** External View Utility Functions                                                                                                ***/\n    /**************************************************************************************************************************************/\n\n    function isInExitWindow(address owner_) external view override returns (bool isInExitWindow_) {\n        uint256 exitCycleId_ = exitCycleId[owner_];\n\n        if (exitCycleId_ == 0) return false; // No withdrawal request\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(exitCycleId_);\n\n        isInExitWindow_ = block.timestamp >= windowStart_ && block.timestamp <  windowEnd_;\n    }\n\n    function lockedLiquidity() external view override returns (uint256 lockedLiquidity_) {\n        uint256 currentCycleId_ = getCurrentCycleId();\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(currentCycleId_);\n\n        if (block.timestamp >= windowStart_ && block.timestamp < windowEnd_) {\n            IPoolManagerLike poolManager_ = IPoolManagerLike(poolManager);\n\n            uint256 totalAssetsWithLosses_ = poolManager_.totalAssets() - poolManager_.unrealizedLosses();\n            uint256 totalSupply_           = IPoolLike(pool).totalSupply();\n\n            lockedLiquidity_ = totalCycleShares[currentCycleId_] * totalAssetsWithLosses_ / totalSupply_;\n        }\n    }\n\n    function previewRedeem(address owner_, uint256 shares_)\n        external view override returns (uint256 redeemableShares_, uint256 resultingAssets_)\n    {\n        uint256 lockedShares_ = lockedShares[owner_];\n\n        if (shares_ != lockedShares_ || shares_ == 0) {\n            return ( redeemableShares_, resultingAssets_ );\n        }\n\n        uint256 exitCycleId_  = exitCycleId[owner_];\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(exitCycleId_);\n\n        if (block.timestamp < windowStart_ || block.timestamp >=  windowEnd_) {\n            return ( redeemableShares_, resultingAssets_ );\n        }\n\n        ( redeemableShares_, resultingAssets_, ) = getRedeemableAmounts(lockedShares_, owner_);\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Public View Utility Functions                                                                                                  ***/\n    /**************************************************************************************************************************************/\n\n    function getConfigAtId(uint256 cycleId_) public view override returns (CycleConfig memory config_) {\n        uint256 configId_ = latestConfigId;\n\n        if (configId_ == 0) return cycleConfigs[configId_];\n\n        while (cycleId_ < cycleConfigs[configId_].initialCycleId) {\n            --configId_;\n        }\n\n        config_ = cycleConfigs[configId_];\n    }\n\n    function getCurrentConfig() public view override returns (CycleConfig memory config_) {\n        uint256 configId_ = latestConfigId;\n\n        while (configId_ != 0 && block.timestamp < cycleConfigs[configId_].initialCycleTime) {\n            --configId_;\n        }\n\n        config_ = cycleConfigs[configId_];\n    }\n\n    // NOTE: If the first cycle has not been reached yet it will still be returned as the current one.\n    function getCurrentCycleId() public view override returns (uint256 cycleId_) {\n        CycleConfig memory config_ = getCurrentConfig();\n\n        cycleId_ = config_.initialCycleId;\n\n        if (block.timestamp > config_.initialCycleTime) {\n            cycleId_ += (block.timestamp - config_.initialCycleTime) / config_.cycleDuration;\n        }\n    }\n\n    function getRedeemableAmounts(uint256 lockedShares_, address owner_)\n        public view override returns (uint256 redeemableShares_, uint256 resultingAssets_, bool partialLiquidity_)\n    {\n        IPoolManagerLike poolManager_ = IPoolManagerLike(poolManager);\n\n        // Calculate how much liquidity is available, and how much is required to allow redemption of shares.\n        uint256 availableLiquidity_      = IERC20Like(asset()).balanceOf(pool);\n        uint256 totalAssetsWithLosses_   = poolManager_.totalAssets() - poolManager_.unrealizedLosses();\n        uint256 totalSupply_             = IPoolLike(pool).totalSupply();\n        uint256 totalRequestedLiquidity_ = totalCycleShares[exitCycleId[owner_]] * totalAssetsWithLosses_ / totalSupply_;\n\n        partialLiquidity_ = availableLiquidity_ < totalRequestedLiquidity_;\n\n        // Calculate maximum redeemable shares while maintaining a pro-rata distribution.\n        redeemableShares_ =\n            partialLiquidity_\n                ? lockedShares_ * availableLiquidity_ / totalRequestedLiquidity_\n                : lockedShares_;\n\n        resultingAssets_ = redeemableShares_ * totalAssetsWithLosses_ / totalSupply_;\n    }\n\n    function getWindowStart(uint256 cycleId_) public view override returns (uint256 windowStart_) {\n        CycleConfig memory config_ = getConfigAtId(cycleId_);\n\n        windowStart_ = config_.initialCycleTime + (cycleId_ - config_.initialCycleId) * config_.cycleDuration;\n    }\n\n    function getWindowAtId(uint256 cycleId_) public view override returns (uint256 windowStart_, uint256 windowEnd_) {\n        CycleConfig memory config_ = getConfigAtId(cycleId_);\n\n        windowStart_ = config_.initialCycleTime + (cycleId_ - config_.initialCycleId) * config_.cycleDuration;\n        windowEnd_   = windowStart_ + config_.windowDuration;\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Address View Functions                                                                                                         ***/\n    /**************************************************************************************************************************************/\n\n    function asset() public view override returns (address asset_) {\n        asset_ = IPoolLike(pool).asset();\n    }\n\n    function factory() external view override returns (address factory_) {\n        factory_ = _factory();\n    }\n\n    function globals() public view override returns (address globals_) {\n        globals_ = IMapleProxyFactory(_factory()).mapleGlobals();\n    }\n\n    function governor() public view override returns (address governor_) {\n        governor_ = IGlobalsLike(globals()).governor();\n    }\n\n    function implementation() external view override returns (address implementation_) {\n        implementation_ = _implementation();\n    }\n\n    function poolDelegate() public view override returns (address poolDelegate_) {\n        poolDelegate_ = IPoolManagerLike(poolManager).poolDelegate();\n    }\n\n    function previewWithdraw(address owner_, uint256 assets_)\n        external pure override returns (uint256 redeemableAssets_, uint256 resultingShares_)\n    {\n        owner_; assets_; redeemableAssets_; resultingShares_;  // Silence compiler warnings\n        return ( redeemableAssets_, resultingShares_ );  // NOTE: Withdrawal not implemented use redeem instead\n    }\n\n    /**************************************************************************************************************************************/\n    /*** Helper Functions                                                                                                               ***/\n    /**************************************************************************************************************************************/\n\n    function _emitProcess(address account_, uint256 sharesToRedeem_, uint256 assetsToWithdraw_) internal {\n        if (sharesToRedeem_ == 0) {\n            return;\n        }\n\n        emit WithdrawalProcessed(account_, sharesToRedeem_, assetsToWithdraw_);\n    }\n\n    function _emitUpdate(address account_, uint256 lockedShares_, uint256 exitCycleId_) internal {\n        if (lockedShares_ == 0) {\n            emit WithdrawalCancelled(account_);\n            return;\n        }\n\n        ( uint256 windowStart_, uint256 windowEnd_ ) = getWindowAtId(exitCycleId_);\n\n        emit WithdrawalUpdated(account_, lockedShares_, _uint64(windowStart_), _uint64(windowEnd_));\n    }\n\n    function _uint64(uint256 input_) internal pure returns (uint64 output_) {\n        require(input_ <= type(uint64).max, \"WM:UINT64_CAST_OOB\");\n        output_ = uint64(input_);\n    }\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/contracts/interfaces/IMapleWithdrawalManagerStorage.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface IMapleWithdrawalManagerStorage {\n\n    struct CycleConfig {\n        uint64 initialCycleId;    // Identifier of the first withdrawal cycle using this configuration.\n        uint64 initialCycleTime;  // Timestamp of the first withdrawal cycle using this configuration.\n        uint64 cycleDuration;     // Duration of the withdrawal cycle.\n        uint64 windowDuration;    // Duration of the withdrawal window.\n    }\n\n    /**\n     *  @dev    Gets the configuration for a given config id.\n     *  @param  configId_        The id of the configuration to use.\n     *  @return initialCycleId   Identifier of the first withdrawal cycle using this configuration.\n     *  @return initialCycleTime Timestamp of the first withdrawal cycle using this configuration.\n     *  @return cycleDuration    Duration of the withdrawal cycle.\n     *  @return windowDuration   Duration of the withdrawal window.\n     */\n    function cycleConfigs(uint256 configId_)\n        external returns (uint64 initialCycleId, uint64 initialCycleTime, uint64 cycleDuration, uint64 windowDuration);\n\n    /**\n     *  @dev    Gets the id of the cycle that account can exit on.\n     *  @param  account_ The address to check the exit for.\n     *  @return cycleId_ The id of the cycle that account can exit on.\n     */\n    function exitCycleId(address account_) external view returns (uint256 cycleId_);\n\n    /**\n     *  @dev    Gets the most recent configuration id.\n     *  @return configId_ The id of the most recent configuration.\n     */\n    function latestConfigId() external view returns (uint256 configId_);\n\n    /**\n     *  @dev    Gets the amount of locked shares for an account.\n     *  @param  account_      The address to check the exit for.\n     *  @return lockedShares_ The amount of shares locked.\n     */\n    function lockedShares(address account_) external view returns (uint256 lockedShares_);\n\n    /**\n     *  @dev    Gets the address of the pool associated with this withdrawal manager.\n     *  @return pool_ The address of the pool.\n     */\n    function pool() external view returns (address pool_);\n\n    /**\n     *  @dev    Gets the address of the pool manager associated with this withdrawal manager.\n     *  @return poolManager_ The address of the pool manager.\n     */\n    function poolManager() external view returns (address poolManager_);\n\n    /**\n     *  @dev    Gets the amount of shares for a cycle.\n     *  @param  cycleId_          The id to cycle to check.\n     *  @return totalCycleShares_ The amount of shares in the cycle.\n     */\n    function totalCycleShares(uint256 cycleId_) external view returns (uint256 totalCycleShares_);\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/contracts/MapleWithdrawalManagerStorage.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { IMapleWithdrawalManagerEvents }  from \"./interfaces/IMapleWithdrawalManagerEvents.sol\";\nimport { IMapleWithdrawalManagerStorage } from \"./interfaces/IMapleWithdrawalManagerStorage.sol\";\n\nabstract contract MapleWithdrawalManagerStorage is IMapleWithdrawalManagerStorage, IMapleWithdrawalManagerEvents {\n\n    address public override pool;\n    address public override poolManager;\n\n    uint256 public override latestConfigId;\n\n    mapping(address => uint256) public override exitCycleId;\n    mapping(address => uint256) public override lockedShares;\n\n    mapping(uint256 => uint256) public override totalCycleShares;\n\n    mapping(uint256 => CycleConfig) public override cycleConfigs;\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/contracts/interfaces/IMapleWithdrawalManager.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\nimport { IMapleProxied } from \"../../modules/maple-proxy-factory/contracts/interfaces/IMapleProxied.sol\";\n\nimport { IMapleWithdrawalManagerStorage } from \"./IMapleWithdrawalManagerStorage.sol\";\n\ninterface IMapleWithdrawalManager is IMapleProxied, IMapleWithdrawalManagerStorage {\n\n    /**************************************************************************************************************************************/\n    /*** State Changing Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev   Add shares to the withdrawal manager.\n     *  @param shares_ Amount of shares to add.\n     *  @param owner_  Address of the owner of shares.\n     */\n    function addShares(uint256 shares_, address owner_) external;\n\n    /**\n     *  @dev   Process the exit of an account.\n     *  @param requestedShares_ Amount of initially requested shares.\n     *  @param owner_           Address of the account which will be processed for exit.\n     */\n    function processExit(uint256 requestedShares_, address owner_) external returns (uint256 redeemableShares_, uint256 resultingAssets_);\n\n    /**\n     *  @dev   Remove shares to the withdrawal manager.\n     *  @param shares_ Amount of shares to remove.\n     *  @param owner_  Address of the owner of shares.\n     */\n    function removeShares(uint256 shares_, address owner_) external returns (uint256 sharesReturned_);\n\n    /**\n     *  @dev   Sets up a new exit configuration.\n     *  @param cycleDuration_  The total duration, in seconds, of a withdrawal cycle.\n     *  @param windowDuration_ The duration, in seconds, of the withdrawal window.\n     */\n    function setExitConfig(uint256 cycleDuration_, uint256 windowDuration_) external;\n\n    /**************************************************************************************************************************************/\n    /*** View Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Gets the asset address used in this withdrawal manager.\n     *  @return asset_ Address of the asset.\n     */\n    function asset() external view returns (address asset_);\n\n    /**\n     *  @dev    Gets the configuration of a given cycle id.\n     *  @param  cycleId_  The id of the cycle.\n     *  @return config_ The configuration info corresponding to the cycle.\n     */\n    function getConfigAtId(uint256 cycleId_) external view returns (CycleConfig memory config_);\n\n    /**\n     *  @dev    Gets the configuration of the current cycle id.\n     *  @return config_ The configuration info corresponding to the cycle.\n     */\n    function getCurrentConfig() external view returns (CycleConfig memory config_);\n\n    /**\n     *  @dev   Gets the id of the current cycle.\n     *  @param cycleId_ The id of the current cycle.\n     */\n    function getCurrentCycleId() external view returns (uint256 cycleId_);\n\n    /**\n     *  @dev    Gets the shares and assets that are redeemable for a given user.\n     *  @param  lockedShares_     The amount of shares that are locked.\n     *  @param  owner_            The owner of the shares.\n     *  @return redeemableShares_ The amount of shares that are redeemable based on current liquidity.\n     *  @return resultingAssets_  The corresponding amount of assets that can be redeemed using the shares.\n     *  @return partialLiquidity_ Boolean indicating if there is enough liquidity to facilitate a full redemption.\n     */\n    function getRedeemableAmounts(uint256 lockedShares_, address owner_)\n        external view returns (uint256 redeemableShares_, uint256 resultingAssets_, bool partialLiquidity_);\n\n    /**\n     *  @dev    Gets the timestamp of the beginning of the withdrawal window for a given cycle.\n     *  @param  cycleId_     The id of the current cycle.\n     *  @return windowStart_ The timestamp of the beginning of the cycle, which is the same as the beginning of the withdrawal window.\n     */\n    function getWindowStart(uint256 cycleId_) external view returns (uint256 windowStart_);\n\n    /**\n     *  @dev    Gets the timestamps of the beginning and end of the withdrawal window for a given cycle.\n     *  @param  cycleId_     The id of the current cycle.\n     *  @return windowStart_ The timestamp of the beginning of the cycle, which is the same as the beginning of the withdrawal window.\n     *  @return windowEnd_   The timestamp of the end of the withdrawal window.\n     */\n    function getWindowAtId(uint256 cycleId_) external view returns (uint256 windowStart_, uint256 windowEnd_);\n\n    /**\n     *  @dev    Gets the address of globals.\n     *  @return globals_ The address of globals.\n     */\n    function globals() external view returns (address globals_);\n\n    /**\n     *  @dev    Gets the address of the governor.\n     *  @return governor_ The address of the governor.\n     */\n    function governor() external view returns (address governor_);\n\n    /**\n     *  @dev    Checks if an account is included in an exit window.\n     *  @param  owner_          The address of the share owners to check.\n     *  @return isInExitWindow_ A boolean indicating whether or not the account is in an exit window.\n     */\n    function isInExitWindow(address owner_) external view returns (bool isInExitWindow_);\n\n    /**\n     *  @dev    Gets the total amount of funds that need to be locked to fulfill exits.\n     *  @return lockedLiquidity_ The amount of locked liquidity.\n     */\n    function lockedLiquidity() external view returns (uint256 lockedLiquidity_);\n\n    /**\n     *  @dev    Gets the pool delegate address.\n     *  @return poolDelegate_ Address of the pool delegate.\n     */\n    function poolDelegate() external view returns (address poolDelegate_);\n\n    /**\n     *  @dev    Gets the amount of shares that can be redeemed.\n     *  @param  owner_            The address to check the redemption for.\n     *  @param  shares_           The amount of requested shares to redeem.\n     *  @return redeemableShares_ The amount of shares that can be redeemed.\n     *  @return resultingAssets_  The amount of assets that will be returned for `redeemableShares`.\n     */\n    function previewRedeem(address owner_, uint256 shares_) external view returns (uint256 redeemableShares_, uint256 resultingAssets_);\n\n    /**\n     *  @dev    Gets the amount of shares that can be withdrawn.\n     *  @param  owner_            The address to check the withdrawal for.\n     *  @param  assets_           The amount of requested shares to withdraw.\n     *  @return redeemableAssets_ The amount of assets that can be withdrawn.\n     *  @return resultingShares_  The amount of shares that will be burned.\n     */\n    function previewWithdraw(address owner_, uint256 assets_) external view returns (uint256 redeemableAssets_, uint256 resultingShares_);\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/contracts/interfaces/IMapleWithdrawalManagerEvents.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity 0.8.7;\n\ninterface IMapleWithdrawalManagerEvents {\n\n    /**\n     *  @dev   Emitted when the withdrawal configuration is updated.\n     *  @param configId_         The identifier of the configuration.\n     *  @param initialCycleId_   The identifier of the withdrawal cycle when the configuration takes effect.\n     *  @param initialCycleTime_ The timestamp of the beginning of the withdrawal cycle when the configuration takes effect.\n     *  @param cycleDuration_    The new duration of the withdrawal cycle.\n     *  @param windowDuration_   The new duration of the withdrawal window.\n     */\n    event ConfigurationUpdated(\n        uint256 indexed configId_,\n        uint64 initialCycleId_,\n        uint64 initialCycleTime_,\n        uint64 cycleDuration_,\n        uint64 windowDuration_\n    );\n\n    /**\n     *  @dev   Emitted when a withdrawal request is cancelled.\n     *  @param account_ Address of the account whose withdrawal request has been cancelled.\n     */\n    event WithdrawalCancelled(address indexed account_);\n\n    /**\n     *  @dev   Emitted when a withdrawal request is processed.\n     *  @param account_          Address of the account processing their withdrawal request.\n     *  @param sharesToRedeem_   Amount of shares that the account will redeem.\n     *  @param assetsToWithdraw_ Amount of assets that will be withdrawn from the pool.\n     */\n    event WithdrawalProcessed(address indexed account_, uint256 sharesToRedeem_, uint256 assetsToWithdraw_);\n\n    /**\n     *  @dev   Emitted when a withdrawal request is updated.\n     *  @param account_      Address of the account whose request has been updated.\n     *  @param lockedShares_ Total amount of shares the account has locked.\n     *  @param windowStart_  Time when the withdrawal window for the withdrawal request will begin.\n     *  @param windowEnd_    Time when the withdrawal window for the withdrawal request will end.\n     */\n    event WithdrawalUpdated(address indexed account_, uint256 lockedShares_, uint64 windowStart_, uint64 windowEnd_);\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/contracts/interfaces/Interfaces.sol": {
+      "content": "// SPDX-License-Identifier: BUSL-1.1\npragma solidity ^0.8.7;\n\ninterface IERC20Like {\n\n    function balanceOf(address account_) external view returns (uint256 balance_);\n\n}\n\ninterface IGlobalsLike {\n\n    function governor() external view returns (address governor_);\n\n    function isPoolDeployer(address poolDeployer_) external view returns (bool isPoolDeployer_);\n\n    function isValidScheduledCall(\n        address caller_,\n        address contract_,\n        bytes32 functionId_,\n        bytes calldata callData_\n    ) external view returns (bool isValid_);\n\n    function operationalAdmin() external view returns (address operationalAdmin_);\n\n    function protocolPaused() external view returns (bool protocolPaused_);\n\n    function securityAdmin() external view returns (address securityAdmin_);\n\n    function unscheduleCall(address caller_, bytes32 functionId_, bytes calldata callData_) external;\n\n}\n\ninterface IPoolLike {\n\n    function asset() external view returns (address asset_);\n\n    function convertToShares(uint256 assets_) external view returns (uint256 shares_);\n\n    function manager() external view returns (address manager_);\n\n    function previewRedeem(uint256 shares_) external view returns (uint256 assets_);\n\n    function redeem(uint256 shares_, address receiver_, address owner_) external returns (uint256 assets_);\n\n    function totalSupply() external view returns (uint256 totalSupply_);\n\n    function transfer(address account_, uint256 amount_) external returns (bool success_);\n\n}\n\ninterface IPoolManagerLike {\n\n    function globals() external view returns (address globals_);\n\n    function poolDelegate() external view returns (address poolDelegate_);\n\n    function totalAssets() external view returns (uint256 totalAssets_);\n\n    function unrealizedLosses() external view returns (uint256 unrealizedLosses_);\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/erc20-helper/src/ERC20Helper.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nimport { IERC20Like } from \"./interfaces/IERC20Like.sol\";\n\n/**\n * @title Small Library to standardize erc20 token interactions.\n */\nlibrary ERC20Helper {\n\n    /**************************************************************************************************************************************/\n    /*** Internal Functions                                                                                                             ***/\n    /**************************************************************************************************************************************/\n\n    function transfer(address token_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transfer.selector, to_, amount_));\n    }\n\n    function transferFrom(address token_, address from_, address to_, uint256 amount_) internal returns (bool success_) {\n        return _call(token_, abi.encodeWithSelector(IERC20Like.transferFrom.selector, from_, to_, amount_));\n    }\n\n    function approve(address token_, address spender_, uint256 amount_) internal returns (bool success_) {\n        // If setting approval to zero fails, return false.\n        if (!_call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, uint256(0)))) return false;\n\n        // If `amount_` is zero, return true as the previous step already did this.\n        if (amount_ == uint256(0)) return true;\n\n        // Return the result of setting the approval to `amount_`.\n        return _call(token_, abi.encodeWithSelector(IERC20Like.approve.selector, spender_, amount_));\n    }\n\n    function _call(address token_, bytes memory data_) private returns (bool success_) {\n        if (token_.code.length == uint256(0)) return false;\n\n        bytes memory returnData;\n        ( success_, returnData ) = token_.call(data_);\n\n        return success_ && (returnData.length == uint256(0) || abi.decode(returnData, (bool)));\n    }\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/erc20-helper/src/interfaces/IERC20Like.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title Interface of the ERC20 standard as needed by ERC20Helper.\ninterface IERC20Like {\n\n    function approve(address spender_, uint256 amount_) external returns (bool success_);\n\n    function transfer(address recipient_, uint256 amount_) external returns (bool success_);\n\n    function transferFrom(address owner_, address recipient_, uint256 amount_) external returns (bool success_);\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/contracts/MapleProxiedInternals.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { ProxiedInternals } from \"../modules/proxy-factory/contracts/ProxiedInternals.sol\";\n\n/// @title A Maple implementation that is to be proxied, will need MapleProxiedInternals.\nabstract contract MapleProxiedInternals is ProxiedInternals { }\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/contracts/interfaces/IMapleProxied.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { IProxied } from \"../../modules/proxy-factory/contracts/interfaces/IProxied.sol\";\n\n/// @title A Maple implementation that is to be proxied, must implement IMapleProxied.\ninterface IMapleProxied is IProxied {\n\n    /**\n     *  @dev   The instance was upgraded.\n     *  @param toVersion_ The new version of the loan.\n     *  @param arguments_ The upgrade arguments, if any.\n     */\n    event Upgraded(uint256 toVersion_, bytes arguments_);\n\n    /**\n     *  @dev   Upgrades a contract implementation to a specific version.\n     *         Access control logic critical since caller can force a selfdestruct via a malicious `migrator_` which is delegatecalled.\n     *  @param toVersion_ The version to upgrade to.\n     *  @param arguments_ Some encoded arguments to use for the upgrade.\n     */\n    function upgrade(uint256 toVersion_, bytes calldata arguments_) external;\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/contracts/interfaces/IMapleProxyFactory.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-or-later\npragma solidity 0.8.7;\n\nimport { IDefaultImplementationBeacon } from \"../../modules/proxy-factory/contracts/interfaces/IDefaultImplementationBeacon.sol\";\n\n/// @title A Maple factory for Proxy contracts that proxy MapleProxied implementations.\ninterface IMapleProxyFactory is IDefaultImplementationBeacon {\n\n    /**************************************************************************************************************************************/\n    /*** Events                                                                                                                         ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev   A default version was set.\n     *  @param version_ The default version.\n     */\n    event DefaultVersionSet(uint256 indexed version_);\n\n    /**\n     *  @dev   A version of an implementation, at some address, was registered, with an optional initializer.\n     *  @param version_               The version registered.\n     *  @param implementationAddress_ The address of the implementation.\n     *  @param initializer_           The address of the initializer, if any.\n     */\n    event ImplementationRegistered(uint256 indexed version_, address indexed implementationAddress_, address indexed initializer_);\n\n    /**\n     *  @dev   A proxy contract was deployed with some initialization arguments.\n     *  @param version_                 The version of the implementation being proxied by the deployed proxy contract.\n     *  @param instance_                The address of the proxy contract deployed.\n     *  @param initializationArguments_ The arguments used to initialize the proxy contract, if any.\n     */\n    event InstanceDeployed(uint256 indexed version_, address indexed instance_, bytes initializationArguments_);\n\n    /**\n     *  @dev   A instance has upgraded by proxying to a new implementation, with some migration arguments.\n     *  @param instance_           The address of the proxy contract.\n     *  @param fromVersion_        The initial implementation version being proxied.\n     *  @param toVersion_          The new implementation version being proxied.\n     *  @param migrationArguments_ The arguments used to migrate, if any.\n     */\n    event InstanceUpgraded(address indexed instance_, uint256 indexed fromVersion_, uint256 indexed toVersion_, bytes migrationArguments_);\n\n    /**\n     *  @dev   The MapleGlobals was set.\n     *  @param mapleGlobals_ The address of a Maple Globals contract.\n     */\n    event MapleGlobalsSet(address indexed mapleGlobals_);\n\n    /**\n     *  @dev   An upgrade path was disabled, with an optional migrator contract.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     */\n    event UpgradePathDisabled(uint256 indexed fromVersion_, uint256 indexed toVersion_);\n\n    /**\n     *  @dev   An upgrade path was enabled, with an optional migrator contract.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     *  @param migrator_    The address of the migrator, if any.\n     */\n    event UpgradePathEnabled(uint256 indexed fromVersion_, uint256 indexed toVersion_, address indexed migrator_);\n\n    /**************************************************************************************************************************************/\n    /*** State Variables                                                                                                                ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev The default version.\n     */\n    function defaultVersion() external view returns (uint256 defaultVersion_);\n\n    /**\n     *  @dev The address of the MapleGlobals contract.\n     */\n    function mapleGlobals() external view returns (address mapleGlobals_);\n\n    /**\n     *  @dev    Whether the upgrade is enabled for a path from a version to another version.\n     *  @param  toVersion_   The initial version.\n     *  @param  fromVersion_ The destination version.\n     *  @return allowed_     Whether the upgrade is enabled.\n     */\n    function upgradeEnabledForPath(uint256 toVersion_, uint256 fromVersion_) external view returns (bool allowed_);\n\n    /**************************************************************************************************************************************/\n    /*** State Changing Functions                                                                                                       ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Deploys a new instance proxying the default implementation version, with some initialization arguments.\n     *          Uses a nonce and `msg.sender` as a salt for the CREATE2 opcode during instantiation to produce deterministic addresses.\n     *  @param  arguments_ The initialization arguments to use for the instance deployment, if any.\n     *  @param  salt_      The salt to use in the contract creation process.\n     *  @return instance_  The address of the deployed proxy contract.\n     */\n    function createInstance(bytes calldata arguments_, bytes32 salt_) external returns (address instance_);\n\n    /**\n     *  @dev   Enables upgrading from a version to a version of an implementation, with an optional migrator.\n     *         Only the Governor can call this function.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     *  @param migrator_    The address of the migrator, if any.\n     */\n    function enableUpgradePath(uint256 fromVersion_, uint256 toVersion_, address migrator_) external;\n\n    /**\n     *  @dev   Disables upgrading from a version to a version of a implementation.\n     *         Only the Governor can call this function.\n     *  @param fromVersion_ The starting version of the upgrade path.\n     *  @param toVersion_   The destination version of the upgrade path.\n     */\n    function disableUpgradePath(uint256 fromVersion_, uint256 toVersion_) external;\n\n    /**\n     *  @dev   Registers the address of an implementation contract as a version, with an optional initializer.\n     *         Only the Governor can call this function.\n     *  @param version_               The version to register.\n     *  @param implementationAddress_ The address of the implementation.\n     *  @param initializer_           The address of the initializer, if any.\n     */\n    function registerImplementation(uint256 version_, address implementationAddress_, address initializer_) external;\n\n    /**\n     *  @dev   Sets the default version.\n     *         Only the Governor can call this function.\n     *  @param version_ The implementation version to set as the default.\n     */\n    function setDefaultVersion(uint256 version_) external;\n\n    /**\n     *  @dev   Sets the Maple Globals contract.\n     *         Only the Governor can call this function.\n     *  @param mapleGlobals_ The address of a Maple Globals contract.\n     */\n    function setGlobals(address mapleGlobals_) external;\n\n    /**\n     *  @dev   Upgrades the calling proxy contract's implementation, with some migration arguments.\n     *  @param toVersion_ The implementation version to upgrade the proxy contract to.\n     *  @param arguments_ The migration arguments, if any.\n     */\n    function upgradeInstance(uint256 toVersion_, bytes calldata arguments_) external;\n\n    /**************************************************************************************************************************************/\n    /*** View Functions                                                                                                                 ***/\n    /**************************************************************************************************************************************/\n\n    /**\n     *  @dev    Returns the deterministic address of a potential proxy, given some arguments and salt.\n     *  @param  arguments_       The initialization arguments to be used when deploying the proxy.\n     *  @param  salt_            The salt to be used when deploying the proxy.\n     *  @return instanceAddress_ The deterministic address of a potential proxy.\n     */\n    function getInstanceAddress(bytes calldata arguments_, bytes32 salt_) external view returns (address instanceAddress_);\n\n    /**\n     *  @dev    Returns the address of an implementation version.\n     *  @param  version_        The implementation version.\n     *  @return implementation_ The address of the implementation.\n     */\n    function implementationOf(uint256 version_) external view returns (address implementation_);\n\n    /**\n     *  @dev    Returns if a given address has been deployed by this factory/\n     *  @param  instance_   The address to check.\n     *  @return isInstance_ A boolean indication if the address has been deployed by this factory.\n     */\n    function isInstance(address instance_) external view returns (bool isInstance_);\n\n    /**\n     *  @dev    Returns the address of a migrator contract for a migration path (from version, to version).\n     *          If oldVersion_ == newVersion_, the migrator is an initializer.\n     *  @param  oldVersion_ The old version.\n     *  @param  newVersion_ The new version.\n     *  @return migrator_   The address of a migrator contract.\n     */\n    function migratorForPath(uint256 oldVersion_, uint256 newVersion_) external view returns (address migrator_);\n\n    /**\n     *  @dev    Returns the version of an implementation contract.\n     *  @param  implementation_ The address of an implementation contract.\n     *  @return version_        The version of the implementation contract.\n     */\n    function versionOf(address implementation_) external view returns (uint256 version_);\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/modules/proxy-factory/contracts/ProxiedInternals.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nimport { SlotManipulatable } from \"./SlotManipulatable.sol\";\n\n/// @title An implementation that is to be proxied, will need ProxiedInternals.\nabstract contract ProxiedInternals is SlotManipulatable {\n\n    /// @dev Storage slot with the address of the current factory. `keccak256('eip1967.proxy.factory') - 1`.\n    bytes32 private constant FACTORY_SLOT = bytes32(0x7a45a402e4cb6e08ebc196f20f66d5d30e67285a2a8aa80503fa409e727a4af1);\n\n    /// @dev Storage slot with the address of the current factory. `keccak256('eip1967.proxy.implementation') - 1`.\n    bytes32 private constant IMPLEMENTATION_SLOT = bytes32(0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc);\n\n    /// @dev Delegatecalls to a migrator contract to manipulate storage during an initialization or migration.\n    function _migrate(address migrator_, bytes calldata arguments_) internal virtual returns (bool success_) {\n        uint256 size;\n\n        assembly {\n            size := extcodesize(migrator_)\n        }\n\n        if (size == uint256(0)) return false;\n\n        ( success_, ) = migrator_.delegatecall(arguments_);\n    }\n\n    /// @dev Sets the factory address in storage.\n    function _setFactory(address factory_) internal virtual returns (bool success_) {\n        _setSlotValue(FACTORY_SLOT, bytes32(uint256(uint160(factory_))));\n        return true;\n    }\n\n    /// @dev Sets the implementation address in storage.\n    function _setImplementation(address implementation_) internal virtual returns (bool success_) {\n        _setSlotValue(IMPLEMENTATION_SLOT, bytes32(uint256(uint160(implementation_))));\n        return true;\n    }\n\n    /// @dev Returns the factory address.\n    function _factory() internal view virtual returns (address factory_) {\n        return address(uint160(uint256(_getSlotValue(FACTORY_SLOT))));\n    }\n\n    /// @dev Returns the implementation address.\n    function _implementation() internal view virtual returns (address implementation_) {\n        return address(uint160(uint256(_getSlotValue(IMPLEMENTATION_SLOT))));\n    }\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/modules/proxy-factory/contracts/SlotManipulatable.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\nabstract contract SlotManipulatable {\n\n    function _getReferenceTypeSlot(bytes32 slot_, bytes32 key_) internal pure returns (bytes32 value_) {\n        return keccak256(abi.encodePacked(key_, slot_));\n    }\n\n    function _getSlotValue(bytes32 slot_) internal view returns (bytes32 value_) {\n        assembly {\n            value_ := sload(slot_)\n        }\n    }\n\n    function _setSlotValue(bytes32 slot_, bytes32 value_) internal {\n        assembly {\n            sstore(slot_, value_)\n        }\n    }\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/modules/proxy-factory/contracts/interfaces/IDefaultImplementationBeacon.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title An beacon that provides a default implementation for proxies, must implement IDefaultImplementationBeacon.\ninterface IDefaultImplementationBeacon {\n\n    /// @dev The address of an implementation for proxies.\n    function defaultImplementation() external view returns (address defaultImplementation_);\n\n}\n"
+    },
+    "modules/withdrawal-manager-cyclical/modules/maple-proxy-factory/modules/proxy-factory/contracts/interfaces/IProxied.sol": {
+      "content": "// SPDX-License-Identifier: AGPL-3.0-only\npragma solidity ^0.8.7;\n\n/// @title An implementation that is to be proxied, must implement IProxied.\ninterface IProxied {\n\n    /**\n     *  @dev The address of the proxy factory.\n     */\n    function factory() external view returns (address factory_);\n\n    /**\n     *  @dev The address of the implementation contract being proxied.\n     */\n    function implementation() external view returns (address implementation_);\n\n    /**\n     *  @dev   Modifies the proxy's implementation address.\n     *  @param newImplementation_ The address of an implementation contract.\n     */\n    function setImplementation(address newImplementation_) external;\n\n    /**\n     *  @dev   Modifies the proxy's storage by delegate-calling a migrator contract with some arguments.\n     *         Access control logic critical since caller can force a selfdestruct via a malicious `migrator_` which is delegatecalled.\n     *  @param migrator_  The address of a migrator contract.\n     *  @param arguments_ Some encoded arguments to use for the migration.\n     */\n    function migrate(address migrator_, bytes calldata arguments_) external;\n\n}\n"
+    }
+  }
+}
